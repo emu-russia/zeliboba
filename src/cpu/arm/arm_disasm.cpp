@@ -286,35 +286,41 @@ void arm_mul(DState& s, u32 addr, u32 instr) {
             s.s("mul"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
-        case 0x2u:
+        case 0x1u:
             s.s("mla"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs); s.s(", "); s.reg(rd_lo);
             return;
-        case 0x4u:
+        case 0x2u:
             s.s("umaal"); s.cond_suffix(); s.c(' ');
             s.reg(rd_lo); s.s(", "); s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
-        case 0x6u:
+        case 0x3u:
             s.s("mls"); s.cond_suffix(); s.c(' ');
             s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs); s.s(", "); s.reg(rd_lo);
             return;
-        case 0x8u: case 0x9u:
+        case 0x4u:
             s.s("umull"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_lo); s.s(", "); s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
-        case 0xAu: case 0xBu:
+        case 0x5u:
             s.s("umlal"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_lo); s.s(", "); s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
-        case 0xCu: case 0xDu:
+        case 0x6u:
             s.s("smull"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_lo); s.s(", "); s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
-        default:
+        case 0x7u:
             s.s("smlal"); s.s_flag(sf); s.cond_suffix(); s.c(' ');
             s.reg(rd_lo); s.s(", "); s.reg(rd_hi); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
             return;
+        default:
+            break;
     }
+    char tmp[16];
+    std::snprintf(tmp, sizeof(tmp), "%08X", instr);
+    s.s(".word 0x");
+    s.s(tmp);
 }
 
 // ---- media / DSP -----------------------------------------------------------
@@ -1434,6 +1440,26 @@ void arm_decode(DState& s, u32 addr, unsigned& length) {
         return;
     }
     if (blk == 1u) {
+        // Hints (ARM ARM A8.8.16): cond 0011 0010 0000 1111 0000 0000 oooo. They
+        // share bits [27:20] with MSR (immediate) and used to print as
+        // `teq rN, #imm`, which made the kernel boot loader's `sev` look like a
+        // skipped data-processing instruction.
+        if ((instr & 0x0FFF0F00u) == 0x03200F00u) {
+            switch (instr & 0xFFu) {
+                case 0u: s.s("nop"); break;
+                case 1u: s.s("yield"); break;
+                case 2u: s.s("wfe"); break;
+                case 3u: s.s("wfi"); break;
+                case 4u: s.s("sev"); break;
+                case 0xF0u: s.s("dbg #0"); break;
+                default:
+                    s.s("hint #");
+                    s.u(instr & 0xFFu);
+                    break;
+            }
+            s.cond_suffix();
+            return;
+        }
         if (op >= 0xAu && ((instr >> 12) & 0xFu) == 0xFu) {
             arm_msr_imm(s, instr);
             return;

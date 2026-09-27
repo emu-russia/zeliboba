@@ -1,4 +1,4 @@
-// zeliboba - ARM Cortex-A9 (ARMv7-A + Thumb-2 + VFPv3-D16) interpreter.
+﻿// zeliboba - ARM Cortex-A9 (ARMv7-A + Thumb-2 + VFPv3-D16) interpreter.
 //
 // This is a faithful port of the VitaTestSuite reference implementation
 // (Core/ArmCore.cs). Keeping the decode classification identical matters: the
@@ -479,7 +479,6 @@ void ArmCore::take_exception(u32 vector_offset, u32 new_mode, u32 return_address
     const int o = static_cast<int>(old_mode & arm::kModeMask);
     bank_sp_[o] = r[13];
     bank_lr_[o] = r[14];
-    bank_spsr_[o] = saved_cpsr;
     if (o == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) bank_r8_[o][j] = r[8 + j];
     }
@@ -490,6 +489,11 @@ void ArmCore::take_exception(u32 vector_offset, u32 new_mode, u32 return_address
     it_state_ = 0;
 
     const int n = static_cast<int>(new_mode & arm::kModeMask);
+    // SPSR_<new mode> = CPSR (ARM ARM B1.8.3). Saving it into the *old* mode's
+    // bank (as this did) left the exception's own SPSR stale, so a cross-mode
+    // exception return (RFE / `movs pc, lr`) restored the wrong PSR - evidence:
+    // arm_mode_banking_switches_sp.
+    bank_spsr_[n] = saved_cpsr;
     r[13] = bank_sp_[n];
     r[14] = return_address;
     if (n == static_cast<int>(arm::kModeFiq)) {
@@ -801,7 +805,28 @@ void ArmCore::execute_arm() {
     if (op1v == 1u) {
         // 001x: data processing (immediate) / MSR immediate.
         const u32 dp_op = (instr >> 21) & 0xFu;
-        if ((dp_op & 0xAu) == 0xAu && ((instr >> 12) & 0xFu) == 0xFu) {
+        // Hints (ARM ARM A8.8.16): cond 0011 0010 0000 1111 0000 0000 oooo with
+        // 0 NOP, 1 YIELD, 2 WFE, 3 WFI, 4 SEV and 0xF0 DBG (anything else in the
+        // space is unallocated). They share bits [27:20] with MSR (immediate),
+        // and NOP has Rd == 1111 with an empty field mask, so the MSR test below
+        // used to halt the core on `sev`/`wfe` - the kernel boot loader's spin
+        // barrier primitives (0xE320F004, WFE with cond == NE). Evidence:
+        // arm_hints_and_barriers_are_noops.
+        if ((instr & 0x0FFF0F00u) == 0x03200000u) {
+            const u32 hint = instr & 0xFFu;
+            if (hint <= 4u || hint == 0xF0u) {
+                write_r15(cur_instr_addr_ + 4u);
+                return;
+            }
+            undefined("unallocated hint encoding");
+            return;
+        }
+        // MSR (immediate) is `cond 0011 0R10 mask 1111 rotate imm8` (ARM ARM
+        // A8.8.103), i.e. bits [24:21] == 1001 for CPSR and 1011 for SPSR plus
+        // Rd == 1111. The mask test used to be `(dp_op & 0xA) == 0xA`, which
+        // rejects the CPSR form (1001) and turns `msr cpsr_f, #imm` into TEQ;
+        // evidence: arm_psr_transfer_msr_immediate.
+        if ((dp_op == 0x9u || dp_op == 0xBu) && ((instr >> 12) & 0xFu) == 0xFu) {
             msr_arm(instr, arm::decode_imm12(instr));
             return;
         }
@@ -863,6 +888,13 @@ void ArmCore::execute_data_processing(u32 instr, u32 op, bool immediate) {
     // TST/TEQ/CMP/CMN together as "logical", so CMP/CMN never updated C or V --
     // which breaks every subsequent conditional that tests carry or overflow.
     const bool logical = op <= 1u || op == 0x8u || op == 0x9u;
+    // ARM ARM A8.8.2: with S == 1 the C flag is the shifter carry out for the
+    // logical opcodes, and that set includes ORR/BIC/MOV/MVN as well as
+    // AND/EOR/TST/TEQ. Limiting it to the latter meant `movs r0, r1, lsl #1`
+    // (r1 = 0x80000000) left C clear instead of setting it, and the same for
+    // ORRS/BICS/MVNS; evidence: arm_dp_shifter_carry_for_logical_ops_with_s.
+    const bool shifter_sets_carry =
+        logical || op == 0xCu || op == 0xDu || op == 0xEu || op == 0xFu;
 
     // A32 MOVW / MOVT: bits [27:25] = 001, opcode 1000 (MOVW) or 1010 (MOVT)
     // with S == 0; otherwise those opcodes are TST / CMP.
@@ -875,8 +907,19 @@ void ArmCore::execute_data_processing(u32 instr, u32 op, bool immediate) {
     }
 
     u32 op2;
-    if (immediate) op2 = arm::decode_imm12(instr);
-    else op2 = shifter_operand(instr, s && logical);
+    if (immediate) {
+        op2 = arm::decode_imm12(instr);
+        // For the immediate form the shifter carry out of a rotation is the top
+        // bit of the expanded immediate (ARM ARM A8.8.2); a rotate of 0 shifts
+        // nothing out and leaves C alone. Without this, MOVS/ANDS/... with a
+        // rotated immediate never updated C at all.
+        if (s && shifter_sets_carry && ((instr >> 8) & 0xFu) != 0u) {
+            if ((op2 & 0x80000000u) != 0u) cpsr |= arm::kFlagC;
+            else cpsr &= ~arm::kFlagC;
+        }
+    } else {
+        op2 = shifter_operand(instr, s && shifter_sets_carry);
+    }
 
     const u32 a = (op == 0xFu || op == 0xDu) ? 0u : read_reg(rn);
     u32 result = 0;
@@ -975,105 +1018,84 @@ void ArmCore::execute_arm_exclusive(u32 instr) {
 void ArmCore::decode_arm_mul_media(u32 instr) {
     const u32 op = (instr >> 21) & 0xFu;
     const bool s = (instr & (1u << 20)) != 0;
-    const int rn_field = static_cast<int>((instr >> 16) & 0xFu);
-    const int rd_field = static_cast<int>((instr >> 12) & 0xFu);
-    const int rs = static_cast<int>((instr >> 8) & 0xFu);
-    const int rm = static_cast<int>(instr & 0xFu);
+    // Multiply field layout (ARM ARM A5.3.1, confirmed with capstone):
+    //   [19:16] = Rd (RdHi for the long forms)
+    //   [15:12] = Ra (RdLo for the long forms)
+    //   [11:8]  = Rm, [3:0] = Rn, [7:4] = 1001 and [24:21] = opcode:
+    //   0 MUL, 1 MLA, 2 UMAAL, 3 MLS, 4 UMULL, 5 UMLAL, 6 SMULL, 7 SMLAL.
+    // This used to dispatch ops 1/2/3/5/6 into the halfword-multiply helpers
+    // (which live in the 0001 0xxx space and are decoded by decode_arm_media)
+    // and the long forms into a swapped hi/lo pair, so MLA, MLS, UMAAL, UMULL,
+    // UMLAL, SMULL and SMLAL all executed as some other instruction (SMLAL even
+    // reported itself undefined); evidence: arm_multiply_mla_and_mls,
+    // arm_multiply_long_forms, arm_multiply_umaal and
+    // arm_multiply_long_sets_nz_from_the_64_bit_result.
+    const int rdh = static_cast<int>((instr >> 16) & 0xFu);
+    const int rdl = static_cast<int>((instr >> 12) & 0xFu);
+    const int rm = static_cast<int>((instr >> 8) & 0xFu);
+    const int rn = static_cast<int>(instr & 0xFu);
 
-    // SDIV/UDIV: 0111 0001 / 0111 0011 with Rd = bits [19:16] and Rn = [15:12].
-    if (op == 0x1u && (instr & 0xFu) == 0u) {
-        const u32 dividend = r[rn_field];
-        const u32 divisor = r[rs];
-        u32 quotient;
-        if (divisor == 0) {
-            quotient = 0u;  // SDIV/UDIV by zero yields 0
-        } else if ((instr & (1u << 22)) != 0u) {
-            quotient = dividend / divisor;  // UDIV
-        } else {
-            const s32 a = static_cast<s32>(dividend);
-            const s32 b = static_cast<s32>(divisor);
-            if (a == INT32_MIN && b == -1) quotient = 0x80000000u;
-            else quotient = static_cast<u32>(a / b);
-        }
-        r[rn_field] = quotient;
-        write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-
-    if (op == 0x1u) {
-        // SMLABB/SMLABT/SMLATB/SMLATT and SMLAWB/SMLAWT.
-        r[rd_field] = dsp_smla(instr, rd_field, rn_field, rs, rm);
-        write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-    if (op == 0x3u) {
-        // SMULBB/SMULBT/SMULTB/SMULTT, SMULWB/SMULWT.
-        r[rd_field] = dsp_smul(instr, rs, rm);
-        write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-    if (op == 0x5u) {
-        // SMLALBB/SMLALBT/SMLALTB/SMLALTT.
-        decode_smlalxy(instr, static_cast<u32>(rd_field), static_cast<u32>(rn_field), rm, rs);
-        return;
-    }
-    if (op == 0x2u || op == 0x6u) {
-        if (op == 0x2u) r[rd_field] = dsp_smul(instr, rs, rm);  // SMULW
-        else r[rd_field] = dsp_smla(instr, rd_field, rn_field, rs, rm);  // SMLAW
-        write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-
-    switch (op) {
-        case 0u: {
-            const u32 value = r[rm] * r[rs];
-            r[rn_field] = value;
-            if (s) set_nz(value);
-            break;
-        }
-        case 4u: {
-            const u64 value = static_cast<u64>(r[rm]) * r[rs] + r[rd_field] + r[rn_field];
-            r[rd_field] = static_cast<u32>(value);
-            r[rn_field] = static_cast<u32>(value >> 32);
-            break;
-        }
-        case 6u: {
-            const u32 value = r[rn_field] - r[rm] * r[rs];
-            r[rd_field] = value;
-            break;
-        }
-        case 8u:
-        case 9u:
-        case 0xAu:
-        case 0xBu:
-        case 0xCu:
-        case 0xDu:
-        case 0xEu:
-        case 0xFu: {
-            const bool is_unsigned = (op & 4u) == 0u;
-            const bool accumulate = (op & 2u) != 0u;
-            u64 product;
-            if (is_unsigned) {
-                product = static_cast<u64>(r[rm]) * r[rs];
+    // Ops 8..F are the SWP/SWPB encodings (bits [11:8] == 0) and the exclusive
+    // access space, which execute_arm() has already filtered out.
+    if (op >= 0x8u) {
+        // SWP/SWPB: cond 0001 0000 Rn Rd 0000 1001 Rm. Deprecated in ARMv7 but
+        // still implemented by the Cortex-A9; this core used to run it as a
+        // 64 bit multiply and clobber two registers.
+        if ((op == 0x8u || op == 0xCu) && rm == 0) {
+            const bool byte = op == 0xCu;
+            const u32 address = read_reg(rdh);  // bits [19:16] is Rn for SWP
+            if (byte) {
+                const u32 old = mem_read_byte(address);
+                if (pending_fault_ != arm::FaultKind::None) return;
+                mem_write_byte(address, read_reg(rn) & 0xFFu);  // bits [3:0] is Rm
+                if (pending_fault_ != arm::FaultKind::None) return;
+                write_reg(rdl, old & 0xFFu);                    // bits [15:12] is Rd
             } else {
-                product = static_cast<u64>(static_cast<s64>(static_cast<s32>(r[rm])) *
-                                           static_cast<s32>(r[rs]));
+                const u32 old = mem_read_word(address & ~3u, false);
+                if (pending_fault_ != arm::FaultKind::None) return;
+                mem_write_word(address & ~3u, read_reg(rn));
+                if (pending_fault_ != arm::FaultKind::None) return;
+                write_reg(rdl, old);
             }
-            if (accumulate) {
-                product += static_cast<u64>(r[rn_field]) | (static_cast<u64>(r[rd_field]) << 32);
-            }
-            r[rn_field] = static_cast<u32>(product);
-            r[rd_field] = static_cast<u32>(product >> 32);
-            if (s) {
-                cpsr &= 0x0FFFFFFFu;
-                if ((r[rd_field] & 0x80000000u) != 0) cpsr |= arm::kFlagN;
-                if (r[rd_field] == 0 && r[rn_field] == 0) cpsr |= arm::kFlagZ;
-            }
-            break;
-        }
-        default:
-            undefined("multiply encoding");
+            write_r15(cur_instr_addr_ + 4u);
             return;
+        }
+        undefined("multiply encoding");
+        return;
+    }
+
+    if (op == 0x0u) {  // MUL Rd, Rn, Rm
+        const u32 value = r[rn] * r[rm];
+        r[rdh] = value;
+        if (s) set_nz(value);
+    } else if (op == 0x1u) {  // MLA Rd, Rn, Rm, Ra
+        const u32 value = r[rn] * r[rm] + r[rdl];
+        r[rdh] = value;
+        if (s) set_nz(value);
+    } else if (op == 0x3u) {  // MLS Rd, Rn, Rm, Ra
+        r[rdh] = r[rn] * r[rm] - r[rdl];
+    } else {
+        // The 64 bit forms: UMAAL (unsigned, accumulate, no flags), UMULL,
+        // UMLAL, SMULL and SMLAL.
+        const bool smul = op >= 0x6u;
+        const bool accumulate = op == 0x2u || op == 0x5u || op == 0x7u;
+        u64 product;
+        if (smul) {
+            product = static_cast<u64>(static_cast<s64>(static_cast<s32>(r[rn])) *
+                                       static_cast<s32>(r[rm]));
+        } else {
+            product = static_cast<u64>(r[rn]) * r[rm];
+        }
+        if (accumulate) {
+            product += static_cast<u64>(r[rdl]) | (static_cast<u64>(r[rdh]) << 32);
+        }
+        r[rdl] = static_cast<u32>(product);
+        r[rdh] = static_cast<u32>(product >> 32);
+        if (s) {
+            cpsr &= 0x0FFFFFFFu;
+            if ((r[rdh] & 0x80000000u) != 0) cpsr |= arm::kFlagN;
+            if (r[rdh] == 0 && r[rdl] == 0) cpsr |= arm::kFlagZ;
+        }
     }
     write_r15(cur_instr_addr_ + 4u);
 }
@@ -1226,8 +1248,32 @@ void ArmCore::decode_arm_media(u32 instr) {
         case 0x7Cu: case 0x7Du: case 0x7Eu: case 0x7Fu:
             decode_bitfield(instr, rd, rn, rs);
             break;
+        case 0x71u:  // SDIV
+        case 0x73u: {  // UDIV
+            // ARM ARM A8.8.165 / A8.8.174: cond 0111 0001 (SDIV) / 0111 0011
+            // (UDIV) Rd 1111 Rm 0001 Rn. These shared their opcode space with
+            // the SMMUL family here and were executed as SMMUL/SMMLA/SMMLS,
+            // writing the result to bits [15:12] (== 1111, i.e. the PC).
+            const int rd_div = static_cast<int>((instr >> 16) & 0xFu);
+            const int rn_div = static_cast<int>(instr & 0xFu);
+            const u32 dividend = r[rn_div];
+            const u32 divisor = r[rs];
+            u32 quotient;
+            if (divisor == 0u) {
+                quotient = 0u;  // divide by zero yields 0
+            } else if (o1 == 0x73u) {
+                quotient = dividend / divisor;
+            } else {
+                const s32 a = static_cast<s32>(dividend);
+                const s32 b = static_cast<s32>(divisor);
+                if (a == INT32_MIN && b == -1) quotient = 0x80000000u;
+                else quotient = static_cast<u32>(a / b);
+            }
+            r[rd_div] = quotient;
+            break;
+        }
         case 0x75u: case 0x76u: case 0x77u:
-        case 0x71u: case 0x72u: case 0x73u:
+        case 0x72u:
             decode_smmul(instr, rd, rn, rs, rm, o1);
             break;
         default:
@@ -1287,9 +1333,22 @@ void ArmCore::decode_media_a(u32 instr, int rd, int rn, int rs, int rm, u32 ga) 
             r[rn] = static_cast<u32>(static_cast<s32>(r[rd]) + mh * sh);
             return;
         case 0x12u: {  // SMLAWy / SMULWy
-            const s64 product = static_cast<s64>(mh) * static_cast<s32>(r[rs]);
-            const s32 hi = static_cast<s32>(product >> 16);
-            r[rn] = x ? static_cast<u32>(hi) : static_cast<u32>(static_cast<s32>(r[rd]) + hi);
+            // ARM ARM A8.8.152 / A8.8.163: the *word* operand is Rn (bits [3:0],
+            // reached here as r[rm]) and the halfword operand is Rm (bits [11:8],
+            // i.e. r[rs]); "B"/"T" select its bottom/top half through the y bit
+            // (bit 6, already folded into `sh`). This used to take the halfword
+            // from bits [3:0] and the word from bits [11:8], which is the other
+            // way round, so all four forms multiplied the wrong operands.
+            // SMLAWB adds Ra *before* the >> 16 (bits [47:16] of the sum).
+            const s64 product = static_cast<s64>(static_cast<s32>(r[rm])) * static_cast<s16>(sh);
+            if (x) {  // SMULWy
+                r[rn] = static_cast<u32>(static_cast<s32>(product >> 16));
+                return;
+            }
+            const s64 sum = product + static_cast<s32>(r[rd]);
+            if (sum > 2147483647LL || sum < -2147483648LL) cpsr |= arm::kFlagQ;
+            else cpsr &= ~arm::kFlagQ;
+            r[rn] = static_cast<u32>(static_cast<s32>(sum >> 16));
             return;
         }
         case 0x14u: {  // SMLALxy
@@ -1308,7 +1367,7 @@ void ArmCore::decode_media_a(u32 instr, int rd, int rn, int rs, int rm, u32 ga) 
 u32 ArmCore::select_bytes(u32 a, u32 b, u32 cpsr_value) {
     u32 result = 0;
     for (int k = 0; k < 4; ++k) {
-        const bool ge = (cpsr_value & (0x10000000u >> k)) != 0;
+        const bool ge = (cpsr_value & (0x00010000u << k)) != 0;
         const u32 mask = 0xFFu << (k * 8);
         result |= ge ? (b & mask) : (a & mask);
     }
@@ -1317,9 +1376,15 @@ u32 ArmCore::select_bytes(u32 a, u32 b, u32 cpsr_value) {
 
 void ArmCore::parallel_add_sub(u32 instr, int rd, int rn, int rm, u32 op1, u32 op2) {
     (void)instr;
-    const bool is_unsigned = op1 >= 5u;
-    const bool halving = (op1 == 3u || op1 == 7u);
-    const bool saturating = (op1 == 2u || op1 == 6u);
+    // op1 is the full bits [27:20] field: 0x61 SADD16/SASX/SSAX/SSUB16/SADD8/
+    // SSUB8, 0x62 the saturating Q* forms, 0x63 the halving SH* forms, 0x65/0x66/
+    // 0x67 the same for unsigned. So bit 2 selects unsigned and bits [1:0] select
+    // plain/saturating/halving. The comparisons used to be against the bare
+    // values 2/3/6/7, which never matched, so QADD16/QSUB16/SHADD16/... silently
+    // ran as the plain wrapping forms (evidence: arm_media_parallel_add_sub).
+    const bool is_unsigned = (op1 & 4u) != 0u;
+    const bool halving = (op1 & 3u) == 3u;
+    const bool saturating = (op1 & 3u) == 2u;
     const u32 a = r[rn];
     const u32 b = r[rm];
     u32 result = 0;
@@ -1342,7 +1407,7 @@ void ArmCore::parallel_add_sub(u32 instr, int rd, int rn, int rm, u32 op1, u32 o
             if (saturating) res = arm::saturate_signed(res, 8);
             else if (halving) res >>= 1;
             result |= static_cast<u32>(res & 0xFF) << (k * 8);
-            if (res >= 0) ge |= 0x10000000u >> k;
+            if (res >= 0) ge |= 0x00010000u << k;
         }
     } else if (is_asx || is_sax) {
         s32 a0 = static_cast<s32>(a & 0xFFFFu);
@@ -1413,7 +1478,12 @@ void ArmCore::parallel_add_sub(u32 instr, int rd, int rn, int rm, u32 op1, u32 o
     }
 
     r[rd] = result;
-    if (is8) cpsr = (cpsr & 0x0FFFFFFFu) | ge;
+    // GE[3:0] lives in CPSR[19:16] (ARM ARM A2.5); setting bits 28..25 (the
+    // NZCV/Q neighbours) corrupted the condition flags, and SEL read the same
+    // wrong bits, so `sadd8` followed by a flag test branched on N/Z/C/V
+    // instead of on the byte comparisons. Evidence: arm_media_parallel_add_sub
+    // and arm_media_sel.
+    if (is8) cpsr = (cpsr & ~arm::kFlagGE) | ge;
 }
 
 void ArmCore::decode_sat_extend(u32 instr, int rd, int rn, int rm, u32 op1, u32 op2) {
@@ -1485,7 +1555,11 @@ void ArmCore::decode_sat_extend(u32 instr, int rd, int rn, int rm, u32 op1, u32 
                 sat = static_cast<s32>(lv);
             }
         } else {
-            sat = arm::saturate_signed(static_cast<s32>(value), static_cast<unsigned>(sat_imm) + 1u);
+            // SSAT: Q is set when the value actually saturates (ARM ARM
+            // A8.8.164); this path used to leave Q alone.
+            const s32 raw = static_cast<s32>(value);
+            sat = arm::saturate_signed(raw, static_cast<unsigned>(sat_imm) + 1u);
+            if (sat != raw) cpsr |= arm::kFlagQ;
         }
         r[rd] = static_cast<u32>(sat);
         return;
@@ -1908,6 +1982,17 @@ void ArmCore::execute_arm_branch(u32 instr) {
 void ArmCore::execute_arm_unconditional(u32 instr) {
     const u32 blk = (instr >> 25) & 7u;
 
+    // Unconditional hints: 1111 0011 0010 0000 1111 0000 0000 oooo (NOP/YIELD/
+    // WFE/WFI/SEV, DBG = 0xF0). Without this the space falls into the Advanced
+    // SIMD classifier below and is reported as NEON.
+    if ((instr & 0x0FFF0F00u) == 0x03200000u) {
+        const u32 hint = instr & 0xFFu;
+        if (hint <= 4u || hint == 0xF0u) {
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+    }
+
     // 1111 101H: BLX (immediate). H is *bit 24* and contributes bit 1 of the
     // offset: target = PC + 8 + SignExtend(imm24:H:'0', 26), then word aligned.
     // (The reference core tested bit 4 as if it were H and dropped H from the
@@ -1928,6 +2013,15 @@ void ArmCore::execute_arm_unconditional(u32 instr) {
 
     // 1111 110x / 1111 111x: coprocessor and VFP.
     if (blk == 6u || blk == 7u) {
+        // CLREX / DSB / DMB / ISB (1111 0101 0111 1111 1111 0000 0xxx xxxx) also
+        // live here. They must be decoded before the bit 4 split below, because
+        // CLREX has bit 4 set and used to be handed to execute_arm_vfp, which
+        // reported it as an undefined coprocessor instruction (evidence:
+        // arm_hints_and_barriers_are_noops).
+        if ((instr & 0xFFFFFF00u) == 0xF57FF000u) {
+            decode_arm_misc_uncond(instr);
+            return;
+        }
         if ((instr & 0x10u) == 0u) {
             if (blk == 6u) {
                 execute_arm_coprocessor(instr);
@@ -2963,16 +3057,35 @@ void ArmCore::thumb_misc16(u32 i) {
         write_r15(cur_instr_addr_ + 2u);
         return;
     }
-    if ((i & 0xFF00u) == 0xB600u) {
-        if ((i & 0x00F0u) == 0x0060u) {
-            if (mode() != arm::kModeUser) cpsr |= arm::kFlagI;
-        } else if ((i & 0x00F0u) == 0x0070u) {
-            if (mode() != arm::kModeUser) cpsr &= ~arm::kFlagI;
-        } else if ((i & 0x00FFu) == 0x0002u) {
-            cpsr |= arm::kFlagE;
-        } else if ((i & 0x00FFu) == 0x0000u) {
-            cpsr &= ~arm::kFlagE;
+    // CPS (T1): 1011 0110 011 imod(2) 0 AIF(3) with A/I/F in bits [2:0]
+    // (ARM ARM A7.7.24) - the handler used to ignore the field selection and
+    // always act on I.
+    if ((i & 0xFFE0u) == 0xB660u) {
+        const u32 imod = (i >> 4) & 3u;
+        const u32 aif = i & 7u;
+        if (mode() != arm::kModeUser) {
+            if (imod == 2u) {
+                if ((aif & 4u) != 0u) cpsr &= ~arm::kFlagA;
+                if ((aif & 2u) != 0u) cpsr &= ~arm::kFlagI;
+                if ((aif & 1u) != 0u) cpsr &= ~arm::kFlagF;
+            } else if (imod == 3u) {
+                if ((aif & 4u) != 0u) cpsr |= arm::kFlagA;
+                if ((aif & 2u) != 0u) cpsr |= arm::kFlagI;
+                if ((aif & 1u) != 0u) cpsr |= arm::kFlagF;
+            }
         }
+        write_r15(cur_instr_addr_ + 2u);
+        return;
+    }
+    // SETEND (T1): 1011 0110 0101 0 E 0 0 - E is bit 3 (ARM ARM A7.7.152). The
+    // handler looked for B600/B602 instead, so SETEND never changed CPSR.E.
+    if ((i & 0xFFF7u) == 0xB650u) {
+        if ((i & 8u) != 0u) cpsr |= arm::kFlagE;
+        else cpsr &= ~arm::kFlagE;
+        write_r15(cur_instr_addr_ + 2u);
+        return;
+    }
+    if ((i & 0xFF00u) == 0xB600u) {
         write_r15(cur_instr_addr_ + 2u);
         return;
     }
@@ -3166,7 +3279,11 @@ void ArmCore::thumb32_data_processing_shifted() {
     const int type = static_cast<int>((hw2 >> 4) & 3u);
     const int amount = static_cast<int>(((hw2 >> 12) & 7u) << 2 | ((hw2 >> 6) & 3u));
 
-    const u32 shifted = shift_imm(r[rm], type, amount, false);
+    // ARM ARM A7.7.5: with S == 1 the logical opcodes (AND/BIC/ORR/ORN/EOR) take
+    // C from the shifter; the arithmetic ones do not. Passing set_carry = false
+    // unconditionally left C untouched for every `ands.w`/`orrs.w`/... form.
+    const bool logical_opc = opc <= 5u;
+    const u32 shifted = shift_imm(r[rm], type, amount, sf && logical_opc);
 
     u32 result;
     bool carry = flag_c();
@@ -3219,6 +3336,21 @@ void ArmCore::thumb32_data_processing_modified() {
     const int rd = static_cast<int>((hw2 >> 8) & 0xFu);
     const u32 imm12v = (i << 11) | (((hw2 >> 12) & 7u) << 8) | (hw2 & 0xFFu);
     const u32 imm = arm::thumb_expand_imm(imm12v);
+    // Carry out of ThumbExpandImm_C (ARM ARM A7.4.3): for the logical opcodes
+    // with S == 1 this - not the old value of C - is what the instruction must
+    // write. With a rotate of 0 nothing is shifted out and C is preserved.
+    const bool imm_carry = [&]() {
+        const u32 top8 = (imm12v >> 8) & 0xFu;
+        if ((imm12v & 0xC00u) == 0u) {
+            if (top8 == 0u) return flag_c();
+            if (top8 < 8u) return (imm12v & 0x80u) != 0u;  // replicated bytes
+            const u32 v = 0x80u | (imm12v & 0x7Fu);
+            const int rot = static_cast<int>(top8 - 8u);
+            return rot == 0 ? flag_c() : ((v >> (rot - 1)) & 1u) != 0u;
+        }
+        const int r = static_cast<int>((imm12v >> 7) & 0x1Fu);
+        return r == 0 ? flag_c() : ((imm >> 31) & 1u) != 0u;
+    }();
 
     // The "Rd == 1111" forms of AND/EOR/ADD/SUB are the TST/TEQ/CMN/CMP aliases.
     if (rd == 15 && (opc == 0x0u || opc == 0x4u || opc == 0x8u || opc == 0xDu)) {
@@ -3231,8 +3363,13 @@ void ArmCore::thumb32_data_processing_modified() {
         else if (opc == 0x8u) result = add_with_carry(a, imm, false, carry, overflow);
         else result = sub_with_carry(a, imm, true, carry, overflow);
         if (sf) {
-            if (opc == 0x0u || opc == 0x4u) set_nz(result);
-            else set_nzcv(result, carry, overflow);
+            if (opc == 0x0u || opc == 0x4u) {
+                if (imm_carry) cpsr |= arm::kFlagC;
+                else cpsr &= ~arm::kFlagC;
+                set_nz(result);
+            } else {
+                set_nzcv(result, carry, overflow);
+            }
         }
         write_r15(cur_instr_addr_ + 4u);
         return;
@@ -3259,8 +3396,13 @@ void ArmCore::thumb32_data_processing_modified() {
     }
     r[rd] = result;
     if (sf) {
-        if (logical) set_nz(result);
-        else set_nzcv(result, carry, overflow);
+        if (logical) {
+            if (imm_carry) cpsr |= arm::kFlagC;
+            else cpsr &= ~arm::kFlagC;
+            set_nz(result);
+        } else {
+            set_nzcv(result, carry, overflow);
+        }
     }
     write_r15(cur_instr_addr_ + 4u);
 }
@@ -3310,10 +3452,13 @@ void ArmCore::thumb32_data_processing_plain() {
         }
         case 0x14u:  // SBFX
         case 0x1Cu: {  // UBFX
-            const int width = static_cast<int>(hw2 >> 12);
+            // ARM ARM A7.7.10: `1111 0011 1100 Rn : 0 imm3 Rd imm2 widthm1` -
+            // widthm1 is hw2<4:0> (it used to be read as hw2<15:12>, which is
+            // part of imm3, so every UBFX/SBFX extracted the wrong field width);
+            // evidence: arm_thumb2_movw_ubfx_and_bfi.
+            const int w = static_cast<int>(hw2 & 0x1Fu) + 1;
             const int l2 = static_cast<int>(((hw2 >> 6) & 3u) | ((hw2 >> 10) & 0x1Cu));
-            const int w = width + 1;
-            if (w <= 0 || w > 32 || l2 + w > 32) {
+            if (w > 32 || l2 + w > 32) {
                 undefined("T32 bitfield width");
                 return;
             }
@@ -3326,10 +3471,12 @@ void ArmCore::thumb32_data_processing_plain() {
             break;
         }
         case 0x16u: {  // BFI / BFC
-            const int width = static_cast<int>(hw2 >> 12);
+            // ARM ARM A7.7.5: hw2<4:0> is msb (not width-1), so the width is
+            // msb - lsb + 1.
+            const int msb = static_cast<int>(hw2 & 0x1Fu);
             const int l2 = static_cast<int>(((hw2 >> 6) & 3u) | ((hw2 >> 10) & 0x1Cu));
-            const int w = width + 1;
-            if (w <= 0 || w > 32 || l2 + w > 32) {
+            const int w = msb - l2 + 1;
+            if (w < 1 || w > 32 || l2 + w > 32) {
                 undefined("T32 BFI width");
                 return;
             }
@@ -3402,25 +3549,70 @@ void ArmCore::thumb32_data_processing_register() {
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
+            if (op2 == 1u) {
+                // MLS T1 (A7.7.45): op1 = 0000, op2 = 0001. This lived in the
+                // op1 == 1 slot, which is the halfword multiply group, so real
+                // MLS was undefined and SMULxy/SMLAxy ran as MLS.
+                r[rd] = r[rn] * r[rm] - r[ra];                   // MLS
+                write_r15(cur_instr_addr_ + 4u);
+                return;
+            }
             break;
         case 0x1u:
+            // SMULBB/SMULBT/SMULTB/SMULTT, SMLABB/..., SMULWB/SMULWT and
+            // SMLAWB/SMLAWT (ARM ARM A7.7.45). Not implemented; report rather
+            // than execute something else.
+            undefined("T32 halfword multiply (SMULxy/SMLAxy/SMULWy/SMLAWy)");
+            return;
+        case 0x2u:  // SMUAD / SMLAD
+        case 0x3u:  // SMULWy / SMLAWy
+        case 0x4u:  // SMUSD / SMLSD
+        case 0x5u:  // SMMUL / SMMLA / SMMLS
+        case 0x6u:
+        case 0x7u:  // USAD8 / USADA8
+            undefined("T32 DSP multiply (SMUAD/SMUSD/SMMUL/USAD8)");
+            return;
+        case 0x8u:
             if (op2 == 0u) {
-                r[rd] = r[ra] - r[rn] * r[rm];                   // MLS
+                // SMULL RdLo, RdHi, Rn, Rm: hw2<15:12> = RdLo, hw2<11:8> = RdHi.
+                // Only the high half used to be written, so the low half kept
+                // its old value; evidence: arm_thumb32_multiply_long.
+                const s64 product = static_cast<s64>(static_cast<s32>(r[rn])) *
+                                    static_cast<s32>(r[rm]);
+                r[ra] = static_cast<u32>(static_cast<u64>(product));
+                r[rd] = static_cast<u32>(static_cast<u64>(product) >> 32);
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
             break;
-        case 0x8u:
-            if (op2 == 0u) {
-                // SMULL
-                r[rd] = static_cast<u32>((static_cast<s64>(static_cast<s32>(r[rn])) *
-                                          static_cast<s32>(r[rm])) >> 32);
+        case 0x9u:  // SDIV (op2 == 1111)
+            if (op2 == 0xFu) {
+                const u32 divisor = r[rm];
+                u32 quotient = 0u;
+                if (divisor != 0u) {
+                    const s32 a = static_cast<s32>(r[rn]);
+                    const s32 b = static_cast<s32>(divisor);
+                    quotient = (a == INT32_MIN && b == -1) ? 0x80000000u
+                                                           : static_cast<u32>(a / b);
+                }
+                r[rd] = quotient;
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
-            if (op2 == 1u) {
-                // UMULL
-                r[rd] = static_cast<u32>((static_cast<u64>(r[rn]) * r[rm]) >> 32);
+            break;
+        case 0xAu:
+            if (op2 == 0u) {
+                // UMULL RdLo, RdHi, Rn, Rm (op1 = 1010).
+                const u64 product = static_cast<u64>(r[rn]) * r[rm];
+                r[ra] = static_cast<u32>(product);
+                r[rd] = static_cast<u32>(product >> 32);
+                write_r15(cur_instr_addr_ + 4u);
+                return;
+            }
+            break;
+        case 0xBu:  // UDIV (op2 == 1111)
+            if (op2 == 0xFu) {
+                r[rd] = r[rm] == 0u ? 0u : r[rn] / r[rm];
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
@@ -3641,27 +3833,32 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         return;
     }
     if ((hw1 & 0xFFF0u) == 0xE8C0u || (hw1 & 0xFFF0u) == 0xE8D0u) {
-        // STREXB / LDREXB.
+        // STREXB/LDREXB and STREXH/LDREXH (ARM ARM A7.7.77/A7.7.89): the size is
+        // hw2<7:4> - 0100 is a byte and 0101 a halfword. Both used to be handled
+        // as byte accesses, so LDREXH/STREXH silently moved one byte.
         const bool load = (hw1 & 0x10u) != 0u;
-        const u32 address = read_reg(rn);
+        const bool half = ((hw2 >> 4) & 0xFu) == 0x5u;
+        const unsigned width = half ? 2u : 1u;
+        const u32 address = half ? (read_reg(rn) & ~1u) : read_reg(rn);
         if (!load) {
             const int rd = static_cast<int>(hw2 & 0xFu);
             u32 status = 1u;
-            if (bus->take_exclusive(address, 1u, static_cast<int>(core_id_), mmu.context_idr)) {
-                mem_write_byte(address, r[rt] & 0xFFu);
+            if (bus->take_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr)) {
+                if (half) mem_write_half(address, r[rt] & 0xFFFFu);
+                else mem_write_byte(address, r[rt] & 0xFFu);
                 if (pending_fault_ != arm::FaultKind::None) return;
                 status = 0u;
             }
             exclusive_valid_ = false;
             r[rd] = status;
         } else {
-            const u32 value = mem_read_byte(address);
+            const u32 value = half ? mem_read_half(address) : mem_read_byte(address);
             if (pending_fault_ != arm::FaultKind::None) return;
-            bus->mark_exclusive(address, 1u, static_cast<int>(core_id_), mmu.context_idr);
+            bus->mark_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr);
             exclusive_valid_ = true;
             exclusive_addr_ = address;
             exclusive_id_ = mmu.context_idr;
-            r[rt] = value & 0xFFu;
+            r[rt] = half ? (value & 0xFFFFu) : (value & 0xFFu);
         }
         write_r15(cur_instr_addr_ + 4u);
         return;
@@ -3940,8 +4137,37 @@ void ArmCore::thumb32_misc() {
     const int rd = static_cast<int>((hw2 >> 8) & 0xFu);
     const int rm = static_cast<int>(hw2 & 0xFu);
 
-    // Hints: 1111 0011 1010 ....
+    // Hints: 1111 0011 1010 ....  The CPS instruction (ARM ARM A7.7.24) shares
+    // this prefix: 1111 0011 1010 1111 : 1 0 imod(2) M(1) 0 AIF(3) 0 0 0 0 mode(5),
+    // i.e. hw2<11:8> is nonzero for CPS and zero for the hints (NOP/YIELD/WFE/
+    // WFI/SEV/DBG). This blocked the whole prefix, so CPS.W was a NOP.
     if (hw1 == 0xF3AFu && (hw2 & 0x8000u) != 0u) {
+        if ((hw2 & 0x0F00u) == 0u) {
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+        const u32 imod = (hw2 >> 9) & 3u;
+        const u32 m = (hw2 >> 8) & 1u;
+        const u32 aif = (hw2 >> 5) & 7u;
+        const u32 new_mode = hw2 & 0x1Fu;
+        if (mode() == arm::kModeUser) {
+            undefined("T32 CPS from User mode");
+            return;
+        }
+        if (m != 0u && new_mode != 0u) {
+            bank_switch(mode(), new_mode);
+            cpsr = (cpsr & ~arm::kModeMask) | (new_mode & arm::kModeMask);
+            thumb = (cpsr & arm::kFlagT) != 0;
+        }
+        if (imod == 2u) {
+            if ((aif & 4u) != 0u) cpsr &= ~arm::kFlagA;
+            if ((aif & 2u) != 0u) cpsr &= ~arm::kFlagI;
+            if ((aif & 1u) != 0u) cpsr &= ~arm::kFlagF;
+        } else if (imod == 3u) {
+            if ((aif & 4u) != 0u) cpsr |= arm::kFlagA;
+            if ((aif & 2u) != 0u) cpsr |= arm::kFlagI;
+            if ((aif & 1u) != 0u) cpsr |= arm::kFlagF;
+        }
         write_r15(cur_instr_addr_ + 4u);
         return;
     }
@@ -3954,23 +4180,36 @@ void ArmCore::thumb32_misc() {
         write_r15(cur_instr_addr_ + 4u);
         return;
     }
-    // MRS: 1111 0011 1110 1111 1000 Rd 0000 0000.
-    if (hw1 == 0xF3EFu && (hw2 & 0xF000u) == 0x8000u) {
-        const bool use_spsr = (hw2 & 0x100u) != 0u;
+    // MRS: 1111 0011 1110 1111 1000 Rd 0000 0000 for APSR and
+    //      1111 0011 1111 1111 1000 Rd 0000 0000 for SPSR (ARM ARM A7.7.84):
+    // the APSR/SPSR bit is hw1 bit 4, not hw2 bit 8 (which is Rd<0>), so
+    // `mrs r1, apsr` (F3EF 8100) used to read SPSR and `mrs rN, spsr` was
+    // rejected. Evidence: thumb32_mrs_and_msr.
+    if ((hw1 & 0xFFF0u) == 0xF3E0u && (hw2 & 0xF000u) == 0x8000u) {
+        const bool use_spsr = (hw1 & 0x10u) != 0u;
         r[rd] = use_spsr ? spsr() : cpsr;
         write_r15(cur_instr_addr_ + 4u);
         return;
     }
-    // MSR (register): 1111 0011 1000 1110 1000 Rd 0000 Rm.
+    // MSR (register): 1111 0011 1000 1111 1000 Rd 0000 Rm (CPSR) and
+    // 1111 0011 1001 1111 ... (SPSR). The sysm field is hw2<11:8> and is the
+    // same 4 bit field mask as the A32 MSR: bit3 = f, bit2 = s, bit1 = x,
+    // bit0 = c (ARM ARM A7.7.85). The code used to treat it as a 2 bit field,
+    // so the usual `msr cpsr_f, r0` (sysm = 1000) fell through with a mask of
+    // 0xFFFFFFFF and rewrote the mode and T bit.
     if ((hw1 & 0xFFF0u) == 0xF380u && (hw2 & 0xF000u) == 0x8000u) {
         const u32 sysm = (hw2 >> 8) & 0xFu;
-        const bool use_spsr = (hw2 & 0x100u) != 0u;
+        const bool use_spsr = (hw1 & 0x10u) != 0u;
         const u32 value = r[rm];
-        u32 mask = 0xFFFFFFFFu;
-        if (sysm == 0u) mask = 0x000000FFu;
-        else if (sysm == 1u) mask = 0x0000FF00u;
-        else if (sysm == 2u) mask = 0x00FF0000u;
-        else if (sysm == 3u) mask = 0xFF000000u;
+        u32 mask = 0u;
+        if ((sysm & 8u) != 0u) mask |= 0xFF000000u;
+        if ((sysm & 4u) != 0u) mask |= 0x00FF0000u;
+        if ((sysm & 2u) != 0u) mask |= 0x0000FF00u;
+        if ((sysm & 1u) != 0u) mask |= 0x000000FFu;
+        if (mask == 0u) {
+            undefined("T32 MSR with an empty field mask");
+            return;
+        }
         if (use_spsr) set_spsr((spsr() & ~mask) | (value & mask));
         else write_cpsr_masked(value, mask);
         write_r15(cur_instr_addr_ + 4u);
@@ -4074,12 +4313,17 @@ void ArmCore::execute_vfp_op(bool dbl, u32 instr, u32 opcv1, u32 opcv2, int vd, 
             write_r15(cur_instr_addr_ + 4u);
             return;
         }
-        if (opc2v == 4u) {
-            // VCMP (N == 0) / VCMPE (N == 1); Vm == 0 compares with 0.0.
-            if (dbl) vfp.compare(vfp.read_f64(vd), vm == 0 ? 0.0 : vfp.read_f64(vm), n_bit);
-            else {
+        if (opc2v == 4u || opc2v == 5u) {
+            // VCMP (N == 0) / VCMPE (N == 1); opc2 == 5 is the "#0.0" form
+            // (ARM ARM A8.8.312). opc2 == 4 compares against Vm even when Vm is
+            // s0/d0, which the old `vm == 0 ? 0.0 : read(vm)` conflated with
+            // the zero form.
+            const bool with_zero = opc2v == 5u;
+            if (dbl) {
+                vfp.compare(vfp.read_f64(vd), with_zero ? 0.0 : vfp.read_f64(vm), n_bit);
+            } else {
                 vfp.compare(static_cast<f64>(vfp.read_f32(vd)),
-                            vm == 0 ? 0.0 : static_cast<f64>(vfp.read_f32(vm)), n_bit);
+                            with_zero ? 0.0 : static_cast<f64>(vfp.read_f32(vm)), n_bit);
             }
             write_r15(cur_instr_addr_ + 4u);
             return;
@@ -4424,6 +4668,7 @@ void ArmCore::execute_vfp_two_register(u32 instr, bool cp10) {
                 case 1u: value = vfp.fpscr; break;
                 case 6u: value = vfp.mvfr0; break;
                 case 7u: value = vfp.mvfr1; break;
+                case 8u: value = vfp.fpexc; break;  // VMRS Rt, FPEXC (A8.8.234)
                 default: value = 0u; break;
             }
             if (rt == 15) cpsr = (cpsr & 0x0FFFFFFFu) | (value & 0xF0000000u);
