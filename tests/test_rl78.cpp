@@ -1298,4 +1298,782 @@ ZLB_TEST(rl78_prefix_pages_decode_densely) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 6. MOV / MOVW: every operand form
+// ---------------------------------------------------------------------------
+
+/// The 3-bit register field of the one-byte "mov a, r" / "mov r, a" opcodes:
+/// field n selects RL78_Reg_X + n, so field 1 is A (and 0x61 is not an opcode,
+/// it opens the two-byte page).
+const Rl78Reg kField8[8] = {Rl78Reg::X, Rl78Reg::A, Rl78Reg::C, Rl78Reg::B,
+                            Rl78Reg::E, Rl78Reg::D, Rl78Reg::L, Rl78Reg::H};
+
+/// The 2-bit register-pair field: AX BC DE HL.
+const Rl78Reg kField16[4] = {Rl78Reg::AX, Rl78Reg::BC, Rl78Reg::DE, Rl78Reg::HL};
+
+/// Load `hex` at the code base and point the core at it *without* the reset
+/// Bench::code() performs, so a sequence can be continued where it stopped.
+/// The opcode window is cleared first, exactly like Bench::code() does.
+void at(Bench& bench, const char* hex) {
+    for (u32 i = 0; i < 32; ++i) bench.bus.write8(kBase + i, 0);
+    bench.put(kBase, hex);
+    bench.cpu.pc = kBase;
+}
+
+/// Address of the data page slot `offset` bytes above 0xF0000.
+u32 data(u32 offset) { return 0xF0000u + offset; }
+
+ZLB_TEST(rl78_mov_a_from_every_register) {
+    // 0x60 | r = "mov a, r" (binutils: `0110 0rba  mov %0, %1` with DR(A) and
+    // SRB(rba)).  The A slot (0x61) is the ES/two-byte page, not a register.
+    Bench bench;
+    const u8 value[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    for (int field = 0; field < 8; ++field) {
+        if (field == 1) continue;
+        const std::string hex = format("%02X", 0x60 | field);
+        bench.code(hex.c_str());
+        bench.cpu.a = 0x00;
+        bench.cpu.set_reg8(kField8[field], value[field]);
+        bench.cpu.step();
+        if (bench.cpu.a != value[field]) {
+            ZLB_FAIL(format("0x%02X (mov a, %s) left a = 0x%02X", 0x60 | field,
+                            rl78_reg_name(kField8[field]), bench.cpu.a));
+        }
+        ZLB_EXPECT_EQ(kBase + 1, bench.cpu.pc);
+    }
+}
+
+ZLB_TEST(rl78_mov_every_register_from_a) {
+    // 0x70 | r = "mov r, a" (`0111 0rba  mov %0, %1` with DRB(rba) and SR(A)).
+    Bench bench;
+    const u8 value[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    for (int field = 0; field < 8; ++field) {
+        if (field == 1) continue;
+        const std::string hex = format("%02X", 0x70 | field);
+        bench.code(hex.c_str());
+        bench.cpu.set_reg8(kField8[field], 0x00);
+        bench.cpu.a = value[field];
+        bench.cpu.step();
+        const u8 got = bench.cpu.get_reg8(kField8[field]);
+        if (got != value[field]) {
+            ZLB_FAIL(format("0x%02X (mov %s, a) left %s = 0x%02X", 0x70 | field,
+                            rl78_reg_name(kField8[field]), rl78_reg_name(kField8[field]), got));
+        }
+        ZLB_EXPECT_EQ(kBase + 1, bench.cpu.pc);
+    }
+}
+
+ZLB_TEST(rl78_mov_immediate_to_every_register) {
+    // 0x50 | r = "mov r, #imm8"; the immediate follows the opcode.
+    Bench bench;
+    bench.code("50115122523353445455556656775788");
+    for (int i = 0; i < 8; ++i) bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11u, bench.cpu.x);
+    ZLB_EXPECT_EQ(0x22u, bench.cpu.a);
+    ZLB_EXPECT_EQ(0x33u, bench.cpu.c);
+    ZLB_EXPECT_EQ(0x44u, bench.cpu.b);
+    ZLB_EXPECT_EQ(0x55u, bench.cpu.e);
+    ZLB_EXPECT_EQ(0x66u, bench.cpu.d);
+    ZLB_EXPECT_EQ(0x77u, bench.cpu.l);
+    ZLB_EXPECT_EQ(0x88u, bench.cpu.h);
+    ZLB_EXPECT_EQ(kBase + 16, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_mov_a_indirect_hl_de_sp) {
+    Bench bench;
+    bench.code("8B");  // mov a, [hl]
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.bus.write8(data(0x10), 0x5A);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 1, bench.cpu.pc);
+
+    at(bench, "8C05");  // mov a, [hl+5]
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.bus.write8(data(0x15), 0x6B);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x6B, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "89");  // mov a, [de]
+    bench.cpu.d = 0x00;
+    bench.cpu.e = 0x20;
+    bench.bus.write8(data(0x20), 0x7C);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x7C, bench.cpu.a);
+
+    at(bench, "8A03");  // mov a, [de+3]
+    bench.cpu.d = 0x00;
+    bench.cpu.e = 0x20;
+    bench.bus.write8(data(0x23), 0x8D);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x8D, bench.cpu.a);
+
+    at(bench, "88");  // mov a, [sp]
+    bench.cpu.sp = 0x0030;
+    bench.bus.write8(data(0x30), 0x9E);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x9E, bench.cpu.a);
+
+    at(bench, "8802");  // mov a, [sp+2]
+    bench.cpu.sp = 0x0030;
+    bench.bus.write8(data(0x32), 0xAF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xAF, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_mov_to_indirect_hl_de_sp) {
+    Bench bench;
+    bench.code("9B");  // mov [hl], a
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.a = 0x41;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x41, bench.bus.read8(data(0x10)));
+    ZLB_EXPECT_EQ(kBase + 1, bench.cpu.pc);
+
+    at(bench, "9C05");  // mov [hl+5], a
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.a = 0x42;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x42, bench.bus.read8(data(0x15)));
+
+    at(bench, "99");  // mov [de], a
+    bench.cpu.d = 0x00;
+    bench.cpu.e = 0x20;
+    bench.cpu.a = 0x43;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x43, bench.bus.read8(data(0x20)));
+
+    at(bench, "9A03");  // mov [de+3], a
+    bench.cpu.d = 0x00;
+    bench.cpu.e = 0x20;
+    bench.cpu.a = 0x44;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x44, bench.bus.read8(data(0x23)));
+
+    at(bench, "9802");  // mov [sp+2], a
+    bench.cpu.sp = 0x0030;
+    bench.cpu.a = 0x45;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x45, bench.bus.read8(data(0x32)));
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_mov_a_hl_based_index) {
+    // [HL+B] and [HL+C]: the index register is added to HL.
+    Bench bench;
+    bench.code("61C9");  // mov a, [hl+b]
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.b = 0x05;
+    bench.bus.write8(data(0x15), 0x9A);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x9A, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "61E9");  // mov a, [hl+c]
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.c = 0x06;
+    bench.bus.write8(data(0x16), 0xAB);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xAB, bench.cpu.a);
+
+    at(bench, "61D9");  // mov [hl+b], a
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.b = 0x07;
+    bench.cpu.a = 0xCD;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xCD, bench.bus.read8(data(0x17)));
+
+    at(bench, "61F9");  // mov [hl+c], a
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.c = 0x08;
+    bench.cpu.a = 0xEF;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xEF, bench.bus.read8(data(0x18)));
+}
+
+ZLB_TEST(rl78_mov_a_saddr_and_sfr_window) {
+    // Short direct (0x8D) is 0xFFF00 + n below 0x20 and 0xFFE00 + n above;
+    // SFR (0x8E) is always 0xFFF00 + n.
+    Bench bench;
+    bench.bus.write8(0xFFE20, 0x11);
+    bench.bus.write8(0xFFF00, 0x22);
+    bench.bus.write8(0xFFF20, 0x33);
+
+    bench.code("8D20");  // mov a, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "8D00");  // mov a, 0xFFF00 (saddr 0 lands in the SFR window)
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x22, bench.cpu.a);
+
+    at(bench, "8E20");  // mov a, 0xFFF20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x33, bench.cpu.a);
+
+    // The five control registers are served by the core, not by RAM.
+    bench.cpu.sp = 0x4455;
+    bench.cpu.psw = 0x00AB;
+    at(bench, "8EF8");  // mov a, spl
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x55, bench.cpu.a);
+    at(bench, "8EF9");  // mov a, sph (plain RAM: not mirrored by the core)
+    bench.bus.write8(0xFFFF9, 0x66);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x66, bench.cpu.a);
+    at(bench, "8EFA");  // mov a, psw
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xAB, bench.cpu.a);
+    at(bench, "8EFD");  // mov a, es
+    bench.cpu.es = 0x07;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x07, bench.cpu.a);
+    at(bench, "8EFC");  // mov a, cs
+    bench.cpu.cs = 0x03;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x03, bench.cpu.a);
+    at(bench, "8EFE");  // mov a, pmc
+    bench.cpu.pmc = 0x09;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x09, bench.cpu.a);
+}
+
+ZLB_TEST(rl78_mov_saddr_and_sfr_store) {
+    Bench bench;
+    bench.code("9D20");  // mov 0xFFE20, a
+    bench.cpu.a = 0x5A;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(0xFFE20));
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "9E20");  // mov 0xFFF20, a
+    bench.cpu.a = 0x5B;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5B, bench.bus.read8(0xFFF20));
+
+    at(bench, "9EF8");  // mov spl, a -> the core's SP low byte
+    bench.cpu.sp = 0x1234;
+    bench.cpu.a = 0x77;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1277u, bench.cpu.sp);
+    ZLB_EXPECT_EQ(0x00, bench.bus.read8(0xFFFF8));  // never reaches RAM
+
+    at(bench, "9EFA");  // mov psw, a
+    bench.cpu.a = 0x01;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0001u, bench.cpu.psw);
+
+    at(bench, "9EFE");  // mov pmc, a
+    bench.cpu.a = 0x0A;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0A, bench.cpu.pmc);
+}
+
+ZLB_TEST(rl78_mov_a_direct16) {
+    Bench bench;
+    bench.bus.write8(0xF0100, 0x77);
+    bench.bus.write8(0x20100, 0x88);
+
+    bench.code("8F0001");  // mov a, !0x0100
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x77, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    // With ES = 2 and the 0x11 prefix the same !addr16 reads page 2.
+    bench.code("4102" "118F0001");  // mov es, #2 ; es: mov a, !0x0100
+    bench.cpu.step();
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x88, bench.cpu.a);
+    ZLB_EXPECT_EQ(0x02, bench.cpu.es);
+}
+
+ZLB_TEST(rl78_mov_direct16_store) {
+    Bench bench;
+    bench.code("9F0001");  // mov !0x0100, a
+    bench.cpu.a = 0x99;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x99, bench.bus.read8(0xF0100));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    bench.code("4102" "119F0001");  // mov es, #2 ; es: mov !0x0100, a
+    bench.bus.write8(0xF0100, 0x00);
+    bench.cpu.a = 0xAA;
+    bench.cpu.step();
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xAA, bench.bus.read8(0x20100));
+    ZLB_EXPECT_EQ(0x00, bench.bus.read8(0xF0100));
+}
+
+ZLB_TEST(rl78_mov_immediate_to_memory) {
+    Bench bench;
+    bench.code("C8055A");  // mov [sp+5], #0x5A
+    bench.cpu.sp = 0x0010;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(data(0x15)));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    at(bench, "CA035A");  // mov [de+3], #0x5A
+    bench.cpu.d = 0x00;
+    bench.cpu.e = 0x20;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(data(0x23)));
+
+    at(bench, "CC045A");  // mov [hl+4], #0x5A
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x30;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(data(0x34)));
+
+    at(bench, "CD205A");  // mov 0xFFE20, #0x5A
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(0xFFE20));
+
+    at(bench, "CEF55A");  // mov 0xFFF F5, #0x5A
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(0xFFFF5));
+
+    at(bench, "CF00015A");  // mov !0x0100, #0x5A
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5A, bench.bus.read8(0xF0100));
+    ZLB_EXPECT_EQ(kBase + 4, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_mov_immediate_into_sfr_mirror) {
+    Bench bench;
+    bench.code("CEF801");  // mov spl, #1
+    bench.cpu.sp = 0x1234;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1201u, bench.cpu.sp);
+
+    at(bench, "CEFA01");  // mov psw, #1
+    bench.cpu.psw = 0x0006;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0001u, bench.cpu.psw);
+
+    at(bench, "CEFE11");  // mov pmc, #0x11
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11, bench.cpu.pmc);
+
+    at(bench, "CEFD0A");  // mov es, #0x0A
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0A, bench.cpu.es);
+}
+
+ZLB_TEST(rl78_mov_b_c_x_from_memory) {
+    Bench bench;
+    bench.bus.write8(0xFFE20, 0x11);
+    bench.bus.write8(0xF0100, 0x22);
+
+    bench.code("D820");  // mov x, 0xFFE20
+    bench.cpu.x = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11, bench.cpu.x);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "D90001");  // mov x, !0x0100
+    bench.cpu.x = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x22, bench.cpu.x);
+
+    at(bench, "E820");  // mov b, 0xFFE20
+    bench.cpu.b = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11, bench.cpu.b);
+
+    at(bench, "E90001");  // mov b, !0x0100
+    bench.cpu.b = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x22, bench.cpu.b);
+
+    at(bench, "F820");  // mov c, 0xFFE20
+    bench.cpu.c = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x11, bench.cpu.c);
+
+    at(bench, "F90001");  // mov c, !0x0100
+    bench.cpu.c = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x22, bench.cpu.c);
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_mov_es_cs_control_registers) {
+    Bench bench;
+    bench.code("4105");  // mov es, #5
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x05, bench.cpu.es);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    bench.bus.write8(0xFFE20, 0x0C);
+    at(bench, "61B820");  // mov es, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0C, bench.cpu.es);
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    at(bench, "9EFC");  // mov cs, a
+    bench.cpu.a = 0x06;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x06, bench.cpu.cs);
+
+    at(bench, "9EFD");  // mov es, a
+    bench.cpu.a = 0x07;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x07, bench.cpu.es);
+
+    at(bench, "8EFD");  // mov a, es
+    bench.cpu.es = 0x03;
+    bench.cpu.a = 0;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x03, bench.cpu.a);
+}
+
+ZLB_TEST(rl78_movw_register_pair_moves) {
+    // `0001 0ra0` moves AX into a pair, `0001 0ra1` moves a pair into AX.
+    Bench bench;
+    bench.code("303412" "12" "14" "16");  // movw ax,#0x1234 ; movw bc,ax ...
+    for (int i = 0; i < 4; ++i) bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::BC));
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::DE));
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::HL));
+    ZLB_EXPECT_EQ(kBase + 6, bench.cpu.pc);
+
+    for (int field = 1; field < 4; ++field) {
+        // movw rp, #0x1234 ; movw ax, rp
+        const std::string hex = format("%02X3412%02X", 0x30 | (field << 1), 0x10 | (field << 1) | 1);
+        at(bench, hex.c_str());
+        bench.cpu.step();
+        bench.cpu.step();
+        if (bench.cpu.get_reg16(Rl78Reg::AX) != 0x1234u) {
+            ZLB_FAIL(format("0x%02X (movw ax, %s) did not load AX", (field << 1) | 0x11,
+                            rl78_reg_name(kField16[field])));
+        }
+    }
+}
+
+ZLB_TEST(rl78_movw_immediate_to_register_pair) {
+    // The 16-bit immediate is stored little endian.
+    Bench bench;
+    bench.code("303412" "327856" "34BC9A" "36F0DE");
+    for (int i = 0; i < 4; ++i) bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::AX));
+    ZLB_EXPECT_EQ(0x5678u, bench.cpu.get_reg16(Rl78Reg::BC));
+    ZLB_EXPECT_EQ(0x9ABCu, bench.cpu.get_reg16(Rl78Reg::DE));
+    ZLB_EXPECT_EQ(0xDEF0u, bench.cpu.get_reg16(Rl78Reg::HL));
+    ZLB_EXPECT_EQ(kBase + 12, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_movw_ax_memory_forms) {
+    Bench bench;
+    bench.bus.write16(data(0x12), 0x1111);
+    bench.bus.write16(data(0x20), 0x2222);
+    bench.bus.write16(data(0x23), 0x3333);
+    bench.bus.write16(data(0x30), 0x4444);
+    bench.bus.write16(data(0x34), 0x5555);
+    bench.bus.write16(0xFFE20, 0x6666);
+    bench.bus.write16(0xFFF20, 0x7777);
+    bench.bus.write16(0xF0100, 0x8888);
+
+    bench.code("A802");  // movw ax, [sp+2]
+    bench.cpu.sp = 0x0010;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1111u, bench.cpu.get_reg16(Rl78Reg::AX));
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "A9");  // movw ax, [de]
+    bench.cpu.d = 0x00; bench.cpu.e = 0x20;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x2222u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AA03");  // movw ax, [de+3]
+    bench.cpu.d = 0x00; bench.cpu.e = 0x20;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x3333u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AB");  // movw ax, [hl]
+    bench.cpu.h = 0x00; bench.cpu.l = 0x30;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x4444u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AC04");  // movw ax, [hl+4]
+    bench.cpu.h = 0x00; bench.cpu.l = 0x30;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5555u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AD20");  // movw ax, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x6666u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AE20");  // movw ax, 0xFFF20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x7777u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "AF0001");  // movw ax, !0x0100
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x8888u, bench.cpu.get_reg16(Rl78Reg::AX));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    // The word forms see the core's control registers, not RAM.
+    bench.cpu.sp = 0xFE20;
+    at(bench, "AEF8");  // movw ax, sp
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xFE20u, bench.cpu.get_reg16(Rl78Reg::AX));
+}
+
+ZLB_TEST(rl78_movw_memory_store_forms) {
+    Bench bench;
+    bench.code("B802");  // movw [sp+2], ax
+    bench.cpu.set_reg16(Rl78Reg::AX, 0xBEEF);
+    bench.cpu.sp = 0x0010;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(data(0x12)));
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "B9");  // movw [de], ax
+    bench.cpu.d = 0x00; bench.cpu.e = 0x20;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(data(0x20)));
+
+    at(bench, "BA03");  // movw [de+3], ax
+    bench.cpu.d = 0x00; bench.cpu.e = 0x20;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(data(0x23)));
+
+    at(bench, "BB");  // movw [hl], ax
+    bench.cpu.h = 0x00; bench.cpu.l = 0x30;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(data(0x30)));
+
+    at(bench, "BC04");  // movw [hl+4], ax
+    bench.cpu.h = 0x00; bench.cpu.l = 0x30;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(data(0x34)));
+
+    at(bench, "BD20");  // movw 0xFFE20, ax
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(0xFFE20));
+
+    at(bench, "BE20");  // movw 0xFFF20, ax
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(0xFFF20));
+
+    at(bench, "BF0001");  // movw !0x0100, ax
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.bus.read16(0xF0100));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    // Writing the SP SFR updates the core, not RAM at 0xFFFF8.
+    at(bench, "BEF8");  // movw sp, ax
+    bench.cpu.sp = 0x0000;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xBEEFu, bench.cpu.sp);
+    ZLB_EXPECT_EQ(0x0000u, bench.bus.read16(0xFFFF8));
+}
+
+ZLB_TEST(rl78_movw_based_register_forms) {
+    // movw AX, addr16[B]/[C]/[BC] and the matching stores: the 16-bit field is
+    // the page offset and the register is the index.
+    Bench bench;
+    bench.bus.write16(0xF0103, 0x1111);
+    bench.bus.write16(0xF0202, 0x2222);
+    bench.bus.write16(0xF0500, 0x3333);
+
+    bench.code("590001");  // movw ax, 0x0100[b]
+    bench.cpu.b = 0x03;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1111u, bench.cpu.get_reg16(Rl78Reg::AX));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+
+    at(bench, "690002");  // movw ax, 0x0200[c]
+    bench.cpu.c = 0x02;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x2222u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "790003");  // movw ax, 0x0300[bc]
+    bench.cpu.set_reg16(Rl78Reg::BC, 0x0200);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x3333u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    bench.cpu.set_reg16(Rl78Reg::AX, 0xABCD);
+    at(bench, "580001");  // movw 0x0100[b], ax
+    bench.cpu.b = 0x03;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xABCDu, bench.bus.read16(0xF0103));
+
+    at(bench, "680002");  // movw 0x0200[c], ax
+    bench.cpu.c = 0x02;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xABCDu, bench.bus.read16(0xF0202));
+
+    at(bench, "780003");  // movw 0x0300[bc], ax
+    bench.cpu.set_reg16(Rl78Reg::BC, 0x0200);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0xABCDu, bench.bus.read16(0xF0500));
+}
+
+ZLB_TEST(rl78_movw_saddr_and_direct_forms) {
+    Bench bench;
+    bench.bus.write16(0xFFE20, 0x1234);
+    bench.bus.write16(0xF0100, 0x5678);
+
+    bench.code("DA20");  // movw bc, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::BC));
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "DB0001");  // movw bc, !0x0100
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5678u, bench.cpu.get_reg16(Rl78Reg::BC));
+
+    at(bench, "EA20");  // movw de, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::DE));
+
+    at(bench, "EB0001");  // movw de, !0x0100
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5678u, bench.cpu.get_reg16(Rl78Reg::DE));
+
+    at(bench, "FA20");  // movw hl, 0xFFE20
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.cpu.get_reg16(Rl78Reg::HL));
+
+    at(bench, "FB0001");  // movw hl, !0x0100
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x5678u, bench.cpu.get_reg16(Rl78Reg::HL));
+}
+
+ZLB_TEST(rl78_movw_immediate_and_sfr_destination) {
+    Bench bench;
+    bench.code("C9203412");  // movw 0xFFE20, #0x1234
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.bus.read16(0xFFE20));
+    ZLB_EXPECT_EQ(kBase + 4, bench.cpu.pc);
+
+    at(bench, "CBF63412");  // movw 0xFFF F6, #0x1234 (plain RAM)
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x1234u, bench.bus.read16(0xFFFF6));
+
+    // ES and PMC share the 0xFFFFD/0xFFFFE word.
+    at(bench, "CBFD0A0B");  // movw 0xFFFFD, #0x0B0A
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0A, bench.cpu.es);
+    ZLB_EXPECT_EQ(0x0B, bench.cpu.pmc);
+    ZLB_EXPECT_EQ(0x0B0Au, bench.cpu.read_data16(kRl78SfrEs));
+}
+
+ZLB_TEST(rl78_clrw_and_onew) {
+    Bench bench;
+    bench.code("F6");  // clrw ax
+    bench.cpu.set_reg16(Rl78Reg::AX, 0xFFFF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0000u, bench.cpu.get_reg16(Rl78Reg::AX));
+    ZLB_EXPECT_EQ(kBase + 1, bench.cpu.pc);
+
+    at(bench, "F7");  // clrw bc
+    bench.cpu.set_reg16(Rl78Reg::BC, 0xFFFF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0000u, bench.cpu.get_reg16(Rl78Reg::BC));
+
+    at(bench, "E6");  // onew ax
+    bench.cpu.set_reg16(Rl78Reg::AX, 0x0000);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0001u, bench.cpu.get_reg16(Rl78Reg::AX));
+
+    at(bench, "E7");  // onew bc
+    bench.cpu.set_reg16(Rl78Reg::BC, 0x0000);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x0001u, bench.cpu.get_reg16(Rl78Reg::BC));
+
+    // Neither touches the flags.
+    at(bench, "F6");
+    bench.cpu.psw = 0x00D7;
+    bench.cpu.set_reg16(Rl78Reg::AX, 0xFFFF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x00D7u, bench.cpu.psw);
+}
+
+ZLB_TEST(rl78_clrb_and_oneb) {
+    Bench bench;
+    for (int field = 0; field < 4; ++field) {
+        const std::string hex = format("%02X", 0xF0 | field);
+        bench.code(hex.c_str());
+        bench.cpu.set_reg8(kField8[field], 0xFF);
+        bench.cpu.step();
+        if (bench.cpu.get_reg8(kField8[field]) != 0x00) {
+            ZLB_FAIL(format("0x%02X (clrb %s) left 0x%02X", 0xF0 | field,
+                            rl78_reg_name(kField8[field]), bench.cpu.get_reg8(kField8[field])));
+        }
+        const std::string one = format("%02X", 0xE0 | field);
+        bench.code(one.c_str());
+        bench.cpu.set_reg8(kField8[field], 0x00);
+        bench.cpu.step();
+        if (bench.cpu.get_reg8(kField8[field]) != 0x01) {
+            ZLB_FAIL(format("0x%02X (oneb %s) left 0x%02X", 0xE0 | field,
+                            rl78_reg_name(kField8[field]), bench.cpu.get_reg8(kField8[field])));
+        }
+    }
+
+    at(bench, "F420");  // clrb 0xFFE20
+    bench.bus.write8(0xFFE20, 0xFF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x00, bench.bus.read8(0xFFE20));
+
+    at(bench, "E420");  // oneb 0xFFE20
+    bench.bus.write8(0xFFE20, 0x00);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x01, bench.bus.read8(0xFFE20));
+
+    at(bench, "F50001");  // clrb !0x0100
+    bench.bus.write8(0xF0100, 0xFF);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x00, bench.bus.read8(0xF0100));
+
+    at(bench, "E50001");  // oneb !0x0100
+    bench.bus.write8(0xF0100, 0x00);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x01, bench.bus.read8(0xF0100));
+    ZLB_EXPECT_EQ(kBase + 3, bench.cpu.pc);
+}
+
+ZLB_TEST(rl78_es_prefix_scopes_one_instruction) {
+    Bench bench;
+    bench.bus.write8(0x10100, 0x99);
+    bench.bus.write8(0xF0100, 0x88);
+    bench.bus.write8(0x10010, 0x77);
+    bench.bus.write8(0xF0010, 0x66);
+
+    bench.code("4101" "118F0001" "8F0001");  // mov es,#1 ; es: mov a,!0x0100 ; mov a,!0x0100
+    bench.cpu.step();
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x99, bench.cpu.a);
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x88, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 9, bench.cpu.pc);
+
+    // The prefix also moves register-indirect accesses onto the ES page.
+    at(bench, "118B");  // es: mov a, [hl]
+    bench.cpu.es = 0x01;
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x77, bench.cpu.a);
+    ZLB_EXPECT_EQ(kBase + 2, bench.cpu.pc);
+
+    at(bench, "8B");  // mov a, [hl] (no prefix)
+    bench.cpu.h = 0x00;
+    bench.cpu.l = 0x10;
+    bench.cpu.step();
+    ZLB_EXPECT_EQ(0x66, bench.cpu.a);
+}
+
 }  // namespace

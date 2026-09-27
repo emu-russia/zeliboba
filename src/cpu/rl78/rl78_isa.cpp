@@ -16,6 +16,22 @@
 // byte of a two-byte page (`switch (op[1] & 0x8f)` on the 0x31 page, the whole byte
 // elsewhere); rl78_row_mask() combines it with the prefix byte and the row's own
 // variable bits.  gen_isa.py asserts that this reproduces the C# RowM array.
+//
+// CORRECTION (rows 173 and 215, `movw %e0, %1` with a B/C/BC base register):
+// both rows used to read {0x60, var 0x09} / {0x70, var 0x09} while carrying the
+// fixed base register of the *0x68* / *0x78* encoding.  A variable bit 3 with no
+// operand field to consume it made the row also match 0x60 and 0x70, and because
+// six fixed bits beat the five of the real `mov %0, %1` rows (92 and 181) the
+// tie-break in rl78_find_row() handed those two opcodes to the movw row.  That
+// lost the real instructions: `0110 0rba mov a, rba` (binutils rl78-decode.opc)
+// makes 0x60 "mov a, x" and `0111 0rba mov rba, a` makes 0x70 "mov x, a"; the
+// .opc has no `0110 0000`/`0111 0000` movw pattern at all - the [B], [C] and [BC]
+// based stores are 0x58, 0x68 and 0x78 (rows 84, 173, 215) and the loads 0x59,
+// 0x69, 0x79 (rows 85, 174, 216).  Evidence: run the in-repo disassembler over
+// 60 00 00 / 70 00 00 before the correction and it prints the bogus
+// "movw 0x0000[c], ax" / "movw 0x0000[bc], ax" instead of "mov a, x" / "mov x, a"
+// (see rl78_mov_a_from_every_register / rl78_mov_every_register_from_a in
+// tests/test_rl78.cpp).
 
 #include "cpu/rl78/rl78_isa.h"
 
@@ -260,7 +276,7 @@ const Rl78Row kRl78Rows[kRl78RowCount] = {
     /* 170 rorc     */ {0xFB, 0x61, 2, 0x00, 0xFF,  2, 48, 102, 26, 0x00, 0, 2},
     /* 171 reti     */ {0xFC, 0x61, 2, 0x00, 0xFF,  2, 49, 103, 22, 0x00, 0, 0},
     /* 172 stop     */ {0xFD, 0x61, 2, 0x00, 0xFF,  2, 50, 104, 32, 0x00, 0, 0},
-    /* 173 movw     */ {0x60, 0x00, 1, 0x09, 0xFF,  3,  6,  60, 13, 0x00, 1, 2},
+    /* 173 movw     */ {0x68, 0x00, 1, 0x00, 0xFF,  3,  6,  60, 13, 0x00, 1, 2},
     /* 174 movw     */ {0x69, 0x00, 1, 0x00, 0xFF,  3,  6,  61, 13, 0x00, 1, 2},
     /* 175 or       */ {0x6A, 0x00, 1, 0x00, 0xFF,  3, 25, 105, 20, 0x40, 0, 2},
     /* 176 or       */ {0x6B, 0x00, 1, 0x00, 0xFF,  2, 25,  72, 20, 0x40, 0, 2},
@@ -302,7 +318,7 @@ const Rl78Row kRl78Rows[kRl78RowCount] = {
     /* 212 or1      */ {0x8E, 0x71, 2, 0x70, 0xFF,  2, 55, 131, 20, 0x00, 0, 2},
     /* 213 xor1     */ {0x8F, 0x71, 2, 0x70, 0xFF,  2, 56, 132, 36, 0x00, 0, 2},
     /* 214 not1     */ {0xC0, 0x71, 2, 0x00, 0xFF,  2, 57, 133, 36, 0x00, 0, 2},
-    /* 215 movw     */ {0x70, 0x00, 1, 0x09, 0xFF,  3,  6,  60, 13, 0x00, 1, 2},
+    /* 215 movw     */ {0x78, 0x00, 1, 0x00, 0xFF,  3,  6,  60, 13, 0x00, 1, 2},
     /* 216 movw     */ {0x79, 0x00, 1, 0x00, 0xFF,  3,  6,  61, 13, 0x00, 1, 2},
     /* 217 xor      */ {0x7A, 0x00, 1, 0x00, 0xFF,  3, 27, 134, 36, 0x40, 0, 2},
     /* 218 xor      */ {0x7B, 0x00, 1, 0x00, 0xFF,  2, 27,  74, 36, 0x40, 0, 2},
