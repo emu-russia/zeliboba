@@ -56,14 +56,13 @@ const std::array<Insn, 225>& instruction_table() {
         prepared = true;
         for (Insn& insn : table) insn.op_count = count_operands(insn.ops);
 
-        // Two entries in the CGEN derived table describe their register operand
-        // with the wrong field: the encodings are (+ MAJ_1 rn (f-sub4 14/15)) so
-        // the register lives in bits 4..7 (the `rn` field), but the operand list
-        // says `rma` (bits 8..11), which the mask 0xFF0F forces to zero.  Fix
-        // them up so that `jmp $rm` / `jsr $rm` print the register they encode.
-        for (Insn& insn : table) {
-            if (insn.op == Op::Jmp || insn.op == Op::Jsr) insn.ops[0].field = Field::Rn;
-        }
+        // NOTE: `jmp`/`jsr` keep the register field the table gives them.  Their
+        // encodings are `(+ MAJ_1 (f-rn 0) rm (f-sub4 14/15))`: bits 8..11 are
+        // fixed to zero by the mask, and the register really is `rm` (bits
+        // 4..7) - which is what the interpreter reads as well.  An earlier fixup
+        // here re-pointed the operand at `rn` (bits 8..11) and made the
+        // formatter print `jmp $0` for the boot ROM's `jmp $1` at 0x5C50A
+        // (word 0x101E), disagreeing with the listing and with execution.
 
         // The CGEN lookup order groups by major opcode and takes the most
         // specific mask first; the generated list is in architecture manual

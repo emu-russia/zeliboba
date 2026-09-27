@@ -43,6 +43,32 @@ bool signed_sub_overflow(u32 a, u32 b) {
     return (((a ^ result) & (~b ^ result)) & 0x80000000u) != 0;
 }
 
+/// Number of leading zero bits: the `ldz` result and the bit count the modulo
+/// addressing unit derives its mask from.  The reference description computes
+/// that mask as `(srl (const SI -1) (do_ldz (or mb me)))`, which is the smallest
+/// mask covering both MB and ME - e.g. MB = 0x50000, ME = 0x5003f gives
+/// `0xFFFFFFFF >> 13 == 0x7ffff`.  Counting *significant* bits instead (the
+/// value the core used to return) produces 0x1fff there and the wrap can never
+/// trigger, so `do_ldz` must be a leading-zero count; the instruction's own
+/// comment in cpu/mep-core.cpu is "leading zeroes".
+int leading_zeros(u32 value) {
+    int n = 0;
+    while (n < 32 && (value & 0x80000000u) == 0) {
+        value <<= 1;
+        ++n;
+    }
+    return n;
+}
+
+/// CGEN `mod0`/`mod1`: post-modify the base register of a coprocessor
+/// addressing-unit transfer, wrapping at the end address of the modulo window.
+u32 modulo_update(u32 base, u32 mb, u32 me, u32 displacement) {
+    const u32 range = mb | me;
+    const u32 mask = (range == 0) ? 0u : (0xFFFFFFFFu >> leading_zeros(range));
+    if ((base & mask) == (me & mask)) return (base & ~mask) | mb;
+    return base + displacement;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -352,8 +378,13 @@ u32 MePCore::cop_access(const char* kind, unsigned size, u32 address, u32 value,
         return out;
     }
     const unsigned width = size == 0 ? 1u : size;
+    // The coprocessor registers are 64 bit wide, but the model only holds the
+    // low 32 bits (the `$cN` file is the GPR file), so an eight byte store is
+    // the register zero extended.  Shifting the 32 bit `value` by 32 or more
+    // would be undefined and on x86/ARM64 repeats the low word.
     for (unsigned i = 0; i < width; ++i) {
-        cbus.write(address + i, (value >> (8 * i)) & 0xFFu);
+        const u8 byte = (i < 4) ? static_cast<u8>((value >> (8 * i)) & 0xFFu) : 0u;
+        cbus.write(address + i, byte);
     }
     return value;
 }
@@ -364,6 +395,7 @@ void MePCore::cop_word(const mep::Insn& insn, u32 word, u32 address) {
     const u32 base = r[static_cast<size_t>(rm)];
 
     u32 disp = 0;
+    u32 update = 0;
     switch (insn.op) {
         case mep::Op::Swcp:
         case mep::Op::Lwcp:
@@ -381,7 +413,14 @@ void MePCore::cop_word(const mep::Insn& insn, u32 word, u32 address) {
         case mep::Op::Lhucp:
             disp = mep::field_value(mep::Field::F12s20, word, address);
             break;
-        default: disp = mep::field_value(mep::Field::FCdisp10, word, address); break;
+        default:
+            // The addressing-unit forms (`sbcpa`, `shcpm0`, ...) transfer
+            // through $rm itself - the reference body is
+            // `(set (mem QI rma) (and crn #xff))` followed by
+            // `(set rma (add rma (ext SI cdisp10)))` - so cdisp10 is only the
+            // post-modify amount and must not be added to the address.
+            update = mep::field_value(mep::Field::FCdisp10, word, address);
+            break;
     }
 
     unsigned size = 4;
@@ -452,35 +491,48 @@ void MePCore::cop_word(const mep::Insn& insn, u32 word, u32 address) {
         cop_access(kind, size, target, r[static_cast<size_t>(crn)], false);
     }
 
-    // The a/m forms are the addressing unit variants: they post-increment the
-    // base register by the access size (modulo forms wrap between MB/ME).
+    // The a/m forms are the addressing unit variants.  Their base register is
+    // post-modified by the `cdisp10` operand (`update`), not by the access size:
+    // the reference description for the plain forms is
+    // `(set rma (add rma (ext SI cdisp10)))` (cpu/mep-core.cpu sbcpa/shcpa/...)
+    // and the m0/m1 siblings replace that add with `(mod0 cdisp10)` /
+    // `(mod1 cdisp10)`.  The plain post-increment forms (`swcpi`) do add the
+    // access size.
     switch (insn.op) {
         case mep::Op::Swcpi:
         case mep::Op::Lwcpi:
+            r[static_cast<size_t>(rm)] = base + 4;
+            break;
         case mep::Op::Swcpa:
         case mep::Op::Lwcpa:
-        case mep::Op::Swcpm0:
-        case mep::Op::Lwcpm0:
-        case mep::Op::Swcpm1:
-        case mep::Op::Lwcpm1: r[static_cast<size_t>(rm)] = base + 4; break;
         case mep::Op::Sbcpa:
         case mep::Op::Lbcpa:
-        case mep::Op::Sbcpm0:
-        case mep::Op::Lbcpm0:
-        case mep::Op::Sbcpm1:
-        case mep::Op::Lbcpm1:
-        case mep::Op::Lbucpa:
-        case mep::Op::Lbucpm0:
-        case mep::Op::Lbucpm1: r[static_cast<size_t>(rm)] = base + 1; break;
         case mep::Op::Shcpa:
         case mep::Op::Lhcpa:
+        case mep::Op::Lbucpa:
+        case mep::Op::Lhucpa:
+            r[static_cast<size_t>(rm)] = base + update;
+            break;
+        case mep::Op::Swcpm0:
+        case mep::Op::Lwcpm0:
+        case mep::Op::Sbcpm0:
+        case mep::Op::Lbcpm0:
         case mep::Op::Shcpm0:
         case mep::Op::Lhcpm0:
+        case mep::Op::Lbucpm0:
+        case mep::Op::Lhucpm0:
+            r[static_cast<size_t>(rm)] = modulo_update(base, mb0, me0, update);
+            break;
+        case mep::Op::Swcpm1:
+        case mep::Op::Lwcpm1:
+        case mep::Op::Sbcpm1:
+        case mep::Op::Lbcpm1:
         case mep::Op::Shcpm1:
         case mep::Op::Lhcpm1:
-        case mep::Op::Lhucpa:
-        case mep::Op::Lhucpm0:
-        case mep::Op::Lhucpm1: r[static_cast<size_t>(rm)] = base + 2; break;
+        case mep::Op::Lbucpm1:
+        case mep::Op::Lhucpm1:
+            r[static_cast<size_t>(rm)] = modulo_update(base, mb1, me1, update);
+            break;
         default: break;
     }
 }
@@ -491,25 +543,36 @@ void MePCore::cop_word64(const mep::Insn& insn, u32 word, u32 address) {
     const bool load = insn.mnem[0] == 'l';
 
     u32 disp = 0;
+    u32 update = 0;
     if (insn.op == mep::Op::Smcp16 || insn.op == mep::Op::Lmcp16) {
         disp = mep::field_value(mep::Field::F16s16, word, address);
     } else if (insn.op != mep::Op::Smcp && insn.op != mep::Op::Lmcp &&
                insn.op != mep::Op::Smcpi && insn.op != mep::Op::Lmcpi) {
-        disp = mep::field_value(mep::Field::FCdisp10, word, address);
+        // The `a`/`m` forms transfer through $rm and use cdisp10a8 as the
+        // post-modify amount only (see the comment in cop_word).
+        update = mep::field_value(mep::Field::FCdisp10, word, address);
     }
     const u32 target = (r[static_cast<size_t>(rm)] + disp) & 0xFFFFFFF8u;
     if (!load) cop_access("smcp", 8, target, r[static_cast<size_t>(crn)], false);
 
     switch (insn.op) {
-        case mep::Op::Smcpa:
-        case mep::Op::Lmcpa:
-        case mep::Op::Smcpm0:
-        case mep::Op::Lmcpm0:
-        case mep::Op::Smcpm1:
-        case mep::Op::Lmcpm1:
         case mep::Op::Smcpi:
         case mep::Op::Lmcpi:
             r[static_cast<size_t>(rm)] = r[static_cast<size_t>(rm)] + 8;
+            break;
+        case mep::Op::Smcpa:
+        case mep::Op::Lmcpa:
+            r[static_cast<size_t>(rm)] = r[static_cast<size_t>(rm)] + update;
+            break;
+        case mep::Op::Smcpm0:
+        case mep::Op::Lmcpm0:
+            r[static_cast<size_t>(rm)] =
+                modulo_update(r[static_cast<size_t>(rm)], mb0, me0, update);
+            break;
+        case mep::Op::Smcpm1:
+        case mep::Op::Lmcpm1:
+            r[static_cast<size_t>(rm)] =
+                modulo_update(r[static_cast<size_t>(rm)], mb1, me1, update);
             break;
         default: break;
     }
@@ -994,8 +1057,11 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
         case Op::LdcLo: {
             const int csr = stc_ldc_csr(insn, word);
             // Reading the PC through `ldc $rn,$pc` yields the address of the
-            // following instruction.
-            R[static_cast<size_t>(rn)] = (csr == 0) ? (address + 4) : get_csr(csr);
+            // following instruction.  The reference description is
+            // `(set-vliw-modified-pcrel-offset rn 2 4 8)`, i.e. `rn = pc + 2` in
+            // core operating mode (only the Venezia VLIW modes add 4 / 8), and
+            // `ldc` is a 16 bit instruction - this used to add 4 unconditionally.
+            R[static_cast<size_t>(rn)] = (csr == 0) ? (address + 2) : get_csr(csr);
             break;
         }
         case Op::Di: psw &= ~kPswInterruptEnable; break;
@@ -1152,13 +1218,10 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
 
         // -------------------------------------------------------- dsp/misc
         case Op::Ldz: {
-            u32 v = R[static_cast<size_t>(rm)];
-            int n = 32;
-            while (n > 0 && (v & 0x80000000u) == 0) {
-                v <<= 1;
-                --n;
-            }
-            R[static_cast<size_t>(rn)] = static_cast<u32>(n);
+            // "leading zeroes": the count of zero bits above the most
+            // significant one (`ldz $rn,0` is 32), not the number of
+            // significant bits.
+            R[static_cast<size_t>(rn)] = static_cast<u32>(leading_zeros(R[static_cast<size_t>(rm)]));
             break;
         }
         case Op::Abs: {
@@ -1210,8 +1273,13 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
                 R[static_cast<size_t>(rn)] = 0;
                 break;
             }
-            const u32 max = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
-            if (R[static_cast<size_t>(rn)] > max) R[static_cast<size_t>(rn)] = max;
+            // The reference description clamps with a *signed* upper compare and
+            // then clamps negatives to zero:
+            //   (if (gt rn max) (set rn max)) (if (lt rn 0) (set rn 0))
+            const s32 max = static_cast<s32>((1u << n) - 1u);
+            const s32 v = static_cast<s32>(R[static_cast<size_t>(rn)]);
+            if (v > max) R[static_cast<size_t>(rn)] = static_cast<u32>(max);
+            else if (v < 0) R[static_cast<size_t>(rn)] = 0;
             break;
         }
         case Op::Sadd: {
