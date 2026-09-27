@@ -518,11 +518,12 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
     if (count != 0u) return false;                        // the KBL filled it itself
     if (target == 0u) return false;                       // slot not initialised
 
-    // The blocks come from the tail of the region the partition describes
-    // (+0x18 size, +0x1C base) - the loader's own allocations grow from the start,
-    // so the tail is the part that stays free.
-    const u32 region_size = read_va(pool_va + 0x18u, ok);
-    const u32 region_base = read_va(pool_va + 0x1Cu, ok);
+    // The blocks come from the tail of the region the partition describes: the
+    // builder 0x40032108 stores the base at +0x18 (`str r3,[r0,#0x18]`) and the
+    // size at +0x1C (`str.w r5,[r0,#0x1c]`), and the loader's own allocations grow
+    // from the start, so the tail is the part that stays free.
+    const u32 region_base = read_va(pool_va + 0x18u, ok);
+    const u32 region_size = read_va(pool_va + 0x1Cu, ok);
     if (!ok || region_size < 0x1000u || region_base == 0u) {
         partition_region_base_ = 0x40000000u;
         partition_region_size_ = 0x00300000u;
@@ -531,19 +532,27 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
         partition_region_size_ = region_size;
     }
     u32& next = partition_block_next_[0];
-    if (next == 0u || next + 0x1000u * blocks > partition_region_size_) {
-        // Seed just below the top of the region and grow downwards.
-        next = partition_region_size_ - 0x1000u * blocks;
-    }
+    const u32 span = 0x1000u * blocks;
+    // Always seed from the *tail* of the region: the loader's own allocations grow
+    // from the base (its first request is a whole 1 MiB), so anything below is
+    // already spoken for.  The loader maps the region lazily, though, so the tail
+    // pages may still be unmapped (a probe write faults) - walk downwards from the
+    // tail and keep the pages that accept a zero write.  Zeroing them also keeps
+    // the objects the loader builds inside them clean, which the "stale lock"
+    // symptom of round 95 needed.
+    if (next == 0u || next > region_size || next < region_size / 4u) next = region_size - span;
+    if (next < span) return false;
 
     u32 head = 0;
     u32 written = 0;
-    for (u32 i = 0; i < blocks; ++i) {
-        const u32 block = partition_region_base_ + next + 0x1000u * i;
-        // Touching the block itself is best effort: at this point the loader may
-        // not have mapped the region writable yet, and the allocator's cache path
-        // only returns the pointer (the caller initialises the block).
-        (void)write_va(block, 0u);
+    u32 cursor = next;
+    while (written < blocks && cursor >= 0x1000u) {
+        const u32 block = partition_region_base_ + cursor;
+        if (!write_va(block, 0u)) {
+            // Not mapped writable yet: skip this page and try the one below.
+            cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
+            continue;
+        }
         if (written == 0u) {
             head = block;
             if (!write_va(slot + 4u, block)) break;
@@ -551,9 +560,10 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
             if (!write_va(slot + 4u + 4u * written, block)) break;
         }
         ++written;
+        cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
     }
     if (written == 0u) return false;
-    next -= 0x1000u * written;
+    next = cursor;
     // Count last (high half of the target word): the allocator only looks at the
     // slot when the count is non-zero.
     if (!write_va(slot, target | (written << 16))) return false;
