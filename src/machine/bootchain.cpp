@@ -722,9 +722,10 @@ bool Vita::trace_arm_boot_pc(u32 core, u32 pc) {
     const u32 insn = (arm->cpsr & 0x20u) ? arm_bus_->read16(pc) : arm_bus_->read32(pc);
     std::fprintf(stderr,
                  "[pctrap] arm%u pc=%08X insn=%08X sp=%08X lr=%08X r0=%08X r1=%08X r2=%08X r3=%08X "
-                 "r4=%08X r5=%08X r6=%08X r7=%08X\n",
+                 "r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X sl=%08X sb=%08X r12=%08X cpsr=%08X\n",
                  core, pc, insn, arm->r[13], arm->r[14], arm->r[0], arm->r[1], arm->r[2], arm->r[3],
-                 arm->r[4], arm->r[5], arm->r[6], arm->r[7]);
+                 arm->r[4], arm->r[5], arm->r[6], arm->r[7], arm->r[8], arm->r[9], arm->r[10],
+                 arm->r[11], arm->r[12], arm->cpsr);
     if (pc == 0x4003234Eu || pc == 0x40032366u || pc == 0x400327D6u || pc == 0x400327D8u ||
         pc == 0x40031BE4u || pc == 0x4002BB62u) {
         std::fprintf(stderr,
