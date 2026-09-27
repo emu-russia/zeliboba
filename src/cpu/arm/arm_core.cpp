@@ -2604,14 +2604,22 @@ void ArmCore::thumb_shift_imm(u32 i) {
 void ArmCore::thumb_add_sub(u32 i) {
     const bool immediate = (i & 0x400u) != 0u;
     const bool sub = (i & 0x200u) != 0u;
-    const int rn = static_cast<int>((i >> 6) & 7u);
-    const int rm = static_cast<int>((i >> 3) & 7u);
+    // Encoding (ARM ARM A7.2, ADD/SUB register T1): `0001 100 Rm Rn Rd`, i.e. the
+    // *second* source is in bits[8:6] and the first in bits[5:3].  This used to read
+    // both operands from bits[5:3] (`r[rm] + r[rm]`), which silently computed
+    // `Rn + Rn` for every three-operand register ADD/SUB.  kernel_boot_loader builds
+    // its memory-map node size/end with `adds r0, r1, r3` (0x40032C7A): with r1 =
+    // 0x300000 and r3 = 0x40000000 it produced 0x600000 instead of 0x40300000, so the
+    // page-map walk was skipped as "empty region" and the physical memory partition
+    // stayed empty (docs/KBL.md, round 52).
+    const int rn = static_cast<int>((i >> 3) & 7u);  // first source operand
+    const int rm = static_cast<int>((i >> 6) & 7u);  // second source operand (or imm3)
     const int rd = static_cast<int>(i & 7u);
-    const u32 op2v = immediate ? static_cast<u32>(rn) : r[rm];
+    const u32 op2v = immediate ? static_cast<u32>(rm) : r[rm];
     bool carry;
     bool overflow;
-    const u32 result = sub ? sub_with_carry(r[rm], op2v, true, carry, overflow)
-                           : add_with_carry(r[rm], op2v, false, carry, overflow);
+    const u32 result = sub ? sub_with_carry(r[rn], op2v, true, carry, overflow)
+                           : add_with_carry(r[rn], op2v, false, carry, overflow);
     r[rd] = result;
     set_nzcv(result, carry, overflow);
     write_r15(cur_instr_addr_ + 2u);
