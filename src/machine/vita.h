@@ -309,6 +309,20 @@ private:
     bool satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch);
     u64 boot_fault_fixes_ = 0;
 
+    /// Development substitution for the data the stage before kernel_boot_loader
+    /// is supposed to leave in the ARM's scratchpad.  The KBL builds a physical
+    /// memory partition (VA 0x51C0) with a per-core cache of 0x1000-byte blocks,
+    /// but nothing in the KBL ever *adds* memory to it, and every allocation asks
+    /// for a flag (0x10) that forbids carving a fresh block - so the cache stays
+    /// empty for the whole run, every allocation returns 0x80020005, the object
+    /// manager (boot context +0x8C) is never created and all class registrations
+    /// fail with 0x80024501 (docs/KBL.md, round 51).  On hardware the partition
+    /// arrives pre-populated, so this hook lets the allocator take its own carving
+    /// path at 0x40032366 instead of the cache-only failure at 0x4003234E.
+    /// Returns true when it redirected the PC (the caller then skips stepping).
+    bool satisfy_arm_boot_pc(u32 core, u32 pc);
+    u64 boot_pc_fixes_ = 0;
+
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the
     /// end of its work (see docs/KBL.md, round 39).

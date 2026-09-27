@@ -335,6 +335,53 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     return true;
 }
 
+// Development substitution experiment for the partition allocator's cache-only flag
+// check - **off by default**, enabled with ZLB_ALLOC_CARVE=1.
+//
+// kernel_boot_loader builds its physical memory partition itself (VA 0x51C0: region
+// {0x40000000, 3 MiB}, a per-core cache of 0x1000-byte block pointers and free lists
+// per size class), but nothing in the KBL ever *adds* memory to it, and every
+// allocation site asks for flag 0x10, which the allocator treats as "must come from
+// the cache": `bics r0, r11, #0x21` at 0x40032356 returns 0x80020005 instead of
+// carving a fresh block.  Measured over 230M instructions the cache is written
+// exactly 37 times, all of them part of its own initialisation, so every allocation
+// fails, the object manager at boot context +0x8C is never created and all 24 class
+// registrations return 0x80024501 (docs/KBL.md, rounds 50-51).
+//
+// The experiment redirects the PC from the failure path (0x4003235C) into the
+// allocator's own carving path (0x40032366), i.e. it treats flag 0x10 as
+// carve-capable.  Result: each of the four cores ends up spinning in the partition
+// mutex (`0x4003A1B0`, the word at partition+0x0E, which is already non-zero), so the
+// KBL gets *stuck* instead of failing cleanly - the missing memory really has to
+// arrive pre-populated from the stage before the KBL, and that is what to model next.
+// Disabled with ZLB_NO_SUBSTITUTION=1 (which wins over ZLB_ALLOC_CARVE).
+bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
+    constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
+    constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
+    static const bool disabled = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (value != nullptr && value[0] != '0') return true;
+        const char* carve = std::getenv("ZLB_ALLOC_CARVE");
+        return carve == nullptr || carve[0] == '0';
+    }();
+    if (disabled || pc != kCacheOnlyFailurePc) return false;
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    Cpu* cpu = arm_cores_[core].get();
+    if (!cpu) return false;
+
+    cpu->set_pc(kCarvePathPc);
+    if (boot_pc_fixes_ == 0) {
+        ZLB_LOG_INFO("machine",
+                     "partition allocator: empty 0x1000 block cache -> using the carving path at 0x%08X "
+                     "(ZLB_ALLOC_CARVE experiment)",
+                     kCarvePathPc);
+        add_milestone(
+            "KBL partition allocator cache miss redirected to its carving path (ZLB_ALLOC_CARVE experiment)");
+    }
+    ++boot_pc_fixes_;
+    return true;
+}
+
 bool Vita::mirror_cmep_scratch_to_arm() {    // See the note at the call site: ARM PA 0 mirrors the CMeP's 32 KiB scratch.
     constexpr u32 kScratchSize = 0x8000;
     if (shared_sram_.size() < kScratchSize) return false;

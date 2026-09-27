@@ -449,6 +449,7 @@ void Vita::run_slice() {
                 stop_slice = true;
                 break;
             }
+            if (satisfy_arm_boot_pc(static_cast<u32>(i), core->get_pc())) continue;
             core->run(1, no_abort);
         }
         if (stop_slice) break;
