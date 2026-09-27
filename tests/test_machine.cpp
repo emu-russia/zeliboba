@@ -1,4 +1,4 @@
-﻿// zeliboba - machine wiring self tests.
+// zeliboba - machine wiring self tests.
 //
 // These do not need a working CPU core: they verify the board description
 // (memory windows, shared SRAM, fitted parts, eMMC) which is what the boot chain
@@ -116,4 +116,39 @@ ZLB_TEST(machine_workspace_paths_resolve) {
     const std::string resolved = resolve_workspace_path("dumps/vita_prototype_bootrom.bin");
     ZLB_EXPECT_TRUE(file_exists(resolved));
     ZLB_EXPECT_TRUE(resolve_workspace_path("C:/absolute/path") == "C:/absolute/path");
+}
+
+// A breakpoint has to be exact even though a scheduler slice runs a whole budget
+// of instructions per core: the debugger installs `pc_hook` for that, and the
+// slice must end *before* the matching instruction executes.
+ZLB_TEST(machine_pc_hook_stops_the_slice_before_the_instruction) {
+    Vita& vita = shared_machine();
+    vita.reset(false);
+
+    Cpu* arm0 = vita.arm_core(0);
+    ZLB_EXPECT_TRUE(arm0 != nullptr);
+    if (!arm0) return;
+
+    // Let the core run a little so its PC is inside real code, then arm the hook
+    // on the instruction it is about to execute.
+    for (int i = 0; i < 8; ++i) vita.run_slice();
+    const u32 armed_pc = arm0->get_pc();
+    const u64 insns_before = arm0->instructions;
+
+    vita.pc_hook = [armed_pc](Arch arch, int, u32 pc) {
+        return arch == Arch::Arm && pc == armed_pc;
+    };
+    vita.run_slice();
+
+    ZLB_EXPECT_TRUE(vita.pc_hook_stopped());
+    ZLB_EXPECT_EQ(static_cast<u32>(vita.pc_hook_pc()), armed_pc);
+    ZLB_EXPECT_EQ(static_cast<u32>(arm0->get_pc()), armed_pc);
+    ZLB_EXPECT_TRUE(arm0->instructions == insns_before);
+
+    // With the hook gone the same slice makes progress again.
+    vita.clear_pc_hook_stop();
+    vita.pc_hook = nullptr;
+    vita.run_slice();
+    ZLB_EXPECT_FALSE(vita.pc_hook_stopped());
+    ZLB_EXPECT_TRUE(arm0->instructions > insns_before);
 }

@@ -183,6 +183,23 @@ public:
 
     CoreBudget& budget() { return budget_; }
 
+    /// Optional per-instruction PC observation, used by the debugger to make
+    /// breakpoints exact without giving up the fast budget.  A slice runs
+    /// `budget().arm` instructions per Kermit core, so a breakpoint tested only
+    /// at the slice boundary would be silently skipped; this hook is called with
+    /// the PC *about to execute* and, when it returns true, the slice ends
+    /// immediately with that instruction still pending.  The CMeP and Ernie
+    /// cores run a whole budget per slice, so they are not covered - a
+    /// breakpoint there is still only exact with a one-instruction budget.
+    std::function<bool(Arch arch, int core, u32 pc)> pc_hook;
+
+    /// True when `pc_hook` ended the last slice; cleared by clear_pc_hook_stop().
+    bool pc_hook_stopped() const { return pc_hook_stopped_; }
+    void clear_pc_hook_stop() { pc_hook_stopped_ = false; }
+    Arch pc_hook_arch() const { return pc_hook_arch_; }
+    int pc_hook_core() const { return pc_hook_core_; }
+    u32 pc_hook_pc() const { return pc_hook_pc_; }
+
     /// Run one scheduler slice: each core gets its budget of instructions.
     void run_slice();
 
@@ -323,6 +340,11 @@ private:
 
     VitaConfig config_;
     CoreBudget budget_;
+
+    bool pc_hook_stopped_ = false;
+    Arch pc_hook_arch_ = Arch::Unknown;
+    int pc_hook_core_ = 0;
+    u32 pc_hook_pc_ = 0;
 
     std::unique_ptr<Bus> arm_bus_;
     std::unique_ptr<Bus> cmep_bus_;

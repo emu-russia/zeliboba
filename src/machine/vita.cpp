@@ -436,10 +436,22 @@ void Vita::run_slice() {
     // faithful model - a coarser one lets a core race several instructions ahead
     // of a spin loop that hardware would have seen instantly.
     for (int step = 0; step < budget_.arm; ++step) {
+        bool stop_slice = false;
         for (int i = 0; i < kArmCoreCount; ++i) {
             Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
-            if (core && !core->halted) core->run(1, no_abort);
+            if (!core || core->halted) continue;
+            if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
+                // Leave the instruction pending: the debugger resumes from it.
+                pc_hook_stopped_ = true;
+                pc_hook_arch_ = Arch::Arm;
+                pc_hook_core_ = i;
+                pc_hook_pc_ = core->get_pc();
+                stop_slice = true;
+                break;
+            }
+            core->run(1, no_abort);
         }
+        if (stop_slice) break;
     }
 
     if (kermit_) kermit_->tick(static_cast<u64>(budget_.arm));

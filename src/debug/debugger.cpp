@@ -316,18 +316,63 @@ void Debugger::run_until(u32 address, int64_t limit) {
 void Debugger::run_machine(int64_t slices) {
     stop_requested_ = false;
     // A machine slice runs `budget().arm` instructions on *every* core (256 by
-    // default), and breakpoints/watchpoints are only tested at slice boundaries -
-    // so a breakpoint inside a slice is silently skipped.  With breakpoints or
-    // watchpoints armed, drop to one instruction per core per slice so the stop is
-    // exact; a plain runm keeps the fast budget.
+    // default).  An ARM breakpoint no longer needs a one-instruction budget:
+    // `pc_hook` is consulted before each Kermit instruction, so the stop is exact
+    // while the machine keeps running at full speed - which matters, because the
+    // kernel boot loader needs hundreds of millions of instructions to reach the
+    // code under study.  Watchpoints are still found by diffing the bus traces at
+    // slice boundaries, so they keep the slow but exact one-instruction path.
     CoreBudget& budget = vita_.budget();
     const int saved_arm_budget = budget.arm;
-    if (!breakpoints_.empty() || !watchpoints_.empty()) budget.arm = 1;
+    if (!watchpoints_.empty()) budget.arm = 1;
     struct Restore {
         CoreBudget& budget;
         int value;
-        ~Restore() { budget.arm = value; }
-    } restore{budget, saved_arm_budget};
+        std::function<bool(Arch, int, u32)>& hook;
+        Vita& vita;
+        std::array<std::set<u32>, Vita::kArmCoreCount>* parked = nullptr;
+        std::array<std::set<u32>, Vita::kArmCoreCount>& saved;
+        ~Restore() {
+            budget.arm = value;
+            hook = nullptr;
+            if (!parked) return;
+            // Put the cores' own breakpoint sets back.
+            for (int i = 0; i < Vita::kArmCoreCount; ++i) {
+                Cpu* core = vita.arm_core(i);
+                if (core) core->breakpoints = saved[static_cast<size_t>(i)];
+            }
+        }
+    } restore{budget, saved_arm_budget, vita_.pc_hook, vita_, nullptr, parked_arm_breaks_};
+
+    auto arm_breaks = breakpoints_.find(Arch::Arm);
+    if (arm_breaks != breakpoints_.end() && !arm_breaks->second.empty()) {
+        const auto& set = arm_breaks->second;
+        // Resuming from an ARM breakpoint has to execute the instruction under
+        // it exactly once, on the core that stopped - otherwise the hook fires
+        // again on the very same PC and `runm` never gets past the breakpoint.
+        const u32 resume_pc = last_stop_.stopped && last_stop_.arch == Arch::Arm ? last_stop_.address : 0;
+        int resume_core = resume_pc ? last_stop_.core : -1;
+        vita_.pc_hook = [&set, resume_pc, resume_core](Arch arch, int core, u32 pc) mutable {
+            if (arch != Arch::Arm) return false;
+            if (core == resume_core && pc == resume_pc) {
+                resume_core = -1;  // one free step over the breakpoint
+                return false;
+            }
+            return set.count(pc) != 0;
+        };
+        // Cpu::run() returns *before* executing an instruction whose address is in
+        // the core's own breakpoint set - and that is exactly the instruction the
+        // hook just waved through, so the machine would never get past a
+        // breakpoint.  The hook owns ARM breakpoints during a whole-machine run,
+        // so park the per-core sets and put them back when the run returns.
+        for (int i = 0; i < Vita::kArmCoreCount; ++i) {
+            Cpu* core = vita_.arm_core(i);
+            if (!core) continue;
+            parked_arm_breaks_[static_cast<size_t>(i)] = core->breakpoints;
+            core->breakpoints.clear();
+        }
+        restore.parked = &parked_arm_breaks_;
+    }
 
     for (int64_t i = 0; i < slices && !stop_requested_; ++i) {
         if (vita_.stage() == BootStage::Failed) break;
@@ -336,6 +381,17 @@ void Debugger::run_machine(int64_t slices) {
             trace_from = std::max(trace_from, bus->trace.total());
         }
         vita_.run_slice();
+        if (vita_.pc_hook_stopped()) {
+            vita_.clear_pc_hook_stop();
+            last_stop_.stopped = true;
+            last_stop_.arch = vita_.pc_hook_arch();
+            last_stop_.address = vita_.pc_hook_pc();
+            last_stop_.core = vita_.pc_hook_core();
+            last_stop_.reason = format("arm%d breakpoint at 0x%08X", vita_.pc_hook_core(),
+                                       vita_.pc_hook_pc());
+            print("[stop] " + last_stop_.reason);
+            return;
+        }
         // Slices bypass step(), so record the PC history here as well - "how did
         // this core get here" is the question a whole-machine run raises most.
         if (history_enabled_) {
@@ -373,6 +429,7 @@ bool Debugger::machine_breakpoint_check() {
                     last_stop_.stopped = true;
                     last_stop_.arch = Arch::Arm;
                     last_stop_.address = cpu->get_pc();
+                    last_stop_.core = i;
                     last_stop_.reason = format("arm%d breakpoint at 0x%08X", i, cpu->get_pc());
                     print("[stop] " + last_stop_.reason);
                     return true;
@@ -959,7 +1016,7 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "execution\n"
         "  step [n] | s [n]       step the active core n instructions (all cores advance 1:1)\n"
         "  run [n] | r [n]        run n machine steps, stopping on breakpoints/watchpoints\n"
-        "  runm [n]               run n whole machine slices (fast, no breakpoint checks)\n"
+        "  runm [n]               run n whole machine slices (fast; ARM breakpoints stay exact)\n"
         "  until <addr>           run until the active core reaches addr\n"
         "  reset                  power-on reset\n"
         "  core [mep|arm|rl78]    show or select the active core\n"

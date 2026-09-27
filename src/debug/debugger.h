@@ -41,6 +41,10 @@ struct StopInfo {
     std::string reason;
     Arch arch = Arch::Unknown;
     u32 address = 0;
+    /// Which core of `arch` stopped (0..3 for the Kermit cluster, 0 otherwise).
+    /// Needed to resume correctly: the instruction under the breakpoint has to
+    /// run exactly once, on that one core.
+    int core = 0;
     u64 steps = 0;
 };
 
@@ -168,6 +172,9 @@ private:
     Arch active_arch_ = Arch::MeP;
     int arm_core_index_ = 0;
     std::map<Arch, std::set<u32>> breakpoints_;
+    /// The Kermit cores' own breakpoint sets, parked while a whole-machine run
+    /// uses `Vita::pc_hook` for ARM breakpoints (see run_machine).
+    std::array<std::set<u32>, Vita::kArmCoreCount> parked_arm_breaks_;
     std::deque<Watchpoint> watchpoints_;
     int next_watchpoint_id_ = 1;
     bool stop_requested_ = false;
