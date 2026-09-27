@@ -793,6 +793,52 @@ bool Debugger::execute(const std::string& line) {
         for (const std::string& line : memory_dump(address, rows)) emit(line);
         return true;
     }
+    if (command == "vpa" || command == "vmem") {
+        // `mem` reads *physical* memory.  That is a trap for anyone inspecting the
+        // kernel boot loader, which rebuilds its page tables as it goes: the same
+        // object VA lives at a different PA before and after that (round 57 in
+        // docs/KBL.md lost several rounds to exactly this).  `vpa` translates a VA
+        // through the active core's tables - and prints the descriptor chain it
+        // used - while `vmem` also dumps the bytes at the resulting PA.
+        Cpu* cpu = active_core();
+        auto* arm = dynamic_cast<ArmCore*>(cpu);
+        if (!arm) {
+            emit("vpa: the active core has no MMU (select an ARM core first)");
+            return true;
+        }
+        const u32 va = arg_address(args, 0, cpu->get_pc());
+        // Turn the walk recording on just for this query: the walk itself keeps
+        // last_walk up to date, but the hot path only publishes it when asked.
+        const bool saved_walks = arm->mmu.record_walks;
+        arm->mmu.record_walks = true;
+        const arm::MmResult result = arm->mmu.translate(va, false, false, arm->mode());
+        const ArmMmu::WalkRecord walk = arm->mmu.last_walk;
+        arm->mmu.record_walks = saved_walks;
+
+        if (!result.ok) {
+            emit(format("VA 0x%08X -> %s (fsr 0x%X)  L1[0x%03X]@0x%08X=0x%08X", va,
+                        arm::fault_name(result.fault), result.fsr_status, (va >> 20) & 0xFFFu,
+                        walk.l1_addr, walk.l1_desc));
+            if (walk.used_l2) {
+                emit(format("   L2[0x%02X]@0x%08X=0x%08X domain=%u", (va >> 12) & 0xFFu, walk.l2_addr,
+                            walk.l2_desc, walk.domain));
+            }
+            return true;
+        }
+        emit(format("VA 0x%08X -> PA 0x%08X  %s%s  (ttbr%d base=0x%08X L1[0x%03X]=0x%08X)", va,
+                    result.phys_addr, result.device ? "device" : (result.strongly_ordered ? "strongly-ordered" : "normal"),
+                    result.normal && !result.device && !result.strongly_ordered ? " cacheable" : "",
+                    walk.ttbr_num, walk.ttbr_base, (va >> 20) & 0xFFFu, walk.l1_desc));
+        if (walk.used_l2) {
+            emit(format("   L2[0x%02X]@0x%08X=0x%08X domain=%u", (va >> 12) & 0xFFu, walk.l2_addr, walk.l2_desc,
+                        walk.domain));
+        }
+        if (command == "vmem") {
+            const int rows = arg_int(args, 1, 4);
+            for (const std::string& line : memory_dump(result.phys_addr, rows)) emit(line);
+        }
+        return true;
+    }
     if (command == "save") {
         // Dump a range of the active core's address space to a file.  The
         // decrypted stages only exist inside the machine, and reversing them is
@@ -1023,7 +1069,9 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "inspection\n"
         "  regs | reg <name> <v>  registers of the active core\n"
         "  dis [addr] [count]     disassemble\n"
-        "  mem [addr] [rows]      hex dump\n"
+        "  mem [addr] [rows]      hex dump (physical address)\n"
+        "  vpa <va>               translate a VA through the active core's MMU and show the walk\n"
+        "  vmem <va> [rows]       like vpa, then hex dump the bytes at the resulting PA\n"
         "  poke <addr> <val> [s]  write physical memory (s = 8|16|32)\n"
         "  save <addr> <len> <f>  dump memory to a file (feed it to tools/zdis)\n"
         "  trace [n]              last n bus accesses\n"
