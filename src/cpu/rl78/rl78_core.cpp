@@ -684,10 +684,18 @@ StepResult Rl78Core::step() {
 
     page_ = insn.has_es_prefix ? (static_cast<u32>(es & 0x0F) << 16) : 0xF0000u;
 
-    const u32 before = pc;
+    // A transfer to the address the instruction already has (the classic
+    // "br $-2" / "bnz $-2" idle loop) leaves PC numerically unchanged, so the
+    // old `pc == before` test in this function could not tell it apart from an
+    // instruction that never writes PC: the loop was advanced by insn.length and
+    // fell through into whatever followed.  execute() now reports whether it
+    // wrote PC instead.  Evidence: `EF FE` at 0x1000 (br $-2) used to end with
+    // PC=0x1002 instead of 0x1000; tests/test_rl78.cpp
+    // rl78_self_branches_do_not_fall_through pins the fixed behaviour.
+    pc_written_ = false;
     execute(insn);
     cycles += static_cast<u64>(cycles_for(insn));
-    if (!halted && pc == before) pc = (pc + insn.length) & 0xFFFFFu;
+    if (!halted && !pc_written_) pc = (pc + insn.length) & 0xFFFFFu;
     bus->context.pc = pc;
     return result;
 }
@@ -716,11 +724,13 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
             push_frame(static_cast<u16>(pc + insn.length), psw);
             psw = static_cast<u16>(psw & ~kRl78FlagIe);
             pc = bus->read16(0x7E) & 0xFFFFu;
+            pc_written_ = true;
             ZLB_LOG_DBG("cpu", "RL78 BRK -> vector 0x007E, PC=0x%05X", pc);
             break;
 
         case kEoRet:
             pc = pop();
+            pc_written_ = true;
             break;
 
         case kEoReti: {
@@ -728,6 +738,7 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
             const u32 return_pc = pop_frame(return_psw);
             pc = return_pc;
             psw = return_psw;
+            pc_written_ = true;
             ZLB_LOG_DBG("cpu", "RL78 RETI -> PC=0x%05X", pc);
             break;
         }
@@ -756,6 +767,7 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
             if (take) {
                 const u32 next = pc + insn.length;
                 pc = next + rl78_instruction_length(*bus, next);
+                pc_written_ = true;
             }
             break;
         }
@@ -1014,6 +1026,7 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
                 push(static_cast<u16>(pc + insn.length));
             }
             pc = target & 0xFFFFFu;
+            pc_written_ = true;
             break;
         }
 
@@ -1023,6 +1036,7 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
             const u32 target = bus->read16(entry) & 0xFFFFu;
             push(static_cast<u16>(pc + insn.length));
             pc = target;
+            pc_written_ = true;
             break;
         }
 
@@ -1035,7 +1049,10 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
                 case Rl78OpType::BitInd: {
                     const bool value = read_bit(insn.ops[1]);
                     const bool take = insn.ops[1].condition == Rl78Cond::T ? value : !value;
-                    if (take) pc = target & 0xFFFFFu;
+                    if (take) {
+                        pc = target & 0xFFFFFu;
+                        pc_written_ = true;
+                    }
                     break;
                 }
                 default: {
@@ -1050,7 +1067,10 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
                         case Rl78Cond::T: take = true; break;
                         default: take = false; break;
                     }
-                    if (take) pc = target & 0xFFFFFu;
+                    if (take) {
+                        pc = target & 0xFFFFFu;
+                        pc_written_ = true;
+                    }
                     break;
                 }
             }
@@ -1062,6 +1082,7 @@ void Rl78Core::execute(const Rl78Decoded& insn) {
             if (read_bit(insn.ops[1])) {
                 write_bit(insn.ops[1], false);
                 pc = static_cast<u32>(insn.ops[0].addend) & 0xFFFFFu;
+                pc_written_ = true;
             }
             break;
         }

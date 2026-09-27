@@ -153,6 +153,12 @@ private:
     /// an 0x11 ES: prefix is in effect.
     u32 page_ = 0xF0000;
 
+    /// Set by execute() when the instruction wrote PC itself.  step() uses it to
+    /// tell "this instruction does not touch PC, so advance it" apart from "this
+    /// branch/jump/return moved PC onto the address it already had", which is a
+    /// real transfer (a self loop) and must not be advanced.
+    bool pc_written_ = false;
+
     std::array<bool, 8> irq_levels_{};
     std::array<u8, 8> irq_vectors_{};
 
