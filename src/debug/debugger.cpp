@@ -861,6 +861,44 @@ bool Debugger::execute(const std::string& line) {
         emit(format("saved %u bytes from %08X to %s", length, address, path.c_str()));
         return true;
     }
+    if (command == "vpoke") {
+        // Virtual-address counterpart of `poke`: translate the VA through the
+        // active core's tables and write the resulting PA.  Patching a kernel
+        // object whose address moves with the page tables (see `vpa`) is the main
+        // use, so the translation is printed along with the write.
+        if (args.size() < 2) return "usage: vpoke <va> <value> [8|16|32]";
+        Cpu* cpu = active_core();
+        auto* arm = dynamic_cast<ArmCore*>(cpu);
+        if (!arm) {
+            emit("vpoke: the active core has no MMU (use poke)");
+            return true;
+        }
+        const u32 va = arg_address(args, 0, 0);
+        u64 value = 0;
+        if (!parse_u64(args[1], value)) return "cannot parse the value";
+        const int bits = args.size() > 2 ? arg_int(args, 2, 32) : 32;
+        const bool saved_walks = arm->mmu.record_walks;
+        arm->mmu.record_walks = true;
+        const arm::MmResult result = arm->mmu.translate(va, true, false, arm->mode());
+        const ArmMmu::WalkRecord walk = arm->mmu.last_walk;
+        arm->mmu.record_walks = saved_walks;
+        if (!result.ok) {
+            emit(format("vpoke: VA 0x%08X does not translate (%s, fsr 0x%X, L1[0x%03X]@0x%08X=0x%08X)", va,
+                        arm::fault_name(result.fault), result.fsr_status, (va >> 20) & 0xFFFu, walk.l1_addr,
+                        walk.l1_desc));
+            return true;
+        }
+        Bus& bus = *cpu->bus;
+        switch (bits) {
+            case 8: bus.write8(result.phys_addr, static_cast<u8>(value)); break;
+            case 16: bus.write16(result.phys_addr, static_cast<u16>(value)); break;
+            case 32: bus.write32(result.phys_addr, static_cast<u32>(value)); break;
+            default: return "size must be 8, 16 or 32";
+        }
+        emit(format("vpoke VA 0x%08X -> PA 0x%08X <- 0x%llX (%d bit)  reads back 0x%08X", va, result.phys_addr,
+                    static_cast<unsigned long long>(value), bits, bus.read32(result.phys_addr & ~3u)));
+        return true;
+    }
     if (command == "poke") {
         // Write a value to physical memory through the active core's bus. This is
         // the escape hatch for experiments the device models cannot express yet -
@@ -1073,6 +1111,7 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  vpa <va>               translate a VA through the active core's MMU and show the walk\n"
         "  vmem <va> [rows]       like vpa, then hex dump the bytes at the resulting PA\n"
         "  poke <addr> <val> [s]  write physical memory (s = 8|16|32)\n"
+        "  vpoke <va> <val> [s]   translate a VA through the active core's MMU, then write\n"
         "  save <addr> <len> <f>  dump memory to a file (feed it to tools/zdis)\n"
         "  trace [n]              last n bus accesses\n"
         "  trace find <addr>      accesses to an address\n"
