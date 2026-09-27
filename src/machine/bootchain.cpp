@@ -358,25 +358,32 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
 // arrive pre-populated from the stage before the KBL, and that is what to model next.
 // Disabled with ZLB_NO_SUBSTITUTION=1 (which wins over ZLB_ALLOC_CARVE).
 bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
-    // Substitution: the KBL's partition has an empty block cache in every size
-    // class because nothing in the loader ever *adds* memory to it (it only ever
-    // returns blocks, 0x40032768, and no block was ever handed out).  Every
-    // allocation it makes for itself asks for flag 0x10, which `bics r0, fp, #0x33`
-    // at 0x40032356 reads as "the block must come from the cache, never carve", so
-    // all of them fail with 0x80020005 - including the two the boot-init walk needs:
-    // the fixed heap instance (0x40031BE4, class 0x2000) and the object manager's
-    // own block (0x4002BB62, class 0x1000).  The cache slot layout is the one the
-    // partition's own init (0x400321E8..0x40032236) writes: per core, {u16 target,
-    // u16 count, u32 head, u32[3] extra}, classes 0x1000/0x2000 at +0x00/+0x20,
-    // table at partition+0x9C (VA 0x52C0 in this run, per-core stride 0x20).
+    // Round 94/95 measurements (docs/KBL.md round 95): every allocation the KBL
+    // makes for itself calls the partition allocator 0x40032278 with flag 0x10.
+    //   * size == 0x1000 is the *only* size served from the per-core page cache
+    //     (`cmp.w r1,#0x1000; bne <carve>` at 0x40032278), whose slot is
+    //     {u16 target, u16 count, u32 head, u32 extra0, u32 extra1} at
+    //     `[partition+0x9C] + core*0x20`; the cache is only ever *filled* by the
+    //     "return block" path 0x40032768, so it starts empty;
+    //   * any other power-of-two size goes to the carving path 0x40032366, which
+    //     needs a class marker 0x00010002 in `partition+0x38+8*class` plus a
+    //     matching page entry in the partition's page table at `[partition+0x20]`
+    //     (entry = state<<28 | class<<20 | pages, states 0x10000000/0x20000000
+    //     are the ones it accepts) - that is the "memory the previous stage
+    //     leaves behind" the round-82 analysis predicted, now pinned to a
+    //     structure and a consumer.
+    // The substitution therefore seeds the page cache for class 0x1000 (which is
+    // what the object manager's own block is) at the allocator entry, so the
+    // loader's *own* cache path (0x4003228C..0x400322F4) hands the blocks out and
+    // keeps its counters consistent.  ZLB_NO_SUBSTITUTION=1 disables it.
+    constexpr u32 kPartitionAllocEntry = 0x40032278u;
     constexpr u32 kInstanceAllocPc = 0x40031BE4u;    // bl 0x40032278 (0x2000)
     constexpr u32 kManagerAllocPc = 0x4002BB62u;     // bl 0x40032278 (0x1000)
 
-    // Experiment (ZLB_PART_ALLOC_CARVE=1): same two call sites, but the cache-only
+    // Experiment (ZLB_PART_ALLOC_CARVE=1): same call sites, but the cache-only
     // flag is cleared so the allocator takes its own carving path (0x40032366).
-    // Result (docs/KBL.md round 72): the carve path does *not* succeed either - the
-    // free-list slot for a class is a decoy node, so the carve falls into the page
-    // scan (0x400324D4) and out again, leaving the state unchanged.
+    // Result (docs/KBL.md rounds 72/95): the carve path does *not* succeed either -
+    // the class markers are empty, so it walks off the end and reports 0x80020005.
     static const bool carve_experiment = [] {
         const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
         if (value != nullptr && value[0] != '0') return false;
@@ -404,17 +411,20 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     }
 
     // Substitution (on by default, off with ZLB_NO_SUBSTITUTION=1): the allocator is
-    // about to run with the cache-only flag and a class whose cache slot is empty.
+    // about to run for the class whose page cache is empty.
     static const bool supply_blocks = [] {
         const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
         return value == nullptr || value[0] == '0';
     }();
-    if (supply_blocks && (pc == kInstanceAllocPc || pc == kManagerAllocPc)) {
+    if (supply_blocks && (pc == kPartitionAllocEntry || pc == kInstanceAllocPc ||
+                          pc == kManagerAllocPc)) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 size = 0;
+                u64 pool = 0x51C0u;
                 arm->get_register("r1", size);
-                supply_kbl_partition_block(core, static_cast<u32>(size));
+                if (pc == kPartitionAllocEntry) arm->get_register("r0", pool);
+                supply_kbl_partition_block(core, static_cast<u32>(pool), static_cast<u32>(size));
             }
         }
         return false;    // fall through to the instruction itself
@@ -446,26 +456,17 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     return true;
 }
 
-// Substitution body: put `blocks` free blocks of the requested class into the
-// calling core's cache slot of the KBL's own partition (VA 0x51C0).  The partition
-// record and its cache table are addressed through the core's active page tables,
-// because the loader rebuilds them while it boots (docs/KBL.md round 57).
-bool Vita::supply_kbl_partition_block(u32 core, u32 size) {
-    // Only the two classes the boot-init walk actually needs.
-    u32 class_offset = 0;
-    u32 class_index = 0;
-    u32 block_size = 0;
-    if (size == 0x1000u) {
-        class_offset = 0x00u;
-        class_index = 0;
-        block_size = 0x1000u;
-    } else if (size == 0x2000u) {
-        class_offset = 0x20u;
-        class_index = 1;
-        block_size = 0x2000u;
-    } else {
-        return false;
-    }
+// Substitution body: put free blocks of the requested class into the calling
+// core's page-cache slot of the KBL's own partition.  The partition record, its
+// cache table and the region it describes are all addressed through the core's
+// active page tables, because the loader rebuilds them while it boots (docs/KBL.md
+// round 57), and every field offset here was read out of the allocator itself
+// (round 95): +0x08 magic 0x4080502B, +0x18 size, +0x1C base, +0x9C cache table,
+// cache slot = table + core*0x20.
+bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
+    // The page cache is only consulted for 0x1000 (see the note at the call site);
+    // larger classes need the class markers and the page table instead.
+    if (size != 0x1000u) return false;
 
     static bool configured = false;
     if (!configured) {
@@ -475,7 +476,10 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 size) {
             partition_blocks_per_class_ = count > 0 ? static_cast<u32>(count) : 1u;
         }
     }
-    const u32 blocks = partition_blocks_per_class_;
+    // The slot holds {u16 target, u16 count, u32 head, u32 extra0, u32 extra1} and
+    // the pop path only reads head / extra0 / extra1, so at most three blocks can
+    // be handed out from one seeding.
+    const u32 blocks = partition_blocks_per_class_ < 3u ? partition_blocks_per_class_ : 3u;
 
     Cpu* cpu = arm_cores_[core].get();
     ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
@@ -497,57 +501,70 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 size) {
         return true;
     };
 
-    constexpr u32 kPartitionVa = 0x000051C0u;    // the KBL's partition record (POOL)
+    if (pool_va == 0u) pool_va = 0x000051C0u;
     bool ok = true;
-    const u32 magic = read_va(kPartitionVa + 0x08u, ok);
+    const u32 magic = read_va(pool_va + 0x08u, ok);
     if (!ok || magic != 0x4080502Bu) return false;   // partition not built yet
-    const u32 cache_table = read_va(kPartitionVa + 0x9Cu, ok);
+    const u32 cache_table = read_va(pool_va + 0x9Cu, ok);
     if (!ok || cache_table == 0u) return false;
 
-    const u32 slot = cache_table + core * 0x20u + class_offset;
-    const u32 target = read_va(slot, ok);
-    const u32 count = read_va(slot + 4u, ok) & 0xFFFFu;   // low half of the {target,count} word
-    if (count != 0u) return false;                         // the KBL filled it itself
+    const u32 slot = cache_table + core * 0x20u;
+    const u32 word0 = read_va(slot, ok);
+    // The slot is {u16 target, u16 count} in one word (the allocator reads the
+    // target with `ldrh [r7]` at 0x400322AA and the count with `ldrh [r7,#2]` at
+    // 0x400322A0), then the head pointer at +4 and two spare pointers after it.
+    const u32 target = word0 & 0xFFFFu;
+    const u32 count = (word0 >> 16) & 0xFFFFu;
+    if (count != 0u) return false;                        // the KBL filled it itself
+    if (target == 0u) return false;                       // slot not initialised
 
-    // The blocks come from the unused tail of the region the partition describes
-    // (region record at VA 0x5180: base at +0x00, size at +0x04), so they stay
-    // inside the memory the loader itself owns.
-    bool region_ok = true;
-    const u32 region_base = read_va(0x00005180u, region_ok);
-    const u32 region_size = read_va(0x00005184u, region_ok);
-    if (!region_ok || region_size == 0u) {
+    // The blocks come from the tail of the region the partition describes
+    // (+0x18 size, +0x1C base) - the loader's own allocations grow from the start,
+    // so the tail is the part that stays free.
+    const u32 region_size = read_va(pool_va + 0x18u, ok);
+    const u32 region_base = read_va(pool_va + 0x1Cu, ok);
+    if (!ok || region_size < 0x1000u || region_base == 0u) {
         partition_region_base_ = 0x40000000u;
         partition_region_size_ = 0x00300000u;
     } else {
         partition_region_base_ = region_base;
         partition_region_size_ = region_size;
     }
-    u32& next = partition_block_next_[class_index];
-    if (next == 0u || next + block_size * blocks > partition_region_size_) {
-        // Seed at half the region and grow: everything below is used by the
-        // loader's own structures in this run.
-        next = partition_region_size_ / 2u;
+    u32& next = partition_block_next_[0];
+    if (next == 0u || next + 0x1000u * blocks > partition_region_size_) {
+        // Seed just below the top of the region and grow downwards.
+        next = partition_region_size_ - 0x1000u * blocks;
     }
 
     u32 head = 0;
+    u32 written = 0;
     for (u32 i = 0; i < blocks; ++i) {
-        const u32 block = partition_region_base_ + next;
-        next += block_size;
-        write_va(block, 0u);                 // empty link (the allocator rewrites it)
-        write_va(block + 4u, 0u);
-        head = block;
+        const u32 block = partition_region_base_ + next + 0x1000u * i;
+        // Touching the block itself is best effort: at this point the loader may
+        // not have mapped the region writable yet, and the allocator's cache path
+        // only returns the pointer (the caller initialises the block).
+        (void)write_va(block, 0u);
+        if (written == 0u) {
+            head = block;
+            if (!write_va(slot + 4u, block)) break;
+        } else {
+            if (!write_va(slot + 4u + 4u * written, block)) break;
+        }
+        ++written;
     }
-    // Head first, then the count: the allocator only looks when the count is set.
-    if (!write_va(slot + 4u, head)) return false;
-    if (!write_va(slot, (target & 0xFFFF0000u) | (blocks & 0xFFFFu))) return false;
+    if (written == 0u) return false;
+    next -= 0x1000u * written;
+    // Count last (high half of the target word): the allocator only looks at the
+    // slot when the count is non-zero.
+    if (!write_va(slot, target | (written << 16))) return false;
 
     ++partition_supplied_;
-    if (partition_supplied_ <= 2) {
+    if (partition_supplied_ <= 4) {
         ZLB_LOG_INFO("machine",
-                     "partition block cache supplied: arm%u class 0x%X -> %u block(s) at VA 0x%08X "
+                     "partition page cache supplied: arm%u class 0x%X -> %u block(s) at VA 0x%08X "
                      "(slot 0x%08X) (development substitution)",
-                     core, size, blocks, head, slot);
-        add_milestone("KBL partition block cache pre-populated for class 0x" + hex(size, 0) +
+                     core, size, written, head, slot);
+        add_milestone("KBL partition page cache pre-populated for class 0x" + hex(size, 0) +
                       " (development substitution)");
     }
     return true;

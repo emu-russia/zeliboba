@@ -345,7 +345,7 @@ private:
     /// blocks taken from the region's free end into that slot (target/step 7, as
     /// the partition's own init leaves it).  Off only with ZLB_NO_SUBSTITUTION=1,
     /// tuned with ZLB_PART_BLOCK_CACHE=<n> (default 4).
-    bool supply_kbl_partition_block(u32 core, u32 size);
+    bool supply_kbl_partition_block(u32 core, u32 pool_va, u32 size);
     u32 partition_blocks_per_class_ = 4;
     u32 partition_supplied_ = 0;
     u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< per class, VA inside the region
