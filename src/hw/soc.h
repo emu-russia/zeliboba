@@ -28,8 +28,11 @@ constexpr u32 kDramSize = 0x04000000;  // 64 MiB window used by the boot chain
 constexpr u32 kScuBase = 0x40000000;   ///< private/secure window; the kernel boot loader
                                         ///< ELF is linked at 0x40020000 and runs with the MMU off
 constexpr u32 kPeripheralWindowSize = 0x00010000;  ///< MPCore peripheral block (SCU/GIC/timers)
-constexpr u32 kScuSize = 0x08000000;    ///< 128 MiB physical DRAM window (the KBL
-                                        ///< touches 0x44000000, past the first 64 MiB)
+constexpr u32 kScuSize = 0x20000000;    ///< 512 MiB DRAM window (wiki Physical_Memory:
+                                        ///< "0x40000000 0x20000000 512MiB DRAM"); covers the
+                                        ///< secure DRAM, the non-secure shared DRAM and the
+                                        ///< NSKBL (0x50000000) / kernel module (0x52000000)
+                                        ///< windows
 
 /// Shared peripheral interrupt numbers (GIC SPI ids).
 enum class Irq : u32 {

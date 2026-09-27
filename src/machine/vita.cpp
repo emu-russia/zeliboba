@@ -142,8 +142,9 @@ void Vita::build_buses() {
     arm_bus_->add_ram_alias("arm_priv", kermit::kScuBase, kermit::kScuSize, dram_.data(),
                             "physical DRAM window (kernel boot loader and kernel image)");
     arm_bus_->add_ram("arm_dram", 0x04000000, kermit::kDramBase, "main DRAM (64 MiB module window)");
-    // The KBL's fourth PT_LOAD lands at 0x50000000; keep a scratch window there.
-    arm_bus_->add_ram("arm_buf", 0x00400000, 0x50000000, "KBL staging window 0x50000000");
+    // 0x50000000 is inside the 512 MiB DRAM window (the wiki puts the ARZL-compressed
+    // NSKBL at 0x50000000 and the uncompressed one at 0x51000000), so no separate
+    // staging block is mapped there any more.
 
     // --- Ernie (RL78 syscon) ----------------------------------------------
     syscon_bus_->add_ram("ernie_flash", ernie::kFlashSize, ernie::kFlashBase, "Ernie code/data flash");
