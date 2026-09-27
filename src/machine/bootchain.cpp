@@ -265,6 +265,23 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     if (va >= 0x00100000u) return false;
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
 
+    // Which physical address the low window holds is the open question here: the
+    // wiki pins the SPAD32K alias at 0x0 and the "MeP boot" mirror of the CMeP SRAM
+    // at 0x40000, but the KBL *uses* VA 0x40000 as the base of a 0x300000-byte heap
+    // (its own region table at VA 0x51C0 holds {0x40000000, 0x00300000, 0x00040000}),
+    // which only makes sense if the low window continues into DRAM.  The rule is
+    // selectable while this is being pinned down:
+    //   identity  (default)  VA 0x00000..0xFFFFF -> PA = VA
+    //   dram                 VA < 0x40000 -> PA = VA, above that PA = 0x40000000 + VA - 0x40000
+    //   dram-abs             VA < 0x40000 -> PA = VA, above that PA = 0x40000000 + VA
+    static const int low_map = [] {
+        const char* value = std::getenv("ZLB_ARM_LOW_MAP");
+        if (value == nullptr) return 0;
+        if (std::strcmp(value, "dram") == 0) return 1;
+        if (std::strcmp(value, "dram-abs") == 0) return 2;
+        return 0;
+    }();
+
     Cpu* cpu = arm_cores_[core].get();
     ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
     if (!arm || !arm->mmu.enabled()) return false;
@@ -278,16 +295,20 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     const u32 slot = l2_base + l2_index * 4u;
     if (arm_bus_->read32(slot) != 0u) return false;             // already mapped
 
+    u32 pa = va;
+    if (low_map == 1 && va >= 0x40000u) pa = 0x40000000u + (va - 0x40000u);
+    else if (low_map == 2 && va >= 0x40000u) pa = 0x40000000u + va;
+
     // Take the attribute bits from the KBL's own first entry so the substituted
     // page has the same cacheability/permissions as the pages it installed.
     u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
     if ((attributes & 3u) != 2u) attributes = 0x47Eu;           // small page, AP=11
-    arm_bus_->write32(slot, (va & 0xFFFFF000u) | attributes);
+    arm_bus_->write32(slot, (pa & 0xFFFFF000u) | attributes);
 
     ++boot_fault_fixes_;
     ZLB_LOG_INFO("machine",
                  "boot window mapping supplied: arm%u VA 0x%08X -> PA 0x%08X (attr 0x%03X) in L2 0x%08X[0x%02X] (%s)",
-                 core, va, va, attributes, l2_base, l2_index, fetch ? "fetch" : (write ? "write" : "read"));
+                 core, va, pa, attributes, l2_base, l2_index, fetch ? "fetch" : (write ? "write" : "read"));
     add_milestone("ARM low window mapping supplied for VA 0x" + hex(va, 8) + " (development substitution)");
     return true;
 }
