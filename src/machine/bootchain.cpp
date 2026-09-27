@@ -33,6 +33,19 @@ const char* to_string(BootStage stage) {
 
 namespace {
 
+/// Development substitutions are on unless ZLB_NO_SUBSTITUTION says otherwise.
+bool substitutions_enabled_static() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        return value != nullptr && value[0] != '0';
+    }();
+    return !disabled;
+}
+
+/// How long the CMeP may keep running after the secure kernel's "done" jump while
+/// its second loader finishes the ARM boot context (see poll_boot_chain).
+constexpr u64 kCmepFinishBudget = 2000000;
+
 /// Read the whole SLB2 container: the eMMC boot partition first (that is where
 /// the hardware looks at power-on), then the two "bls" copies in the user area
 /// that a reconstructed image carries as well.
@@ -683,17 +696,48 @@ void Vita::poll_boot_chain() {
     }
 
     // The secure kernel's success path re-enters the 0x40000 window (see
-    // Vita::cmep_pc_hook): on hardware that is the point where it has told the
-    // syscon to reset the ARM at 0x00000000 (wiki, step 4).
+    // Vita::cmep_pc_hook): that jump goes back into the *second loader*, whose
+    // remaining work is what fills the ARM boot context (the second loader copies
+    // 1 KiB from DRAM to scratch+0x100, image 0x40A86, and clears the scratch
+    // header - which is also what our traces saw at SPAD+0x100).  On hardware the
+    // syscon releases the ARM only after the CMeP is done, so the model keeps the
+    // CMeP running for a bounded budget first: halting it at the jump lost the
+    // context and left kernel_boot_loader without its objects.
     if (secure_kernel_done_) {
         secure_kernel_done_ = false;
         secure_kernel_active_ = false;
-        cmep_->halted = true;
-        if (ernie_) ernie_->release_soc();
-        ZLB_LOG_INFO("boot",
-                     "secure kernel finished (jump back to 0x40000): substituting the syscon handshake, "
-                     "releasing the ARM");
-        add_milestone("CMeP secure kernel finished -> syscon SoC release (development substitution)");
+        if (substitutions_enabled_static()) {
+            cmep_finish_pending_ = true;
+            cmep_finish_steps_ = 0;
+            ZLB_LOG_INFO("boot",
+                         "secure kernel finished (jump back to 0x40000): letting the second loader finish "
+                         "before the ARM is released");
+            add_milestone("secure kernel finished -> second loader continues (ARM boot context)");
+        } else {
+            cmep_->halted = true;
+            if (ernie_) ernie_->release_soc();
+            ZLB_LOG_INFO("boot",
+                         "secure kernel finished (jump back to 0x40000): substituting the syscon handshake, "
+                         "releasing the ARM");
+            add_milestone("CMeP secure kernel finished -> syscon SoC release (development substitution)");
+        }
+    }
+
+    // Bounded continuation: the second loader's post-processing runs, then the ARM
+    // is released (either because the CMeP stops by itself or when the budget ends).
+    if (cmep_finish_pending_ && !boot_.arm_released) {
+        ++cmep_finish_steps_;
+        const bool stopped = cmep_ == nullptr || cmep_->halted;
+        if (stopped || cmep_finish_steps_ >= kCmepFinishBudget) {
+            cmep_finish_pending_ = false;
+            if (cmep_) cmep_->halted = true;
+            if (ernie_) ernie_->release_soc();
+            ZLB_LOG_INFO("boot",
+                         "second loader finished after the secure kernel (%s, %llu steps): releasing the ARM",
+                         stopped ? "it stopped by itself" : "budget reached",
+                         static_cast<unsigned long long>(cmep_finish_steps_));
+            add_milestone("CMeP second-loader post-processing done -> syscon SoC release");
+        }
     }
 
     // The secure kernel starts by waiting for the CMeP->ARM status word to be
@@ -722,6 +766,22 @@ void Vita::poll_boot_chain() {
         u64 gp = 0;
         if (cmep_->get_register("gp", gp) && gp != 0u) {
             cmep_bus_->write32(static_cast<u32>(gp) - 32748u, 9u);
+        }
+        // ... and wake the core: the wait loop is
+        //     0x80045E  bsr 0x801D5A          ; read the state
+        //     0x800462  bnei $0, 0x9, 0x800488
+        //     0x800488  sleep                 ; wait for the reply
+        //     0x80048A  bra 0x80045E
+        // so the secure kernel is *asleep* when the answer arrives.  Without the
+        // wake the state variable is set but never read again, the secure kernel
+        // never reaches the code that builds the ARM boot context (the structure
+        // with the 0x61CE6649 signature at DRAM+0xA0 which the second loader then
+        // copies into the scratchpad), and kernel_boot_loader finds an empty
+        // context.  This stands in for the CMeP interrupt the mailbox raises.
+        if (cmep_->halted) {
+            cmep_->halted = false;
+            ZLB_LOG_INFO("boot", "woke the CMeP for the handshake reply (MeP interrupt not modelled)");
+            add_milestone("CMeP woken for the handshake reply (development substitution)");
         }
         ZLB_LOG_INFO("boot",
                      "ARM boot ROM consumed the CMeP status 0x%X and answered 0xE0000010 <- 1 (handshake)",

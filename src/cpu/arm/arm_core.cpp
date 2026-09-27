@@ -312,7 +312,7 @@ void ArmCore::write_cpsr_masked(u32 value, u32 mask) {
 
 void ArmCore::set_access_pc() {
     bus->context.pc = cur_instr_addr_;
-    bus->context.core = name;
+    bus->context.core = name.c_str();
 }
 
 arm::MmResult ArmCore::translate_or_fix(u32 va, bool write, bool fetch) {

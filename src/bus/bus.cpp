@@ -87,7 +87,7 @@ void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
     const MemRegion* region = region_at(address, 1);
     std::fprintf(stderr, "[wtrap] %-14s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
                  region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
-                 static_cast<unsigned long long>(value), context.pc, context.core.c_str(),
+                 static_cast<unsigned long long>(value), context.pc, context.core,
                  _ReturnAddress());
 }
 
@@ -96,7 +96,7 @@ void Bus::note_read_trap(u32 address, unsigned size, u64 value) {
     const MemRegion* region = region_at(address, 1);
     std::fprintf(stderr, "[rtrap] %-14s +0x%05X r%u = 0x%llX pc=%08X core=%s\n",
                  region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
-                 static_cast<unsigned long long>(value), context.pc, context.core.c_str());
+                 static_cast<unsigned long long>(value), context.pc, context.core);
 }
 
 // ---------------------------------------------------------------------------

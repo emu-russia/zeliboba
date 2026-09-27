@@ -170,7 +170,7 @@ void MePCore::tick(u64 cycles_) {
 
 void MePCore::set_context(u32 address) {
     if (bus == nullptr) return;
-    bus->context.core = name;
+    bus->context.core = name.c_str();
     bus->context.pc = address;
 }
 

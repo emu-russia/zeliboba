@@ -25,7 +25,13 @@ namespace zlb {
 /// One Cortex-A9 core's worth of CP15 / translation state.
 class ArmMmu {
 public:
-    explicit ArmMmu(Bus& bus) : bus_(&bus) {}
+    explicit ArmMmu(Bus& bus) : bus_(&bus) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ZLB_MMU_WALKS");
+            return value != nullptr && value[0] != '0';
+        }();
+        record_walks = enabled;
+    }
 
     // ---- CP15 system control registers ------------------------------------
 
@@ -87,6 +93,12 @@ public:
     u64 total_faults = 0;
 
     void note_fault(const WalkRecord& walk, u32 pc, bool write, bool fetch);
+
+    /// When set, every *successful* translation is copied into `last_walk` so the
+    /// debugger can show the walk that produced an address.  Off by default: a
+    /// WalkRecord copy per memory access costs more than the page walk itself, so
+    /// only the fault ring is kept unconditionally.  ZLB_MMU_WALKS=1 turns it on.
+    bool record_walks = false;
 
     void reset();
 

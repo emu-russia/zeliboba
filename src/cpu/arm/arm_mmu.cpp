@@ -214,20 +214,33 @@ u32 ArmMmu::select_ttbr(u32 va, int& ttbr_num) const {
 /// than the ones the debugger actually needs.
 arm::MmResult ArmMmu::translate(u32 va, bool write, bool fetch, u32 mode) {
     const arm::MmResult result = translate_walk(va, write, fetch, mode);
-    WalkRecord record = last_walk;
-    record.va = va;
-    record.ok = result.ok;
-    record.fault = result.fault;
-    record.write = write;
-    record.fetch = fetch;
-    if (!result.ok) note_fault(record, bus_->context.pc, write, fetch);
-    else last_walk = record;
+    if (!result.ok) {
+        // Faults are rare, so the rich record is built only here; a successful
+        // translation is not recorded at all unless the debugger asked for it
+        // (record_walks, ZLB_MMU_WALKS=1).  Copying a WalkRecord per memory access
+        // used to cost more than the walk itself.
+        WalkRecord record = last_walk;
+        record.va = va;
+        record.fault = result.fault;
+        record.write = write;
+        record.fetch = fetch;
+        note_fault(record, bus_->context.pc, write, fetch);
+        return result;
+    }
+    if (record_walks) {
+        WalkRecord record = last_walk;
+        record.va = va;
+        record.ok = true;
+        record.write = write;
+        record.fetch = fetch;
+        last_walk = record;
+    }
     return result;
 }
 
 arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     arm::MmResult result;
-    last_walk = WalkRecord{};
+    if (record_walks) last_walk = WalkRecord{};
 
     if (!enabled()) {
         result.ok = true;

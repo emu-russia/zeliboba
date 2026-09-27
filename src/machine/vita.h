@@ -304,6 +304,14 @@ private:
     bool secure_kernel_active_ = false;
     /// Set when the secure kernel re-enters the 0x40000 window (its "done" path).
     bool secure_kernel_done_ = false;
+    /// The secure kernel's "done" jump returns into the *second loader*, which then
+    /// finishes its own work - and that work is what fills the ARM boot context at
+    /// the scratch +0x100.  The model lets the CMeP run on for a bounded budget
+    /// before releasing the ARM instead of halting it at the jump; otherwise the
+    /// second loader's post-processing (and with it the context the ARM reads)
+    /// never happens (see docs/KBL.md round 48.15).
+    bool cmep_finish_pending_ = false;
+    u64 cmep_finish_steps_ = 0;
     /// SceKblParam inputs collected while staging the SLB2 images.
     u32 secure_kernel_size_ = 0;
     u32 kprx_auth_sm_pa_ = 0;

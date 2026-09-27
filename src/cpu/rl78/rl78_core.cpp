@@ -213,7 +213,7 @@ void Rl78Core::reset() {
     irq_levels_.fill(false);
 
     bus->context.pc = 0;
-    bus->context.core = name;
+    bus->context.core = name.c_str();
     reset_vector = bus->read16(0);
     pc = reset_vector & 0xFFFFu;
 }
@@ -654,7 +654,7 @@ StepResult Rl78Core::step() {
     StepResult result;
     result.address = pc;
     bus->context.pc = pc;
-    bus->context.core = name;
+    bus->context.core = name.c_str();
 
     if (pending_vector >= 0 && interrupts_enabled()) take_pending();
 

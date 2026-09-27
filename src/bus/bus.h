@@ -58,7 +58,7 @@ bool bus_read_trap_contains(u32 address);
 
 /// Who is currently executing, for the access trace.
 struct BusContext {
-    std::string core = "none";
+    const char* core = "none";   // borrowed: the cores assign name.c_str()
     u32 pc = 0;
 };
 
