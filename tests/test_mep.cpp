@@ -2550,6 +2550,62 @@ ZLB_TEST(mep_jmp_register_field_matches_the_listing) {
     ZLB_EXPECT_TRUE(mep_disassemble(f.bus, kCode, length) == std::string("jsr $1"));
 }
 
+ZLB_TEST(mep_disassembler_agrees_with_the_constructed_encodings) {
+    // The words the coverage tests use are literals; this pins the decode of the
+    // trickiest field layouts (MAJ_0/MAJ_1 overlap, the 32 bit forms whose
+    // operand order differs from the field order, the coprocessor sub-opcodes
+    // and the pc relative branches) to the mnemonic and operands they encode.
+    struct Expect {
+        u32 word;
+        unsigned length;
+        const char* text;
+    };
+    static const Expect expected[] = {
+        {0x00009231u, 2, "add3 $1,$2,$3"},          // MAJ_9
+        {0x00004110u, 2, "add3 $1,$sp,0x10"},       // MAJ_4, fixed source register
+        {0x0000101Eu, 2, "jmp $1"},                 // ROM word 0x5C50A
+        {0x0000101Fu, 2, "jsr $1"},
+        {0x0004C12Au, 4, "sw $1,4($2)"},            // MAJ_12, ROM word 0x5C01A
+        {0x00008104u, 2, "sb $1,0x4($tp)"},         // MAJ_8, 3 bit register
+        {0x0000410Au, 2, "sw $1,0x8($sp)"},         // MAJ_4, scaled by four
+        {0x0500E102u, 4, "sw $1,(0x50000)"},        // MAJ_14, 24 bit address
+        {0x0501E3DFu, 4, "lw $3,(0x501dc)"},
+        {0x05EBD200u, 4, "movu $2,0x5eb00"},        // MAJ_13, 24 bit immediate
+        {0x0000F121u, 4, "ldz $1,$2"},              // MAJ_15 sub 1, F16u16 0
+        {0x1040F101u, 4, "clip $1,0x8"},            // cimm5 in the second halfword
+        {0x1041F101u, 4, "clipu $1,0x8"},
+        {0x2300F121u, 4, "casb3 $3,$1,($2)"},       // FRl5 lives in halfword two
+        {0x0004F565u, 4, "sbcpa $c5,($6+),4"},      // cdisp10 form
+        {0x3004F565u, 4, "smcpa $c5,($6+),4"},
+        {0x0004F56Cu, 4, "swcp $c5,4($6)"},
+        {0x0008E210u, 4, "beqi $2,0x1,0x40010"},    // MAJ_14, Rn + uimm4
+        {0x0008D834u, 4, "bcpeq 0x3,0x40010"},      // MAJ_13, Rm as the mask
+        {0x0000B008u, 2, "bra 0x40008"},            // MAJ_11
+        {0x0000A108u, 2, "beqz $1,0x40008"},        // MAJ_10
+        {0x0002D809u, 4, "bsr 0x40200"},            // MAJ_13
+        {0x0002D80Bu, 4, "bsrv 0x40200"},
+        {0x0500D808u, 4, "jmp 0x50000"},            // pcabs24a2
+        {0x0003E109u, 4, "repeat $1,0x40006"},      // MAJ_14 sub 9
+        {0x7800u, 4, "--syscall--"},                // scattered call number
+        {0x00000006u, 2, "--reserved--"},           // Op::Ri0
+    };
+    Fixture f;
+    for (const Expect& item : expected) {
+        f.word(kCode, item.word);
+        // A 16 bit opword only fills the first halfword; zero the second so a
+        // leftover 32 bit word cannot leak into it.
+        if ((item.word >> 16) == 0) f.word(kCode + 2, 0x0000u);
+        unsigned length = 0;
+        const std::string text = mep_disassemble(f.bus, kCode, length);
+        if (text != std::string(item.text)) {
+            std::printf("      word 0x%08X: got '%s' want '%s'\n", item.word, text.c_str(),
+                        item.text);
+        }
+        ZLB_EXPECT_TRUE(text == std::string(item.text));
+        ZLB_EXPECT_EQ(length, item.length);
+    }
+}
+
 ZLB_TEST(mep_reset_does_not_touch_devices) {
     // A core reset must not power-cycle the board: a register file standing in
     // for the ARM->CMeP mailbox keeps its value across reset(entry).
