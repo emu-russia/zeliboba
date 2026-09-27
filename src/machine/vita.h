@@ -355,6 +355,11 @@ private:
     u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< cursor + class-table cursor
     u32 partition_region_base_ = 0x40000000u;
     u32 partition_region_size_ = 0x00300000u;
+    /// The KBL's 0xC0-byte exception vector table (its ELF vaddr=0 segment), kept so
+    /// the model can restore it at the mapping the KBL installs for VA 0x16100
+    /// (round 94).
+    std::vector<u8> kbl_vectors_;
+    bool kbl_vectors_restored_ = false;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

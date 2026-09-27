@@ -454,6 +454,42 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the instruction still has to run
     }
 
+    // Substitution (round 94): restore the ARM exception vectors at the mapping the
+    // KBL installed.  The KBL points VBAR at VA 0x16100 and maps that VA onto its
+    // own DRAM page (`vpa 0x16100` = PA 0x40000100), where its copy is incomplete
+    // (two `ldr pc,[pc,#0x18]` words followed by data), so every exception entry
+    // falls into zeros and the core ends up hopping through the whole vector page.
+    // The model stages the real 0xC0-byte table from the KBL's ELF segment (vaddr 0)
+    // the first time the core enters the vector window, at the physical address the
+    // core's own tables resolve.  ZLB_NO_SUBSTITUTION=1 disables it.
+    if (supply_blocks && !kbl_vectors_restored_ && !kbl_vectors_.empty() && pc >= 0x16100u &&
+        pc < 0x16200u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                // The KBL's mapping of the vector page is a device page, so a *write*
+                // translation is refused; resolve it read-only and put the bytes down
+                // through the bus (the model owns the memory), falling back to the
+                // mapping measured with `vpa 0x16100` when even that fails.
+                u32 pa = 0;
+                std::string fault;
+                const bool mapped = arm->translate(0x00016100u, false, false, pa, fault);
+                if (!mapped) pa = 0x40000100u;
+                for (size_t i = 0; i < kbl_vectors_.size(); ++i) {
+                    arm_bus_->write8(pa + static_cast<u32>(i), kbl_vectors_[i]);
+                }
+                kbl_vectors_restored_ = true;
+                ZLB_LOG_INFO("machine",
+                             "ARM exception vectors restored at PA 0x%08X (VA 0x16100 mapping%s, "
+                             "%zu bytes) (development substitution)",
+                             pa, mapped ? "" : " not readable - using the measured fallback",
+                             kbl_vectors_.size());
+                add_milestone("ARM exception vectors restored at PA 0x" + hex(pa, 8) +
+                              " (development substitution)");
+            }
+        }
+        return false;    // the instruction still has to run
+    }
+
     constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
     constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
     static const bool disabled = [] {
@@ -902,6 +938,14 @@ bool Vita::start_arm_kernel_boot_loader() {
         for (size_t i = 0; i < boot_vectors.size(); ++i) {
             arm_bus_->write8(board::kArmVectorPage + static_cast<u32>(i), boot_vectors[i]);
         }
+        // Round 94: the KBL re-maps VA 0x16100 onto its own DRAM page
+        // (`vpa 0x16100` = PA 0x40000100) and what it has there is only two vector
+        // words plus data, so its exception entries land in zeros and the core ends
+        // up in an exception storm.  Keep the bytes so the model can restore them
+        // at whatever mapping the KBL installed, the first time the core enters the
+        // vector window (see satisfy_arm_boot_pc).
+        kbl_vectors_ = boot_vectors;
+        kbl_vectors_restored_ = false;
         ZLB_LOG_INFO("machine", "vector page staged at PA 0x%08X (%zu bytes); ARM entry 0x%08X",
                      board::kArmVectorPage, boot_vectors.size(), arm_entry);
         add_milestone("ARM vector page staged at 0x" + hex(board::kArmVectorPage, 8) +
