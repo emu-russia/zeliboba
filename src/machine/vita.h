@@ -346,9 +346,13 @@ private:
     /// the partition's own init leaves it).  Off only with ZLB_NO_SUBSTITUTION=1,
     /// tuned with ZLB_PART_BLOCK_CACHE=<n> (default 4).
     bool supply_kbl_partition_block(u32 core, u32 pool_va, u32 size);
+    /// Create the per-class table the SceUID registration walks through the global
+    /// 0x400B291C; the loader never writes that global itself (round 93).
+    bool supply_kbl_class_table(u32 core);
     u32 partition_blocks_per_class_ = 4;
     u32 partition_supplied_ = 0;
-    u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< per class, VA inside the region
+    u32 class_tables_supplied_ = 0;
+    u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< cursor + class-table cursor
     u32 partition_region_base_ = 0x40000000u;
     u32 partition_region_size_ = 0x00300000u;
 

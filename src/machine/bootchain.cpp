@@ -430,6 +430,30 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // fall through to the instruction itself
     }
 
+    // Substitution (round 93): the SceUID registration at 0x4002BD00 walks a
+    // per-class table through the global 0x400B291C
+    //   0x4002BFAC  movwls r2, #0x291c / movtls r2, #0x400b ; r2 = 0x400B291C
+    //   0x4002BFB8  ldrls  r2, [r2]                        ; table base
+    //   0x4002BFBC  addls.w sb, r2, r3, lsl #2             ; r3 = class*5
+    //   0x4002BFC2  blx    0x4003A28C                      ; lock(&table[class])
+    // and that global is *never* written: a write trap over the whole run sees only
+    // the BSS zero-fill (pc 0x400211E0) at 0x400B291C, so the table base stays 0,
+    // the lock call gets a NULL pointer and the KBL spins in the second spinlock
+    // (pc 0x4003A2B8, R0 = 0, LR = 0x4002BFC7).  The model creates it: an 8-entry,
+    // 0x14-byte-per-entry table in a writable page it allocates for itself, stored
+    // into the global before the registration loop runs.  ZLB_NO_SUBSTITUTION=1
+    // disables it.
+    constexpr u32 kClassTableGlobal = 0x400B291Cu;
+    constexpr u32 kSystemInitPc = 0x4002BB32u;   // `str r1,[r5]` in the manager builder
+    if (supply_blocks && pc == kSystemInitPc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                supply_kbl_class_table(core);
+            }
+        }
+        return false;    // the instruction still has to run
+    }
+
     constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
     constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
     static const bool disabled = [] {
@@ -454,6 +478,75 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     }
     ++boot_pc_fixes_;
     return true;
+}
+
+// Substitution body (round 93): create the per-class table the SceUID registration
+// walks (global 0x400B291C), because nothing in the loader ever writes that global
+// - see the note at the call site.  The table is 8 entries of 0x14 bytes
+// ({lock, count, head, next, spare}) and lives in a page the model allocates for
+// itself out of the partition's region, walking down from the tail until a page
+// accepts writes.
+bool Vita::supply_kbl_class_table(u32 core) {
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (arm == nullptr) return false;
+    constexpr u32 kClassTableGlobalVa = 0x400B291Cu;
+    auto read_va = [&](u32 va, bool& ok) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, false, false, pa, fault)) {
+            ok = false;
+            return 0u;
+        }
+        return arm_bus_->read32(pa);
+    };
+    auto write_va = [&](u32 va, u32 value) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, value);
+        return true;
+    };
+
+    bool ok = true;
+    if (read_va(kClassTableGlobalVa, ok) != 0u || !ok) return false;  // already there
+
+    // The partition pointer itself sits in the system structure (0x400B294C was
+    // written by 0x40032CC8); fall back to the documented VA when it is not up yet.
+    bool pool_ok = true;
+    u32 pool_va = read_va(0x400B294Cu, pool_ok);
+    if (!pool_ok || pool_va == 0u) pool_va = 0x000051C0u;
+    const u32 region_base = read_va(pool_va + 0x18u, ok);
+    const u32 region_size = read_va(pool_va + 0x1Cu, ok);
+    if (!ok || region_base == 0u || region_size < 0x2000u) return false;
+
+    constexpr u32 kTableBytes = 8u * 0x14u;
+    u32& cursor = partition_block_next_[1];
+    if (cursor == 0u || cursor > region_size) cursor = region_size - 0x1000u;
+    while (cursor >= 0x1000u) {
+        const u32 table = region_base + cursor;
+        bool writable = true;
+        for (u32 offset = 0; offset < kTableBytes; offset += 4u) {
+            if (!write_va(table + offset, 0u)) {
+                writable = false;
+                break;
+            }
+        }
+        if (writable) {
+            if (!write_va(kClassTableGlobalVa, table)) return false;
+            cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
+            ++class_tables_supplied_;
+            ZLB_LOG_INFO("machine",
+                         "class table supplied at VA 0x%08X (global 0x%08X, %u entries) "
+                         "(development substitution)",
+                         table, kClassTableGlobalVa, 8u);
+            add_milestone("KBL class table created at VA 0x" + hex(table, 8) +
+                          " (development substitution)");
+            return true;
+        }
+        cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
+    }
+    return false;
 }
 
 // Substitution body: put free blocks of the requested class into the calling

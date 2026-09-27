@@ -193,7 +193,9 @@ def main():
     elif cmd == "refs":
         for arg in sys.argv[2:]:
             addr = int(arg, 0)
-            sites = sorted(w.branches.get(addr, ()) | w.calls.get(addr, ()))
+            # dicts hold collections, but keep the union defensive: an older caller
+            # may hand back a tuple, and `tuple | tuple` raises TypeError.
+            sites = sorted(set(w.branches.get(addr, ())) | set(w.calls.get(addr, ())))
             print("refs to 0x%08X: %d" % (addr, len(sites)))
             for s in sites:
                 print("   0x%08X" % s)
