@@ -267,19 +267,27 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
 
     // Which physical address the low window holds is the open question here: the
     // wiki pins the SPAD32K alias at 0x0 and the "MeP boot" mirror of the CMeP SRAM
-    // at 0x40000, but the KBL *uses* VA 0x40000 as the base of a 0x300000-byte heap
-    // (its own region table at VA 0x51C0 holds {0x40000000, 0x00300000, 0x00040000}),
-    // which only makes sense if the low window continues into DRAM.  The rule is
-    // selectable while this is being pinned down:
-    //   identity  (default)  VA 0x00000..0xFFFFF -> PA = VA
+    // at 0x40000, but the KBL keeps a window record of its own - the object at
+    // 0x400B2B30 has {+0x158 = 0x40118000, +0x15C = 0x00040000, +0x160 = 0x8000,
+    // +0x164 = 0x8000}, i.e. "physical 0x40118000 <-> virtual 0x40000, 32 KiB" -
+    // and that physical address is exactly the copy of the low window it maps at
+    // VA 0x0000-0x7FFF.  The rule is selectable while this is being pinned down:
+    //   identity             VA 0x00000..0xFFFFF -> PA = VA
     //   dram                 VA < 0x40000 -> PA = VA, above that PA = 0x40000000 + VA - 0x40000
     //   dram-abs             VA < 0x40000 -> PA = VA, above that PA = 0x40000000 + VA
+    //   window   (default)   VA < 0x40000 -> PA = VA, above that PA = 0x40118000 + VA - 0x40000
+    //
+    // `window` is the one the KBL's own record asks for, and measured runs agree:
+    // with it the core keeps executing and moves on (0x4002BD1C -> 0x4002B054),
+    // while identity and dram-abs end in the 0x4003B724 trap and dram ends in an
+    // endless free-list walk at 0x40031E8A.
     static const int low_map = [] {
         const char* value = std::getenv("ZLB_ARM_LOW_MAP");
-        if (value == nullptr) return 0;
+        if (value == nullptr) return 3;
+        if (std::strcmp(value, "identity") == 0) return 0;
         if (std::strcmp(value, "dram") == 0) return 1;
         if (std::strcmp(value, "dram-abs") == 0) return 2;
-        return 0;
+        return 3;
     }();
 
     Cpu* cpu = arm_cores_[core].get();
@@ -298,6 +306,7 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     u32 pa = va;
     if (low_map == 1 && va >= 0x40000u) pa = 0x40000000u + (va - 0x40000u);
     else if (low_map == 2 && va >= 0x40000u) pa = 0x40000000u + va;
+    else if (low_map == 3 && va >= 0x40000u) pa = 0x40118000u + (va - 0x40000u);
 
     // Take the attribute bits from the KBL's own first entry so the substituted
     // page has the same cacheability/permissions as the pages it installed.
