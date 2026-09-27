@@ -261,47 +261,59 @@ bool Vita::build_kbl_param() {
     // model, so the documented fields are written here (a development
     // substitution; the magic and layout follow the wiki).
     const u32 base = board::kKblParamBase;
+    const u32 dram_base = board::kKblParamDram;
     auto put8 = [&](u32 offset, u8 value) { arm_bus_->write8(base + offset, value); };
     auto put32 = [&](u32 offset, u32 value) { arm_bus_->write32(base + offset, value); };
+    auto put8_dram = [&](u32 offset, u8 value) { arm_bus_->write8(dram_base + offset, value); };
+    auto put32_dram = [&](u32 offset, u32 value) { arm_bus_->write32(dram_base + offset, value); };
+    // Most fields go into both copies (the second loader leaves one in the scratchpad
+    // and one in secure DRAM); the magic is scratchpad-only, see below.
+    auto put_field8 = [&](u32 offset, u8 value) { put8(offset, value); put8_dram(offset, value); };
+    auto put_field32 = [&](u32 offset, u32 value) { put32(offset, value); put32_dram(offset, value); };
 
-    for (u32 i = 0; i < board::kKblParamSize; ++i) put8(i, 0);
-    put8(0x00, 1);                                         // version
-    put8(0x01, 0);
-    put8(0x02, board::kKblParamSize & 0xFF);               // size = 0x100
-    put8(0x03, (board::kKblParamSize >> 8) & 0xFF);
-    put32(0x04, 0x01040000);                               // current firmware version (1.04)
-    put32(0x08, 0x01040000);                               // minimum firmware version (SMI leaf)
+    for (u32 i = 0; i < board::kKblParamSize; ++i) {
+        put8(i, 0);
+        put8_dram(i, 0);
+    }
+    put_field8(0x00, 1);                                         // version
+    put_field8(0x01, 0);
+    put_field8(0x02, board::kKblParamSize & 0xFF);               // size = 0x100
+    put_field8(0x03, (board::kKblParamSize >> 8) & 0xFF);
+    put_field32(0x04, 0x01040000);                               // current firmware version (1.04)
+    put_field32(0x08, 0x01040000);                               // minimum firmware version (SMI leaf)
     // 0x20 QA flags: none.  0x30 boot flags: no Ernie NVS overrides.
     // 0x40 DIP switches (0x20 bytes): no CP board (zeroes), then the release-mode
     // values the wiki lists (sdk 0, shell 0, debug 0x00080002, system 0x20000000).
-    put32(0x50, 0x00000000);                               // SDK (SCE) flags
-    put32(0x54, 0x00000000);                               // Shell flags
-    put32(0x58, 0x00080002);                               // Debug control flags (release)
-    put32(0x5C, 0x20000000);                               // System control flags (release)
-    put32(0x60, 0x40000000);                               // DRAM base paddr
-    put32(0x64, kermit::kScuSize);                         // DRAM size (modelled window)
-    put32(0x6C, 0x00000004);                               // boot type indicator 1: product mode
+    put_field32(0x50, 0x00000000);                               // SDK (SCE) flags
+    put_field32(0x54, 0x00000000);                               // Shell flags
+    put_field32(0x58, 0x00080002);                               // Debug control flags (release)
+    put_field32(0x5C, 0x20000000);                               // System control flags (release)
+    put_field32(0x60, 0x40000000);                               // DRAM base paddr
+    put_field32(0x64, kermit::kScuSize);                         // DRAM size (modelled window)
+    put_field32(0x6C, 0x00000004);                               // boot type indicator 1: product mode
     // 0x70 OpenPsId: no per-console id in the dumps, left zero.
-    put32(0x80, board::kCmepSecureKernelBase);             // secure_kernel.enp paddr
-    put32(0x84, secure_kernel_size_);
+    put_field32(0x80, board::kCmepSecureKernelBase);             // secure_kernel.enp paddr
+    put_field32(0x84, secure_kernel_size_);
     // 0x88 context_auth_sm.self: not present in the 1.04 SLB2.
-    put32(0x90, kprx_auth_sm_pa_);                         // kprx_auth_sm.self paddr
-    put32(0x94, kprx_auth_sm_size_);
-    put32(0x98, prog_rvk_pa_);                             // prog_rvk.srvk paddr
-    put32(0x9C, prog_rvk_size_);
-    put32(0xA8, 0x5A5A0001);                               // __stack_chk_guard (model constant)
-    put32(0xAC, 0xA5A50002);                               // unknown (model constant)
-    for (u32 i = 0; i < 0x10; ++i) put8(0xB0 + i, static_cast<u8>(0x10 + i));  // session id
-    put32(0xC0, 0x00000060);                               // sleep factor (syscon cmd 3)
-    put32(0xC4, 0x0000FF14);                               // wakeup factor (syscon cmd 0x10)
-    put32(0xC8, 0x00000040);                               // USB info (syscon cmd 0x800)
-    put32(0xCC, 0x00000000);                               // boot controls info (cmd 0x100)
-    put32(0xD0, 0x00000000);                               // resume context paddr (cold boot)
-    put32(0xD4, 0x00406000);                               // hardware info (syscon cmd 5, IRS-002)
-    put32(0xD8, 0x0000000C);                               // power info: AC + power button
-    put32(0xE8, 0x00000000);                               // hardware info 2 (syscon cmd 6)
-    put32(0xF8, 0x00010000);                               // bootloader revision
-    put32(0xFC, board::kKblParamMagic);                    // magic 0xCBAC03AA
+    put_field32(0x90, kprx_auth_sm_pa_);                         // kprx_auth_sm.self paddr
+    put_field32(0x94, kprx_auth_sm_size_);
+    put_field32(0x98, prog_rvk_pa_);                             // prog_rvk.srvk paddr
+    put_field32(0x9C, prog_rvk_size_);
+    put_field32(0xA8, 0x5A5A0001);                               // __stack_chk_guard (model constant)
+    put_field32(0xAC, 0xA5A50002);                               // unknown (model constant)
+    for (u32 i = 0; i < 0x10; ++i) put_field8(0xB0 + i, static_cast<u8>(0x10 + i));  // session id
+    put_field32(0xC0, 0x00000060);                               // sleep factor (syscon cmd 3)
+    put_field32(0xC4, 0x0000FF14);                               // wakeup factor (syscon cmd 0x10)
+    put_field32(0xC8, 0x00000040);                               // USB info (syscon cmd 0x800)
+    put_field32(0xCC, 0x00000000);                               // boot controls info (cmd 0x100)
+    put_field32(0xD0, 0x00000000);                               // resume context paddr (cold boot)
+    put_field32(0xD4, 0x00406000);                               // hardware info (syscon cmd 5, IRS-002)
+    put_field32(0xD8, 0x0000000C);                               // power info: AC + power button
+    put_field32(0xE8, 0x00000000);                               // hardware info 2 (syscon cmd 6)
+    put_field32(0xF8, 0x00010000);                               // bootloader revision
+    // The wiki's Secure DRAM layout marks the DRAM copy as "SceKblParam with magic
+    // not set": only the scratchpad copy carries the magic.
+    put32(0xFC, board::kKblParamMagic);
 
     ZLB_LOG_INFO("boot",
                  "SceKblParam built at 0x%08X (magic 0x%08X, dram 0x%08X+0x%X, kprx_auth_sm 0x%08X/0x%X, "

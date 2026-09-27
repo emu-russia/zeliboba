@@ -3388,3 +3388,67 @@ KBL строит собственные таблицы (TTBR0 → L1 0x40108000,
 | Чтение структуры ARM-ом | — | **подтверждено трапом (offsets 0x100/0x1C4)** |
 | Цепочка | доходит до ARM KBL | **без изменений (шаги 1-4 автоматически)** |
 | Самотесты | 210 / 15 / 22 | **210 / 15 / 22** |
+
+## Раунд 45. Карта памяти ARM из вики и reset-vector secure DRAM
+
+### 45.1 Что даёт вики `Physical_Memory`
+
+Главная таблица объясняет всю низкую карту ARM:
+
+| Start | Size | World | Комментарий |
+|---|---|---|---|
+| 0x00000000 | 0x40000 | NS/S | **ARM Boot. By default, alias of physical address 0x1F000000** (ScePower scratchpad). Can be remapped |
+| 0x00040000 | 0x20000 | S | **MeP boot. Mirror of physical address 0x00800000** |
+| 0x00800000 | 0x20000 | S | **Cmep 128KiB SRAM. Stores second_loader, secure_kernel and Secure Modules** |
+| 0x1F000000 | 0x8000 | NS/S | SPAD32K (fallback DIP switches at +0x80) |
+| 0x1F840000 | 0x20000 | NS/S | SPAD128K (Venezia) |
+| 0x40000000 | 0x200000 | S | **Secure DRAM** (FW ≥0.996) |
+| 0x40200000 | — | NS/S | Non-secure Shared DRAM (FW ≥0.996) |
+
+и раздел «FW 3.60 Secure DRAM»:
+
+```
+0x40000000 0xC0    SKBL Reset Vector          <- точка входа ARM, её пишет second_loader
+0x40000500 0x9500  kprx_auth_sm.self
+0x40009B00 0x780   prog_rvk.srvk
+0x4001FD00 0x100   SceKblParam (magic not set)
+0x40020000 0x370C8 SKBL segment 0
+0x40073570 0x200   SceKblParam
+```
+
+Наш KBL (FW ≥0.996) грузится по 0x40020000 ✓, но **модель стартует ARM прямо с
+0x40020000**, минуя reset-vector по 0x40000000 — а именно он на железе и готовит
+окружение (там же лежат stage-адреса модулей). Это следующий шаг.
+
+### 45.2 Что сделано в модели
+
+* **Окна ARM приведены к вики**: PA 0x0 — алиас ScePower scratchpad (0x1F000000),
+  PA 0x40000-0x5FFFF — зеркало CMeP SRAM (0x00800000). Реализовано одной
+  backing-store парой (`cmep_priv_` 2 МиБ + alias на ARM), плюс `arm_bootrom`
+  стал алиасом `shared_sram_`.
+  *Попутно:* `Bus::add_ram_alias` принимает **(base, size)**, а `add_ram` —
+  **(size, base)**; перепутанный порядок сначала сломал самотесты (окно 8 МиБ
+  поверх 2 МиБ вектора), это поймано и исправлено, базовая линия 210/15/22 цела.
+* **SceKblParam пишется в две копии** по вики: scratchpad 0x1F000040 (с magic) и
+  secure DRAM 0x4001FD00 (без magic — «SceKblParam with magic not set»).
+* **Модули стейджятся по адресам вики**: `kprx_auth_sm.self` → 0x40000500,
+  `prog_rvk.srvk` → 0x40009B00 (было 0x40780000/0x407A0000).
+
+### 45.3 Что осталось (следующий раунд)
+
+1. **Смоделировать reset-vector 0x40000000** (0xC0 байт), который на железе
+   пишет second_loader: это стаб, который задаёт начальные таблицы страниц,
+   стеки и прыгает в SKBL 0x40020000. Без него KBL сам строит таблицы
+   (VA 0..0x7FFF → 32 КиБ копия scratch) и падает на векторе 0x16100.
+2. После этого — старт ARM с 0x40000000 и проверка, доходит ли KBL до NSKBL.
+
+### 45.4 Итог раунда
+
+| Метрика | Было | Стало |
+|---|---|---|
+| ARM PA 0 | отдельная RAM | **алиас ScePower scratchpad (вики)** |
+| ARM PA 0x40000 | не отображено | **зеркало CMeP SRAM 0x00800000 (вики)** |
+| SceKblParam | одна копия (scratchpad) | **две: 0x1F000040 (magic) и 0x4001FD00 (без magic)** |
+| Модули ядра | 0x40780000/0x407A0000 | **0x40000500/0x40009B00 (вики)** |
+| Точка входа ARM | 0x40020000 (SKBL) | **осталось: 0x40000000 (reset vector, не реализован)** |
+| Самотесты | 210 / 15 / 22 | **210 / 15 / 22** |

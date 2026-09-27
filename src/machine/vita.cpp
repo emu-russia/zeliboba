@@ -105,6 +105,12 @@ void Vita::build_buses() {
     syscon_bus_ = std::make_unique<Bus>();
 
     shared_sram_.assign(board::kSharedSramSize, 0);
+    // The CMeP's private 2 MiB window starts with the 128 KiB SRAM the wiki calls
+    // out ("0x00800000 0x20000 S Cmep 128KiB SRAM. Stores second_loader,
+    // secure_kernel and Secure Modules"); the ARM sees that SRAM mirrored at
+    // PA 0x00040000-0x0005FFFF ("MeP boot. Mirror of physical address 0x00800000").
+    // One backing store, two windows.
+    cmep_priv_.assign(cmep::kPrivateSize, 0);
     // The main DRAM module is one piece of silicon: the CMeP stages what the
     // ARM later runs (the CMeP second loader builds its ADMA2 table at
     // 0x40000400 and reads the secure kernel / kernel boot loader straight into
@@ -114,14 +120,22 @@ void Vita::build_buses() {
 
     // --- CMeP ("F00D") -----------------------------------------------------
     cmep_bus_->add_ram("cmep_ram", 0x20000, cmep::kRamBase, "CMeP RAM / first loader window (128 KiB)");
-    cmep_bus_->add_ram("cmep_priv", cmep::kPrivateSize, cmep::kPrivateBase, "CMeP private RAM (secure kernel)");
+    cmep_bus_->add_ram_alias("cmep_priv", cmep::kPrivateBase, cmep::kPrivateSize, cmep_priv_.data(),
+                             "CMeP private RAM (128 KiB SRAM + secure kernel)");
     cmep_bus_->add_ram_alias("cmep_dram", kermit::kScuBase, kermit::kScuSize, dram_.data(),
                              "main DRAM seen by the CMeP (ADMA2 table, kernel staging)");
     build_shared_windows();
 
     // --- ARM Cortex-A9 -----------------------------------------------------
-    MemRegion& bootrom = arm_bus_->add_ram("arm_bootrom", 0x10000, 0x00000000, "ARM boot/exception vectors");
-    bootrom.readonly = false;
+    // PA 0 is an alias of the ScePower scratchpad (wiki: "ARM Boot. By default,
+    // alias of physical address 0x1F000000 i.e. ScePower scratchpad"), which is
+    // where the second loader leaves SceKblParam and the secure boot stack.
+    arm_bus_->add_ram_alias("arm_bootrom", 0x00000000, board::kArmBootWindowSize, shared_sram_.data(),
+                            "ARM boot window (alias of the power scratchpad)");
+    // PA 0x00040000-0x0005FFFF mirrors the CMeP's 128 KiB SRAM: the kernel boot
+    // loader reads the staged images and its parameters through this window.
+    arm_bus_->add_ram_alias("arm_mep_boot", board::kArmMepBootBase, board::kArmMepBootSize, cmep_priv_.data(),
+                            "MeP boot window (mirror of CMeP SRAM 0x00800000)");
     // The kernel boot loader runs with the MMU off and is linked at 0x40020000,
     // so 0x40000000 is the physical DRAM window; it is also where the kernel
     // modules are mapped through 0x80000000 later on.

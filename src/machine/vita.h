@@ -61,6 +61,15 @@ struct VitaConfig {
 namespace board {
 constexpr u32 kSharedSramBase = 0x1F000000;   ///< visible to both ARM and CMeP
 constexpr u32 kSharedSramSize = 0x00040000;   ///< 256 KiB
+/// The ARM's low window aliases the power scratchpad (wiki Physical_Memory:
+/// "0x00000000 0x40000 ARM Boot. By default, alias of physical address 0x1F000000
+/// i.e. ScePower scratchpad").
+constexpr u32 kArmBootWindowSize = 0x00010000;
+/// CMeP 128 KiB SRAM (wiki: "0x00800000 0x20000 S Cmep 128KiB SRAM. Stores
+/// second_loader, secure_kernel and Secure Modules").  The ARM sees it mirrored at
+/// 0x00040000-0x0005FFFF ("MeP boot. Mirror of physical address 0x00800000").
+constexpr u32 kArmMepBootBase = 0x00040000;
+constexpr u32 kArmMepBootSize = 0x00020000;
 constexpr u32 kCmepStackTop = 0x00060000;     ///< reset value of the CMeP $0/stack
 constexpr u32 kSecondLoaderStaging = 0x00040000;  ///< where the first loader stages stage 2
 constexpr u32 kCmepRamBase = 0x00040000;
@@ -80,13 +89,19 @@ constexpr u32 kCmepSecureKernelBase = 0x00800000;
 /// SPAD32K, and staging the container there overwrote it (see kKblParamBase).
 constexpr u32 kSecondLoaderStagingDram = 0x407C0000;  ///< inside the shared DRAM window
 /// SceKblParam: 0x100-byte record the second loader builds and the secure/non-secure
-/// kernel boot loaders read (wiki KBL_Param).
+/// kernel boot loaders read (wiki KBL_Param).  Two copies are documented: one in the
+/// power scratchpad (its DIP-switch field is pinned at 0x1F000080, so the record is
+/// at 0x1F000040) and one in secure DRAM ("0x4001FD00 - SceKblParam with magic not
+/// set" in the wiki's FW 3.60 Secure DRAM layout, right below SKBL).
 constexpr u32 kKblParamBase = 0x1F000040;
+constexpr u32 kKblParamDram = 0x4001FD00;
 constexpr u32 kKblParamSize = 0x100;
 constexpr u32 kKblParamMagic = 0xCBAC03AAu;
-/// Where the two SLB2 kernel-module images are staged for the boot loaders.
-constexpr u32 kKprxAuthSmStaging = 0x40780000;
-constexpr u32 kProgRvkStaging = 0x407A0000;
+/// Where the two SLB2 kernel-module images are staged.  The wiki's Secure DRAM
+/// layout fixes them: kprx_auth_sm.self at 0x40000500 (0x9500 bytes on 3.60) and
+/// prog_rvk.srvk at 0x40009B00.
+constexpr u32 kKprxAuthSmStaging = 0x40000500;
+constexpr u32 kProgRvkStaging = 0x40009B00;
 }  // namespace board
 
 class Vita {
@@ -300,6 +315,9 @@ private:
     /// Shared boot SRAM: the ARM boot ROM stages the second loader here and the
     /// CMeP reads it. Both buses alias the same host buffer at 0x1F000000.
     std::vector<u8> shared_sram_;
+    /// CMeP private window (2 MiB at 0x00800000); its first 128 KiB is the SRAM the
+    /// ARM mirrors at 0x40000.
+    std::vector<u8> cmep_priv_;
     /// Main DRAM (the module's 128 MiB physical window): the CMeP stages the
     /// secure kernel and the kernel boot loader in it and the ARM runs them from
     /// there, so both buses alias this one buffer at 0x40000000.
