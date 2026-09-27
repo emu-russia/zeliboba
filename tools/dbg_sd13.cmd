@@ -1,0 +1,8 @@
+core mep
+bp 0x474FE
+bp 0x47694
+bp 0x4772C
+bp 0x46F8A
+run 30000000
+regs
+quit

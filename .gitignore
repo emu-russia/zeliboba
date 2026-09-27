@@ -1,0 +1,11 @@
+build*/
+out/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.img
+*.bin.tmp
+third_party/SDL3-devel-VC.zip
+.vs/

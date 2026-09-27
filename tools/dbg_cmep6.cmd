@@ -1,0 +1,6 @@
+core mep
+run 3000000
+dis 0x436e0 0x43750
+map 0xE0A00000
+map 0xE0A00028
+quit

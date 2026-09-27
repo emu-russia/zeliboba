@@ -1,0 +1,8 @@
+core mep
+bp 0x4B9FC
+run 400000
+mem 0x5DB90 2
+mem 0x5DBA8 2
+mem 0x5DA50 2
+mem 0x5D8B8 1
+quit

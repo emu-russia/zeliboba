@@ -1,0 +1,6 @@
+bp 0x449A6
+run 400000
+mem 0x40000400 1
+mem 0x561A4 6
+mem 0x55B30 4
+quit

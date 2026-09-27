@@ -1,0 +1,7 @@
+core mep
+run 200000000
+mem 0xE0000000 2
+mem 0xE20A0000 1
+mem 0x1F000000 8
+dis 0x40380 24
+quit

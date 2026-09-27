@@ -1,0 +1,3 @@
+map 0xE0B00008
+map 0xE0B00024
+quit
