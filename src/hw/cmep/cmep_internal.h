@@ -499,6 +499,9 @@ public:
     bool pending() const { return pending_; }
     void clear_pending() { pending_ = false; }
 
+    const char* register_name(u32 address) const override;
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+
     /// Poke a descriptor into the window (tests / the SC init path).
     void post_descriptor(const std::vector<u8>& bytes, u32 window_base);
 

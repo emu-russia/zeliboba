@@ -426,9 +426,14 @@ ZLB_TEST(thumb32_blx_immediate_carries_the_whole_offset) {
 ZLB_TEST(thumb_conditional_branch) {
     Fixture f;
     // movs r0, #0 ; beq +4 ; movs r1, #1 ; movs r2, #2
+    //
+    // T16 B<c> is `1101 cond imm8` with PC = PC + 4 + (imm8 << 1), so imm8 = 0
+    // branches to the instruction *after* the next one (the old encoding 0xD001
+    // asked for PC + 6 and could never land on base + 6, which is what the test
+    // body expects).
     const std::vector<u16> code = {
         static_cast<u16>(t16_mov_imm(0, 0)),   // movs r0, #0
-        0xD001u,                               // beq +2 halfwords
+        0xD000u,                               // beq +4 (imm8 = 0)
         static_cast<u16>(t16_mov_imm(1, 1)),   // movs r1, #1  (skipped)
         static_cast<u16>(t16_mov_imm(2, 2)),   // movs r2, #2
     };
@@ -441,6 +446,42 @@ ZLB_TEST(thumb_conditional_branch) {
     f.cpu.step();  // movs r2, #2
     ZLB_EXPECT_EQ(f.reg(1), 0u);
     ZLB_EXPECT_EQ(f.reg(2), 2u);
+
+    // A non-zero imm8 (1 -> PC + 6) has to skip two halfwords instead of one.
+    Fixture g;
+    const std::vector<u16> wider = {
+        static_cast<u16>(t16_mov_imm(0, 0)),   // base + 0
+        0xD001u,                               // beq +6
+        static_cast<u16>(t16_mov_imm(1, 1)),   // skipped
+        static_cast<u16>(t16_mov_imm(3, 3)),   // skipped
+        static_cast<u16>(t16_mov_imm(2, 4)),   // base + 8
+    };
+    g.load(kCodeBase, pack_halfwords(wider));
+    g.cpu.reset(kCodeBase | 1u);
+    g.cpu.step();
+    g.cpu.step();
+    ZLB_EXPECT_EQ(g.cpu.get_pc(), kCodeBase + 8u);
+    g.cpu.step();
+    ZLB_EXPECT_EQ(g.reg(1), 0u);
+    ZLB_EXPECT_EQ(g.reg(3), 0u);
+    ZLB_EXPECT_EQ(g.reg(2), 4u);
+
+    // The same branch with the condition false falls through.
+    Fixture h;
+    const std::vector<u16> not_taken = {
+        static_cast<u16>(t16_mov_imm(0, 1)),   // movs r0, #1 -> Z clear
+        0xD001u,                               // beq +6 (not taken)
+        static_cast<u16>(t16_mov_imm(1, 1)),
+        static_cast<u16>(t16_mov_imm(3, 3)),
+        static_cast<u16>(t16_mov_imm(2, 4)),
+    };
+    h.load(kCodeBase, pack_halfwords(not_taken));
+    h.cpu.reset(kCodeBase | 1u);
+    h.cpu.step();
+    h.cpu.step();
+    ZLB_EXPECT_EQ(h.cpu.get_pc(), kCodeBase + 4u);
+    h.cpu.step();
+    ZLB_EXPECT_EQ(h.reg(1), 1u);
 }
 
 ZLB_TEST(thumb_cbz_and_tbb_free_cbnz) {
@@ -728,7 +769,11 @@ ZLB_TEST(vfp_double_arithmetic_and_compare) {
     ZLB_EXPECT_TRUE((f.cpu.vfp.fpscr & ArmVfp::kNs) == 0);
 
     // VMRS APSR_nzcv, FPSCR moves the flags into the CPSR.
-    const u32 vmrs = 0xEEF1FA10u | (1u << 8);  // vmrs apsr_nzcv, fpscr (bit 8 = the @ bit)
+    //
+    // The encoding is 0xEEF1FA10 (coproc = 0b1010).  The test used to OR in bit 8,
+    // which changes the coprocessor field to 0b1011 (CP11) - a different
+    // instruction that the core correctly rejects, so the flags were never moved.
+    const u32 vmrs = 0xEEF1FA10u;  // vmrs apsr_nzcv, fpscr
     f.bus.write32(kCodeBase + 4, vmrs);
     f.cpu.reset(kCodeBase + 4);
     f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
@@ -811,10 +856,14 @@ ZLB_TEST(vfp_vmsr_fpexc_enables_the_unit) {
     ZLB_EXPECT_FALSE(vmrs.faulted);
     ZLB_EXPECT_EQ(f.reg(0), 0x40000000u);
 
-    // And now the data processing instruction is allowed through.
-    f.cpu.vfp.write_f32(0, 2.5f);
+    // And now the data processing instruction is allowed through.  VMOV moves
+    // 2.5f (0x40200000) from r0 into s0 and the VADD doubles it; the test used to
+    // poke s0 directly and then let the VMOV overwrite it with r0 = 0x40000000
+    // (= 2.0f), so 5.0f could never appear.
+    f.set_reg(0, 0x40200000u);  // 2.5f
     const StepResult vmov = f.cpu.step();
     ZLB_EXPECT_FALSE(vmov.faulted);
+    ZLB_EXPECT_NEAR(f.cpu.vfp.read_f32(0), 2.5f, 1e-6);
     const StepResult vadd_result = f.cpu.step();
     ZLB_EXPECT_FALSE(vadd_result.faulted);
     ZLB_EXPECT_NEAR(f.cpu.vfp.read_f32(0), 5.0f, 1e-6);
@@ -1372,8 +1421,9 @@ ZLB_TEST(disasm_a32_branch_and_literal) {
     ZLB_EXPECT_TRUE(bl.find("0x80000048") != std::string::npos);
 
     const std::string ldr = arm_disassemble(f.bus, kCodeBase + 4, false, length);
-    ZLB_EXPECT_TRUE(ldr.find("ldr r0, #0x80000018") != std::string::npos);
-    ZLB_EXPECT_TRUE(ldr.find("0x80000018") != std::string::npos);
+    // LDR r0, [pc, #0x10] with PC = instruction + 8: 0x80000004 + 8 + 0x10.
+    ZLB_EXPECT_TRUE(ldr.find("ldr r0, #0x8000001C") != std::string::npos);
+    ZLB_EXPECT_TRUE(ldr.find("0x8000001C") != std::string::npos);
 }
 
 ZLB_TEST(disasm_thumb16_and_thumb32) {
@@ -1394,7 +1444,10 @@ ZLB_TEST(disasm_thumb16_and_thumb32) {
     ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 6, true, length).find("bx r14") != std::string::npos);
 
     std::vector<u32> words;
-    emit_thumb32_bl(words, kCodeBase, kCodeBase + 0x100u);
+    // BL carries a PC-relative offset, so the instruction has to be emitted for
+    // the address it is going to live at (the old test emitted it for kCodeBase
+    // and then loaded it at +0x20, which shifts the decoded target by 0x20).
+    emit_thumb32_bl(words, kCodeBase + 0x20u, kCodeBase + 0x100u);
     f.load(kCodeBase + 0x20, words);
     const std::string bl = arm_disassemble(f.bus, kCodeBase + 0x20, true, length);
     ZLB_EXPECT_EQ(length, 4u);

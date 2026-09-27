@@ -62,7 +62,8 @@ ZLB_TEST(cmep_devices_installed) {
             ZLB_EXPECT_TRUE(device->name().rfind("CMeP.", 0) == 0);
             // The debugger's MMIO view needs a name at the exact address.
             if (device->register_name(address) == nullptr && device->base() == address) {
-                ZLB_EXPECT_TRUE(device->register_name(address) != nullptr);
+                ZLB_FAIL(format("device %s has no register name for its own base 0x%08X",
+                                device->name().c_str(), address));
             }
         }
     }
@@ -80,7 +81,9 @@ ZLB_TEST(cmep_register_names_are_readable) {
         if (device == nullptr) continue;
         std::vector<RegisterInfo> regs;
         device->enumerate_registers(regs);
-        ZLB_EXPECT_FALSE(regs.empty());
+        if (regs.empty()) {
+            ZLB_FAIL(format("device %s enumerates no registers", device->name().c_str()));
+        }
         for (const RegisterInfo& info : regs) ZLB_EXPECT_FALSE(info.name.empty());
     }
 }
@@ -105,9 +108,17 @@ ZLB_TEST(cmep_keyring_capture_and_flags) {
     if (slots.count(0x501) != 0) {
         const KeyringSlot& slot = slots.find(0x501)->second;
         // 0x5CD64 builds big-endian words from four consecutive bytes, i.e. the
-        // staged words are little-endian; word 0 holds the flags.
+        // staged words are little-endian; word 0 holds the flags.  The 32-byte
+        // value therefore has word n in bytes 4n..4n+3 with the low byte first:
+        // word 0 (0x11) at byte 0 and word 7 (0x88) at byte 28.  (The old
+        // expectation `value[31] == 0x88` could never hold for any uniform word
+        // order - it asked for word 0 little-endian and word 7 big-endian.)
         ZLB_EXPECT_EQ(slot.value[0], 0x11);
-        ZLB_EXPECT_EQ(slot.value[31], 0x88);
+        ZLB_EXPECT_EQ(slot.value[4], 0x22);
+        ZLB_EXPECT_EQ(slot.value[8], 0x33);
+        ZLB_EXPECT_EQ(slot.value[28], 0x88);
+        ZLB_EXPECT_EQ(slot.value[29], 0x00);
+        ZLB_EXPECT_EQ(slot.value[31], 0x00);
         ZLB_EXPECT_EQ(slot.flags, 0x11);
         ZLB_EXPECT_TRUE(slot.present);
     }
@@ -244,17 +255,20 @@ ZLB_TEST(bigmac_aes_vectors) {
     // FIPS-197 C.1 (AES-128) and C.3 (AES-256) plus an SP 800-38A CBC block.
     u8 key128[16];
     u8 block[16];
-    for (int i = 0; i < 16; ++i) {
-        key128[i] = static_cast<u8>(i);
-        block[i] = static_cast<u8>(i);
-    }
+    for (int i = 0; i < 16; ++i) key128[i] = static_cast<u8>(i);
+    // The C.1 *plaintext* is 00112233445566778899aabbccddeeff, not 00..0f: the
+    // expected ciphertext below belongs to that input (the test used to feed the
+    // key bytes as the plaintext, so it could never match).
+    for (int i = 0; i < 16; ++i) block[i] = static_cast<u8>(i * 0x11);
     const u8 want128[16] = {0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
                             0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a};
     u8 out[16];
+    u8 plain128[16];
+    std::memcpy(plain128, block, 16);
     cmep_detail::aes_encrypt_block(key128, 128, block, out);
     ZLB_EXPECT_EQ(std::memcmp(out, want128, 16), 0);
     cmep_detail::aes_decrypt_block(key128, 128, out, block);
-    for (int i = 0; i < 16; ++i) ZLB_EXPECT_EQ(block[i], static_cast<u8>(i));
+    for (int i = 0; i < 16; ++i) ZLB_EXPECT_EQ(block[i], plain128[i]);
 
     u8 key256[32];
     for (int i = 0; i < 32; ++i) key256[i] = static_cast<u8>(i);
@@ -323,6 +337,12 @@ ZLB_TEST(bigmac_rng_is_deterministic) {
     // Two blocks seeded identically produce the same stream (documented model).
     Fixture g;
     ZLB_EXPECT_EQ(g.cmep.bigmac_device().rng().state, first_state);
+    // `f` has already consumed eight RNG commands above; give `g` the same
+    // history, otherwise the two streams are simply at different offsets.
+    for (int i = 0; i < 8; ++i) {
+        g.cmep.bigmac_device().execute(0, 0, 0, nullptr,
+                                       static_cast<u32>(cmep_detail::BigmacFunction::Rng));
+    }
     Bus& bus_a = f.bus;
     Bus& bus_b = g.bus;
     for (int i = 0; i < 4; ++i) {

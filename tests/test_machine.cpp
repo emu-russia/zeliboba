@@ -21,7 +21,10 @@ Vita& shared_machine() {
         VitaConfig config;
         config.rebuild_emmc = false;  // never write a multi-hundred-MiB file in tests
         vita.build(config);
-        vita.reset(false);
+        // Cold reset: `Bus::reset()` clears every RAM region, so a *warm* reset
+        // straight after build() would drop the fitted first loader (and the
+        // tests below check exactly that it is there).
+        vita.reset(true);
         built = true;
     }
     return vita;
@@ -34,7 +37,9 @@ ZLB_TEST(machine_memory_map) {
 
     // CMeP RAM window holds the first loader and the staging buffer.
     ZLB_EXPECT_TRUE(vita.cmep_bus().is_ram(board::kCmepRamBase, board::kCmepRamSize));
-    ZLB_EXPECT_TRUE(vita.cmep_bus().is_mapped(board::kCmepStackTop));
+    // kCmepStackTop is the *first byte past* the window (the stack grows down
+    // from it), so the last usable byte is the mapped one.
+    ZLB_EXPECT_TRUE(vita.cmep_bus().is_ram(board::kCmepStackTop - 4));
     ZLB_EXPECT_TRUE(vita.cmep_bus().is_ram(0x5C000, 16));
 
     // ARM DRAM, SRAM and private region.
@@ -123,11 +128,17 @@ ZLB_TEST(machine_workspace_paths_resolve) {
 // slice must end *before* the matching instruction executes.
 ZLB_TEST(machine_pc_hook_stops_the_slice_before_the_instruction) {
     Vita& vita = shared_machine();
-    vita.reset(false);
+    vita.reset(true);
 
     Cpu* arm0 = vita.arm_core(0);
     ZLB_EXPECT_TRUE(arm0 != nullptr);
     if (!arm0) return;
+
+    // The ARM cores stay halted until the CMeP has handed the boot context over
+    // (round 92), so enter the kernel-boot-loader stage explicitly: this test is
+    // about the debugger's exact breakpoints, not about the boot timing.
+    ZLB_EXPECT_TRUE(vita.enter_stage(BootStage::ArmKernelBootLoader));
+    ZLB_EXPECT_FALSE(arm0->halted);
 
     // Let the core run a little so its PC is inside real code, then arm the hook
     // on the instruction it is about to execute.

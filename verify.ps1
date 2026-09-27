@@ -9,7 +9,7 @@
 param(
     [int]$Steps = 400000,
     [switch]$SkipBuild,
-    [int]$BaselineFailures = 12
+    [int]$BaselineFailures = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -33,11 +33,12 @@ if (-not $SkipBuild) {
 $zeliboba = Join-Path $bin "zeliboba.exe"
 if (-not (Test-Path $zeliboba)) { throw "zeliboba.exe was not built" }
 
-# The self tests carry a known, documented baseline of failures (mostly the ARM
-# disassembler/VFP/Thumb decoder and a few device tests - see docs/STATUS.md).  The
-# step therefore passes when the count of failing cases is *no worse* than the
-# baseline, so that a regression is visible as a failure instead of drowning in the
-# fifteen that are always there.  -BaselineFailures <n> overrides the number.
+# The self tests are expected to be fully green (round 92 finished the last
+# documented failures: the ARM decoder/disassembler, the CMeP device register
+# names, the Bigmac vector/stream tests and the machine wiring tests).  A
+# non-zero baseline is still accepted so an older tree can be checked, but the
+# default is zero: any failing case is a regression.  -BaselineFailures <n>
+# overrides the number.
 Step "self tests" {
     $output = & (Join-Path $bin "zlb_tests.exe") 2>&1 | Out-String
     Write-Host $output
@@ -50,7 +51,7 @@ Step "self tests" {
         return 1
     }
     if ($failedCases -lt $BaselineFailures) {
-        Write-Host ("self tests: {0} failing case(s) - fewer than the baseline of {1}; update docs/STATUS.md" -f $failedCases, $BaselineFailures) -ForegroundColor Yellow
+        Write-Host ("self tests: {0} failing case(s) - better than the baseline of {1}; update docs/STATUS.md" -f $failedCases, $BaselineFailures) -ForegroundColor Yellow
     }
     # Step() reads $LASTEXITCODE, and the test binary just set it to 1 on its way out.
     $global:LASTEXITCODE = 0

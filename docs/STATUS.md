@@ -24,7 +24,7 @@ Stage 1 **не достигнут**: ARM доходит до исполнени�
 
 | Что | Подтверждение |
 |---|---|
-| Сборка и самотесты | `build.ps1`; `zlb_tests.exe`: **411 прогонов / 12 падений / 17 ассертов** (базовая линия, см. §7) |
+| Сборка и самотесты | `build.ps1`; `zlb_tests.exe`: **411 прогонов / 0 падений** (раунд 92 закрыл последние 12 «известных» — см. §7) |
 | Реконструкция eMMC из PUP | `verify.ps1` → «verify OK»: 992 файла, 0 расхождений, MBR/SLB2/os0/vs0 |
 | Первый загрузчик CMeP (MeP) | реальный дамп `dumps/vita_prototype_bootrom.bin` в окне 0x5C000; SUCCESS + передача на 0x40000 |
 | Вторая стадия CMeP | исполняет SLB2-образ из eMMC (4121 чтение eMMC, idstorage в DRAM, SC-команды); заканчивается вызовом сервиса `jmp 0x5FF00` |
@@ -225,7 +225,7 @@ $env:ZLB_NO_SUBSTITUTION=1
 
 | Метрика | Значение |
 |---|---|
-| Самотесты | **411 прогонов / 12 падений / 17 ассертов** — базовая линия уменьшилась с 15 до 12: после правок декодера ARM (аудит C1-C8) попутно исправились `thumb_bl_and_blx`, `arm_mode_banking_switches_sp` и `arm_thumb2_movw_ubfx_and_bfi`. Остались известные: 5 arm (thumb_conditional_branch, два VFP, два disasm), 3 cmep, 2 bigmac, 2 machine. `verify.ps1` сверяет это число с `-BaselineFailures` (по умолчанию 12) и падает только при регрессе. История покрытия: RL78 31→109 (0 падений), MeP 13→78, ARM 57→108 — см. `docs/CPU_ARM_AUDIT.md` |
+| Самотесты | **411 прогонов / 0 падений / 0 ассертов, зелёные**. Раунд 92 разобрал все 12 «известных» падений и оказалось, что **девять из них — ошибки самих тестов**, а не модели: `thumb_conditional_branch` (кодировка `0xD001` вместо `0xD000` — PC+4+imm8*2 не мог дать ожидаемый адрес), `vfp_vmsr_fpexc_enables_the_unit` (тест писал 2.5 в s0, а затем `vmov s0,r0` затирал его значением r0 = 2.0), `vfp_double_arithmetic_and_compare` (бит 8 в `vmrs` менял сопроцессор на CP11 — другая инструкция), `disasm_a32_branch_and_literal` (`ldr r0,[pc,#0x10]` с PC+8 → 0x8000001C, а не 0x…18), `disasm_thumb16_and_thumb32` (BL эмитировался для kCodeBase, а грузился по +0x20), `bigmac_aes_vectors` (в качестве plaintext подавались байты ключа 00..0f, а не FIPS-197 C.1 `00112233…`), `bigmac_rng_is_deterministic` (потоки сравнивались на разных смещениях RNG), `cmep_keyring_capture_and_flags` (`value[31]` не может быть 0x88 ни при каком едином порядке слов — слово 7 лежит в байтах 28..31), `machine_first_loader_is_fitted` (`reset(false)` обнуляет RAM, поэтому фиттинг терялся; тест теперь делает холодный сброс). Плюс две настоящие дырки в модели: у `CMeP.ScXfer` не было карты регистров (теперь есть `register_name`/`enumerate_registers`) и `machine_memory_map` проверял `kCmepStackTop` (первый байт *за* окном CMeP RAM). `verify.ps1` теперь по умолчанию требует ноль падений (`-BaselineFailures 0`) История покрытия: RL78 31→109, MeP 13→78, ARM 57→130 — см. `docs/CPU_ARM_AUDIT.md` |
 | eMMC | 992 файла, 0 расхождений |
 | Цепочка | шаги 1-4 вики автоматически; ARM запускает `kernel_boot_loader` |
 | CMeP | вторая стадия ~600k инструкций, **secure kernel 117 083 инструкции** (рукопожатия 0x9/0x101/0x102/0x106, пробуждение на ответ ARM) |

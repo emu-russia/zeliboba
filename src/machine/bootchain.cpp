@@ -918,8 +918,35 @@ void Vita::poll_boot_chain() {
     boot_.cmep_status = cmep_block_ ? cmep_block_->cmep_status() : 0;
 
     // ARM release: the syscon or the CMeP has signalled that the SoC may start.
-    if (!boot_.arm_released && ernie_ && ernie_->soc_released() && arm_ && arm_->halted) {
-        start_arm_kernel_boot_loader();
+    //
+    // Round 92: the syscon's power-on path releases the SoC immediately
+    // (ernie_power.cpp: "the syscon releases the SoC as soon as the reset
+    // sequencing is done"), which is true for the *ARM boot ROM* but not for
+    // kernel_boot_loader: on hardware the boot ROM waits for the CMeP, whose
+    // second loader is what leaves the boot context in the scratchpad.  Starting
+    // the KBL at power-on made it read the scratch *before* the second loader had
+    // finished with it (the model's record at +0xC0..+0x100 was cleared by the
+    // second loader's memset at 0x40ABC, so the KBL saw zeroes).  Hold the KBL
+    // back until the CMeP's context phase is over, with a slice budget as a
+    // safety net.  `ZLB_ARM_WAIT_CMEP=0` restores the old timing.
+    if (!boot_.arm_released && arm_ && arm_->halted) {
+        static const bool wait_for_cmep = [] {
+            const char* value = std::getenv("ZLB_ARM_WAIT_CMEP");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!cmep_context_done_) {
+            ++arm_wait_slices_;
+            const bool budget_out = arm_wait_slices_ >= kArmWaitCmepSlices;
+            if (!wait_for_cmep || budget_out) {
+                cmep_context_done_ = true;
+                ZLB_LOG_INFO("boot", "ARM release: not waiting for the CMeP boot context (%s, %llu slices)",
+                             wait_for_cmep ? "budget reached" : "ZLB_ARM_WAIT_CMEP=0",
+                             static_cast<unsigned long long>(arm_wait_slices_));
+            }
+        }
+        if (cmep_context_done_ && ernie_ && ernie_->soc_released()) {
+            start_arm_kernel_boot_loader();
+        }
     }
 
     if (boot_.stage == BootStage::ArmBootRom || boot_.stage == BootStage::PowerOn) {
@@ -989,6 +1016,7 @@ void Vita::poll_boot_chain() {
         } else {
             cmep_->halted = true;
             if (ernie_) ernie_->release_soc();
+            cmep_context_done_ = true;   // no CMeP continuation is modelled (round 92)
             ZLB_LOG_INFO("boot",
                          "secure kernel finished (jump back to 0x40000): substituting the syscon handshake, "
                          "releasing the ARM");
@@ -1005,6 +1033,7 @@ void Vita::poll_boot_chain() {
             cmep_finish_pending_ = false;
             if (cmep_) cmep_->halted = true;
             if (ernie_) ernie_->release_soc();
+            cmep_context_done_ = true;   // the ARM may start now (round 92)
             ZLB_LOG_INFO("boot",
                          "second loader finished after the secure kernel (%s, %llu steps): releasing the ARM",
                          stopped ? "it stopped by itself" : "budget reached",

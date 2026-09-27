@@ -372,6 +372,16 @@ private:
     /// never happens (see docs/KBL.md round 48.15).
     bool cmep_finish_pending_ = false;
     u64 cmep_finish_steps_ = 0;
+    /// Round 92: the power-on path of the syscon releases the SoC as soon as the
+    /// reset sequencing is done (ernie_power.cpp), so without this gate the model
+    /// starts kernel_boot_loader *before* the CMeP second loader has even been
+    /// handed off - and the ARM then reads the boot context the second loader is
+    /// about to clear/fill (see docs/KBL.md round 92).  On hardware the ARM boot
+    /// ROM waits for the CMeP.  `ZLB_ARM_WAIT_CMEP=0` restores the old timing.
+    bool cmep_context_done_ = false;
+    u64 arm_wait_slices_ = 0;
+    /// Safety net: never hold the ARM back longer than this many machine slices.
+    static constexpr u64 kArmWaitCmepSlices = 400000;
     /// SceKblParam inputs collected while staging the SLB2 images.
     u32 secure_kernel_size_ = 0;
     u32 kprx_auth_sm_pa_ = 0;

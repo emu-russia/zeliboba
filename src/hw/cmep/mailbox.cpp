@@ -516,8 +516,51 @@ void ScXferDevice::write(u32 address, unsigned size, u64 value) {
     }
 }
 
-void ScXferDevice::post_descriptor(const std::vector<u8>& bytes, u32 window_base) {
-    // The descriptor is queued at +0xB0FF00 of the selected window (sc_xfer
+const char* ScXferDevice::register_name(u32 address) const {
+    // The window is 0xE0B00000 | (channel << 16); the only populated bytes are
+    // the 0x2C-byte descriptor sc_xfer leaves at +0xFF00 of the selected window
+    // (see the layout comment on the class in cmep_internal.h).
+    if (address < kBase || address >= kBase + kSize) return nullptr;
+    const u32 offset = address - kBase;
+    const u32 in_window = offset & 0xFFFFu;
+    if (in_window < kDescriptorOffset) {
+        return in_window == 0 ? "SC window base" : nullptr;
+    }
+    const u32 field = in_window - kDescriptorOffset;
+    if (field == 0x00) return "SC descriptor mode/flags";
+    if (field >= 0x04 && field < 0x08) return "SC descriptor timeout";
+    if (field >= 0x08 && field < 0x0C) return "SC descriptor timeout2";
+    if (field == 0x0E) return "SC descriptor channel";
+    if (field >= 0x18 && field < 0x1C) return "SC descriptor window base";
+    if (field >= 0x24 && field < 0x28) return "SC descriptor control pointer";
+    if (field < kDescriptorSize) return "SC descriptor byte";
+    return nullptr;
+}
+
+void ScXferDevice::enumerate_registers(std::vector<RegisterInfo>& out) const {
+    // Every SC transfer window: entries for the base, the mode/channel bytes and
+    // the two 32-bit pointers the engine actually consumes.
+    static const u32 kChannels[] = {0x00, 0x01};
+    static const u32 kFields[] = {0x00, 0x04, 0x08, 0x0E, 0x18, 0x24};
+    for (u32 channel : kChannels) {
+        const u32 window = kCmdWindow + (channel << 16);
+        RegisterInfo base;
+        base.address = window;
+        base.name = "SC window base";
+        out.push_back(base);
+        for (u32 field : kFields) {
+            const u32 address = window + kDescriptorOffset + field;
+            const char* name = register_name(address);
+            RegisterInfo info;
+            info.address = address;
+            info.name = name ? name : "SC descriptor";
+            info.width = (field == 0x00 || field == 0x0E) ? 1u : 4u;
+            out.push_back(std::move(info));
+        }
+    }
+}
+
+void ScXferDevice::post_descriptor(const std::vector<u8>& bytes, u32 window_base) {    // The descriptor is queued at +0xB0FF00 of the selected window (sc_xfer
     // builds it in RAM at 0x5EE20 and hands that address to sc_read, so the
     // window copy is the debugger/test entry point).
     descriptor_.assign(kDescriptorSize, 0);

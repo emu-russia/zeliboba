@@ -5230,3 +5230,80 @@ ARM R15 = 0x4003A1E0 (bne 0x4003a1c0)   R14 = 0x400312B1
 * тест `second_loader_substitutions_stay_inside_the_staged_image`
   (`tests/test_cmep.cpp`) проверяет, что каждая запись лежит внутри
   хэшируемых `0x16600` байт образа — с прежней таблицей он падает.
+
+## Раунд 92. ARM отпускался слишком рано: boot-контекст до KBL доходил нулевым
+
+Раунд 91 показал, что запись SceKblParam, которую ставит модель
+(`build_kbl_param()`, вики-адрес `0x1F000040`), KBL читает как нули, потому что
+second_loader обнуляет хвост `SPAD+0x100..0x200` (memset `0x40ABC`) **до** чтения.
+Причина оказалась в порядке событий модели.
+
+### 92.1 Кто и когда отпускает ARM
+
+`poll_boot_chain()` запускает KBL, как только `ernie_->soc_released()` и ядро
+`arm0` не спит. Но `soc_released` выставляется **на включении питания**:
+
+```
+src/hw/syscon/ernie_power.cpp
+170: void PowerState::release_soc() { if (soc_released) return; soc_released = true; ... }
+176: bool run_power_state_machine(...) {
+178:     if (!state.soc_released) {
+179:         // Power-on: the syscon releases the SoC as soon as the reset sequencing
+180:         // is done. ...
+182:         state.release_soc();
+```
+
+Поэтому отложенное «отпускание» в обработчике `secure_kernel_done_`
+(`cmep_finish_pending_`) ни на что не влияло: к этому моменту флаг
+`boot_.arm_released` уже был выставлен. Лог это видно прямо:
+
+```
+42: [info] ARM started on kernel_boot_loader at 0x40020000 (eMMC SLB2)
+62: [info] CMeP handed off to the staged image at 0x402FC
+```
+
+— ARM стартовал **на двадцать строк лога раньше**, чем CMeP вообще перешёл ко
+второй стадии. На железе ARM boot ROM ждёт CMeP; модель же подменяет boot ROM
+нативным кодом и сразу шла в KBL.
+
+### 92.2 Гейт `ZLB_ARM_WAIT_CMEP`
+
+KBL теперь стартует только после того, как фаза CMeP, собирающая boot-контекст,
+закончилась (`cmep_context_done_`), с бюджетом `kArmWaitCmepSlices = 400000`
+срезов как страховкой от зависания; `ZLB_ARM_WAIT_CMEP=0` возвращает прежний
+порядок. Новый лог:
+
+```
+47: CMeP handed off to the staged image at 0x402FC
+64: CMeP handed off to the staged image at 0x40002
+67: second loader finished after the secure kernel (it stopped by itself, 1 steps): releasing the ARM
+71: SceKblParam built at 0x1F000040 (...)
+73: mirrored the CMeP scratch (32 KiB) to ARM PA 0 (context at +0x100: 00000060 0000FF14)
+77: ARM started on kernel_boot_loader at 0x40020000
+```
+
+### 92.3 Результат: KBL видит контекст
+
+Трап чтений окна ARM (`ZLB_RTRAP=0-200`), тот же прогон, что и в §91.3, но с
+гейтом:
+
+```
++0x001C4 r4 = 0x0  pc=4002028C   (SceKblParam+0x184 - ранняя проверка, модель его не пишет)
++0x00100 r4 = 0x60 pc=400376E4   (SceKblParam+0xC0 - теперь значение на месте)
+```
+
+То есть 128-байтная копия `PA 0x100 -> 0x400B2DC8`, которую делает KBL, теперь
+получает то, что положила модель, а не нули. Барьер Stage 1 при этом не снят:
+конечное состояние то же — спинлок на `NULL+0x28` (§91.4), аллокатор разделов
+по-прежнему пуст (`0x80020005`), `ctx+0x8C` не создан. Но теперь исключён
+целый класс ложных выводов: «KBL не видит boot-контекст» больше не объясняется
+порядком событий.
+
+### 92.4 Что осталось от предыдущей ступени
+
+* `SceKblParam+0x184` (PA `0x1C4`) — ранняя проверка KBL; модель это поле не
+  пишет (раунд 54 разбирал её и признал «не наш случай»; теперь видно, что она
+  читается уже после того, как контекст доставлен).
+* Хвост `SceKblParam+0xC0..` на железе заполняет secure kernel, которого в
+  модели нет — именно поэтому подстановка `build_kbl_param()` остаётся, но
+  теперь она хотя бы не затирается кодом second_loader'а.
