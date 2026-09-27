@@ -903,6 +903,46 @@ ZLB_TEST(vfp_int_to_float_and_back) {
     ZLB_EXPECT_EQ(v.compare(3.0, 2.0, false), 2);
 }
 
+ZLB_TEST(vfp_vcvt_between_single_and_double) {
+    // VCVT.F64.F32 / VCVT.F32.F64 (ARM ARM A8.8.314, opc2 == 7): the sz bit names
+    // the *source* type, so the D and M bits belong to the other operand.  This
+    // form was decoded as an undefined instruction (audit L2) - a core halt in the
+    // middle of any float routine that widens or narrows a value.
+    // Encodings verified with capstone: EE B7 0A C0 / EE B7 0B C0 / EE B7 1A C0.
+    Fixture f;
+    ArmVfp& v = f.cpu.vfp;
+    const u32 vcvt_f64_f32 = 0xEEB70AC0u;  // vcvt.f64.f32 d0, s0
+    const u32 vcvt_f32_f64 = 0xEEB70BC0u;  // vcvt.f32.f64 s0, d0
+    const u32 vcvt_f64_f32_d1 = 0xEEB71AC0u;  // vcvt.f64.f32 d1, s0
+    const u32 vcvt_f32_f64_s2 = 0xEEB71BC0u;  // vcvt.f32.f64 s2, d0
+    f.load(kCodeBase, {vcvt_f64_f32, vcvt_f32_f64, vcvt_f64_f32_d1, vcvt_f32_f64_s2});
+
+    f.cpu.reset(kCodeBase);
+    v.fpexc = ArmVfp::kFpexcEn;
+    // NB: write_s/write_f32 differ - write_s stores a *raw* 32-bit pattern (the
+    // integer converters use it), write_f32 stores a float.
+    v.write_f32(0, 1.5f);
+    f.cpu.step();
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    ZLB_EXPECT_NEAR(v.read_f64(0), 1.5, 1e-12);
+
+    // Widening keeps the value, narrowing rounds to single precision.
+    v.write_f64(0, 1.0 / 3.0);
+    f.cpu.step();
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    ZLB_EXPECT_NEAR(static_cast<double>(v.read_f32(0)), 1.0 / 3.0, 1e-7);
+    ZLB_EXPECT_NE(static_cast<double>(v.read_f32(0)), 1.0 / 3.0);
+
+    // The destination's D bit (bit 22) is the *high* bit of the double register...
+    v.write_f32(0, -2.25f);
+    f.cpu.step();
+    ZLB_EXPECT_NEAR(v.read_f64(1), -2.25, 1e-12);
+    // ...and the low bit of the single register in the other direction.
+    v.write_f64(0, 4.5);
+    f.cpu.step();
+    ZLB_EXPECT_NEAR(static_cast<double>(v.read_f32(2)), 4.5, 1e-7);
+}
+
 ZLB_TEST(vfp_vcvt_vs_vcvtr_rounding) {
     // ARM ARM A8.8.314 (VCVT / VCVTR between floating-point and integer): opc2
     // 1100 is the unsigned and 1101 the signed float -> integer converter, and
@@ -2710,6 +2750,12 @@ constexpr u32 a32_ldrexb(u32 rd, u32 rn) { return 0xE1D00F9Fu | (rn << 16) | (rd
 constexpr u32 a32_strexb(u32 rd, u32 rm, u32 rn) { return 0xE1C00F90u | (rn << 16) | (rd << 12) | rm; }
 constexpr u32 a32_ldrexh(u32 rd, u32 rn) { return 0xE1F00F9Fu | (rn << 16) | (rd << 12); }
 constexpr u32 a32_strexh(u32 rd, u32 rm, u32 rn) { return 0xE1E00F90u | (rn << 16) | (rd << 12) | rm; }
+/// LDREXD/STREXD (ARM ARM A8.8.67 / A8.8.158, layout confirmed against QEMU's
+/// target/arm/a32.decode): the opcode carries a single register field - Rt for
+/// LDREXD (bits [15:12]) and Rt for STREXD (bits [3:0]) - and the second register
+/// is always Rt + 1.
+constexpr u32 a32_ldrexd(u32 rd, u32 rn) { return 0xE1B00F9Fu | (rn << 16) | (rd << 12); }
+constexpr u32 a32_strexd(u32 rd, u32 rt, u32 rn) { return 0xE1A00F90u | (rn << 16) | (rd << 12) | rt; }
 
 }  // namespace
 
@@ -3143,6 +3189,39 @@ ZLB_TEST(arm_exclusive_word_byte_half) {
     f.set_reg(1, kDataBase + 2u);
     f.cpu.step();
     ZLB_EXPECT_EQ(f.reg(0), 0xABCDu);
+}
+
+ZLB_TEST(arm_exclusive_doubleword) {
+    // LDREXD/STREXD (audit L3): Rt must be even and the pair is Rt (low) / Rt+1
+    // (high).  Both forms used to be decoded as a multiply, so the core clobbered
+    // two registers instead of touching the monitored address.
+    Fixture f;
+    f.load(kCodeBase, {a32_ldrexd(0, 1), a32_strexd(4, 2, 1)});
+    f.bus.write32(kDataBase, 0x11223344u);
+    f.bus.write32(kDataBase + 4, 0x55667788u);
+    f.cpu.reset(kCodeBase);
+    f.set_reg(1, kDataBase);
+    f.set_reg(2, 0xAAAABBBBu);
+    f.set_reg(3, 0xCCCCDDDDu);
+    f.cpu.step();  // LDREXD r0, r1, [r1]
+    ZLB_EXPECT_EQ(f.reg(0), 0x11223344u);
+    ZLB_EXPECT_EQ(f.reg(1), 0x55667788u);
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    f.set_reg(1, kDataBase);
+    f.cpu.step();  // STREXD r4, r2, r3, [r1]
+    ZLB_EXPECT_EQ(f.reg(4), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(kDataBase), 0xAAAABBBBu);
+    ZLB_EXPECT_EQ(f.bus.read32(kDataBase + 4), 0xCCCCDDDDu);
+
+    // Without a reservation the store must fail and leave memory alone.
+    f.bus.write32(kCodeBase + 8, a32_strexd(4, 2, 1));
+    f.cpu.reset(kCodeBase + 8);
+    f.set_reg(1, kDataBase);
+    f.set_reg(2, 0x11111111u);
+    f.set_reg(3, 0x22222222u);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(4), 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(kDataBase), 0xAAAABBBBu);
 }
 
 ZLB_TEST(arm_hints_and_barriers_are_noops) {

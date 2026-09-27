@@ -776,6 +776,7 @@ void ArmCore::execute_arm() {
             // not a multiply: bits 27-20 select the variant.
             const u32 excl = instr & 0x0FF00FF0u;
             if (excl == 0x01900F90u || excl == 0x01800F90u ||  // LDREX  / STREX
+                excl == 0x01B00F90u || excl == 0x01A00F90u ||  // LDREXD / STREXD
                 excl == 0x01D00F90u || excl == 0x01C00F90u ||  // LDREXB / STREXB
                 excl == 0x01F00F90u || excl == 0x01E00F90u) {  // LDREXH / STREXH
                 execute_arm_exclusive(instr);
@@ -978,22 +979,37 @@ void ArmCore::execute_data_processing(u32 instr, u32 op, bool immediate) {
 // ---- multiply / media (bits [27:23] = 00001) ------------------------------
 
 void ArmCore::execute_arm_exclusive(u32 instr) {
-    const u32 kind = (instr >> 20) & 0xFu;  // 8 STREX, 9 LDREX, C STREXB, D LDREXB, E STREXH, F LDREXH
+    // 8 STREX, 9 LDREX, A STREXD, B LDREXD, C STREXB, D LDREXB, E STREXH, F LDREXH
+    const u32 kind = (instr >> 20) & 0xFu;
     const int rn = static_cast<int>((instr >> 16) & 0xFu);
     const int rd = static_cast<int>((instr >> 12) & 0xFu);  // Rt for loads, Rd for stores
     const int low = static_cast<int>(instr & 0xFu);         // Rt for stores, imm4 for loads
     const u32 base = read_reg(rn);
 
-    const bool is_load = (kind == 0x9u || kind == 0xDu || kind == 0xFu);
+    const bool is_doubleword = (kind == 0xAu || kind == 0xBu);
+    const bool is_load = (kind == 0x9u || kind == 0xBu || kind == 0xDu || kind == 0xFu);
     if (is_load) {
         // A32 LDREX/LDREXB/LDREXH take no offset: bits 3-0 are the fixed 1111.
         (void)low;
-        const unsigned width = (kind == 0xDu) ? 1u : ((kind == 0xFu) ? 2u : 4u);
-        const u32 address = (kind == 0xDu) ? base : ((kind == 0xFu) ? (base & ~1u) : (base & ~3u));
+        const unsigned width = is_doubleword ? 8u : ((kind == 0xDu) ? 1u : ((kind == 0xFu) ? 2u : 4u));
+        const u32 address = (kind == 0xDu) ? base
+                            : ((kind == 0xFu) ? (base & ~1u)
+                                              : (base & ~(is_doubleword ? 7u : 3u)));
         u32 value = 0;
-        if (kind == 0x9u) value = mem_read_word(address, false);
-        else if (kind == 0xDu) value = mem_read_byte(address) & 0xFFu;
-        else value = mem_read_half(address) & 0xFFFFu;
+        u32 value_hi = 0;
+        if (is_doubleword) {
+            // LDREXD: Rt must be even-numbered and holds the low word, Rt+1 the high
+            // one (ARM ARM A8.8.66); the pair is not allowed to wrap to r15.
+            value = mem_read_word(address, false);
+            if (pending_fault_ != arm::FaultKind::None) return;
+            value_hi = mem_read_word(address + 4u, false);
+        } else if (kind == 0x9u) {
+            value = mem_read_word(address, false);
+        } else if (kind == 0xDu) {
+            value = mem_read_byte(address) & 0xFFu;
+        } else {
+            value = mem_read_half(address) & 0xFFFFu;
+        }
         if (pending_fault_ != arm::FaultKind::None) return;
 
         // The reservation lives in the bus (the SCU's global monitor) so that a
@@ -1003,14 +1019,29 @@ void ArmCore::execute_arm_exclusive(u32 instr) {
         exclusive_addr_ = address;
         exclusive_id_ = mmu.context_idr;
         r[rd] = value;
+        if (is_doubleword && rd < 15) r[rd + 1] = value_hi;
     } else {
-        const unsigned width = (kind == 0xCu) ? 1u : ((kind == 0xEu) ? 2u : 4u);
-        const u32 address = (kind == 0xCu) ? base : ((kind == 0xEu) ? (base & ~1u) : (base & ~3u));
+        const unsigned width = is_doubleword ? 8u : ((kind == 0xCu) ? 1u : ((kind == 0xEu) ? 2u : 4u));
+        const u32 address = (kind == 0xCu) ? base
+                            : ((kind == 0xEu) ? (base & ~1u)
+                                              : (base & ~(is_doubleword ? 7u : 3u)));
         u32 status = 1u;
         if (bus->take_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr)) {
-            if (kind == 0x8u) mem_write_word(address, r[low]);
-            else if (kind == 0xCu) mem_write_byte(address, r[low] & 0xFFu);
-            else mem_write_half(address, r[low] & 0xFFFFu);
+            if (is_doubleword) {
+                // STREXD Rd, Rt, Rt2, [Rn]: the opcode has a single register field
+                // (bits [3:0] = Rt) and Rt2 is Rt + 1 - QEMU's a32.decode notes
+                // exactly that ("rt2 for STREXD/LDREXD is set by the helper after
+                // checking rt is even"), and the pair must not wrap to r15.
+                mem_write_word(address, r[low]);
+                if (pending_fault_ != arm::FaultKind::None) return;
+                mem_write_word(address + 4u, r[(low + 1) & 0xFu]);
+            } else if (kind == 0x8u) {
+                mem_write_word(address, r[low]);
+            } else if (kind == 0xCu) {
+                mem_write_byte(address, r[low] & 0xFFu);
+            } else {
+                mem_write_half(address, r[low] & 0xFFFFu);
+            }
             if (pending_fault_ != arm::FaultKind::None) return;
             status = 0u;
         }
@@ -4345,6 +4376,30 @@ void ArmCore::execute_vfp_op(bool dbl, u32 instr, u32 opcv1, u32 opcv2, int vd, 
             const u32 imm8 = (imm4h << 4) | (instr & 0xFu);
             if (dbl) vfp.write_d(vd, ArmVfp::expand_immediate64(imm8));
             else vfp.write_s(vd, ArmVfp::expand_immediate(imm8));
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+        if (opc2v == 7u) {
+            // VCVT between single and double precision (ARM ARM A8.8.314):
+            //   VCVT.F64.F32 <Dd>, <Sm>  (sz = 0)
+            //   VCVT.F32.F64 <Sd>, <Dm>  (sz = 1)
+            // sz selects the *source* type, so the D and M bits belong to the
+            // destination and source of that conversion - not to `vd`/`vm`, which
+            // were decoded for the source size.  This form used to fall through to
+            // "undefined", which halts the core (audit L2).
+            const int f_d = static_cast<int>((instr >> 12) & 0xFu);
+            const int f_m = static_cast<int>(instr & 0xFu);
+            const bool d_high = (instr & (1u << 22)) != 0u;
+            const bool m_high = (instr & (1u << 5)) != 0u;
+            if (!dbl) {
+                const int dd = f_d | (d_high ? 16 : 0);                 // D register
+                const int sm = (f_m << 1) | (m_high ? 1 : 0);           // S register
+                vfp.write_f64(dd, static_cast<f64>(vfp.read_f32(sm)));
+            } else {
+                const int sd = (f_d << 1) | (d_high ? 1 : 0);           // S register
+                const int dm = f_m | (m_high ? 16 : 0);                 // D register
+                vfp.write_f32(sd, static_cast<f32>(vfp.read_f64(dm)));
+            }
             write_r15(cur_instr_addr_ + 4u);
             return;
         }
