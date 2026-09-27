@@ -695,6 +695,50 @@ void arm_mem_operand(DState& s, u32 instr, int rn, bool p, bool u, bool w, bool 
     }
 }
 
+// ---- exclusive load/store --------------------------------------------------
+
+/// LDREX/STREX share the multiply space (bits [7:4] = 1001) and are told apart
+/// by bits [27:20]: 8/9 word, C/D byte, E/F halfword.  They have to be decoded
+/// before the multiplies, otherwise the loop that kernel_boot_loader uses to
+/// post and wait for completion of a job (a decrementing counter at
+/// 0x4005C008, see docs/KBL.md) disassembles as `smlal r12,r0,r3,r15`.
+bool is_arm_exclusive(u32 instr) {
+    const u32 excl = instr & 0x0FF00FF0u;
+    return excl == 0x01900F90u || excl == 0x01800F90u ||   // LDREX  / STREX
+           excl == 0x01D00F90u || excl == 0x01C00F90u ||   // LDREXB / STREXB
+           excl == 0x01F00F90u || excl == 0x01E00F90u;     // LDREXH / STREXH
+}
+
+void arm_exclusive(DState& s, u32 instr) {
+    const u32 kind = (instr >> 20) & 0xFu;
+    const int rn = static_cast<int>((instr >> 16) & 0xFu);
+    const int rd = static_cast<int>((instr >> 12) & 0xFu);
+    const int rt = static_cast<int>(instr & 0xFu);
+
+    const char* nm = "undef";
+    bool load = true;
+    switch (kind) {
+        case 0x9u: nm = "ldrex"; break;
+        case 0x8u: nm = "strex"; load = false; break;
+        case 0xDu: nm = "ldrexb"; break;
+        case 0xCu: nm = "strexb"; load = false; break;
+        case 0xFu: nm = "ldrexh"; break;
+        case 0xEu: nm = "strexh"; load = false; break;
+        default: break;
+    }
+    s.s(nm);
+    s.cond_suffix();
+    s.c(' ');
+    s.reg(rd);
+    if (!load) {
+        s.s(", ");
+        s.reg(rt);
+    }
+    s.s(", [");
+    s.reg(rn);
+    s.c(']');
+}
+
 void arm_extra_load_store(DState& s, u32 addr, u32 instr) {
     (void)addr;
     const int rd = static_cast<int>((instr >> 12) & 0xFu);
@@ -1401,7 +1445,11 @@ void arm_decode(DState& s, u32 addr, unsigned& length) {
     const u32 ga = (instr >> 20) & 0xFFu;
     const u32 nib = instr & 0xF0u;
     if (nib == 0xB0u || nib == 0xD0u || nib == 0xF0u) { arm_extra_load_store(s, addr, instr); return; }
-    if (nib == 0x90u) { arm_mul(s, addr, instr); return; }
+    if (nib == 0x90u) {
+        if (is_arm_exclusive(instr)) { arm_exclusive(s, instr); return; }
+        arm_mul(s, addr, instr);
+        return;
+    }
     if (ga >= 0x10u && ga <= 0x17u && (ga & 1u) == 0u && (nib == 0x50u || (nib & 0x90u) == 0x80u)) {
         arm_media(s, addr, instr);
         return;

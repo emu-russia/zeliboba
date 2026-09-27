@@ -8,6 +8,8 @@
 
 #include "common/log.h"
 #include "common/util.h"
+#include "cpu/arm/arm_core.h"
+#include "cpu/arm/arm_mmu.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc.h"
@@ -893,6 +895,10 @@ bool Debugger::execute(const std::string& line) {
         emit(cmd_keyring(args));
         return true;
     }
+    if (command == "faults") {
+        emit(cmd_faults(args));
+        return true;
+    }
     if (command == "info") {
         emit(cmd_info(args));
         return true;
@@ -948,6 +954,7 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  gpo                    boot checkpoint from the GPO lines (0xE20A0000)\n"
         "  console                pending firmware console output (UART +0x70)\n"
         "  bootctx                ARM boot context: CMeP DRAM source and the PA 0 mirror\n"
+        "  faults [all]           MMU fault ring: faulting pc, VA and page-table entry\n"
         "  keyring                captured CMeP keyring state\n"
         "  boot                   boot chain report and plan\n"
         "  info                   image / core / access statistics\n"
@@ -1125,6 +1132,44 @@ std::string Debugger::cmd_boot(const std::vector<std::string>& args) {
     return out;
 }
 
+/// MMU fault ring of the ARM cores: which instruction faulted, at which virtual
+/// address, and which descriptor the walk used. Without this the only trace of a
+/// translation fault is the abort vector the core ends up in, which is exactly
+/// the case that stalled kernel_boot_loader (VBAR 0x16100 is unmapped there, so
+/// the *first* data abort and the vector fetch that follows it look alike).
+std::string Debugger::cmd_faults(const std::vector<std::string>& args) {
+    const bool all = !args.empty() && (to_lower(args[0]) == "all");
+    std::string out;
+    for (int i = 0; i < Vita::kArmCoreCount; ++i) {
+        Cpu* cpu = vita_.arm_core(i);
+        if (!cpu) continue;
+        if (!all && i != arm_core_index_) continue;
+        auto* arm = dynamic_cast<ArmCore*>(cpu);
+        if (!arm) continue;
+        const ArmMmu& mmu = arm->mmu;
+        out += format("arm%d: %llu fault(s), %llu walk(s)  VBAR=0x%08X TTBR0=0x%08X TTBR1=0x%08X TTBCR=0x%X\n", i,
+                      static_cast<unsigned long long>(mmu.total_faults), static_cast<unsigned long long>(mmu.walks),
+                      mmu.vbar, mmu.ttbr0, mmu.ttbr1, mmu.ttbcr);
+        if (mmu.fault_count == 0) {
+            out += "  (no faults recorded)\n";
+            continue;
+        }
+        for (int f = 0; f < mmu.fault_count; ++f) {
+            const ArmMmu::WalkRecord& walk = mmu.faults[f];
+            out += format("  #%d VA=0x%08X pc=0x%08X %-5s %-38s x%d\n", f, walk.va, walk.pc,
+                          walk.fetch ? "fetch" : (walk.write ? "write" : "read"),
+                          arm::fault_name(walk.fault), walk.repeats);
+            out += format("     ttbr%d base=0x%08X L1[0x%03X]@0x%08X=0x%08X", walk.ttbr_num, walk.ttbr_base,
+                          (walk.va >> 20) & 0xFFFu, walk.l1_addr, walk.l1_desc);
+            if (walk.used_l2) {
+                out += format(" L2[0x%02X]@0x%08X=0x%08X", (walk.va >> 12) & 0xFFu, walk.l2_addr, walk.l2_desc);
+            }
+            out += format(" domain=%u\n", walk.domain);
+        }
+    }
+    return out;
+}
+
 std::string Debugger::cmd_keyring(const std::vector<std::string>& args) {
     (void)args;
     std::string out;
@@ -1178,7 +1223,7 @@ std::vector<std::string> Debugger::complete(const std::string& prefix) const {
     static const std::vector<std::string> commands = {
         "step", "run", "runm", "until", "reset", "core", "bp", "bpc", "bpl", "watch", "watchc",
         "wpl", "regs", "reg", "dis", "mem", "poke", "save", "trace", "devices", "map", "devget",
-        "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "stage", "keyring", "info", "load",
+        "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "faults", "stage", "keyring", "info", "load",
         "log", "help", "quit"};
     std::vector<std::string> out;
     for (const auto& command : commands) {

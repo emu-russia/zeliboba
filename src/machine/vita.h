@@ -97,11 +97,15 @@ constexpr u32 kKblParamBase = 0x1F000040;
 constexpr u32 kKblParamDram = 0x4001FD00;
 constexpr u32 kKblParamSize = 0x100;
 constexpr u32 kKblParamMagic = 0xCBAC03AAu;
-/// Where the two SLB2 kernel-module images are staged.  The wiki's Secure DRAM
-/// layout fixes them: kprx_auth_sm.self at 0x40000500 (0x9500 bytes on 3.60) and
-/// prog_rvk.srvk at 0x40009B00.
-constexpr u32 kKprxAuthSmStaging = 0x40000500;
-constexpr u32 kProgRvkStaging = 0x40009B00;
+/// Where the two SLB2 kernel-module images are staged.  The wiki's Physical_Memory
+/// says the CMeP's 128 KiB SRAM (0x00800000, which the ARM sees mirrored at
+/// 0x00040000) "Stores second_loader, secure_kernel and Secure Modules", while the
+/// FW 3.60 secure-DRAM table gives the same modules offsets 0x500/0x9B00 inside the
+/// secure image layout.  The second reading is what the kernel boot loader consumes
+/// through the MeP window, so the modules are staged at those offsets from the SRAM
+/// base and the parameter records the window addresses.
+constexpr u32 kKprxAuthSmStaging = 0x00800500;  // CMeP SRAM base (0x00800000) + 0x500
+constexpr u32 kProgRvkStaging = 0x00809B00;     // CMeP SRAM base (0x00800000) + 0x9B00
 }  // namespace board
 
 class Vita {

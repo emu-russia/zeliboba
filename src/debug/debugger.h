@@ -158,6 +158,7 @@ private:
     std::string cmd_dev(const std::vector<std::string>& args, bool write);
     std::string cmd_emmc(const std::vector<std::string>& args);
     std::string cmd_boot(const std::vector<std::string>& args);
+    std::string cmd_faults(const std::vector<std::string>& args);
     std::string cmd_keyring(const std::vector<std::string>& args);
     std::string cmd_image(const std::vector<std::string>& args);
     std::string cmd_log(const std::vector<std::string>& args);
