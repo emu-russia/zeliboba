@@ -63,8 +63,20 @@ constexpr u32 kSharedSramBase = 0x1F000000;   ///< visible to both ARM and CMeP
 constexpr u32 kSharedSramSize = 0x00040000;   ///< 256 KiB
 /// The ARM's low window aliases the power scratchpad (wiki Physical_Memory:
 /// "0x00000000 0x40000 ARM Boot. By default, alias of physical address 0x1F000000
-/// i.e. ScePower scratchpad").
-constexpr u32 kArmBootWindowSize = 0x00010000;
+/// i.e. ScePower scratchpad").  The window is 256 KiB, which is what puts the
+/// SKBL's vector page at PA 0x16100 inside it.
+constexpr u32 kArmBootWindowSize = 0x00040000;
+/// Vector page kernel_boot_loader points VBAR at (the value comes out of its own
+/// platform table).  It is *not* covered by the table the KBL builds for itself
+/// (that one maps only VA 0x0000-0x7FFF to its scratch copy), so the stage that
+/// runs before it - the wiki's "SKBL Reset Vector" written by the second loader -
+/// is what plants the vector table there.  See Vita::satisfy_arm_boot_fault().
+constexpr u32 kArmVectorPage = 0x00016100;
+/// Wiki's FW 3.60 Secure DRAM layout: "0x40000000 0xC0 SKBL Reset Vector (ARM
+/// entry!)".  The KBL's own ELF carries exactly that 0xC0-byte segment at vaddr 0
+/// (8 vectors + the pointer table: vector[0] is `ldr pc,[pc,#0x18]` and the first
+/// pointer is 0x40020000, i.e. the KBL entry).
+constexpr u32 kSkblResetVectorDram = 0x40000000;
 /// CMeP 128 KiB SRAM (wiki: "0x00800000 0x20000 S Cmep 128KiB SRAM. Stores
 /// second_loader, secure_kernel and Secure Modules").  The ARM sees it mirrored at
 /// 0x00040000-0x0005FFFF ("MeP boot. Mirror of physical address 0x00800000").
@@ -268,6 +280,17 @@ private:
     bool build_kbl_param();
     /// Stage `bytes` into DRAM through the CMeP bus (shared backing store).
     bool stage_in_dram(u32 address, const std::vector<u8>& bytes);
+
+    /// Development substitution for the page tables the stage *before*
+    /// kernel_boot_loader leaves behind.  The ARM boot ROM / the second loader's
+    /// 0xC0-byte reset vector are not in the dumps, so the model cannot reproduce
+    /// their tables; the KBL builds its own (VA 0x0000-0x7FFF -> its DRAM scratch
+    /// copy) and then faults on its first access to the low window (VA 0x40000)
+    /// and on its own vector page (VBAR 0x16100).  Installing the low window as an
+    /// identity mapping in the KBL's own L2 and retrying is what the inherited
+    /// mapping would have provided.  Returns true when the fault was satisfied.
+    bool satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch);
+    u64 boot_fault_fixes_ = 0;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

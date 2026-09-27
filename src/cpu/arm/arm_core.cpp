@@ -315,10 +315,17 @@ void ArmCore::set_access_pc() {
     bus->context.core = name;
 }
 
+arm::MmResult ArmCore::translate_or_fix(u32 va, bool write, bool fetch) {
+    arm::MmResult result = mmu.translate(va, write, fetch, mode());
+    if (result.ok || !fault_hook) return result;
+    if (!fault_hook(core_id_, va, write, fetch)) return result;
+    return mmu.translate(va, write, fetch, mode());
+}
+
 u32 ArmCore::mem_read_word(u32 va, bool fetch) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, false, fetch, mode());
+        const arm::MmResult result = translate_or_fix(va, false, fetch);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = fetch ? arm::FaultKind::Prefetch : arm::FaultKind::Data;
@@ -334,7 +341,7 @@ u32 ArmCore::mem_read_word(u32 va, bool fetch) {
 u32 ArmCore::mem_read_half(u32 va) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, false, false, mode());
+        const arm::MmResult result = translate_or_fix(va, false, false);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Data;
@@ -349,7 +356,7 @@ u32 ArmCore::mem_read_half(u32 va) {
 u32 ArmCore::mem_read_byte(u32 va) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, false, false, mode());
+        const arm::MmResult result = translate_or_fix(va, false, false);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Data;
@@ -364,7 +371,7 @@ u32 ArmCore::mem_read_byte(u32 va) {
 void ArmCore::mem_write_word(u32 va, u32 value) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, true, false, mode());
+        const arm::MmResult result = translate_or_fix(va, true, false);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Data;
@@ -380,7 +387,7 @@ void ArmCore::mem_write_word(u32 va, u32 value) {
 void ArmCore::mem_write_half(u32 va, u32 value) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, true, false, mode());
+        const arm::MmResult result = translate_or_fix(va, true, false);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Data;
@@ -396,7 +403,7 @@ void ArmCore::mem_write_half(u32 va, u32 value) {
 void ArmCore::mem_write_byte(u32 va, u32 value) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(va, true, false, mode());
+        const arm::MmResult result = translate_or_fix(va, true, false);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Data;
@@ -433,7 +440,7 @@ void ArmCore::mem_write_double(u32 va, u64 value) {
 u32 ArmCore::fetch_half(u32 addr) {
     set_access_pc();
     if (mmu.enabled()) {
-        const arm::MmResult result = mmu.translate(addr, false, true, mode());
+        const arm::MmResult result = translate_or_fix(addr, false, true);
         if (!result.ok) {
             pending_mm_fault_ = result;
             pending_fault_ = arm::FaultKind::Prefetch;

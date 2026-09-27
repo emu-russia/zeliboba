@@ -197,7 +197,15 @@ void Vita::build_cores() {
         if (!core) continue;
         core->name = i == 0 ? std::string("ARM Cortex-A9")
                             : format("ARM Cortex-A9 #%d", i);
-        if (ArmCore* arm = dynamic_cast<ArmCore*>(core)) arm->core_id_ = static_cast<u32>(i);
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(core)) {
+            arm->core_id_ = static_cast<u32>(i);
+            // Give the machine a chance to supply the low-window mappings that the
+            // stage before kernel_boot_loader leaves behind (see
+            // Vita::satisfy_arm_boot_fault).
+            arm->fault_hook = [this](u32 id, u32 va, bool write, bool fetch) {
+                return satisfy_arm_boot_fault(id, va, write, fetch);
+            };
+        }
     }
     arm_ = arm_cores_[0].get();
 

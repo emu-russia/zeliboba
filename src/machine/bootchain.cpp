@@ -4,6 +4,7 @@
 
 #include "common/log.h"
 #include "common/util.h"
+#include "cpu/arm/arm_core.h"
 #include "cpu/factory.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
@@ -241,8 +242,57 @@ bool Vita::load_cmep_secure_kernel() {
     return true;
 }
 
-bool Vita::mirror_cmep_scratch_to_arm() {
-    // See the note at the call site: ARM PA 0 mirrors the CMeP's 32 KiB scratch.
+// ---------------------------------------------------------------------------
+// The low window kernel_boot_loader expects to inherit (development substitution)
+// ---------------------------------------------------------------------------
+
+bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
+    // The stage that runs before kernel_boot_loader - the ARM boot ROM together
+    // with the 0xC0-byte "SKBL Reset Vector" the second loader writes to
+    // PA 0x40000000 (wiki Boot_Sequence and the FW 3.60 Secure DRAM layout) - is
+    // what maps the ARM's low window.  None of it is in the dumps, and the table
+    // the KBL builds for itself covers only VA 0x0000-0x7FFF (its DRAM copy of the
+    // first 32 KiB), so the first access to the low window (VA 0x40000, the MeP
+    // boot mirror) and the fetch of its own vector page (VBAR 0x16100) fault.
+    // Reproduce the inherited mapping - identity for VA < 1 MiB, which is where
+    // the ARM's boot aliases live - by adding the missing entry to the KBL's own
+    // L2 and retrying the access.
+    static const bool disabled = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (disabled) return false;
+    if (va >= 0x00100000u) return false;
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+
+    Cpu* cpu = arm_cores_[core].get();
+    ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
+    if (!arm || !arm->mmu.enabled()) return false;
+
+    // Walk the core's own TTBR0: L1 -> coarse L2, the layout the KBL installs.
+    const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
+    const u32 l1_entry = arm_bus_->read32(l1_base + ((va >> 20) & 0xFFFu) * 4u);
+    if ((l1_entry & 3u) != 1u) return false;                    // not a coarse table
+    const u32 l2_base = l1_entry & 0xFFFFFC00u;
+    const u32 l2_index = (va >> 12) & 0xFFu;
+    const u32 slot = l2_base + l2_index * 4u;
+    if (arm_bus_->read32(slot) != 0u) return false;             // already mapped
+
+    // Take the attribute bits from the KBL's own first entry so the substituted
+    // page has the same cacheability/permissions as the pages it installed.
+    u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
+    if ((attributes & 3u) != 2u) attributes = 0x47Eu;           // small page, AP=11
+    arm_bus_->write32(slot, (va & 0xFFFFF000u) | attributes);
+
+    ++boot_fault_fixes_;
+    ZLB_LOG_INFO("machine",
+                 "boot window mapping supplied: arm%u VA 0x%08X -> PA 0x%08X (attr 0x%03X) in L2 0x%08X[0x%02X] (%s)",
+                 core, va, va, attributes, l2_base, l2_index, fetch ? "fetch" : (write ? "write" : "read"));
+    add_milestone("ARM low window mapping supplied for VA 0x" + hex(va, 8) + " (development substitution)");
+    return true;
+}
+
+bool Vita::mirror_cmep_scratch_to_arm() {    // See the note at the call site: ARM PA 0 mirrors the CMeP's 32 KiB scratch.
     constexpr u32 kScratchSize = 0x8000;
     if (shared_sram_.size() < kScratchSize) return false;
     for (u32 i = 0; i < kScratchSize; ++i) arm_bus_->write8(i, shared_sram_[i]);
@@ -363,10 +413,23 @@ bool Vita::start_arm_kernel_boot_loader() {
     }
 
     kbl_entry_ = result.entry;
+    // The KBL's ELF carries the ARM exception vector table as a segment at
+    // vaddr 0: eight `ldr pc,[pc,#0x18]` vectors followed by the handler pointer
+    // table (vector[4] -> 0x40020394, the data abort handler).  The wiki's FW 3.60
+    // Secure DRAM layout pins exactly these 0xC0 bytes at PA 0x40000000 as the
+    // "SKBL Reset Vector (ARM entry!)", and the KBL points VBAR at a copy of them
+    // at board::kArmVectorPage.  The second loader is what normally writes both
+    // copies; the model stages them here so the ARM's exception path exists.
+    std::vector<u8> boot_vectors;
     if (result.elf) {
         for (const Segment& segment : result.elf->segments) {
             ZLB_LOG_DBG("boot", "  KBL segment vaddr=0x%08X memsz=0x%X filesz=0x%X flags=%u", segment.vaddr,
                         segment.memsz, segment.filesz, segment.flags);
+            if (segment.vaddr != 0u || segment.filesz == 0u || segment.filesz > 0x1000u) continue;
+            if ((segment.flags & 1u) == 0u) continue;   // the executable (vector) one
+            if (segment.offset + segment.filesz > result.elf->data.size()) continue;
+            boot_vectors.assign(result.elf->data.begin() + static_cast<ptrdiff_t>(segment.offset),
+                                result.elf->data.begin() + static_cast<ptrdiff_t>(segment.offset + segment.filesz));
         }
     }
     ZLB_LOG_INFO("boot", "KBL first word at 0x%08X = 0x%08X (ram=%d)", kbl_entry_,
@@ -388,15 +451,35 @@ bool Vita::start_arm_kernel_boot_loader() {
     // The syscon releases the whole Kermit cluster, not just the boot core: the
     // kernel boot loader brings the other three cores up itself (each reads MPIDR,
     // builds its own tables and joins the four-core barrier).
+    u32 arm_entry = kbl_entry_;
+    if (boot_vectors.size() >= 0x20u) {
+        // Stage the vector page the KBL's VBAR points at.  The *same* bytes belong
+        // at PA 0x40000000 in the wiki's secure DRAM layout ("SKBL Reset Vector
+        // (ARM entry!)"), but the model's MPCore peripheral block (SCU / global
+        // timer / private timer / GIC) currently sits at 0x40000000+ and
+        // Bus::find_device prefers a device over RAM, so those bytes would land in
+        // SCU_CONTROL and the reset vector would read registers back instead of
+        // pointers.  The block has to move out of the DRAM window first (see the
+        // note on kermit::kMpcoreBase - the test suite still pins the current
+        // placement); until then the ARM starts at the KBL entry, which is what the
+        // reset vector's first pointer resolves to anyway.
+        for (size_t i = 0; i < boot_vectors.size(); ++i) {
+            arm_bus_->write8(board::kArmVectorPage + static_cast<u32>(i), boot_vectors[i]);
+        }
+        ZLB_LOG_INFO("machine", "vector page staged at PA 0x%08X (%zu bytes); ARM entry 0x%08X",
+                     board::kArmVectorPage, boot_vectors.size(), arm_entry);
+        add_milestone("ARM vector page staged at 0x" + hex(board::kArmVectorPage, 8) +
+                      " (development substitution)");
+    }
     for (int i = 0; i < kArmCoreCount; ++i) {
         Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
         if (!core) continue;
-        core->reset(kbl_entry_);
+        core->reset(arm_entry);
         core->prepare_reset_context(0, 0, 0, 0);
         core->halted = false;
     }
     boot_.stage = BootStage::ArmKernelBootLoader;
-    boot_.arm_entry = kbl_entry_;
+    boot_.arm_entry = arm_entry;
     boot_.arm_released = true;
     boot_.detail = "ARM released on the kernel boot loader";
     add_milestone("ARM started on kernel_boot_loader at 0x" + hex(kbl_entry_, 8) + " (" + source + ")");

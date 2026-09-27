@@ -83,6 +83,15 @@ public:
     /// Optional hook for the p0..p14 coprocessor space.
     ArmCoprocessorHook* coprocessor_hook = nullptr;
 
+    /// Optional hook for translation faults: `(core id, va, write, fetch)`.
+    /// A machine can use it to install a mapping the modelled firmware would have
+    /// inherited (see Vita::satisfy_arm_boot_fault) - the access is then retried
+    /// instead of raising the abort.  Returning false keeps the normal path.
+    std::function<bool(u32 core, u32 va, bool write, bool fetch)> fault_hook;
+
+    /// MMU lookup for one access, giving `fault_hook` one chance to fix a miss.
+    arm::MmResult translate_or_fix(u32 va, bool write, bool fetch);
+
     /// Emit one log line per executed instruction.
     bool trace_instructions = false;
 

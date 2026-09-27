@@ -315,6 +315,20 @@ void Debugger::run_until(u32 address, int64_t limit) {
 
 void Debugger::run_machine(int64_t slices) {
     stop_requested_ = false;
+    // A machine slice runs `budget().arm` instructions on *every* core (256 by
+    // default), and breakpoints/watchpoints are only tested at slice boundaries -
+    // so a breakpoint inside a slice is silently skipped.  With breakpoints or
+    // watchpoints armed, drop to one instruction per core per slice so the stop is
+    // exact; a plain runm keeps the fast budget.
+    CoreBudget& budget = vita_.budget();
+    const int saved_arm_budget = budget.arm;
+    if (!breakpoints_.empty() || !watchpoints_.empty()) budget.arm = 1;
+    struct Restore {
+        CoreBudget& budget;
+        int value;
+        ~Restore() { budget.arm = value; }
+    } restore{budget, saved_arm_budget};
+
     for (int64_t i = 0; i < slices && !stop_requested_; ++i) {
         if (vita_.stage() == BootStage::Failed) break;
         u64 trace_from = 0;
@@ -322,6 +336,17 @@ void Debugger::run_machine(int64_t slices) {
             trace_from = std::max(trace_from, bus->trace.total());
         }
         vita_.run_slice();
+        // Slices bypass step(), so record the PC history here as well - "how did
+        // this core get here" is the question a whole-machine run raises most.
+        if (history_enabled_) {
+            for (Arch arch : {Arch::MeP, Arch::Rl78, Arch::Arm}) {
+                Cpu* cpu = arch == Arch::Arm ? vita_.arm_core(arm_core_index_) : vita_.core(arch);
+                if (!cpu || cpu->halted) continue;
+                auto& ring = history_[arch];
+                ring.push_back(cpu->get_pc());
+                while (ring.size() > history_limit_) ring.pop_front();
+            }
+        }
         // Slices bypass step(), so check the watchpoints here as well.
         check_watchpoints(trace_from);
 
