@@ -79,6 +79,13 @@ const Slb2Entry* find_entry(const Slb2Image& image, const std::string& name) {
 // ARM boot ROM model
 // ---------------------------------------------------------------------------
 
+bool Vita::stage_in_dram(u32 address, const std::vector<u8>& bytes) {
+    // Both buses share the DRAM backing store, so either one can take the write;
+    // go through the CMeP because that is the side that consumes the image.
+    for (size_t i = 0; i < bytes.size(); ++i) cmep_bus_->write8(address + static_cast<u32>(i), bytes[i]);
+    return true;
+}
+
 bool Vita::arm_boot_rom_stage_second_loader() {
     if (!emmc_) return false;
 
@@ -97,20 +104,16 @@ bool Vita::arm_boot_rom_stage_second_loader() {
             path = resolve_workspace_path("Vita_104_Firmware/Out/SLB2/second_loader.enp");
             if (auto raw = read_file(path)) {
                 // No container: stage the bare image.
-                if (raw->size() > shared_sram_.size()) {
-                    ZLB_LOG_ERROR("machine", "second loader is %zu bytes, larger than the boot SRAM", raw->size());
-                    return false;
-                }
                 std::vector<u8> staged = *raw;
                 if (config_.provision_keys) {
                     std::string why;
                     provision_boot_keys(*cmep_bus_, staged, why);
                 }
-                std::copy(staged.begin(), staged.end(), shared_sram_.begin());
-                second_loader_pa_ = board::kSharedSramBase;
+                stage_in_dram(board::kSecondLoaderStagingDram, staged);
+                second_loader_pa_ = board::kSecondLoaderStagingDram;
                 cmep_block_->set_arm_to_cmep_command(second_loader_pa_ | 1u);
-                boot_.detail = "staged bare second_loader.enp";
-                add_milestone("ARM boot ROM staged second_loader.enp in boot SRAM (bare file)");
+                boot_.detail = "staged bare second_loader.enp in DRAM";
+                add_milestone("ARM boot ROM staged second_loader.enp in DRAM (bare file)");
                 return true;
             }
             ZLB_LOG_WARN("machine", "no SLB2 container and no second_loader.enp available");
@@ -140,9 +143,8 @@ bool Vita::arm_boot_rom_stage_second_loader() {
         ZLB_LOG_ERROR("machine", "SLB2 does not contain a usable second_loader container");
         return false;
     }
-    if (second->data.size() > shared_sram_.size()) {
-        ZLB_LOG_ERROR("machine", "second loader (%zu B) does not fit the %zu B boot SRAM", second->data.size(),
-                      shared_sram_.size());
+    if (second->data.size() > kermit::kScuSize) {
+        ZLB_LOG_ERROR("machine", "second loader is %zu bytes, larger than the modelled DRAM", second->data.size());
         return false;
     }
 
@@ -158,13 +160,28 @@ bool Vita::arm_boot_rom_stage_second_loader() {
         }
     }
 
-    std::copy(staged.begin(), staged.end(), shared_sram_.begin());
-    second_loader_pa_ = board::kSharedSramBase;
+    stage_in_dram(board::kSecondLoaderStagingDram, staged);
+    second_loader_pa_ = board::kSecondLoaderStagingDram;
     cmep_block_->set_arm_to_cmep_command(second_loader_pa_ | 1u);
+
+    // The second loader also stages the two kernel modules the secure/non-secure
+    // boot loaders hand to the kernel (wiki: "the kprx_auth_sm.self and
+    // prog_rvk.srvk read from the eMMC SLB2 partition are both loaded into DRAM");
+    // their paddrs/sizes go into SceKblParam (0x90/0x98).
+    if (const Slb2Entry* kprx = find_entry(*slb2, "kprx_auth_sm.self"); kprx && !kprx->data.empty()) {
+        stage_in_dram(board::kKprxAuthSmStaging, kprx->data);
+        kprx_auth_sm_pa_ = board::kKprxAuthSmStaging;
+        kprx_auth_sm_size_ = static_cast<u32>(kprx->data.size());
+    }
+    if (const Slb2Entry* rvk = find_entry(*slb2, "prog_rvk.srvk"); rvk && !rvk->data.empty()) {
+        stage_in_dram(board::kProgRvkStaging, rvk->data);
+        prog_rvk_pa_ = board::kProgRvkStaging;
+        prog_rvk_size_ = static_cast<u32>(rvk->data.size());
+    }
 
     add_milestone("ARM boot ROM staged " + second->name + " at 0x" + hex(second_loader_pa_, 8) + " (" +
                   std::to_string(second->data.size()) + " bytes)");
-    boot_.detail = "second loader staged in boot SRAM";
+    boot_.detail = "second loader staged in DRAM";
     ZLB_LOG_INFO("machine", "mailbox 0xE0000010 <- 0x%08X (image present)", second_loader_pa_ | 1u);
     return true;
 }
@@ -216,6 +233,7 @@ bool Vita::load_cmep_secure_kernel() {
     cmep_->reset(board::kCmepSecureKernelBase);
     cmep_->halted = false;
     secure_kernel_active_ = true;
+    secure_kernel_size_ = static_cast<u32>(data->size());
     boot_.stage = BootStage::CmepSecureKernel;
     boot_.detail = format("CMeP secure kernel loaded directly at 0x%08X", board::kCmepSecureKernelBase);
     add_milestone("CMeP secure kernel loaded directly at 0x" + hex(board::kCmepSecureKernelBase, 8) + " (" +
@@ -232,6 +250,66 @@ bool Vita::mirror_cmep_scratch_to_arm() {
     ZLB_LOG_INFO("boot", "mirrored the CMeP scratch (32 KiB) to ARM PA 0 (context at +0x100: %08X %08X)",
                  arm_bus_->read32(0x100), arm_bus_->read32(0x104));
     add_milestone("CMeP scratch mirrored to ARM PA 0 (boot context visible to the ARM)");
+    return true;
+}
+
+bool Vita::build_kbl_param() {
+    // SceKblParam - the 0x100-byte record the second loader creates and the secure
+    // and non-secure kernel boot loaders read (wiki: KBL_Param).  Its DIP-switch
+    // field sits at physical 0x1F000080, which fixes the record at 0x1F000040 in
+    // SPAD32K.  The per-console chain that would build it cannot complete in this
+    // model, so the documented fields are written here (a development
+    // substitution; the magic and layout follow the wiki).
+    const u32 base = board::kKblParamBase;
+    auto put8 = [&](u32 offset, u8 value) { arm_bus_->write8(base + offset, value); };
+    auto put32 = [&](u32 offset, u32 value) { arm_bus_->write32(base + offset, value); };
+
+    for (u32 i = 0; i < board::kKblParamSize; ++i) put8(i, 0);
+    put8(0x00, 1);                                         // version
+    put8(0x01, 0);
+    put8(0x02, board::kKblParamSize & 0xFF);               // size = 0x100
+    put8(0x03, (board::kKblParamSize >> 8) & 0xFF);
+    put32(0x04, 0x01040000);                               // current firmware version (1.04)
+    put32(0x08, 0x01040000);                               // minimum firmware version (SMI leaf)
+    // 0x20 QA flags: none.  0x30 boot flags: no Ernie NVS overrides.
+    // 0x40 DIP switches (0x20 bytes): no CP board (zeroes), then the release-mode
+    // values the wiki lists (sdk 0, shell 0, debug 0x00080002, system 0x20000000).
+    put32(0x50, 0x00000000);                               // SDK (SCE) flags
+    put32(0x54, 0x00000000);                               // Shell flags
+    put32(0x58, 0x00080002);                               // Debug control flags (release)
+    put32(0x5C, 0x20000000);                               // System control flags (release)
+    put32(0x60, 0x40000000);                               // DRAM base paddr
+    put32(0x64, kermit::kScuSize);                         // DRAM size (modelled window)
+    put32(0x6C, 0x00000004);                               // boot type indicator 1: product mode
+    // 0x70 OpenPsId: no per-console id in the dumps, left zero.
+    put32(0x80, board::kCmepSecureKernelBase);             // secure_kernel.enp paddr
+    put32(0x84, secure_kernel_size_);
+    // 0x88 context_auth_sm.self: not present in the 1.04 SLB2.
+    put32(0x90, kprx_auth_sm_pa_);                         // kprx_auth_sm.self paddr
+    put32(0x94, kprx_auth_sm_size_);
+    put32(0x98, prog_rvk_pa_);                             // prog_rvk.srvk paddr
+    put32(0x9C, prog_rvk_size_);
+    put32(0xA8, 0x5A5A0001);                               // __stack_chk_guard (model constant)
+    put32(0xAC, 0xA5A50002);                               // unknown (model constant)
+    for (u32 i = 0; i < 0x10; ++i) put8(0xB0 + i, static_cast<u8>(0x10 + i));  // session id
+    put32(0xC0, 0x00000060);                               // sleep factor (syscon cmd 3)
+    put32(0xC4, 0x0000FF14);                               // wakeup factor (syscon cmd 0x10)
+    put32(0xC8, 0x00000040);                               // USB info (syscon cmd 0x800)
+    put32(0xCC, 0x00000000);                               // boot controls info (cmd 0x100)
+    put32(0xD0, 0x00000000);                               // resume context paddr (cold boot)
+    put32(0xD4, 0x00406000);                               // hardware info (syscon cmd 5, IRS-002)
+    put32(0xD8, 0x0000000C);                               // power info: AC + power button
+    put32(0xE8, 0x00000000);                               // hardware info 2 (syscon cmd 6)
+    put32(0xF8, 0x00010000);                               // bootloader revision
+    put32(0xFC, board::kKblParamMagic);                    // magic 0xCBAC03AA
+
+    ZLB_LOG_INFO("boot",
+                 "SceKblParam built at 0x%08X (magic 0x%08X, dram 0x%08X+0x%X, kprx_auth_sm 0x%08X/0x%X, "
+                 "prog_rvk 0x%08X/0x%X)",
+                 base, arm_bus_->read32(base + 0xFC), arm_bus_->read32(base + 0x60),
+                 arm_bus_->read32(base + 0x64), arm_bus_->read32(base + 0x90), arm_bus_->read32(base + 0x94),
+                 arm_bus_->read32(base + 0x98), arm_bus_->read32(base + 0x9C));
+    add_milestone("SceKblParam built at 0x1F000040 (development substitution, wiki layout)");
     return true;
 }
 
@@ -281,6 +359,12 @@ bool Vita::start_arm_kernel_boot_loader() {
     }
     ZLB_LOG_INFO("boot", "KBL first word at 0x%08X = 0x%08X (ram=%d)", kbl_entry_,
                  arm_bus_->read32(kbl_entry_), arm_bus_->is_ram(kbl_entry_, 64) ? 1 : 0);
+
+    // SceKblParam has to be in place before the boot loader runs: the wiki pins its
+    // DIP-switch field at 0x1F000080 and the loaders read the DRAM range, the boot
+    // type and the staged kernel-module paddrs out of it.  Build it first, then
+    // mirror the scratch so the record is visible at ARM PA 0x40 as well.
+    build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
     // "mirror mapped to 0x00000000 on ARM", and the second loader copies its ARM

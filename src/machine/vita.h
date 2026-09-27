@@ -74,6 +74,19 @@ constexpr u32 kFirstLoaderServiceEntry = 0x0005FF00;
 /// vector table of absolute jumps to 0x800100/0x80028C/0x8002A6/0x80037A, i.e.
 /// the image runs from the CMeP's private 2 MiB window at 0x800000.
 constexpr u32 kCmepSecureKernelBase = 0x00800000;
+/// Where the ARM boot ROM stages the second-loader container.  This must *not* be
+/// the shared SRAM: the wiki's `KBL Param` page pins the SceKblParam DIP-switch
+/// field at physical 0x1F000080, i.e. the record lives at 0x1F000040 inside
+/// SPAD32K, and staging the container there overwrote it (see kKblParamBase).
+constexpr u32 kSecondLoaderStagingDram = 0x407C0000;  ///< inside the shared DRAM window
+/// SceKblParam: 0x100-byte record the second loader builds and the secure/non-secure
+/// kernel boot loaders read (wiki KBL_Param).
+constexpr u32 kKblParamBase = 0x1F000040;
+constexpr u32 kKblParamSize = 0x100;
+constexpr u32 kKblParamMagic = 0xCBAC03AAu;
+/// Where the two SLB2 kernel-module images are staged for the boot loaders.
+constexpr u32 kKprxAuthSmStaging = 0x40780000;
+constexpr u32 kProgRvkStaging = 0x407A0000;
 }  // namespace board
 
 class Vita {
@@ -232,6 +245,11 @@ private:
     /// window at PA 0, which is where the wiki says the scratch is mirrored.
     bool mirror_cmep_scratch_to_arm();
 
+    /// Write the SceKblParam record (wiki KBL_Param) at board::kKblParamBase.
+    bool build_kbl_param();
+    /// Stage `bytes` into DRAM through the CMeP bus (shared backing store).
+    bool stage_in_dram(u32 address, const std::vector<u8>& bytes);
+
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the
     /// end of its work (see docs/KBL.md, round 39).
@@ -244,6 +262,12 @@ private:
     bool secure_kernel_active_ = false;
     /// Set when the secure kernel re-enters the 0x40000 window (its "done" path).
     bool secure_kernel_done_ = false;
+    /// SceKblParam inputs collected while staging the SLB2 images.
+    u32 secure_kernel_size_ = 0;
+    u32 kprx_auth_sm_pa_ = 0;
+    u32 kprx_auth_sm_size_ = 0;
+    u32 prog_rvk_pa_ = 0;
+    u32 prog_rvk_size_ = 0;
 
     EmmcCard& emmc_ref() { return *emmc_; }
 
