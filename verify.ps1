@@ -9,7 +9,7 @@
 param(
     [int]$Steps = 400000,
     [switch]$SkipBuild,
-    [int]$BaselineFailures = 15
+    [int]$BaselineFailures = 12
 )
 
 $ErrorActionPreference = "Continue"
