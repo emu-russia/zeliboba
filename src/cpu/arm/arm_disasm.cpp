@@ -610,15 +610,33 @@ void arm_media(DState& s, u32 addr, u32 instr) {
         case 0x7Cu: case 0x7Du: case 0x7Eu: case 0x7Fu:
             arm_bitfield(s, instr, rd);
             return;
-        case 0x71u: case 0x72u: case 0x73u:
-        case 0x75u: case 0x76u: case 0x77u: {
-            const u32 kind = (g >> 1) & 3u;
-            const char* nm = kind == 0u ? "smmul" : (kind == 2u ? "smmla" : "smmls");
-            s.s(nm);
-            if (bit5) s.c('r');
+        case 0x71u:  // SDIV Rd, Rn, Rm (ARM ARM A8.8.165)
+            s.s("sdiv"); s.cond_suffix(); s.c(' ');
+            s.reg(rn); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
+            return;
+        case 0x73u:  // UDIV Rd, Rn, Rm (ARM ARM A8.8.174)
+            s.s("udiv"); s.cond_suffix(); s.c(' ');
+            s.reg(rn); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
+            return;
+        case 0x75u: {
+            // SMMUL/SMMULR/SMMLA/SMMLAR/SMMLS/SMMLSR (ARM ARM A8.8.166-A8.8.169):
+            // one opcode space, bits [7:4] = 0001 SMMLA, 0011 SMMLAR, 1101
+            // SMMLS, 1111 SMMLSR; Ra == 1111 in the 0001/0011 forms is the
+            // plain SMMUL/SMMULR. capstone prints Rd, Rn(bits [3:0]),
+            // Rm(bits [11:8]) and then Ra. The old table derived the form from
+            // bits [21:20] and never looked at the Ra field, so it printed
+            // every SMMUL as SMMLA and every SDIV/UDIV as a multiply.
+            const u32 nibble = instr & 0xF0u;
+            if (nibble != 0x10u && nibble != 0x30u && nibble != 0xD0u && nibble != 0xF0u) break;
+            const bool round = (nibble & 0x20u) != 0u;
+            const bool subtract = (nibble & 0xC0u) == 0xC0u;
+            // `rn` is bits [19:16] and is Rd; `rd` is bits [15:12] and is Ra.
+            const bool accumulate = subtract || rd != 15;
+            s.s(subtract ? "smmls" : (rd == 15 ? "smmul" : "smmla"));
+            if (round) s.c('r');
             s.cond_suffix(); s.c(' ');
-            s.reg(rd); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
-            if (kind != 0u) { s.s(", "); s.reg(rn); }
+            s.reg(rn); s.s(", "); s.reg(rm); s.s(", "); s.reg(rs);
+            if (accumulate) { s.s(", "); s.reg(rd); }
             return;
         }
         default:

@@ -63,117 +63,139 @@ bool bigmac_trace() {
     return on;
 }
 
-/// Development substitution for the SMI leaf, applied to the decrypted second
-/// loader (see docs/KBL.md, round 23).  The loader validates the idstorage SMI
-/// leaf (id 0x80) with keyed integrity checks and an SCE signature whose keys are
-/// baked into its own image and exist in no dump, exactly like the fused boot key
-/// the RSA check of the first stage uses - and that one is already substituted by
-/// machine/bootkeys.cpp.  The four conditional branches below are the only places
-/// that turn a failed check into the loader's error exit, so clearing them lets
-/// the boot chain continue into the secure kernel hand-off.  `ZLB_NO_SUBSTITUTION=1`
-/// turns the substitution off so the unmodified behaviour stays reproducible.
-void apply_development_substitutions(Bus& bus, u32 base, size_t length) {
-    static const bool disabled = [] {
-        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
-        return value != nullptr && value[0] != '0';
-    }();
-    if (disabled) return;
-    // The staged second loader is decrypted to 0x40000 (91648 bytes).
-    constexpr u32 kSecondLoaderBase = 0x00040000;
-    if (base != kSecondLoaderBase || length < 0x16600) return;
-    struct Patch {
-        u32 address;   ///< offset from the image base
-        u32 length;    ///< bytes to clear
-        const char* what;
-    };
-    static const Patch kPatches[] = {
-        {0x63A0, 4, "SMI outer signature check"},
-        {0x63D4, 4, "SMI signature post-check"},
-        {0x6488, 2, "SMI integrity check 1"},
-        {0x64A6, 2, "SMI integrity check 2"},
+/// The staged second loader is decrypted to 0x40000 (cmep::kRamBase).
+constexpr u32 kSecondLoaderBase = 0x00040000;
+
+/// Entries are `{offset, length, word, forced, what}` (see cmep_internal.h).
+/// Every "clear" entry is applied before any "forced" one: 0x64A6 appears in
+/// both, and the replacement instruction has to win over the cleared branch.
+using cmep_detail::SecondLoaderPatch;
+const SecondLoaderPatch kSecondLoaderPatches[] = {
+    {0x63A0, 4, 0, false, "SMI outer signature check"},
+        {0x63D4, 4, 0, false, "SMI signature post-check"},
+        {0x6488, 2, 0, false, "SMI integrity check 1"},
+        {0x64A6, 2, 0, false, "SMI integrity check 2"},
         // The per-console configuration record carries a MAC over its payload
         // (bytes 8..39) that the boot chain verifies with the same keyed Bigmac
         // family the SMI payload uses - keyring slot 0x213, which no dump in the
         // workspace has (see docs/KBL.md round 26).  The three branches after
         // 0x49272/0x48CDE turn a failed verification into the 0x800F0027 exit.
-        {0x9122, 2, "configuration record MAC check 1"},
-        {0x912C, 2, "configuration record MAC check 2"},
-        {0x9136, 2, "configuration record MAC check 3"},
+        {0x9122, 2, 0, false, "configuration record MAC check 1"},
+        {0x912C, 2, 0, false, "configuration record MAC check 2"},
+        {0x9136, 2, 0, false, "configuration record MAC check 3"},
         // The index-15 record goes through its own validator (0x429xx): it
         // compares the record's keyed digest (0x42E42) against the stored field
         // with 0x4C3AA and exits with 0x800F0027 on a mismatch.
-        {0x292E, 2, "configuration record 0x0F digest check"},
-        // Boot-context gate.  At 0x40850 the second loader tests a flag it took
-        // from the hardware-info reply (`lw $8,0x3c($sp)` / `srl $8,0x7` /
-        // `and3 $8,$8,0x1` at 0x40596) and skips building the ARM boot context
-        // when the bit is clear: `beqz $8,0x40858`.  Our syscon reply leaves that
-        // bit clear, so the context the ARM reads at PA 0 stays empty and the
-        // kernel boot loader has no memory map (see docs/KBL.md round 42).
-        // Clearing the branch lets the copy from DRAM to the scratch run.
-        {0x40850, 2, "ARM boot-context gate (beqz $8,0x40858)"},
-    };
-    for (const Patch& patch : kPatches) {
-        const u32 address = kSecondLoaderBase + patch.address;
-        for (u32 i = 0; i < patch.length; ++i) bus.write8(address + i, 0x00);
-        ZLB_LOG_INFO("bigmac", "development substitution: cleared the %s at 0x%05X (ZLB_NO_SUBSTITUTION=1 disables)",
-                     patch.what, address);
-    }
-    // The SMI signature itself cannot be forged: the validator exponentiates the
-    // leaf's signature with the SMI public key at 0x4D024 (e = 0x00010001) and
-    // bignum_run (0x4BBCE) then insists on a valid PKCS#1 v1.5 block - dest[0] =
-    // 0, dest[1] <= 1, ... (0x4BC1E..0x4BD22) - which our zero-filled signature
-    // leaf can never produce, so the engine reports 0x800F0024 and 0x4643C takes
-    // the error exit.  Replacing that one conditional branch at 0x4643C
-    // (`beqz $0,0x4648C`, word 0xA050) with `bra 0x4648C` (word 0xB050) makes the
-    // validation continue on the "signature verified" path.
-    //
-    // The SMI validator's two keyed checks (0x4646E and 0x4648C) then open keyring
-    // slot 0x213 - the per-console key that encrypts the SMI payload - and run
-    // the second loader's keyed Bigmac family (function 0x2309/0x238A/0x2093,
-    // bit 13 = "the flags field names the keyring slot").  Without that key the
-    // operations fail with 0x800F0005 at 0x45042 and the validator hands that
-    // status back to its caller even though every branch that reads it is
-    // already substituted.  Installing `mov $0,0; bra 0x464AE` over the second
-    // check's branch makes the validator report success, which is exactly the
-    // result the hardware produces on a console that owns the key.
-    struct ForcedBranch {
-        u32 address;  ///< offset from the image base
-        u32 word;     ///< MeP instruction(s) to install, little-endian
-        u32 length;   ///< 2 or 4 bytes
-        const char* what;
-    };
-    static const ForcedBranch kBranches[] = {
-        {0x643C, 0xB050u, 2, "SMI RSA result check (beqz $0,0x4648C -> bra 0x4648C)"},
-        {0x64A6, 0xB0065000u, 4, "SMI keyed check 2 result (mov $0,0; bra 0x464AE)"},
+        {0x292E, 2, 0, false, "configuration record 0x0F digest check"},
+        // There used to be a ninth entry here, "ARM boot-context gate
+        // (beqz $8,0x40858)", written with the *absolute* address 0x40850 while
+        // every other entry is an offset from 0x40000.  The loop therefore
+        // patched 0x80850 - unmapped memory (reads return 0xFFFFFFFF) - so the
+        // substitution never had any effect, although it logged that it did
+        // (docs/KBL.md round 91).  It also modelled the wrong thing: the branch
+        // at 0x40850 is the *cold boot / resume* selector.  $8 is bit 7 of the
+        // syscon wakeup factor (`lw $8,0x3c($sp)` at 0x40596, `srl $8,7`,
+        // `and3 $8,$8,1`; command 0x0010 answers 0xFF14 on a cold boot and
+        // 0xFF80 on a resume), the *taken* branch is the cold path (0x40858 ->
+        // 0x4112E, which builds the context), and only the not-taken, resume-only
+        // path (0x40852 -> 0x40A86) copies a saved context from DRAM to the
+        // scratchpad.  Forcing it on a cold boot would have invented a resume.
+        //
+        // The entries below replace an instruction instead of clearing one.
+        //
+        // The SMI signature itself cannot be forged: the validator exponentiates
+        // the leaf's signature with the SMI public key at 0x4D024 (e = 0x00010001)
+        // and bignum_run (0x4BBCE) then insists on a valid PKCS#1 v1.5 block -
+        // dest[0] = 0, dest[1] <= 1, ... (0x4BC1E..0x4BD22) - which our
+        // zero-filled signature leaf can never produce, so the engine reports
+        // 0x800F0024 and 0x4643C takes the error exit.  Replacing that one
+        // conditional branch at 0x4643C (`beqz $0,0x4648C`, word 0xA050) with
+        // `bra 0x4648C` (word 0xB050) makes the validation continue on the
+        // "signature verified" path.
+        //
+        // The SMI validator's two keyed checks (0x4646E and 0x4648C) then open
+        // keyring slot 0x213 - the per-console key that encrypts the SMI payload -
+        // and run the second loader's keyed Bigmac family (function
+        // 0x2309/0x238A/0x2093, bit 13 = "the flags field names the keyring
+        // slot").  Without that key the operations fail with 0x800F0005 at
+        // 0x45042 and the validator hands that status back to its caller even
+        // though every branch that reads it is already substituted.  Installing
+        // `mov $0,0; bra 0x464AE` over the second check's branch makes the
+        // validator report success, which is exactly the result the hardware
+        // produces on a console that owns the key.
+        {0x643C, 2, 0xB050u, true, "SMI RSA result check (beqz $0,0x4648C -> bra 0x4648C)"},
+        {0x64A6, 4, 0xB0065000u, true, "SMI keyed check 2 result (mov $0,0; bra 0x464AE)"},
         // The configuration-record validator (0x4906C) ends in `mov $0,$5`, so a
         // failed MAC leaves 0x78000/0x800F0005 in the return value even when its
         // branches are cleared.  Forcing `mov $0,0` makes the validator report
         // success, the same substitution the SMI validator gets.
-        {0x918C, 0x5000u, 2, "configuration record validator result (mov $0,0)"},
+        {0x918C, 2, 0x5000u, true, "configuration record validator result (mov $0,0)"},
         // The "SCE" command dispatcher (0x4A6DE) validates the structures it is
         // handed (`*(arg) != 0`, the size field, `[structure+8] == 5`, ...) and
         // reports 0x800F0624/0x800F0616 for anything it does not like.  Its
         // answers come from the secure engine, which needs the per-console
         // keyring; the model echoes the request block instead, so the dispatcher
         // is forced to report success (same development substitution as above).
-        {0xABF0, 0x5000u, 2, "SCE command dispatcher result (mov $0,0)"},
+        {0xABF0, 2, 0x5000u, true, "SCE command dispatcher result (mov $0,0)"},
         // The SCE answer validator (0x49D4E..0x49D5C) compares fields of the
         // engine's answer with values the request carried; with the engine
         // substituted those never line up, so the validator is forced to report
         // success as well (its single epilogue is `mov $0,$5`).
-        {0x9D5C, 0x5000u, 2, "SCE answer validator result (mov $0,0)"},
+        {0x9D5C, 2, 0x5000u, true, "SCE answer validator result (mov $0,0)"},
     };
-    for (const ForcedBranch& branch : kBranches) {
-        const u32 address = kSecondLoaderBase + branch.address;
-        for (u32 i = 0; i < branch.length; ++i) {
-            bus.write8(address + i, static_cast<u8>((branch.word >> (8 * i)) & 0xFF));
+// Development substitution for the SMI leaf, applied to the decrypted second
+// loader (see docs/KBL.md, round 23).  The loader validates the idstorage SMI
+// leaf (id 0x80) with keyed integrity checks and an SCE signature whose keys are
+// baked into its own image and exist in no dump, exactly like the fused boot key
+// the RSA check of the first stage uses - and that one is already substituted by
+// machine/bootkeys.cpp.  The four conditional branches below are the only places
+// that turn a failed check into the loader's error exit, so clearing them lets
+// the boot chain continue into the secure kernel hand-off.  `ZLB_NO_SUBSTITUTION=1`
+// turns the substitution off so the unmodified behaviour stays reproducible.
+void apply_development_substitutions(Bus& bus, u32 base, size_t length) {
+    static const bool disabled = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (disabled) return;
+    if (base != kSecondLoaderBase || length < cmep_detail::kSecondLoaderStagedBytes) return;
+    // Apply every cleared branch first and the forced instructions afterwards:
+    // 0x64A6 is in both groups, and the replacement has to win.
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool forced_pass = pass == 1;
+        for (const SecondLoaderPatch& patch : kSecondLoaderPatches) {
+            if (patch.forced != forced_pass) continue;
+            const u32 address = kSecondLoaderBase + patch.offset;
+            // Guard against exactly the round-91 mistake: a patch that lands
+            // outside the staged image writes nowhere and would only lie in the
+            // log.  Unmapped addresses read back as 0xFFFFFFFF.
+            if (!bus.is_ram(address, patch.length)) {
+                ZLB_LOG_WARN("bigmac",
+                             "development substitution %s targets 0x%05X, which is not mapped memory - "
+                             "the patch has no effect (is the offset an absolute address?)",
+                             patch.what, address);
+                continue;
+            }
+            for (u32 i = 0; i < patch.length; ++i) {
+                const u8 value = patch.forced ? static_cast<u8>((patch.word >> (8 * i)) & 0xFF) : 0x00;
+                bus.write8(address + i, value);
+            }
+            ZLB_LOG_INFO("bigmac", "development substitution: %s the %s at 0x%05X (ZLB_NO_SUBSTITUTION=1 disables)",
+                         patch.forced ? "forced" : "cleared", patch.what, address);
         }
-        ZLB_LOG_INFO("bigmac", "development substitution: forced %s at 0x%05X (ZLB_NO_SUBSTITUTION=1 disables)",
-                     branch.what, address);
     }
 }
 
 }  // namespace
+namespace cmep_detail {
+
+const SecondLoaderPatch* second_loader_patches(size_t& count) {
+    count = sizeof(kSecondLoaderPatches) / sizeof(kSecondLoaderPatches[0]);
+    return kSecondLoaderPatches;
+}
+
+}  // namespace cmep_detail
+
 namespace cmep_detail {
 
 namespace {

@@ -1,5 +1,7 @@
 // zeliboba - boot chain orchestration.
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/log.h"
@@ -356,6 +358,68 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
 // arrive pre-populated from the stage before the KBL, and that is what to model next.
 // Disabled with ZLB_NO_SUBSTITUTION=1 (which wins over ZLB_ALLOC_CARVE).
 bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
+    // Substitution: the KBL's partition has an empty block cache in every size
+    // class because nothing in the loader ever *adds* memory to it (it only ever
+    // returns blocks, 0x40032768, and no block was ever handed out).  Every
+    // allocation it makes for itself asks for flag 0x10, which `bics r0, fp, #0x33`
+    // at 0x40032356 reads as "the block must come from the cache, never carve", so
+    // all of them fail with 0x80020005 - including the two the boot-init walk needs:
+    // the fixed heap instance (0x40031BE4, class 0x2000) and the object manager's
+    // own block (0x4002BB62, class 0x1000).  The cache slot layout is the one the
+    // partition's own init (0x400321E8..0x40032236) writes: per core, {u16 target,
+    // u16 count, u32 head, u32[3] extra}, classes 0x1000/0x2000 at +0x00/+0x20,
+    // table at partition+0x9C (VA 0x52C0 in this run, per-core stride 0x20).
+    constexpr u32 kInstanceAllocPc = 0x40031BE4u;    // bl 0x40032278 (0x2000)
+    constexpr u32 kManagerAllocPc = 0x4002BB62u;     // bl 0x40032278 (0x1000)
+
+    // Experiment (ZLB_PART_ALLOC_CARVE=1): same two call sites, but the cache-only
+    // flag is cleared so the allocator takes its own carving path (0x40032366).
+    // Result (docs/KBL.md round 72): the carve path does *not* succeed either - the
+    // free-list slot for a class is a decoy node, so the carve falls into the page
+    // scan (0x400324D4) and out again, leaving the state unchanged.
+    static const bool carve_experiment = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (value != nullptr && value[0] != '0') return false;
+        const char* carve = std::getenv("ZLB_PART_ALLOC_CARVE");
+        return carve != nullptr && carve[0] != '0';
+    }();
+    if (carve_experiment && (pc == kInstanceAllocPc || pc == kManagerAllocPc)) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            Cpu* cpu = arm_cores_[core].get();
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(cpu)) {
+                u64 flags = 0;
+                if (arm->get_register("r2", flags)) {
+                    arm->set_register("r2", flags & ~0x10ull);
+                    ++boot_pc_fixes_;
+                    if (boot_pc_fixes_ <= 2) {
+                        ZLB_LOG_INFO("machine",
+                                     "partition allocator: flag 0x10 -> 0x%llX at pc=0x%08X "
+                                     "(ZLB_PART_ALLOC_CARVE experiment)",
+                                     static_cast<unsigned long long>(flags & ~0x10ull), pc);
+                    }
+                }
+            }
+        }
+        return false;    // the instruction still has to run
+    }
+
+    // Substitution (on by default, off with ZLB_NO_SUBSTITUTION=1): the allocator is
+    // about to run with the cache-only flag and a class whose cache slot is empty.
+    static const bool supply_blocks = [] {
+        const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+        return value == nullptr || value[0] == '0';
+    }();
+    if (supply_blocks && (pc == kInstanceAllocPc || pc == kManagerAllocPc)) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 size = 0;
+                arm->get_register("r1", size);
+                supply_kbl_partition_block(core, static_cast<u32>(size));
+            }
+        }
+        return false;    // fall through to the instruction itself
+    }
+
     constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
     constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
     static const bool disabled = [] {
@@ -380,6 +444,168 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     }
     ++boot_pc_fixes_;
     return true;
+}
+
+// Substitution body: put `blocks` free blocks of the requested class into the
+// calling core's cache slot of the KBL's own partition (VA 0x51C0).  The partition
+// record and its cache table are addressed through the core's active page tables,
+// because the loader rebuilds them while it boots (docs/KBL.md round 57).
+bool Vita::supply_kbl_partition_block(u32 core, u32 size) {
+    // Only the two classes the boot-init walk actually needs.
+    u32 class_offset = 0;
+    u32 class_index = 0;
+    u32 block_size = 0;
+    if (size == 0x1000u) {
+        class_offset = 0x00u;
+        class_index = 0;
+        block_size = 0x1000u;
+    } else if (size == 0x2000u) {
+        class_offset = 0x20u;
+        class_index = 1;
+        block_size = 0x2000u;
+    } else {
+        return false;
+    }
+
+    static bool configured = false;
+    if (!configured) {
+        configured = true;
+        if (const char* value = std::getenv("ZLB_PART_BLOCK_CACHE")) {
+            const long count = std::strtol(value, nullptr, 0);
+            partition_blocks_per_class_ = count > 0 ? static_cast<u32>(count) : 1u;
+        }
+    }
+    const u32 blocks = partition_blocks_per_class_;
+
+    Cpu* cpu = arm_cores_[core].get();
+    ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
+    if (!arm) return false;
+    auto read_va = [&](u32 va, bool& ok) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, false, false, pa, fault)) {
+            ok = false;
+            return 0u;
+        }
+        return arm_bus_->read32(pa);
+    };
+    auto write_va = [&](u32 va, u32 value) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, value);
+        return true;
+    };
+
+    constexpr u32 kPartitionVa = 0x000051C0u;    // the KBL's partition record (POOL)
+    bool ok = true;
+    const u32 magic = read_va(kPartitionVa + 0x08u, ok);
+    if (!ok || magic != 0x4080502Bu) return false;   // partition not built yet
+    const u32 cache_table = read_va(kPartitionVa + 0x9Cu, ok);
+    if (!ok || cache_table == 0u) return false;
+
+    const u32 slot = cache_table + core * 0x20u + class_offset;
+    const u32 target = read_va(slot, ok);
+    const u32 count = read_va(slot + 4u, ok) & 0xFFFFu;   // low half of the {target,count} word
+    if (count != 0u) return false;                         // the KBL filled it itself
+
+    // The blocks come from the unused tail of the region the partition describes
+    // (region record at VA 0x5180: base at +0x00, size at +0x04), so they stay
+    // inside the memory the loader itself owns.
+    bool region_ok = true;
+    const u32 region_base = read_va(0x00005180u, region_ok);
+    const u32 region_size = read_va(0x00005184u, region_ok);
+    if (!region_ok || region_size == 0u) {
+        partition_region_base_ = 0x40000000u;
+        partition_region_size_ = 0x00300000u;
+    } else {
+        partition_region_base_ = region_base;
+        partition_region_size_ = region_size;
+    }
+    u32& next = partition_block_next_[class_index];
+    if (next == 0u || next + block_size * blocks > partition_region_size_) {
+        // Seed at half the region and grow: everything below is used by the
+        // loader's own structures in this run.
+        next = partition_region_size_ / 2u;
+    }
+
+    u32 head = 0;
+    for (u32 i = 0; i < blocks; ++i) {
+        const u32 block = partition_region_base_ + next;
+        next += block_size;
+        write_va(block, 0u);                 // empty link (the allocator rewrites it)
+        write_va(block + 4u, 0u);
+        head = block;
+    }
+    // Head first, then the count: the allocator only looks when the count is set.
+    if (!write_va(slot + 4u, head)) return false;
+    if (!write_va(slot, (target & 0xFFFF0000u) | (blocks & 0xFFFFu))) return false;
+
+    ++partition_supplied_;
+    if (partition_supplied_ <= 2) {
+        ZLB_LOG_INFO("machine",
+                     "partition block cache supplied: arm%u class 0x%X -> %u block(s) at VA 0x%08X "
+                     "(slot 0x%08X) (development substitution)",
+                     core, size, blocks, head, slot);
+        add_milestone("KBL partition block cache pre-populated for class 0x" + hex(size, 0) +
+                      " (development substitution)");
+    }
+    return true;
+}
+
+// Diagnostic PC tracer (see vita.h).  Enabled only when ZLB_PCTRAP=<lo>-<hi> is
+// set; it never changes the run, it only writes to stderr, so it can be left on
+// while the machine executes hundreds of millions of instructions.
+bool Vita::trace_arm_boot_pc(u32 core, u32 pc) {
+    if (!pc_trace_enabled_) return false;
+    if (pc < pc_trace_lo_ || pc > pc_trace_hi_) return false;
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (!arm) return false;
+
+    const u32 insn = (arm->cpsr & 0x20u) ? arm_bus_->read16(pc) : arm_bus_->read32(pc);
+    std::fprintf(stderr,
+                 "[pctrap] arm%u pc=%08X insn=%08X sp=%08X lr=%08X r0=%08X r1=%08X r2=%08X r3=%08X "
+                 "r4=%08X r5=%08X r6=%08X r7=%08X\n",
+                 core, pc, insn, arm->r[13], arm->r[14], arm->r[0], arm->r[1], arm->r[2], arm->r[3],
+                 arm->r[4], arm->r[5], arm->r[6], arm->r[7]);
+    if (pc == 0x4003234Eu || pc == 0x40032366u || pc == 0x400327D6u || pc == 0x400327D8u ||
+        pc == 0x40031BE4u || pc == 0x4002BB62u) {
+        std::fprintf(stderr,
+                     "[pcalloc] pc=%08X core=%u r0=%08X r1=%08X r2=%08X r3=%08X r4=%08X r5=%08X "
+                     "r6=%08X r7=%08X lr=%08X\n",
+                     pc, core, arm->r[0], arm->r[1], arm->r[2], arm->r[3], arm->r[4], arm->r[5],
+                     arm->r[6], arm->r[7], arm->r[14]);
+    }
+    // Diagnostic: dump the partition allocator's inputs and the region table it is
+    // about to read (partition VA 0x51C0, region descriptor VA 0x5180), translated
+    // through the core's own page tables - the loader rebuilds them as it boots.
+    if (pc == 0x40032366u || pc == 0x40031BE4u || pc == 0x4002BB62u) {
+        for (u32 row = 0; row < 10; ++row) {
+            const u32 va = 0x5180u + row * 16u;
+            u32 pa = 0;
+            std::string fault;
+            if (!arm->translate(va, false, false, pa, fault)) {
+                std::fprintf(stderr, "[pcpool] %08X  <no translation: %s>\n", va, fault.c_str());
+                continue;
+            }
+            std::fprintf(stderr, "[pcpool] %08X  %08X %08X %08X %08X\n", va, arm_bus_->read32(pa),
+                         arm_bus_->read32(pa + 4), arm_bus_->read32(pa + 8), arm_bus_->read32(pa + 12));
+        }
+    }
+    return true;
+}
+
+// Reads ZLB_PCTRAP ("<lo>-<hi>", hex) once, at boot-chain construction.
+void Vita::configure_arm_pc_trace() {
+    const char* value = std::getenv("ZLB_PCTRAP");
+    if (value == nullptr) return;
+    const char* dash = std::strchr(value, '-');
+    if (dash == nullptr) return;
+    pc_trace_lo_ = static_cast<u32>(std::strtoul(value, nullptr, 16));
+    pc_trace_hi_ = static_cast<u32>(std::strtoul(dash + 1, nullptr, 16));
+    pc_trace_enabled_ = pc_trace_lo_ <= pc_trace_hi_;
+    ZLB_LOG_INFO("machine", "ARM PC trace armed: 0x%08X-0x%08X (ZLB_PCTRAP)", pc_trace_lo_, pc_trace_hi_);
 }
 
 bool Vita::mirror_cmep_scratch_to_arm() {    // See the note at the call site: ARM PA 0 mirrors the CMeP's 32 KiB scratch.

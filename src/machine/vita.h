@@ -298,6 +298,21 @@ private:
     /// Stage `bytes` into DRAM through the CMeP bus (shared backing store).
     bool stage_in_dram(u32 address, const std::vector<u8>& bytes);
 
+    /// Parse ZLB_PCTRAP into pc_trace_lo_/hi_ (call once, before the ARM runs).
+    void configure_arm_pc_trace();
+
+    /// Diagnostic: every time an ARM core is about to execute an address inside
+    /// ZLB_PCTRAP=<lo>-<hi> (hex), log the PC, the core, the register file and the
+    /// instruction word to stderr.  The KBL's boot-init walk (0x4002C594) is one
+    /// long sequence of calls into helpers that are only reachable through
+    /// pointers, so a breakpoint (which stops on the first hit) cannot show the
+    /// order in which the steps run; this can, and it does not change the run.
+    /// Returns true when the PC was logged (the run continues either way).
+    bool trace_arm_boot_pc(u32 core, u32 pc);
+    u32 pc_trace_lo_ = 0;
+    u32 pc_trace_hi_ = 0;
+    bool pc_trace_enabled_ = false;
+
     /// Development substitution for the page tables the stage *before*
     /// kernel_boot_loader leaves behind.  The ARM boot ROM / the second loader's
     /// 0xC0-byte reset vector are not in the dumps, so the model cannot reproduce
@@ -322,6 +337,20 @@ private:
     /// Returns true when it redirected the PC (the caller then skips stepping).
     bool satisfy_arm_boot_pc(u32 core, u32 pc);
     u64 boot_pc_fixes_ = 0;
+
+    /// Development substitution: hand the KBL's own partition the block cache it
+    /// never fills itself (see the comment on satisfy_arm_boot_pc).  Called from
+    /// the PC hook when an allocation is about to run with the cache-only flag and
+    /// a class whose cache slot is empty; writes `blocks` 0x1000/0x2000-byte
+    /// blocks taken from the region's free end into that slot (target/step 7, as
+    /// the partition's own init leaves it).  Off only with ZLB_NO_SUBSTITUTION=1,
+    /// tuned with ZLB_PART_BLOCK_CACHE=<n> (default 4).
+    bool supply_kbl_partition_block(u32 core, u32 size);
+    u32 partition_blocks_per_class_ = 4;
+    u32 partition_supplied_ = 0;
+    u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< per class, VA inside the region
+    u32 partition_region_base_ = 0x40000000u;
+    u32 partition_region_size_ = 0x00300000u;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

@@ -53,6 +53,32 @@ inline u32 rol32(u32 value, unsigned bits) { return (value << bits) | (value >> 
 /// 64-bit rotate-right, used by SHA-256.
 inline u32 ror32(u32 value, unsigned bits) { return (value >> bits) | (value << (32 - bits)); }
 
+// ---------------------------------------------------------------------------
+// Development substitutions in the decrypted second loader
+// ---------------------------------------------------------------------------
+
+/// One entry of the patch table `apply_development_substitutions()` writes into
+/// the decrypted second loader (see bigmac.cpp for the reasoning behind every
+/// entry).  The table is exposed so that a test can prove each entry lands
+/// *inside* the staged image: round 91 found an entry written as an absolute
+/// address (`0x40850` instead of offset `0x850`), which the loop turned into a
+/// write to `0x80850` - unmapped memory, so the "substitution" was a no-op that
+/// still announced itself in the log.
+struct SecondLoaderPatch {
+    u32 offset;      ///< from the staged image base (0x40000 == cmep::kRamBase)
+    u32 length;      ///< bytes touched
+    u32 word;        ///< `forced` entries install this instruction, little-endian
+    bool forced;     ///< false: the bytes are cleared to zero (a disabled check)
+    const char* what;
+};
+
+/// The patch table itself, so tests can check it without applying it.
+const SecondLoaderPatch* second_loader_patches(size_t& count);
+
+/// The boot chain hashes 0x16600 bytes of the staged second loader (the SLB2
+/// entry is 93184 bytes); every patch has to stay below this bound.
+inline constexpr u32 kSecondLoaderStagedBytes = 0x16600;
+
 /// Deterministic 64-bit LCG.  The hardware RNG is seeded from a fixed constant
 /// so that a given run always produces the same stream (documented in
 /// bigmac.cpp).

@@ -1,4 +1,4 @@
-﻿// zeliboba - ARM Cortex-A9 (ARMv7-A + Thumb-2 + VFPv3-D16) interpreter.
+// zeliboba - ARM Cortex-A9 (ARMv7-A + Thumb-2 + VFPv3-D16) interpreter.
 //
 // This is a faithful port of the VitaTestSuite reference implementation
 // (Core/ArmCore.cs). Keeping the decode classification identical matters: the
@@ -955,8 +955,13 @@ void ArmCore::execute_data_processing(u32 instr, u32 op, bool immediate) {
                 exception_return(result);
                 return;
             }
-            // ARM ALUWritePC: the instruction set does not change.
-            write_r15(result & ~3u);
+            // ARM ARM A8.8.1 (ADC/ADD/AND/.../MOV/MVN): with Rd == 15 and
+            // S == 0 the write is an ALUWritePC, which for A32 is exactly
+            // BXWritePC - the T bit comes from bit 0 of the result and that bit
+            // is not part of the address. Forcing ARM state here (the old
+            // `write_r15(result & ~3u)`) broke every computed jump into Thumb
+            // code (evidence: arm_dp_write_pc_interworks).
+            branch_to(result);
             return;
         }
         r[rd] = result;
@@ -1272,10 +1277,21 @@ void ArmCore::decode_arm_media(u32 instr) {
             r[rd_div] = quotient;
             break;
         }
-        case 0x75u: case 0x76u: case 0x77u:
-        case 0x72u:
+        case 0x75u: {  // SMMUL/SMMULR/SMMLA/SMMLAR/SMMLS/SMMLSR
+            // ARM ARM A8.8.166-A8.8.169: all six forms live at op1 = 0111 0101
+            // and are told apart by bits [7:4] - 0001 SMMLA, 0011 SMMLAR (round),
+            // 1101 SMMLS, 1111 SMMLSR. Rd is bits [19:16], Ra bits [15:12]
+            // (1111 in the 0001/0011 forms is the no-accumulate SMMUL/SMMULR),
+            // and the multiply operands are bits [11:8] and [3:0]. Encodings
+            // verified with capstone (see docs/CPU_ARM_AUDIT.md).
+            const u32 nibble = instr & 0xF0u;
+            if (nibble != 0x10u && nibble != 0x30u && nibble != 0xD0u && nibble != 0xF0u) {
+                undefined("media 0111 0101 multiply");
+                return;
+            }
             decode_smmul(instr, rd, rn, rs, rm, o1);
             break;
+        }
         default:
             undefined("media op1");
             return;
@@ -1592,14 +1608,33 @@ void ArmCore::decode_smuad(u32 instr, int rd, int rn, int rs, int rm, u32 op1, u
 }
 
 void ArmCore::decode_smmul(u32 instr, int rd, int rn, int rs, int rm, u32 op1) {
-    const bool round = (instr & 0x20u) != 0;
-    const s64 product = static_cast<s64>(static_cast<s32>(r[rm])) * static_cast<s32>(r[rs]);
-    s64 res = product;
-    const u32 kind = (op1 >> 1) & 3u;  // 0 = SMMUL, 2 = SMMLA, 3 = SMMLS
-    if (kind == 2u) res = product + static_cast<s32>(r[rn]);
-    else if (kind == 3u) res = static_cast<s32>(r[rn]) - product;
+    // The caller's field names are the media-a ones: `rd` is bits [15:12] (Ra
+    // here), `rn` is bits [19:16] (the real Rd), `rs` is [11:8] and `rm` is
+    // [3:0]. The SMMUL family is op1 = 0111 0101 with bits [7:4] selecting the
+    // form (ARM ARM A8.8.166-A8.8.169, encodings verified with capstone):
+    //   0001 SMMLA   Rd = (Ra:Rm*Rn) >> 32        (Ra << 32) + Rm*Rn
+    //   0011 SMMLAR  the same, then + 0x80000000 before the shift
+    //   1101 SMMLS   Rd = ((Ra << 32) - Rm*Rn) >> 32
+    //   1111 SMMLSR  the same, then + 0x80000000 before the shift
+    // and Ra == 1111 in the 0001/0011 forms is the plain SMMUL/SMMULR.
+    // This used to take Rd from bits [15:12] and the accumulator from bits
+    // [19:16], so it wrote the PC field (r[15], later overwritten by
+    // write_r15) and the whole family was a silent no-op (evidence:
+    // arm_media_smmul_smmla_smmls).
+    (void)op1;
+    const int rd_dst = rn;  // bits [19:16]
+    const int ra = rd;      // bits [15:12]
+    const u32 nibble = instr & 0xF0u;
+    const bool subtract = (nibble & 0xC0u) == 0xC0u;  // 1101 / 1111
+    const bool round = (nibble & 0x20u) != 0u;        // 0011 / 1111
+
+    s64 res = static_cast<s64>(static_cast<s32>(r[rm])) * static_cast<s32>(r[rs]);
+    if (subtract || ra != 15) {
+        const s64 acc = static_cast<s64>(static_cast<s32>(read_reg(ra))) << 32;
+        res = subtract ? acc - res : acc + res;
+    }
     if (round) res += 0x80000000LL;
-    r[rd] = static_cast<u32>(static_cast<s32>(res >> 32));
+    r[rd_dst] = static_cast<u32>(static_cast<s32>(res >> 32));
 }
 
 void ArmCore::decode_bitfield(u32 instr, int rd, int rn, int rs) {
@@ -4340,9 +4375,20 @@ void ArmCore::execute_vfp_op(bool dbl, u32 instr, u32 opcv1, u32 opcv2, int vd, 
                 else vfp.write_f32(vd, n_bit ? static_cast<f32>(static_cast<s32>(raw))
                                              : static_cast<f32>(raw));
             } else {
-                const bool signed_int = (opc2v == 0xDu) || (opc2v == 0xCu ? false : n_bit);
+                // ARM ARM A8.8.314 (VCVT / VCVTR between floating-point and
+                // integer): opc2 1100 selects the unsigned converter and 1101
+                // the signed one, while the N bit selects the rounding - N == 1
+                // is VCVT, which always rounds towards zero, and N == 0 is
+                // VCVTR, which uses FPSCR.RMode. Both used to go through
+                // FPSCR.RMode, so a VCVT under RMode = RP/RM rounded the wrong
+                // way (evidence: vfp_vcvt_vs_vcvtr_rounding).
+                const bool signed_int = (opc2v == 0xDu);
+                const u32 saved_rmode = vfp.fpscr & (3u << 22);
+                if (n_bit) vfp.fpscr = (vfp.fpscr & ~(3u << 22)) | (3u << 22);  // RZ
                 const u32 value = dbl ? vfp.float_to_int(vfp.read_f64(vm), !signed_int)
-                                      : vfp.float_to_int(static_cast<f64>(vfp.read_f32(vm)), !signed_int);
+                                      : vfp.float_to_int(static_cast<f64>(vfp.read_f32(vm)),
+                                                         !signed_int);
+                vfp.fpscr = (vfp.fpscr & ~(3u << 22)) | saved_rmode;
                 vfp.write_s(sd, value);
             }
             write_r15(cur_instr_addr_ + 4u);

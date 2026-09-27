@@ -359,6 +359,7 @@ bool Vita::fit_parts() {
 
 void Vita::reset(bool cold) {
     if (!built_) build();
+    configure_arm_pc_trace();
 
     arm_bus_->reset();
     cmep_bus_->reset();
@@ -440,6 +441,7 @@ void Vita::run_slice() {
         for (int i = 0; i < kArmCoreCount; ++i) {
             Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
             if (!core || core->halted) continue;
+            if (pc_trace_enabled_) trace_arm_boot_pc(static_cast<u32>(i), core->get_pc());
             if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
                 // Leave the instruction pending: the debugger resumes from it.
                 pc_hook_stopped_ = true;

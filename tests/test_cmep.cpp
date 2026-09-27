@@ -665,3 +665,29 @@ ZLB_TEST(cmep_cmd_block_status_and_byte_port) {
     f.bus.write32(0xE6008180, 1);
     ZLB_EXPECT_EQ(f.bus.read32(0xE6008180), 1u);
 }
+
+// ---------------------------------------------------------------------------
+// Development substitutions in the second loader
+// ---------------------------------------------------------------------------
+
+ZLB_TEST(second_loader_substitutions_stay_inside_the_staged_image) {
+    // Round 91: the "ARM boot-context gate" entry was written as the absolute
+    // address 0x40850 while the apply loop adds the image base 0x40000, so the
+    // patch went to 0x80850 - unmapped memory - and silently did nothing.  Every
+    // entry has to land inside the payload the chain hashes (0x16600 bytes), and
+    // each one needs a name so the log can identify it.
+    size_t count = 0;
+    const cmep_detail::SecondLoaderPatch* patches = cmep_detail::second_loader_patches(count);
+    ZLB_EXPECT_TRUE(patches != nullptr);
+    ZLB_EXPECT_TRUE(count > 0);
+    for (size_t i = 0; i < count; ++i) {
+        const cmep_detail::SecondLoaderPatch& patch = patches[i];
+        ZLB_EXPECT_TRUE(patch.what != nullptr && patch.what[0] != '\0');
+        ZLB_EXPECT_TRUE(patch.length == 2 || patch.length == 4);
+        const u32 end = patch.offset + patch.length;
+        ZLB_EXPECT_TRUE(end <= cmep_detail::kSecondLoaderStagedBytes);
+        // The patch has to be reachable at the image base the chain stages it at.
+        ZLB_EXPECT_TRUE(!patch.forced || patch.word != 0u);
+    }
+}
+
