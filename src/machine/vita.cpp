@@ -458,7 +458,13 @@ void Vita::run_slice() {
     }
 
     if (kermit_) kermit_->tick(static_cast<u64>(budget_.arm));
-    if (ernie_) ernie_->advance_milliseconds(static_cast<u64>(budget_.arm / 333));  // ~1 us per slice
+    if (ernie_) {
+        // The syscon's clock/RTC model counts RL78 core cycles: the firmware's
+        // start-up blocks on the X1 stabilisation status (OSTC == 0xC0), so the
+        // SFR has to be told how far the core has run (round 93).
+        if (syscon_) ernie_->tick(syscon_->cycles);
+        ernie_->advance_milliseconds(static_cast<u64>(budget_.arm / 333));  // ~1 us per slice
+    }
 
     boot_.steps_in_stage += static_cast<u64>(budget_.arm + budget_.cmep + budget_.rl78);
     poll_boot_chain();

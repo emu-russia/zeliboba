@@ -118,6 +118,12 @@ public:
     /// Milliseconds since power-on, as the RTC/fuel gauge would see it.
     u64 milliseconds() const { return milliseconds_; }
     void advance_milliseconds(u64 delta);
+    /// Advance the core-cycle driven devices (the SFR clock, RTC and interval
+    /// timer).  The RL78 firmware's start-up waits for the X1 oscillator to
+    /// stabilise (`cmp !0xFFFA2, #0xC0` at 0x3005A), which only ever completes if
+    /// somebody hands the SFR the core's cycle count - before round 93 nothing
+    /// did, so the firmware spun there forever and never left its clock init.
+    void tick(u64 cycles);
     void set_rtc_time(u64 unix_seconds) { rtc_seconds_ = unix_seconds; }
     u64 rtc_time() const { return rtc_seconds_; }
 

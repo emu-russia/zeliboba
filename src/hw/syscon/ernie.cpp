@@ -811,6 +811,11 @@ void ErnieBlock::advance_milliseconds(u64 delta) {    Impl& impl = *impl_;
     soc_released_ = impl.power.soc_released;
 }
 
+void ErnieBlock::tick(u64 cycles) {
+    Impl& impl = *impl_;
+    if (impl.sfr != nullptr) impl.sfr->tick(cycles);
+}
+
 void ErnieBlock::set_power_button(bool pressed) {
     impl_->power.set_power_button(pressed);
     if (pressed) impl_->power.release_soc();
