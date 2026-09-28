@@ -700,9 +700,10 @@ bool Vita::supply_kbl_carve_state(u32 core, u32 pool_va, u32 size) {
     ++partition_supplied_;
     if (partition_supplied_ <= 6) {
         ZLB_LOG_INFO("machine",
-                     "carve state supplied: class 0x%X (index %u) page %u entry 0x%08X "
-                     "(development substitution experiment)",
-                     size, class_index, start_page + index, state | (class_index << 20) | pages);
+                     "carve state supplied: pool=0x%08X class 0x%X (index %u) start=%u end=%u "
+                     "page %u entry 0x%08X (development substitution experiment)",
+                     pool_va, size, class_index, start_page, end_page, start_page + index,
+                     state | (class_index << 20) | pages);
     }
     return true;
 }
@@ -724,7 +725,13 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
         configured = true;
         if (const char* value = std::getenv("ZLB_PART_BLOCK_CACHE")) {
             const long count = std::strtol(value, nullptr, 0);
-            partition_blocks_per_class_ = count > 0 ? static_cast<u32>(count) : 1u;
+            // 0 disables the seeding entirely, so the loader's own carve path can be
+            // exercised on its own (ZLB_KBL_CARVE=1).
+            if (count <= 0) {
+                partition_blocks_per_class_ = 0;
+                return false;
+            }
+            partition_blocks_per_class_ = static_cast<u32>(count);
         }
     }
     // The slot holds {u16 target, u16 count, u32 head, u32 extra0, u32 extra1} and
