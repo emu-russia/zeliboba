@@ -683,12 +683,12 @@ bool Vita::supply_kbl_carve_state(u32 core, u32 pool_va, u32 size) {
     const u32 end_page = read_va(pool_va + 0x88u, ok);
     if (!ok || table == 0u || end_page <= start_page) return false;
 
-    u32& cursor = partition_block_next_[0];
+    u32& cursor = carve_page_next_;                    // a *page index*, not a byte offset
+    const u32 span = end_page - start_page;
     const u32 pages = size >> 12;
-    u32 index = (cursor == 0u || cursor >= (end_page - start_page)) ? (end_page - start_page) / 2u
-                                                                   : cursor;
-    if (index + pages >= (end_page - start_page)) index = (end_page - start_page) / 2u;
-    cursor = index;
+    if (cursor == 0u || cursor + pages >= span) cursor = span / 4u;
+    const u32 index = cursor;
+    cursor += pages;
     // The page-table entry: state | class<<20 | pages.
     u32 state = 0x20000000u;
     if (const char* value = std::getenv("ZLB_KBL_CARVE_STATE")) {

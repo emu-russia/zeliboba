@@ -352,6 +352,8 @@ private:
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
     /// class, so the loader own carve path hands the block out.
     bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);
+    /// Page index (inside the partition region) the carve experiment hands out next.
+    u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;
     u32 partition_supplied_ = 0;
     u32 class_tables_supplied_ = 0;
