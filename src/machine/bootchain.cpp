@@ -298,6 +298,30 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
                      core, va, fetch ? "fetch" : (write ? "write" : "read"),
                      arm != nullptr ? arm->get_pc() : 0u, static_cast<u32>(lr),
                      fetch ? "prefetch" : "data", fault_trace_hits_);
+        // A fetch fault on a garbage address usually means a `pop {…,pc}` took a
+        // corrupted return address off the stack, so dump the frame too: the slot
+        // that must be watched is the word just below SP (the pop has already
+        // updated SP when the fetch faults).
+        if (arm != nullptr && fetch && fault_trace_hits_ <= 6u) {
+            u64 sp = 0;
+            arm->get_register("r13", sp);
+            for (u32 row = 0; row < 3; ++row) {
+                u32 frame[4] = {0, 0, 0, 0};
+                const u32 base = static_cast<u32>(sp) - 0x10u + row * 16u;
+                bool mapped = true;
+                for (u32 i = 0; i < 4; ++i) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(base + i * 4u, false, false, pa, fault)) {
+                        mapped = false;
+                        break;
+                    }
+                    frame[i] = arm_bus_->read32(pa);
+                }
+                ZLB_LOG_INFO("machine", "ARM stack 0x%08X: %08X %08X %08X %08X%s", base, frame[0],
+                             frame[1], frame[2], frame[3], mapped ? "" : "  <unmapped>");
+            }
+        }
     }
     // VA >= 1 MiB is handled by the section-level branch below (round 110); the
     // L2 walk after it only ever runs for the inherited low window.
