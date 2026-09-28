@@ -490,6 +490,39 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the instruction still has to run
     }
 
+    // Substitution (round 100): the class-constructor loop (0x400316A0..0x40031820)
+    // can be handed a bogus block pointer - traced in round 98/99 to the getter at
+    // 0x4002C1AC, which adds the object's base field [obj+0x14] that nothing in the
+    // loader writes (it is zero in the model, so the raw -1 from the caller's table
+    // lookup reaches `str.w r1,[r8]` and faults).  Instead of inventing that base,
+    // skip the store *and* the constructor call for such a block so the loop moves on
+    // and the boot reaches the next barrier.  ZLB_NO_SUBSTITUTION=1 disables it.
+    constexpr u32 kBlockStorePc = 0x4003180Cu;    // str.w r1,[r8]
+    constexpr u32 kAfterBlockPc = 0x40031816u;    // ldrh r2,[r4,#0x22]
+    if (supply_blocks && pc == kBlockStorePc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 block = 0;
+                if (arm->get_register("r8", block) &&
+                    (block == 0xFFFFFFFFull || block < 0x1000ull)) {
+                    arm->set_pc(kAfterBlockPc);
+                    ++boot_pc_fixes_;
+                    if (boot_pc_fixes_ <= 4) {
+                        ZLB_LOG_INFO("machine",
+                                     "class constructor loop: skipped a bogus block 0x%llX at pc=0x%08X "
+                                     "(%s) (development substitution)",
+                                     static_cast<unsigned long long>(block), pc,
+                                     "[obj+0x14] base is not modelled");
+                        add_milestone("KBL class constructor loop skipped a bogus block "
+                                      "(development substitution)");
+                    }
+                    return true;   // handled: do not execute the store
+                }
+            }
+        }
+        return false;    // a valid block: run the instruction
+    }
+
     constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
     constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
     static const bool disabled = [] {
