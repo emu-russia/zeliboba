@@ -209,7 +209,7 @@ u64 ScWindowDevice::read(u32 address, unsigned size) {
             break;
         case kScStat36: value = regs().stat36; break;
         case kScIfType: value = kScIfTypeValue; break;
-        case kScStat1000: value = kScStat1000Value; break;
+        case kScStat1000: value = regs().stat1000; break;
         case kScReq122: value = regs().req122; break;
         case kScIrq124: value = regs().irq124; break;
         case kScReg0194: value = regs().reg0194; break;
@@ -270,6 +270,7 @@ void ScWindowDevice::write(u32 address, unsigned size, u64 raw) {
         case kScReq122: regs().req122 = value; break;
         case kScStat24: regs().stat24 = value; break;
         case kScStat36: regs().stat36 = value; break;
+        case kScStat1000: regs().stat1000 = value; break;
         case kScReg0194: regs().reg0194 = value; break;
         case kScEventsC0:
             // Write-1-to-clear acknowledgement.

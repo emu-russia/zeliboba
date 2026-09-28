@@ -631,12 +631,43 @@ ZLB_TEST(cmep_sysctl_and_sc_window_inputs) {
     // Ernie's shared window: the interface status has to come back from there.
     ZLB_EXPECT_EQ(f.bus.read32(0xE3101000), 0x0001000Fu);
 
+    // 0xE3101000 is a *latch*, not a constant: the second loader writes the strap
+    // value into it and polls it back (0x48516), and later zeroes it and polls
+    // that back as well (0x486BA).  A read-only constant made it spin at 0x486C2.
+    f.bus.write32(0xE3101000, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE3101000), 0u);
+    f.bus.write32(0xE3101000, 0x0001000Fu);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE3101000), 0x0001000Fu);
+
     // Unknown SC registers behave like storage because the CMeP uses them as
     // write-then-poll strobes (0xE3102120 in the second loader at 0x487E8).
     f.bus.write32(0xE3102120, 1u);
     ZLB_EXPECT_EQ(f.bus.read32(0xE3102120), 1u);
     f.bus.write32(0xE3101120, 0u);
     ZLB_EXPECT_EQ(f.bus.read32(0xE3101120), 0u);
+
+    // 0xE3110C00 is the same write-then-poll pattern (second loader 0x4864C) but
+    // sits above the first 64 KiB, so the CMeP's SC window has to cover Ernie's
+    // full 128 KiB span.
+    f.bus.write32(0xE3110C00, 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE3110C00), 1u);
+    f.bus.write32(0xE3110C00, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE3110C00), 0u);
+}
+
+ZLB_TEST(cmep_sc_event_register_serves_each_side_its_own_bits) {
+    // 0xE31000C0 is the SC event register (write-1-to-clear) and the two
+    // processors wait for different bits in it: the second loader's SC bring-up
+    // needs *exactly* 1 (0x485D6..0x485F8) while the ARM's kernel boot loader
+    // needs 0x8/0x10 (0x4003C02E, 0x4003C066).  The CMeP therefore sees its own
+    // pending bit and acknowledges it with a write of 1.
+    Fixture f;
+
+    ZLB_EXPECT_EQ(f.bus.read32(0xE31000C0), 1u);
+    f.bus.write32(0xE31000C0, 0u);   // write-1-to-clear: writing 0 changes nothing
+    ZLB_EXPECT_EQ(f.bus.read32(0xE31000C0), 1u);
+    f.bus.write32(0xE31000C0, 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE31000C0), 0u);
 }
 
 ZLB_TEST(cmep_secure_ctl_forwards_to_the_shared_sc_window) {

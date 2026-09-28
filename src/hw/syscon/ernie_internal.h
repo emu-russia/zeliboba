@@ -284,6 +284,11 @@ struct ScRegs {
     u32 reg0194 = 0;
     u32 engine30 = 0;
     u32 engine32 = 0;
+    /// 0xE3101000: the SC interface status/configuration *latch*.  The second
+    /// loader writes 0x0001000F into it and polls it back (0x48516), and later
+    /// zeroes it and polls that back too (0x486BA), so the register has to hold
+    /// what was written - the strap value is only its power-on state.
+    u32 stat1000 = 0x0001000F;
 
     u32 command = 0;             ///< last command word accepted
     u32 error = 0;               ///< last error code (0 when the reply is good)

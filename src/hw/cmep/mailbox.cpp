@@ -518,11 +518,12 @@ void GpioDevice::write(u32 address, unsigned size, u64 value) {
 // ---------------------------------------------------------------------------
 
 ScBridgeDevice::ScBridgeDevice()
-    // The shared SC window is 64 KiB (Ernie's kScWindowSize): the second loader
-    // touches 0xE31040A4 and 0xE3105000 while it brings the SC engine up
-    // (0x48794, 0x48848), so the CMeP side must cover the whole window instead
-    // of the first 16 KiB.
-    : RegisterFile("CMeP.SecureCtl", cmep::kScBase, 0x10000) {
+    // The shared SC window is 128 KiB (Ernie's kScWindowSize): the second loader
+    // touches 0xE31040A4, 0xE3105000 and 0xE3110C00 while it brings the SC engine
+    // up (0x48794, 0x48848, 0x4864C), so the CMeP side must cover the whole
+    // window - a narrower one left 0xE3110C00 unmapped, its write-then-poll loop
+    // read back 0 and the loader spun there forever.
+    : RegisterFile("CMeP.SecureCtl", cmep::kScBase, cmep::kScWindowSize) {
     define(kCmd124, "SC 0xE3100124", 0);
     define(kReqA0, "SC 0xE31010A0 request", 0);
     define(kAckA4, "SC 0xE31010A4 ack", 0);
@@ -545,6 +546,7 @@ void ScBridgeDevice::reset() {
     requests_ = 0;
     have_a0_ = false;
     have_20a0_ = false;
+    events_c0_ = 1;   // one SC event is pending for the CMeP from power-on
 }
 
 void ScBridgeDevice::attach_shared_sc(Device* sc) {
@@ -557,6 +559,12 @@ void ScBridgeDevice::attach_shared_sc(Device* sc) {
 }
 
 u64 ScBridgeDevice::read(u32 address, unsigned size) {
+    // 0xE31000C0 is read per side (see the note on events_c0_): the CMeP's own
+    // pending SC event is bit 0, and the shared window serves the ARM's bits.
+    if (address == kEventsC0) {
+        const u32 value = events_c0_;
+        return size >= 4 ? value : (value & ((1u << (size * 8)) - 1u));
+    }
     if (shared_sc_ != nullptr && shared_sc_->handles(address)) {
         return shared_sc_->read(address, size);
     }
@@ -586,6 +594,10 @@ u64 ScBridgeDevice::read(u32 address, unsigned size) {
 }
 
 void ScBridgeDevice::write(u32 address, unsigned size, u64 value) {
+    if (address == kEventsC0) {
+        events_c0_ &= ~static_cast<u32>(value);   // write-1-to-clear
+        return;
+    }
     if (shared_sc_ != nullptr && shared_sc_->handles(address)) {
         // The real block is the single source of truth for the SC state; it also
         // runs the command dispatcher when the command word is written.

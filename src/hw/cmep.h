@@ -60,6 +60,10 @@ constexpr u32 kGpioBase = 0xE20A0000;
 constexpr u32 kCmdBlockBase = 0xE6000000;
 constexpr u32 kCmdBlockSize = 0x10000;
 constexpr u32 kScBase = 0xE3100000;
+/// The SC register window is 128 KiB wide: both processors see one block, and
+/// Ernie's SC device answers exactly this span (ernie_internal.h
+/// kScWindowSize).  The second loader reaches 0xE3110C00 through it (0x4864C).
+constexpr u32 kScWindowSize = 0x20000;
 constexpr u32 kScXferBase = 0xE0B00000;
 /// Keyring slot that holds the chip's fused boot key (AES-128 key || IV): the
 /// first loader loads it from image+0xE0 but the hardware value survives.

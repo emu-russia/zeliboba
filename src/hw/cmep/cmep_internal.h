@@ -485,12 +485,29 @@ public:
     static constexpr u32 kReg2100 = 0xE3102100;
     static constexpr u32 kReg3040 = 0xE3103040;
     static constexpr u32 kReg3050 = 0xE3103050;
+    static constexpr u32 kEventsC0 = 0xE31000C0;  ///< SC event register (write-1-to-clear)
 
 private:
     u64 requests_ = 0;
     bool have_a0_ = false;
     bool have_20a0_ = false;
     Device* shared_sc_ = nullptr;
+
+    /// 0xE31000C0 seen from the CMeP: the second loader's SC bring-up waits for
+    /// *exactly* 1 (bit 0) here and acknowledges it by writing the same value
+    /// back, then waits for the register to clear:
+    ///
+    ///     000485D6  movh $2,0xE310 / or3 $2,$2,0xC0
+    ///     000485DE  erepeat 0x485E8
+    ///     000485E2  lw   $0,($2)
+    ///     000485EC  beqi $0,0x1,0x485F0     ; loops until it reads 1
+    ///     000485F0  sw   $0,($3)            ; write-1-to-clear
+    ///     000485FA  bnei $2,0x1,0x485FE     ; wait for the bit to go away
+    ///
+    /// The ARM's kernel boot loader polls the *same* register for bits 3 and 4
+    /// (0x4003C02E / 0x4003C066), so the two sides have their own pending-event
+    /// bits; handing the CMeP the ARM's mask (0x18) made it spin forever.
+    u32 events_c0_ = 1;
 };
 
 // ---------------------------------------------------------------------------
