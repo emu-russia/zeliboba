@@ -368,6 +368,8 @@ private:
     /// Lines already emitted by the fatal-stub diagnostic (round 111): the stubs end
     /// in `b .`, so without the cap the log grows without bound.
     u32 fatal_stub_hits_ = 0;
+    /// Lines already emitted by the unfixable-fault diagnostic (round 112).
+    u32 fault_trace_hits_ = 0;
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;

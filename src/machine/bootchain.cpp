@@ -278,6 +278,27 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     }();
     if (disabled) return false;
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
+
+    // Diagnostic (round 112): every ARM translation the model cannot fix is logged in
+    // order with the pc that asked for it.  The KBL's own abort handlers only report
+    // a code (`0x40021998+`), so the faulting address and the faulting instruction
+    // have to be captured here.  ZLB_KBL_FAULT_TRACE=1 enables it, capped at 24 lines
+    // (a faulting instruction inside a retry loop would otherwise flood the log).
+    static const bool fault_trace = [] {
+        return std::getenv("ZLB_KBL_FAULT_TRACE") != nullptr;
+    }();
+    if (fault_trace && fault_trace_hits_ < 24u) {
+        ++fault_trace_hits_;
+        Cpu* cpu = arm_cores_[core].get();
+        ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
+        u64 lr = 0;
+        if (arm != nullptr) arm->get_register("r14", lr);
+        ZLB_LOG_INFO("machine",
+                     "ARM fault arm%u: VA=0x%08X %s pc=0x%08X lr=0x%08X (%s) [%u]",
+                     core, va, fetch ? "fetch" : (write ? "write" : "read"),
+                     arm != nullptr ? arm->get_pc() : 0u, static_cast<u32>(lr),
+                     fetch ? "prefetch" : "data", fault_trace_hits_);
+    }
     // VA >= 1 MiB is handled by the section-level branch below (round 110); the
     // L2 walk after it only ever runs for the inherited low window.
 
@@ -818,9 +839,16 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // R2 = 0, R3 = 0xFFFFFFFF = the value written).  Rather than skipping the store
     // (which only hides the fault), give the caller a real, zeroed page out of the
     // region the partition describes, so the loop's constructor works on memory the
-    // model actually owns.  ZLB_NO_SUBSTITUTION=1 disables it.
+    // model actually owns.  Round 112: it hands out pages from the *region tail*,
+    // which the KBL's own allocator may also consider free (a double allocation is
+    // the prime suspect for the corrupted return address that now kills the run), so
+    // it can be switched off with ZLB_KBL_INSTANCE_BLOCK=0 while bisecting.
+    static const bool supply_instance_blocks = [] {
+        const char* value = std::getenv("ZLB_KBL_INSTANCE_BLOCK");
+        return value == nullptr || value[0] != '0';
+    }();
     constexpr u32 kGetterStorePc = 0x4002C1CCu;    // str r3,[r1] in the getter
-    if (supply_blocks && pc == kGetterStorePc) {
+    if (supply_blocks && supply_instance_blocks && pc == kGetterStorePc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 value = 0;
