@@ -1045,9 +1045,10 @@ bool Debugger::execute(const std::string& line) {
             else if (name == "second" || name == "secondloader") target = BootStage::CmepSecondLoader;
             else if (name == "secure" || name == "securekernel") target = BootStage::CmepSecureKernel;
             else if (name == "kbl" || name == "arm") target = BootStage::ArmKernelBootLoader;
+            else if (name == "nskbl") target = BootStage::NskblEntry;
             else if (name == "kernel") target = BootStage::KernelEntry;
             else {
-                emit("usage: stage <first|second|secure|kbl|kernel>");
+                emit("usage: stage <first|second|secure|kbl|nskbl|kernel>");
                 return true;
             }
             emit(vita_.enter_stage(target) ? format("entered stage %s", to_string(target))

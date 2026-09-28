@@ -280,6 +280,19 @@ private:
     /// Start the ARM on the kernel boot loader contained in SLB2.
     bool start_arm_kernel_boot_loader();
 
+    /// Run the non-secure kernel boot loader (NSKBL).  The secure kernel boot
+    /// loader stages the ARZL-compressed NSKBL at PA 0x50000000 and decodes it to
+    /// 0x51000000 with its *own* routines (sceArlzDecode 0x4003C330 and
+    /// sceArlzArmFilter 0x4003CB40, both inside kernel_boot_loader.self); this
+    /// stage calls those two functions from the model - nothing about the decode
+    /// is reimplemented - and then enters NSKBL in the non-secure world.
+    bool start_nskbl();
+
+    /// Call one firmware routine on arm0 with the AAPCS argument registers and a
+    /// scratch stack.  Returns the routine's r0; `ok` reports whether it returned
+    /// (rather than exhausting the step budget).
+    u32 arm_call(u32 address, u32 a0, u32 a1, u32 a2, u32 a3, bool* ok);
+
     /// Load the kernel (`os0`) into DRAM and jump to it.
     bool start_kernel();
 

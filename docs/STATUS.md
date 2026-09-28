@@ -5,7 +5,8 @@
 **подстановками** (development substitution) и что делать дальше. Рабочий журнал
 по звеньям цепочки — `docs/KBL.md` (раунды 1-43), по железу — `docs/HARDWARE.md`,
 по eMMC — `docs/EMMC.md`, по Syscon (Ernie), DRAM и JIG — `docs/SYSCON.md`,
-по отладчику — `docs/DEBUGGER.md`.
+по NSKBL (небезопасный загрузчик ядра) — `docs/NSKBL.md`, по отладчику —
+`docs/DEBUGGER.md`.
 
 ## 1. Цель
 
@@ -32,6 +33,7 @@ Stage 1 **не достигнут**: ARM доходит до исполнени�
 | Secure kernel (0x800000) | грузится по своему адресу компоновки, проходит стартовые проверки keyring/sysctl/версии, рукопожатие 0x9/0x101/0x102/0x106 |
 | Отпускание ARM | по «done»-прыжку secure kernel: `release_soc()` → `ARM started on kernel_boot_loader at 0x40020000` |
 | ARM KBL | исполняется на всех четырёх ядрах (барьер 0x4003B384), печатает баннер и «Safe Mode : [ YES ]» |
+| NSKBL | стадия `stage nskbl`: ARZL-поток из `kernel_boot_loader.self` распаковывается **кодом самого KBL** (`sceArlzDecode` 0x4003C330, `sceArlzArmFilter` 0x4003CB40) в `0x51000000`, ядра стартуют в Non-Secure — чекпойнт `0xA1` (self-тест `machine_nskbl_stage_decodes_the_non_secure_loader`); стена — secure-вызов `smc`/`r12=0x103` (`docs/NSKBL.md`) |
 | Консоль прошивки | команда `console`/`uart` показывает вывод KBL (регистр данных `+0x70` блоков 0xE2030000/0xE2040000) |
 | Отладчик | `run/runm/step/until/bp/bpc/bpl/watch/wpl/regs/dis/mem/poke/save/trace/devices/map/devget/devset/emmc/gpo/console/bootctx/faults/boot/stage/keyring/info/load/log` |
 | SDL3-фронтенд | `zeliboba_ui` (видео/звук/ввод), скриншоты через `--screenshot` |
@@ -162,7 +164,12 @@ $env:ZLB_NO_SUBSTITUTION=1
 3. **Окно `0xECxxxxxx`** (Pervasive/DMAC) — хотя бы регистровый файл, чтобы KBL
    не читал нули.
 4. **NSKBL → os0**: после KBL — `os0:psp2bootconfig.skprx`, `SceSysStateMgr`,
-   загрузка модулей ядра из `SceKernelBootimage`.
+   загрузка модулей ядра из `SceKernelBootimage`. **NSKBL уже запускается**:
+   стадия `stage nskbl` распаковывает его **собственным кодом KBL**
+   (`sceArlzDecode` 0x4003C330 + `sceArlzArmFilter` 0x4003CB40, версия фильтра 0)
+   в `0x51000000` и стартует все четыре ядра в Non-Secure — NSKBL доходит до
+   своего первого чекпойнта `0xA1`; следующая стена — `smc` в монитор TrustZone
+   (`r12 = 0x103`, см. `docs/NSKBL.md` §5).
 5. **Stage 2**: Venezia MPE (`docs/VENEZIA.md`, факты из Copetti + вики собраны)
    и PowerVR SGX543MP4+ (`docs/GPU.md`) на OpenGL с шейдерами, затем LiveArea.
 

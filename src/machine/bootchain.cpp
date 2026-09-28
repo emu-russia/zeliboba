@@ -26,6 +26,7 @@ const char* to_string(BootStage stage) {
         case BootStage::CmepSecondLoader: return "cmep-second-loader";
         case BootStage::CmepSecureKernel: return "cmep-secure-kernel";
         case BootStage::ArmKernelBootLoader: return "arm-kernel-boot-loader";
+        case BootStage::NskblEntry: return "nskbl";
         case BootStage::KernelEntry: return "kernel-entry";
         case BootStage::KernelRunning: return "kernel-running";
         case BootStage::Failed: return "failed";
@@ -2187,6 +2188,151 @@ bool Vita::start_arm_kernel_boot_loader() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// NSKBL - the non-secure kernel boot loader
+// ---------------------------------------------------------------------------
+//
+// kernel_boot_loader.self carries the NSKBL as its last segment: an ARZL stream
+// at PA 0x50000000 (segment 4, ARZL header "ARZL" + the range coder).  SKBL
+// decodes it with its own routines and jumps to 0x51000000 in the non-secure
+// world (wiki NSKBL, and the call site at 0x40020588 in the KBL's own code:
+// `sceArlzDecode(0x51000000, 0x1000000, 0x50000004, NULL)` followed by the ARM
+// filter at 0x4003CB40 with version 0).
+//
+// SKBL's boot path cannot reach that call site in the model yet (it is stuck in
+// its per-console object manager), so this stage runs the two firmware routines
+// itself on the emulated core.  Nothing about ARZL or the ARM filter is
+// reimplemented: the code that runs is the code in kernel_boot_loader.self.
+
+namespace {
+/// Free DRAM above the staged second loader (0x407C0000+0x16C00): the scratch
+/// stack for the firmware calls, and the return sentinel they unwind to.
+constexpr u32 kFirmwareCallStackTop = 0x40800000;
+constexpr u32 kFirmwareCallSentinel = 0x407E0000;
+constexpr u32 kArlzDecodeEntry = 0x4003C330;   ///< SceSkbl#sceArlzDecode (ARM mode)
+constexpr u32 kArlzArmFilterEntry = 0x4003CB40;  ///< SceSkbl#sceArlzArmFilter
+constexpr u32 kNskblCompressedPa = 0x50000000;  ///< where SKBL stages the ARZL stream
+constexpr u32 kNskblEntry = 0x51000000;         ///< decoded image / reset vector
+constexpr u32 kNskblMaxSize = 0x1000000;        ///< 16 MiB (KBP bootkernimg mapping)
+}  // namespace
+
+u32 Vita::arm_call(u32 address, u32 a0, u32 a1, u32 a2, u32 a3, bool* ok) {
+    if (ok != nullptr) *ok = false;
+    ArmCore* core = dynamic_cast<ArmCore*>(arm_cores_[0].get());
+    if (core == nullptr) return 0;
+
+    core->reset(address);
+    core->r[0] = a0;
+    core->r[1] = a1;
+    core->r[2] = a2;
+    core->r[3] = a3;
+    core->r[13] = kFirmwareCallStackTop;
+    core->r[14] = kFirmwareCallSentinel;
+
+    // A plain step loop: the boot substitutions must not run inside a firmware
+    // helper (they are keyed to the loader's own PCs, not to these routines).
+    const u64 budget = 200000000ull;
+    u64 steps = 0;
+    while (core->get_pc() != kFirmwareCallSentinel && steps < budget) {
+        core->step();
+        ++steps;
+    }
+    if (core->get_pc() != kFirmwareCallSentinel) {
+        ZLB_LOG_WARN("machine", "firmware call 0x%08X did not return (%llu steps, pc=0x%08X)", address,
+                     static_cast<unsigned long long>(steps), core->get_pc());
+        return core->r[0];
+    }
+    if (ok != nullptr) *ok = true;
+    ZLB_LOG_INFO("machine", "firmware call 0x%08X returned r0=0x%08X after %llu steps", address,
+                 core->r[0], static_cast<unsigned long long>(steps));
+    return core->r[0];
+}
+
+bool Vita::start_nskbl() {
+    if (!arm_) return false;
+
+    // The decoder lives in the KBL, and the compressed NSKBL is one of its
+    // segments, so the image has to be in the ARM's memory either way.
+    std::vector<u8> container;
+    std::vector<u8> kbl;
+    std::string source;
+    if (read_slb2_container(*emmc_, container)) {
+        auto slb2 = parse_slb2(container);
+        if (slb2) {
+            if (const Slb2Entry* entry = find_entry(*slb2, "kernel_boot_loader.self")) {
+                kbl = entry->data;
+                source = "eMMC SLB2";
+            }
+        }
+    }
+    if (kbl.empty()) {
+        std::string path = resolve_workspace_path("Vita_104_Firmware/Out/SLB2/kernel_boot_loader.self");
+        if (auto raw = read_file(path)) {
+            kbl = *raw;
+            source = path_filename(path);
+        }
+    }
+    if (kbl.empty()) {
+        ZLB_LOG_ERROR("machine", "NSKBL: kernel_boot_loader.self not found");
+        return false;
+    }
+
+    LoadResult result = load_image(*arm_bus_, kbl, "kernel_boot_loader.self", keys_);
+    if (!result.ok) {
+        ZLB_LOG_ERROR("machine", "NSKBL: kernel boot loader load failed: %s", result.message.c_str());
+        return false;
+    }
+    // The record NSKBL reads (its boot() copies the KBL Param out of the power
+    // scratchpad) and the scratchpad mirror at PA 0.  A full cold boot leaves the
+    // record there itself; entering this stage directly does not, so the model's
+    // builder fills it in (that is the same fallback the KBL stage uses).
+    const bool have_record = arm_bus_->read32(board::kKblParamBase) != 0;
+    if (!substitutions_enabled_static() || !have_record) build_kbl_param();
+    mirror_cmep_scratch_to_arm();
+
+    const u32 compressed = arm_bus_->read32(kNskblCompressedPa);
+    if (compressed != 0x4C5A5241u) {   // "ARZL"
+        ZLB_LOG_ERROR("machine", "NSKBL: no ARZL stream at PA 0x%08X (found 0x%08X)", kNskblCompressedPa,
+                      compressed);
+        return false;
+    }
+
+    bool ok = false;
+    const u32 decoded = arm_call(kArlzDecodeEntry, kNskblEntry, kNskblMaxSize,
+                                 kNskblCompressedPa + 4, 0, &ok);
+    if (!ok || decoded == 0 || decoded > kNskblMaxSize) {
+        ZLB_LOG_ERROR("machine", "NSKBL: sceArlzDecode failed (r0=0x%08X, ok=%d)", decoded, ok ? 1 : 0);
+        return false;
+    }
+    const u32 filtered = arm_call(kArlzArmFilterEntry, kNskblEntry, decoded, 0, 0, &ok);
+    ZLB_LOG_INFO("machine", "NSKBL: ARZL 0x%X bytes at PA 0x%08X decoded to 0x%X bytes at 0x%08X", 0x194CF,
+                 kNskblCompressedPa, decoded, kNskblEntry);
+    if (!ok) {
+        ZLB_LOG_ERROR("machine", "NSKBL: sceArlzArmFilter failed");
+        return false;
+    }
+    if (filtered != 0 && filtered != decoded)
+        ZLB_LOG_INFO("machine", "NSKBL: ARM filter reports 0x%X bytes", filtered);
+
+    for (int i = 0; i < kArmCoreCount; ++i) {
+        ArmCore* core = dynamic_cast<ArmCore*>(arm_cores_[static_cast<size_t>(i)].get());
+        if (core == nullptr) continue;
+        core->reset(kNskblEntry);
+        // NSKBL is the first code of the non-secure world: SKBL sets SCR.NS and
+        // enters it in SVC mode with the MMU off (wiki NSKBL#Reset).
+        core->ns_ = true;
+        core->scr |= 1u;   // SCR.NS
+        core->halted = false;
+    }
+    boot_.stage = BootStage::NskblEntry;
+    boot_.arm_entry = kNskblEntry;
+    boot_.arm_released = true;
+    boot_.detail = "ARM in the non-secure world on NSKBL";
+    add_milestone("NSKBL decoded to 0x" + hex(kNskblEntry, 8) + " by the KBL's own sceArlzDecode (" +
+                  source + ")");
+    return true;
+}
+
 bool Vita::start_kernel() {
     if (!arm_) return false;
 
@@ -2295,6 +2441,8 @@ bool Vita::enter_stage(BootStage stage) {
             return load_cmep_secure_kernel();
         case BootStage::ArmKernelBootLoader:
             return start_arm_kernel_boot_loader();
+        case BootStage::NskblEntry:
+            return start_nskbl();
         case BootStage::KernelEntry:
         case BootStage::KernelRunning:
             return start_kernel();
@@ -2549,6 +2697,14 @@ std::vector<std::string> Vita::plan_boot() {
     plan.push_back("answered) is modelled by the ARM boot ROM stand-in.  The secure kernel");
     plan.push_back("then posts 0x9/0x101/0x802F and idles: the reply its parser at 0x8018B2");
     plan.push_back("expects is not reproduced yet, which is where step 4 stops.");
+    plan.push_back("");
+    plan.push_back("model (NSKBL): step 5's second half - the ARZL decode of the non-secure kernel");
+    plan.push_back("boot loader - runs in `stage nskbl`.  The decoder and the ARM filter are the");
+    plan.push_back("KBL's *own* routines (0x4003C330 and 0x4003CB40, called from the KBL itself at");
+    plan.push_back("0x40020588), so only the call is modelled: the model sets up the AAPCS");
+    plan.push_back("registers and a scratch stack on arm0 and runs them.  NSKBL starts at");
+    plan.push_back("0x51000000 in the non-secure world and reaches its checkpoint 0xA1; the next");
+    plan.push_back("wall is its first `smc` into the (not modelled) TrustZone monitor.");
     return plan;
 }
 

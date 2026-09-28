@@ -163,3 +163,44 @@ ZLB_TEST(machine_pc_hook_stops_the_slice_before_the_instruction) {
     ZLB_EXPECT_FALSE(vita.pc_hook_stopped());
     ZLB_EXPECT_TRUE(arm0->instructions > insns_before);
 }
+
+// The non-secure kernel boot loader (NSKBL) is the last segment of
+// kernel_boot_loader.self: an ARZL stream staged at PA 0x50000000, which SKBL
+// decodes to 0x51000000 and enters in the non-secure world.  The stage runs the
+// KBL's *own* sceArlzDecode (0x4003C330) and sceArlzArmFilter (0x4003CB40) on
+// the emulated core, so this test pins the whole decode: the reset vector, the
+// startup string of the decoded image and the state the core is left in.
+ZLB_TEST(machine_nskbl_stage_decodes_the_non_secure_loader) {
+    Vita& vita = shared_machine();
+    vita.reset(true);
+
+    ZLB_EXPECT_TRUE(vita.enter_stage(BootStage::NskblEntry));
+    ZLB_EXPECT_TRUE(vita.stage() == BootStage::NskblEntry);
+
+    Bus& arm = vita.arm_bus();
+    // The compressed stream is where the KBL stages it, and the decoder read it
+    // from there (the "ARZL" magic survives in DRAM).
+    ZLB_EXPECT_EQ(arm.read32(0x50000000), 0x4C5A5241u);
+
+    // NSKBL's reset vector: eight `ldr pc, [pc, #0x18]` entries whose pointer
+    // table names the reset handler (0x51000100) first.
+    ZLB_EXPECT_EQ(arm.read32(0x51000000), 0xE59FF018u);
+    ZLB_EXPECT_EQ(arm.read32(0x51000020), 0x51000100u);
+
+    // The startup message of the decoded image.  It sits at 0x51027F66 and is
+    // what the loader prints through SceKernelPrintf once its boot() is done.
+    std::string text;
+    for (u32 i = 0; i < 0x3000; ++i) text.push_back(static_cast<char>(arm.read8(0x51027000 + i)));
+    ZLB_EXPECT_TRUE(text.find("Starting PSP2 Kernel Boot Loader") != std::string::npos);
+    ZLB_EXPECT_TRUE(text.find("psp2bootconfig.skprx") != std::string::npos);
+
+    // Every core starts at the reset vector, in the non-secure world, with the
+    // MMU off (wiki NSKBL#Reset).
+    for (int i = 0; i < Vita::kArmCoreCount; ++i) {
+        Cpu* core = vita.arm_core(i);
+        ZLB_EXPECT_TRUE(core != nullptr);
+        if (!core) continue;
+        ZLB_EXPECT_EQ(static_cast<u32>(core->get_pc()), 0x51000000u);
+        ZLB_EXPECT_FALSE(core->halted);
+    }
+}

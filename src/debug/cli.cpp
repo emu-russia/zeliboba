@@ -57,7 +57,7 @@ void print_usage() {
         "  --no-provision         leave the emulated CMeP key table empty (the first\n"
         "                         loader's RSA check then fails, as on an unprovisioned\n"
         "                         console - see docs/KBL.md)\n"
-        "  --stage <name>         start at first|second|kbl|kernel\n"
+        "  --stage <name>         start at first|second|secure|kbl|nskbl|kernel\n"
         "  --run <n>              run n machine steps after setup\n"
         "  -ex <command>          execute a debugger command (repeatable)\n"
         "  --script <file>        execute debugger commands from a file\n"
@@ -153,6 +153,7 @@ int cli_main(int argc, char** argv) {
         if (stage_name == "first" || stage_name == "firstloader") vita.enter_stage(BootStage::CmepFirstLoader);
         else if (stage_name == "second") vita.enter_stage(BootStage::CmepSecondLoader);
         else if (stage_name == "kbl") vita.enter_stage(BootStage::ArmKernelBootLoader);
+        else if (stage_name == "nskbl") vita.enter_stage(BootStage::NskblEntry);
         else if (stage_name == "kernel") vita.enter_stage(BootStage::KernelEntry);
         else {
             std::fprintf(stderr, "zeliboba: unknown stage '%s'\n", stage_name.c_str());

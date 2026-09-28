@@ -29,6 +29,7 @@ enum class BootStage {
     CmepSecondLoader,
     CmepSecureKernel,
     ArmKernelBootLoader,
+    NskblEntry,
     KernelEntry,
     KernelRunning,
     Failed,
