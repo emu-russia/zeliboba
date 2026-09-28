@@ -349,6 +349,9 @@ private:
     /// Create the per-class table the SceUID registration walks through the global
     /// 0x400B291C; the loader never writes that global itself (round 93).
     bool supply_kbl_class_table(u32 core);
+    /// Experiment (round 101): free-chunk marker plus page-table entry for one size
+    /// class, so the loader own carve path hands the block out.
+    bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);
     u32 partition_blocks_per_class_ = 4;
     u32 partition_supplied_ = 0;
     u32 class_tables_supplied_ = 0;

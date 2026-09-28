@@ -523,6 +523,35 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // a valid block: run the instruction
     }
 
+    // Experiment (ZLB_KBL_CARVE=1): instead of the model handing blocks out of the
+    // page cache, stand in for the region bookkeeping the secure kernel would leave,
+    // so the loader's OWN carve path (0x40032366 -> 0x400323F8) hands the block out:
+    //   * class marker `0x00010002` plus the free page index in pool+0x38+8*class
+    //     (0x00010001 means "class empty", as the loader itself initialises it);
+    //   * the page-table entry at [pool+0x20] + n*4 with state 0x20000000, the class
+    //     in bits 20..24 and the size in 4 KiB units (states 0x10000000/0x20000000
+    //     are the two the carve path accepts, docs/KBL.md §95.1).
+    // ZLB_NO_SUBSTITUTION=1 disables it; ZLB_KBL_CARVE_STATE=<hex> overrides the state.
+    constexpr u32 kCarvePathEntryPc = 0x40032366u;
+    static const bool carry_supply = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_CARVE");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (carry_supply && pc == kCarvePathEntryPc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 size = 0;
+                u64 pool = 0;
+                arm->get_register("r5", size);
+                arm->get_register("r4", pool);
+                supply_kbl_carve_state(core, static_cast<u32>(pool), static_cast<u32>(size));
+            }
+        }
+        return false;    // let the loader's own carve path run
+    }
+
     constexpr u32 kCacheOnlyFailurePc = 0x4003235Cu;  // `mov.w r10, #5 / movt 0x8002`
     constexpr u32 kCarvePathPc = 0x40032366u;         // `add.w r7, r4, #14` (take the mutex)
     static const bool disabled = [] {
@@ -616,6 +645,66 @@ bool Vita::supply_kbl_class_table(u32 core) {
         cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
     }
     return false;
+}
+
+// Experiment body (round 101): give one size class the free-chunk marker and the
+// page-table entry the loader's carve path looks for, so the loader hands the block
+// out itself.  See the note at the call site.
+bool Vita::supply_kbl_carve_state(u32 core, u32 pool_va, u32 size) {
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    if (size < 0x2000u || size > 0x100000u || (size & (size - 1u)) != 0u) return false;
+    u32 class_index = 0;
+    for (u32 s = 0x1000u; s < size; s <<= 1u) ++class_index;    // 0x2000 -> 1, 0x4000 -> 2
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (arm == nullptr) return false;
+    auto read_va = [&](u32 va, bool& ok) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, false, false, pa, fault)) {
+            ok = false;
+            return 0u;
+        }
+        return arm_bus_->read32(pa);
+    };
+    auto write_va = [&](u32 va, u32 value) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, value);
+        return true;
+    };
+    if (pool_va == 0u) pool_va = 0x000051C0u;
+    bool ok = true;
+    if (read_va(pool_va + 0x08u, ok) != 0x4080502Bu || !ok) return false;
+    const u32 marker_va = pool_va + 0x38u + 8u * class_index;
+    if (read_va(marker_va, ok) != 0x00010001u || !ok) return false;   // already has a chunk
+    const u32 table = read_va(pool_va + 0x20u, ok);
+    const u32 start_page = read_va(pool_va + 0x84u, ok);
+    const u32 end_page = read_va(pool_va + 0x88u, ok);
+    if (!ok || table == 0u || end_page <= start_page) return false;
+
+    u32& cursor = partition_block_next_[0];
+    const u32 pages = size >> 12;
+    u32 index = (cursor == 0u || cursor >= (end_page - start_page)) ? (end_page - start_page) / 2u
+                                                                   : cursor;
+    if (index + pages >= (end_page - start_page)) index = (end_page - start_page) / 2u;
+    cursor = index;
+    // The page-table entry: state | class<<20 | pages.
+    u32 state = 0x20000000u;
+    if (const char* value = std::getenv("ZLB_KBL_CARVE_STATE")) {
+        state = static_cast<u32>(std::strtoul(value, nullptr, 16));
+    }
+    if (!write_va(table + index * 4u, state | (class_index << 20) | pages)) return false;
+    if (!write_va(marker_va + 4u, start_page + index)) return false;
+    if (!write_va(marker_va, 0x00010002u)) return false;
+    ++partition_supplied_;
+    if (partition_supplied_ <= 6) {
+        ZLB_LOG_INFO("machine",
+                     "carve state supplied: class 0x%X (index %u) page %u entry 0x%08X "
+                     "(development substitution experiment)",
+                     size, class_index, start_page + index, state | (class_index << 20) | pages);
+    }
+    return true;
 }
 
 // Substitution body: put free blocks of the requested class into the calling
