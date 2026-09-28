@@ -352,6 +352,14 @@ private:
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
     /// class, so the loader own carve path hands the block out.
     bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);
+    /// Substitution (round 108): one fresh zeroed page out of the partition region
+    /// for a class instance whose base field `[obj+0x14]` is the 0xFFFFFFFF sentinel.
+    bool supply_kbl_instance_block(u32 core, u32& out_block);
+    /// Cursor (region byte offset, walks down) for `supply_kbl_instance_block`.
+    u32 instance_block_next_ = 0;
+    u32 instance_blocks_supplied_ = 0;
+    /// Last ARM pc the boot-chain hook saw, per core (round 109 diagnostics).
+    u32 last_arm_pc_[kArmCoreCount] = {};
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;

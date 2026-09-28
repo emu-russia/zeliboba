@@ -358,6 +358,14 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
 // arrive pre-populated from the stage before the KBL, and that is what to model next.
 // Disabled with ZLB_NO_SUBSTITUTION=1 (which wins over ZLB_ALLOC_CARVE).
 bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
+    // Previous instruction address of this core, for the error-path diagnostics
+    // below: the KBL's shared panic stub is entered by a *branch* from one of ~36
+    // sites, so the pc that led there is the only way to name the failing check.
+    u32 previous_pc = 0;
+    if (core < static_cast<u32>(kArmCoreCount)) {
+        previous_pc = last_arm_pc_[core];
+        last_arm_pc_[core] = pc;
+    }
     // Round 94/95 measurements (docs/KBL.md round 95): every allocation the KBL
     // makes for itself calls the partition allocator 0x40032278 with flag 0x10.
     //   * size == 0x1000 is the *only* size served from the per-core page cache
@@ -521,6 +529,112 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             }
         }
         return false;    // a valid block: run the instruction
+    }
+
+    // Diagnostic (ZLB_KBL_PANIC_TRACE=1): the check at 0x40035966 is
+    //     0x40035966  ldr r1,[r4,#0x10]
+    //     0x40035968  cmp r1,r5
+    //     0x4003596A  bls.w 0x4003561C     ; continue when [r4+0x10] <= r5
+    //     0x4003596E  bl 0x4003B724        ; else the KBL's own panic (`b .`)
+    // and it is the place the boot currently dies (round 109: measured with `runm`,
+    // which is the mode that honours this hook - the debugger's `run` single-steps
+    // and never consults it).  Log the operands and the arena so the failing input
+    // is visible without another debugging session.
+    static const bool panic_trace = [] { return std::getenv("ZLB_KBL_PANIC_TRACE") != nullptr; }();
+    if (panic_trace && pc == 0x4003596Eu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, lr = 0, sp = 0;
+                arm->get_register("r0", r0);
+                arm->get_register("r1", r1);
+                arm->get_register("r2", r2);
+                arm->get_register("r3", r3);
+                arm->get_register("r4", r4);
+                arm->get_register("r5", r5);
+                arm->get_register("r6", r6);
+                arm->get_register("r7", r7);
+                arm->get_register("r14", lr);
+                arm->get_register("r13", sp);
+                ZLB_LOG_INFO("machine",
+                             "KBL panic arm%u: entered from pc=0x%08X lr=0x%08X sp=0x%08X "
+                             "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X "
+                             "r6=0x%08X r7=0x%08X",
+                             core, previous_pc, static_cast<u32>(lr), static_cast<u32>(sp),
+                             static_cast<u32>(r0), static_cast<u32>(r1), static_cast<u32>(r2),
+                             static_cast<u32>(r3), static_cast<u32>(r4), static_cast<u32>(r5),
+                             static_cast<u32>(r6), static_cast<u32>(r7));
+            }
+        }
+    }
+    if (panic_trace && pc == 0x40035966u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 r4 = 0, r5 = 0, r0 = 0, r2 = 0, r3 = 0, r6 = 0, r7 = 0, lr = 0;
+                arm->get_register("r4", r4);
+                arm->get_register("r5", r5);
+                arm->get_register("r0", r0);
+                arm->get_register("r2", r2);
+                arm->get_register("r3", r3);
+                arm->get_register("r6", r6);
+                arm->get_register("r7", r7);
+                arm->get_register("r14", lr);
+                u32 pa = 0;
+                std::string fault;
+                const u32 arena = static_cast<u32>(r4);
+                const bool mapped = arm->translate(arena + 0x10u, false, false, pa, fault);
+                ZLB_LOG_INFO("machine",
+                             "panic check arm%u: r4=0x%08X r5=0x%08X [r4+0x10]=0x%08X%s r0=0x%08X "
+                             "r2=0x%08X r3=0x%08X r6=0x%08X r7=0x%08X lr=0x%08X (%s the panic)",
+                             core, arena, static_cast<u32>(r5),
+                             mapped ? arm_bus_->read32(pa) : 0u,
+                             mapped ? "" : " <unmapped>", static_cast<u32>(r0), static_cast<u32>(r2),
+                             static_cast<u32>(r3), static_cast<u32>(r6), static_cast<u32>(r7),
+                             static_cast<u32>(lr),
+                             (mapped && arm_bus_->read32(pa) > static_cast<u32>(r5)) ? "about to take"
+                                                                                    : "will skip");
+            }
+        }
+    }
+
+    // Note (round 109): the loop at 0x4003B3D2..0x4003B3DC (`blx 0x4003A018` relax,
+    // then spin while the 16-bit field at [obj+4] > 0, obj = 0x4005C004) is *not* a
+    // missing hardware completion: it is the KBL's four-core rendezvous, i.e. the
+    // barrier the whole-machine stepping loop already documents for 0x4003B384.  It
+    // resolves by itself as soon as the four Kermit cores are interleaved at
+    // instruction level, which `runm` (whole slices) does - and it deadlocks under
+    // the debugger's `run`, which single-steps the cores and never consults this
+    // hook at all (see docs/KBL.md round 109).  No substitution is needed here.
+
+    // Substitution (round 108): the getter at 0x4002C1AC builds the block pointer as
+    // `[obj+0x14] + table[..]` and the object the class-constructor loop passes in
+    // carries 0xFFFFFFFF in that base field (round 108.1 measured the store itself:
+    // R2 = 0, R3 = 0xFFFFFFFF = the value written).  Rather than skipping the store
+    // (which only hides the fault), give the caller a real, zeroed page out of the
+    // region the partition describes, so the loop's constructor works on memory the
+    // model actually owns.  ZLB_NO_SUBSTITUTION=1 disables it.
+    constexpr u32 kGetterStorePc = 0x4002C1CCu;    // str r3,[r1] in the getter
+    if (supply_blocks && pc == kGetterStorePc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 value = 0;
+                if (arm->get_register("r3", value) && value == 0xFFFFFFFFull) {
+                    u32 block = 0;
+                    if (supply_kbl_instance_block(core, block)) {
+                        arm->set_register("r3", block);
+                        ++boot_pc_fixes_;
+                        if (boot_pc_fixes_ <= 4) {
+                            ZLB_LOG_INFO("machine",
+                                         "instance base getter: 0xFFFFFFFF -> block VA 0x%08X at "
+                                         "pc=0x%08X (development substitution)",
+                                         block, pc);
+                            add_milestone("KBL instance base supplied at VA 0x" + hex(block, 8) +
+                                          " (development substitution)");
+                        }
+                    }
+                }
+            }
+        }
+        return false;    // the store still has to run, with a usable value
     }
 
     // Experiment (ZLB_KBL_CARVE=1): instead of the model handing blocks out of the
@@ -706,6 +820,49 @@ bool Vita::supply_kbl_carve_state(u32 core, u32 pool_va, u32 size) {
                      state | (class_index << 20) | pages);
     }
     return true;
+}
+
+// Substitution body (round 108): hand out one zeroed page from the region the
+// partition describes, for a class instance whose base field the loader never fills
+// in.  The getter 0x4002C1AC returns `[obj+0x14] + table[..]` and the instance the
+// constructor loop passes carries 0xFFFFFFFF there, so the loop receives -1 and its
+// `str.w r1,[r8]` faults (round 108.1).  The page is taken from the region tail,
+// walking downwards while pages refuse a probe write (the loader maps the region
+// lazily), where the page-cache seeding also takes its blocks from.
+bool Vita::supply_kbl_instance_block(u32 core, u32& out_block) {
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (arm == nullptr) return false;
+    auto write_va = [&](u32 va, u32 value) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, value);
+        return true;
+    };
+    const u32 region_size = partition_region_size_;
+    if (region_size < 0x2000u) return false;
+    u32& cursor = instance_block_next_;
+    if (cursor == 0u || cursor > region_size) cursor = region_size - 0x1000u;
+    while (cursor >= 0x1000u) {
+        cursor -= 0x1000u;
+        const u32 block = partition_region_base_ + cursor;
+        bool usable = write_va(block, 0u);      // probe: also zeroes the first word
+        for (u32 offset = 4u; usable && offset < 0x100u; offset += 4u) {
+            usable = write_va(block + offset, 0u);
+        }
+        if (!usable) continue;                  // unmapped: try the page below
+        out_block = block;
+        ++instance_blocks_supplied_;
+        if (instance_blocks_supplied_ <= 4) {
+            ZLB_LOG_INFO("machine",
+                         "instance block supplied: arm%u VA 0x%08X (region 0x%08X+0x%X) "
+                         "(development substitution)",
+                         core, block, partition_region_base_, cursor);
+        }
+        return true;
+    }
+    return false;
 }
 
 // Substitution body: put free blocks of the requested class into the calling
