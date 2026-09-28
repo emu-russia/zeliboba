@@ -769,6 +769,50 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // disables it.
     constexpr u32 kClassTableGlobal = 0x400B291Cu;
     constexpr u32 kSystemInitPc = 0x4002BB32u;   // `str r1,[r5]` in the manager builder
+
+    // Diagnostic experiment (round 155).  The loader builds the low page tables
+    // itself through the helper at 0x4003AD40 (`str r3,[r5,r4,lsl #2]` is the
+    // store), and three of the mappings come out with a *zero* page base:
+    //     L2[0x10] = 0x45F   VA 0x10000
+    //     L2[0x12] = 0x45F   VA 0x12000
+    //     L2[0x14] = 0x45F   VA 0x14000
+    // i.e. three different virtual windows land on physical page 0, which is also
+    // where the whole boot context (SceKblParam at +0x100, the vector stub, the
+    // flags) lives.  Everything the loader puts in those windows therefore
+    // overwrites everything else - the class descriptors, the heap object and the
+    // region nodes all end up on top of each other, which is exactly the state the
+    // "uninitialised descriptor" wall (0x40033FF2, r3 = [r0+56] = 0x65486465,
+    // docs/KBL.md rounds 143-150) shows.  Give each of those windows its own
+    // physical page and see whether the boot gets past that wall.
+    // Measured: it does *not*.  With the experiment on, the loader stops at
+    // checkpoint 0x84 (instead of 0x86/0x87) with arm0 parked at 0x4003A01C and
+    // the MMU off, so the sharing is deliberate (the wiki's
+    // KBPMappingInfo.extraHigh: one physical page, several virtual windows) and
+    // the real defect is that the loader *writes objects* through those windows.
+    // Kept as a switchable instrument for the next round.
+    // ZLB_KBL_LOWALIAS=1 enables the experiment; it is off by default.
+    static const bool lowalias_fix = [] {
+        const char* value = std::getenv("ZLB_KBL_LOWALIAS");
+        return value != nullptr && value[0] != '0';
+    }();
+    constexpr u32 kLowMapStorePc = 0x4003AD6Cu;
+    if (lowalias_fix && pc == kLowMapStorePc && core < static_cast<u32>(kArmCoreCount)) {
+        static std::array<u32, 0x100> pages{};
+        static u32 next = 0x40140000u;   // just above the loader's own page tables
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            if (arm->r[3] == 0x45Fu && arm->r[4] < pages.size()) {
+                const u32 index = arm->r[4];
+                if (pages[index] == 0u) {
+                    pages[index] = next | 0x45Fu;
+                    next += 0x1000u;
+                }
+                arm->r[3] = pages[index];
+                ZLB_LOG_INFO("machine", "low window L2[0x%02X] given its own page 0x%08X (diagnostic)",
+                             index, pages[index] & 0xFFFFF000u);
+            }
+        }
+    }
+
     // Round 110: with the memory walls behind it the KBL now runs the *whole* manager
     // builder and zeroes this field itself (`str r1,[r4,#0x1C]` at 0x4002ADB8, where
     // r4 = 0x400B2900 and +0x1C = the very slot our substitution fills), so the two
