@@ -434,6 +434,12 @@ struct MetadataResult {
     std::string key_source;
     int section_count = 0;
     int key_count = 0;
+    /// The plaintext of the whole metadata region: the decrypted MetadataInfo
+    /// (64 bytes, the recovered key/IV plus its zero padding) followed by the
+    /// decrypted body (metadata header, section table, key vault).  Round 153-8:
+    /// the CMeP's SCE block (0x5FFC0000) needs exactly this to answer the second
+    /// loader's in-place decryption job.
+    std::vector<u8> plaintext;
 };
 
 /// sceutils.get_key_type(): the (sys_version, self_type) pair used to pick the
@@ -623,6 +629,9 @@ bool decrypt_metadata(const std::vector<u8>& data, const SceKeys& keys,
     std::vector<u8> body(body_length);
     aes_cbc_decrypt_any(metadata_key, metadata_iv, data.data() + data_offset + kMetadataInfoSize,
                         body_length, body.data());
+
+    out.plaintext.assign(plain, plain + kMetadataInfoSize);
+    out.plaintext.insert(out.plaintext.end(), body.begin(), body.end());
 
     if (body.size() < kMetadataHeaderSize) {
         report.stage = "metadata body";
@@ -1092,6 +1101,32 @@ std::string describe_self(const std::vector<u8>& data) {
         text += format(" inner=ELF %s entry=0x%X phnum=%u", elf_machine_name(machine), entry, phnum);
     }
     return text;
+}
+
+bool sce_decrypt_metadata_in_place(std::vector<u8>& data, const SceKeys& keys, std::string* why) {
+    SceHeaderFields sce;
+    if (!parse_sce_header_fields(data, sce)) {
+        if (why != nullptr) *why = "not an SCE container";
+        return false;
+    }
+    const size_t region = static_cast<size_t>(sce.metadata_offset) + 48;
+    if (region >= data.size()) {
+        if (why != nullptr) *why = "metadata region is outside the buffer";
+        return false;
+    }
+
+    MetadataResult metadata;
+    SelfDecryptReport report;
+    if (!decrypt_metadata(data, keys, {}, metadata, report)) {
+        if (why != nullptr) *why = report.stage + ": " + report.message;
+        return false;
+    }
+    if (region + metadata.plaintext.size() > data.size()) {
+        if (why != nullptr) *why = "decrypted metadata does not fit the buffer";
+        return false;
+    }
+    std::copy(metadata.plaintext.begin(), metadata.plaintext.end(), data.begin() + region);
+    return true;
 }
 
 }  // namespace zlb

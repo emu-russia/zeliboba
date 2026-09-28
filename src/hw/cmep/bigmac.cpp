@@ -142,6 +142,18 @@ const SecondLoaderPatch kSecondLoaderPatches[] = {
         // substituted those never line up, so the validator is forced to report
         // success as well (its single epilogue is `mov $0,$5`).
         {0x9D5C, 2, 0x5000u, true, "SCE answer validator result (mov $0,0)"},
+        // Round 153-11/153-13: with the SCE window engine working (docs/SYSCON.md
+        // 8.11) the second loader's cold path gets all the way to building
+        // SceKblParam itself.  Two per-console checks still stand in the way and
+        // neither can be answered from the dumps we have:
+        //   * 0x4A52E verifies a 32 byte digest of the metadata against the copy
+        //     the loader carries (error 0x800F0627);
+        //   * 0x40F5E compares the firmware version it reads through 0x40E40 with
+        //     0x01040000 (error 0x800F0037); 0x40E40 answers 0xFFFFFFFF because
+        //     the idstorage reconstruction is an erased placeholder, and the
+        //     caller passes the right value in $6 anyway.
+        {0xA532, 2, 0xB00Eu, true, "SCE metadata digest check (beqz $0,0x4A540 -> bra 0x4A540)"},
+        {0xF76, 2, 0x0360u, true, "firmware version compare (lw $3,0x4($sp) -> mov $3,$6)"},
     };
 // Development substitution for the SMI leaf, applied to the decrypted second
 // loader (see docs/KBL.md, round 23).  The loader validates the idstorage SMI

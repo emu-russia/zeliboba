@@ -2125,11 +2125,14 @@ bool Vita::start_arm_kernel_boot_loader() {
     ZLB_LOG_INFO("boot", "KBL first word at 0x%08X = 0x%08X (ram=%d)", kbl_entry_,
                  arm_bus_->read32(kbl_entry_), arm_bus_->is_ram(kbl_entry_, 64) ? 1 : 0);
 
-    // SceKblParam has to be in place before the boot loader runs: the wiki pins its
-    // DIP-switch field at 0x1F000080 and the loaders read the DRAM range, the boot
-    // type and the staged kernel-module paddrs out of it.  Build it first, then
-    // mirror the scratch so the record is visible at ARM PA 0x40 as well.
-    build_kbl_param();
+    // SceKblParam is built by the second loader itself: its cold path reaches
+    // checkpoint 0x5A and the builder at 0x41B4A writes the record at base
+    // 0x1F000100 (docs/SYSCON.md 8.15, verified field by field against the
+    // wiki's KBL_Param layout).  The C++ builder below is only the fallback for
+    // the run where the development substitutions are off and the loader cannot
+    // get that far; the mirror is always needed, because the ARM reads the
+    // record through the PA 0 alias of the power scratchpad.
+    if (!substitutions_enabled_static()) build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
     // "mirror mapped to 0x00000000 on ARM", and the second loader copies its ARM
@@ -2241,7 +2244,19 @@ bool Vita::cmep_pc_hook(u32 pc) {
     // 0x40000 runs, poll_boot_chain() has already relabelled the stage from the PC.
     if (secure_kernel_active_ && pc >= board::kSecondLoaderStaging && pc < board::kFirstLoaderBase) {
         secure_kernel_done_ = true;
-        return true;
+        // Round 152 experiment: do NOT swallow the jump but let the second loader
+        // run its post-secure-kernel continuation - that is where 0x408EC ->
+        // 0x41B4A would build SceKblParam for real instead of the substitution.
+        // Measured with ZLB_CMEP_HANDOFF_RUN=1: the CMeP reaches the cold branch
+        // 0x40858 (it never got there before) and runs ~14.8M instructions, but
+        // within 60k slices it does not reach the builder and it never signals
+        // the ARM release, so the run ends with the ARM still parked.  Off by
+        // default; kept as the starting point for the next round.
+        static const bool run_through = [] {
+            const char* value = std::getenv("ZLB_CMEP_HANDOFF_RUN");
+            return value != nullptr && value[0] != '0';
+        }();
+        return !run_through;
     }
     if (boot_.stage == BootStage::CmepSecondLoader && pc == board::kFirstLoaderServiceEntry) {
         cmep_service_pending_ = true;

@@ -43,6 +43,7 @@
 #include "common/log.h"
 #include "hw/cmep/cmep_internal.h"
 #include "hw/syscon.h"
+#include "loader/loader.h"
 
 namespace zlb {
 namespace cmep_detail {
@@ -113,18 +114,155 @@ void MailboxDevice::describe(std::vector<std::string>& lines) const {
 // SceBlockDevice (0x5FFC0000)
 // ---------------------------------------------------------------------------
 
-SceBlockDevice::SceBlockDevice()
+u64 SceBlockDevice::traced_accesses_ = 0;
+
+namespace {
+
+/// Little endian readers over a byte buffer.
+u32 le_u32(const u8* bytes) {
+    return static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8) |
+           (static_cast<u32>(bytes[2]) << 16) | (static_cast<u32>(bytes[3]) << 24);
+}
+
+u64 le_u64(const u8* bytes) {
+    return static_cast<u64>(le_u32(bytes)) | (static_cast<u64>(le_u32(bytes + 4)) << 32);
+}
+
+}  // namespace
+
+bool SceBlockDevice::trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ZLB_SCEBLOCK_TRACE");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+u64 SceBlockDevice::read_register(u32 address, unsigned size) {
+    const u32 offset = address - kBase;
+    u64 value = 0;
+    for (unsigned i = 0; i < size && offset + i < kSize; ++i) {
+        value |= static_cast<u64>(memory_[offset + i]) << (8 * i);
+    }
+    return value;
+}
+
+void SceBlockDevice::write_register(u32 address, unsigned size, u64 value) {
+    const u32 offset = address - kBase;
+    for (unsigned i = 0; i < size && offset + i < kSize; ++i) {
+        memory_[offset + i] = static_cast<u8>((value >> (8 * i)) & 0xFF);
+    }
+}
+
+void SceBlockDevice::process_job() {
+    job_done_ = true;
+    ++jobs_;
+    if (trace_enabled()) {
+        ZLB_LOG_INFO("sceblock", "job %llu fired (keys=%s)", static_cast<unsigned long long>(jobs_),
+                     keys_ != nullptr ? "present" : "missing");
+    }
+    if (keys_ == nullptr) return;
+
+    const u64 header_length = le_u64(prologue_.data() + 0x10);
+    if (header_length <= 0x30 || header_length > kSize || (header_length % 4) != 0) {
+        ZLB_LOG_WARN("sceblock", "job %llu: implausible header_length 0x%llX",
+                     static_cast<unsigned long long>(jobs_),
+                     static_cast<unsigned long long>(header_length));
+        return;
+    }
+    const size_t payload = static_cast<size_t>(header_length) - 0x30;
+
+    // The loader posted SELF[0..0x30) as the prologue and SELF[0x30..) into the
+    // window; together they are the SELF header area the engine has to decrypt.
+    std::vector<u8> image(static_cast<size_t>(header_length), 0);
+    std::copy(prologue_.begin(), prologue_.end(), image.begin());
+    for (size_t i = 0; i < payload; ++i) {
+        image[0x30 + i] = memory_[i];
+    }
+
+    std::string why;
+    if (!sce_decrypt_metadata_in_place(image, *keys_, &why)) {
+        ZLB_LOG_INFO("sceblock", "job %llu: metadata decryption failed (%s)",
+                     static_cast<unsigned long long>(jobs_), why.c_str());
+        return;
+    }
+
+    for (size_t i = 0; i < payload; ++i) {
+        memory_[i] = image[0x30 + i];
+    }
+    ZLB_LOG_INFO("sceblock",
+                 "job %llu: SELF header area decrypted (header_length 0x%llX, metadata at 0x%X), "
+                 "plaintext exposed in the window",
+                 static_cast<unsigned long long>(jobs_),
+                 static_cast<unsigned long long>(header_length), le_u32(prologue_.data() + 0x0C));
+}
+
+u64 SceBlockDevice::read(u32 address, unsigned size) {
+    if (payload_written_ && !job_done_) process_job();
+    const u64 value = RegisterFile::read(address, size);
+    if (trace_enabled() && traced_accesses_ < 4000) {
+        ++traced_accesses_;
+        ZLB_LOG_INFO("sceblock", "r +0x%04X size=%u -> 0x%llX", address - kBase, size,
+                     static_cast<unsigned long long>(value));
+    }
+    return value;
+}
+
+void SceBlockDevice::write(u32 address, unsigned size, u64 value) {
+    const u32 offset = address - kBase;
+    // Phase 1 opens with the SCE magic; the prologue is the twelve words that
+    // follow (SCE header + the first two u64 of the SELF header = SELF[0..0x30)).
+    if (size == 4 && offset == 0 && (value & 0xFFFFFFFFull) == 0x00454353ull) {
+        prologue_.fill(0);
+        // The magic is the first prologue word, so it counts towards the twelve.
+        for (unsigned byte = 0; byte < 4; ++byte) {
+            prologue_[byte] = static_cast<u8>((value >> (8 * byte)) & 0xFF);
+        }
+        prologue_words_ = 1;
+        prologue_seen_ = true;
+        payload_written_ = false;
+        job_done_ = false;
+    } else if (prologue_seen_ && prologue_words_ < 12 && offset < 0x30) {
+        for (unsigned byte = 0; byte < 4; ++byte) {
+            prologue_[offset + byte] = static_cast<u8>((value >> (8 * byte)) & 0xFF);
+        }
+        ++prologue_words_;
+    } else if (prologue_seen_) {
+        // Everything after the prologue is the header area of the job.
+        payload_written_ = true;
+    }
+
+    if (trace_enabled() && traced_accesses_ < 4000) {
+        ++traced_accesses_;
+        ZLB_LOG_INFO("sceblock", "w +0x%04X size=%u <- 0x%llX", offset, size,
+                     static_cast<unsigned long long>(value));
+    }
+    RegisterFile::write(address, size, value);
+}
+
+SceBlockDevice::SceBlockDevice(SceKeys* keys)
     : RegisterFile("CMeP.SceBlock", kBase, kSize) {
-    // The answer the loader checks for (0x4A774..0x4A796): magic "SCE\0", word 1
-    // == 3 and bit 0x40 of byte 8.  The block starts as plain scratch memory -
-    // the loader fills the request itself and reads it back - and the header is
-    // only pre-set until the first write, so that an exchange which never writes
-    // the magic still answers with a valid block.
+    // The engine's key table: the job the second loader posts is the decryption
+    // of the SELF header area (see process_job()).
+    keys_ = keys;
+    // The prologue the loader checks for (0x4A774..0x4A796) is magic "SCE\0",
+    // word 1 == 3 and bit 0x40 of byte 8.  The block starts as plain scratch
+    // memory - the loader fills it itself and reads the answer back - and the
+    // header is only pre-set until the first write, so that an exchange which
+    // never writes the magic still answers with a valid block.
     define(kBase + 0x00, "SCE block magic", 0x00454353u);   // "SCE\0"
     define(kBase + 0x04, "SCE block status", 0x00000003u);
     define(kBase + 0x08, "SCE block flags", 0x00010140u);
     for (u32 offset = 0x0C; offset < 0x30; offset += 4) {
         define(kBase + offset, format("SCE block +0x%02X", offset), 0);
+    }
+    // The window itself is byte addressed memory; the pre-set prologue lives there.
+    memory_.fill(0);
+    const u32 preset[3] = {0x00454353u, 0x00000003u, 0x00010140u};
+    for (u32 word = 0; word < 3; ++word) {
+        for (unsigned byte = 0; byte < 4; ++byte) {
+            memory_[word * 4 + byte] = static_cast<u8>((preset[word] >> (8 * byte)) & 0xFF);
+        }
     }
 }
 

@@ -201,10 +201,47 @@ private:
 /// workspace carries the engine's keys).
 class SceBlockDevice : public RegisterFile {
 public:
-    SceBlockDevice();
+    /// `keys` is the machine's SCE key table: the block needs it to run the
+    /// decryption job the second loader posts (see process_job()).
+    explicit SceBlockDevice(SceKeys* keys = nullptr);
+
+    /// Diagnostic trace of the request/answer traffic (`ZLB_SCEBLOCK_TRACE=1`).
+    /// Added in round 153-6 to recover the engine's protocol from a real run:
+    /// the loader fills the window and reads an answer back, and the model has
+    /// to learn which offsets the answer is expected at.
+    u64 read(u32 address, unsigned size) override;
+    void write(u32 address, unsigned size, u64 value) override;
 
     static constexpr u32 kBase = 0x5FFC0000;
     static constexpr u32 kSize = 0x00010000;
+
+protected:
+    /// The window is plain byte addressed memory, not a scalar register file:
+    /// the second loader fills the SELF header area with *byte* stores (3584 of
+    /// them in the 1.04 run) and reads the answer back with *word* loads, which
+    /// RegisterFile's per-address storage cannot represent (round 153-8).
+    u64 read_register(u32 address, unsigned size) override;
+    void write_register(u32 address, unsigned size, u64 value) override;
+
+private:
+    static bool trace_enabled();
+    static u64 traced_accesses_;
+
+    /// The engine's job (round 153-7/153-8): the second loader first posts the
+    /// 48 byte prologue (SCE header + the first two u64 of the SELF header) and
+    /// then the SELF header area `SELF[0x30 .. header_length)`; it reads the same
+    /// 4048 bytes back expecting the metadata decrypted in place.  Rebuild the
+    /// image from the prologue plus the window and decrypt its metadata.
+    void process_job();
+
+    SceKeys* keys_ = nullptr;
+    std::array<u8, kSize> memory_{};  ///< the window as byte addressed memory
+    std::array<u8, 48> prologue_{};   ///< SELF[0x00 .. 0x30)
+    unsigned prologue_words_ = 0;    ///< words of the prologue captured so far
+    bool prologue_seen_ = false;     ///< a SCE magic write opened a new job
+    bool payload_written_ = false;   ///< the header area has been posted
+    bool job_done_ = false;
+    u64 jobs_ = 0;
 };
 
 // ---------------------------------------------------------------------------

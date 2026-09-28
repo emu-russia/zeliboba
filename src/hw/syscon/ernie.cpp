@@ -102,6 +102,8 @@ struct ErnieBlock::Impl {
     ernie::EmmcHost emmc_host;
     ernie::PowerState power;
     ernie::PowerPolicy policy;
+    ernie::NvsStore nvs;        ///< Ernie NVS (data flash), read by 0x1082
+    ernie::ScratchPad scratch;  ///< Ernie scratch pad, read/written by 0x0090/0x0091
 
     bool installed = false;
     u64 cycles = 0;  ///< absolute cycle count fed to the clock model
@@ -389,6 +391,56 @@ std::vector<u8> ErnieBlock::Impl::dispatch(u32 command, const std::vector<u8>& p
             return framed;
         }
 
+        // --- NVS / scratch pad ---------------------------------------------
+        case 0x1082: {  // nvs_read (0x3764D)
+            // `u16 offset` + `u8 length`, answered with `length` bytes.  The
+            // 1.04 second loader sends [80 04 08] (NVS 0x480, the Qaf token /
+            // extra UART / safe mode flags) and the decompiled 3.60 loader calls
+            // this `syscon_read_cmd_0x1082_ptr_0x480_into_gbuf`.
+            if (payload.size() < 3) return error_reply(0x02, 0x00);
+            const u16 offset = static_cast<u16>(payload[0] | (payload[1] << 8));
+            const size_t length = payload[2];
+            std::vector<u8> data;
+            if (!nvs.read(offset, length, data)) return error_reply(0x03, 0x00);
+            ZLB_LOG_DBG("ernie.sc", "nvs read 0x%04X+%u -> %02X %02X %02X %02X", offset,
+                        static_cast<unsigned>(length), data.size() > 0 ? data[0] : 0,
+                        data.size() > 1 ? data[1] : 0, data.size() > 2 ? data[2] : 0,
+                        data.size() > 3 ? data[3] : 0);
+            return ok_reply(data);
+        }
+        case 0x1083: {  // nvs_write (0x37722)
+            // The same header followed by the data to store (the wiki does not
+            // name the command; the payload shape and the flags bit are the
+            // evidence).
+            if (payload.size() < 3) return error_reply(0x02, 0x00);
+            const u16 offset = static_cast<u16>(payload[0] | (payload[1] << 8));
+            const size_t length = payload[2];
+            if (payload.size() < 3 + length) return error_reply(0x02, 0x00);
+            if (!nvs.write(offset, payload.data() + 3, length)) return error_reply(0x03, 0x00);
+            return ok_reply(u32_payload(0));
+        }
+        case 0x0090: {  // scratchpad_read (0x36540)
+            // `u16 offset` + `u8 length`.  The second loader reads 0x20 bytes at
+            // 0xE0, the `SceDIPSW dipsw` field, which is what ends up in the
+            // SceKblParam DIP switch block.
+            if (payload.size() < 3) return error_reply(0x02, 0x00);
+            const u16 offset = static_cast<u16>(payload[0] | (payload[1] << 8));
+            const size_t length = payload[2];
+            std::vector<u8> data;
+            if (!scratch.read(offset, length, data)) return error_reply(0x03, 0x00);
+            ZLB_LOG_DBG("ernie.sc", "scratchpad read 0x%04X+%u", offset,
+                        static_cast<unsigned>(length));
+            return ok_reply(data);
+        }
+        case 0x0091: {  // scratchpad_write (0x365E0)
+            if (payload.size() < 3) return error_reply(0x02, 0x00);
+            const u16 offset = static_cast<u16>(payload[0] | (payload[1] << 8));
+            const size_t length = payload[2];
+            if (payload.size() < 3 + length) return error_reply(0x02, 0x00);
+            if (!scratch.write(offset, payload.data() + 3, length)) return error_reply(0x03, 0x00);
+            return ok_reply(u32_payload(0));
+        }
+
         // --- panel / UART state -----------------------------------------
         case 0x0100:    // get_panel_state (0x36132, length 0x06)
         case 0x0103:    // get_panel_state2 (0x361C5, length 0x06)
@@ -476,27 +528,14 @@ std::vector<u8> ErnieBlock::Impl::dispatch(u32 command, const std::vector<u8>& p
             return ok_reply(block);
         }
 
-        // --- eMMC ---------------------------------------------------------
-        case 0x1100: {  // storage_read (0x35B57, length 0x06 without data)
-            if (payload.size() < 8) {
-                std::vector<u8> data(6, 0);
-                if (card != nullptr && card->attached()) {
-                    data[0] = static_cast<u8>(emmc_host.partition());
-                    const u64 blocks = card->block_count();
-                    for (int i = 0; i < 4; ++i) data[1 + i] = static_cast<u8>((blocks >> (8 * i)) & 0xFF);
-                    data[5] = 0x01;
-                }
-                return ok_reply(data);
-            }
-            const u64 lba = ernie::load_le32(payload.data());
-            const u32 count = ernie::load_le32(payload.data() + 4);
-            std::vector<u8> data;
-            if (!emmc_host.read_blocks(lba, count, data)) return error_reply(0x03, 0x00);
-            ZLB_LOG_DBG("ernie.sc", "storage_read lba=%llu count=%u -> %u bytes, first=%02X %02X %02X %02X",
-                        static_cast<unsigned long long>(lba), count, static_cast<unsigned>(data.size()),
-                        data.size() > 0 ? data[0] : 0, data.size() > 1 ? data[1] : 0,
-                        data.size() > 2 ? data[2] : 0, data.size() > 3 ? data[3] : 0);
-            return ok_reply(data, static_cast<u8>(emmc_host.card_status() & 0xFF));
+        // --- storage group (labels unverified, see ernie_sc.cpp) ------------
+        case 0x1100: {  // get_ernie_dl_version (0x35B57)
+            // The USS-1001 table entry carries flags = 0x0000, i.e. this command
+            // takes no payload at all, and the wiki's boot trace shows the four
+            // byte answer `01 01 13 00` -- the Ernie DownLoader version.  It is
+            // not a block read: the eMMC hangs off Kermit's SDIO0 controller and
+            // the second loader drives it directly.
+            return ok_reply({0x01, 0x01, 0x13, 0x00});
         }
         case 0x1101: {  // storage_write (0x35B8E)
             if (payload.size() < 8) return error_reply(0x02, 0x00);
@@ -513,16 +552,6 @@ std::vector<u8> ErnieBlock::Impl::dispatch(u32 command, const std::vector<u8>& p
             if (card == nullptr || !card->attached()) return error_reply(0x04, 0x00);
             const std::array<u8, 16>& cid = card->cid();
             return ok_reply(std::vector<u8>(cid.begin(), cid.end()));
-        }
-        case 0x1082: {  // emmc_get_csd (0x3764D)
-            if (card == nullptr || !card->attached()) return error_reply(0x04, 0x00);
-            const std::array<u8, 16>& csd = card->csd();
-            return ok_reply(std::vector<u8>(csd.begin(), csd.end()));
-        }
-        case 0x1083: {  // emmc_get_ext_csd (0x37722)
-            if (card == nullptr || !card->attached()) return error_reply(0x04, 0x00);
-            const std::vector<u8>& ext = card->ext_csd();
-            return ok_reply(std::vector<u8>(ext.begin(), ext.begin() + std::min<size_t>(ext.size(), 32)));
         }
         case 0x1180: {  // emmc_read (0x35749, length 0x06)
             if (payload.size() >= 8) {
@@ -686,6 +715,8 @@ void ErnieBlock::reset() {
     impl.power.reset();
     impl.channel.reset();
     impl.emmc_host.reset();
+    impl.nvs.reset();
+    impl.scratch.reset();
     impl.power.bind(impl.sfr, &impl.emmc_host);
     impl.cycles = 0;
     impl.ticks = 0;

@@ -132,6 +132,13 @@ bool parse_self_header(const std::vector<u8>& data, SelfHeader& out);
 /// hardware keyring can be substituted through `keys`).
 std::optional<std::vector<u8>> self_to_elf(const std::vector<u8>& data, const SceKeys& keys);
 
+/// Decrypt the SELF metadata region (SceHeader.metadata_offset + 48 .. header_length)
+/// and write the plaintext back into `data` in place.  This is the job the CMeP's
+/// SCE block (0x5FFC0000) performs for the second loader: the loader copies
+/// SELF[0x30 .. header_length) into the block and reads the metadata back
+/// decrypted (round 153-7/153-8 in docs/SYSCON.md).
+bool sce_decrypt_metadata_in_place(std::vector<u8>& data, const SceKeys& keys, std::string* why);
+
 /// SLB2 container: second_loader.enp + kernel_boot_loader.self (+ extra entries).
 struct Slb2Entry {
     std::string name;

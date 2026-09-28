@@ -96,16 +96,21 @@ constexpr u32 kFirstLoaderServiceEntry = 0x0005FF00;
 /// the image runs from the CMeP's private 2 MiB window at 0x800000.
 constexpr u32 kCmepSecureKernelBase = 0x00800000;
 /// Where the ARM boot ROM stages the second-loader container.  This must *not* be
-/// the shared SRAM: the wiki's `KBL Param` page pins the SceKblParam DIP-switch
-/// field at physical 0x1F000080, i.e. the record lives at 0x1F000040 inside
-/// SPAD32K, and staging the container there overwrote it (see kKblParamBase).
+/// the shared SRAM (SPAD32K at 0x1F000000): the second loader builds SceKblParam
+/// at 0x1F000100 inside it (see kKblParamBase) and the kernel boot loader reads
+/// the record from there through the ARM's physical alias, so staging the
+/// container over the scratchpad would destroy it.
 constexpr u32 kSecondLoaderStagingDram = 0x407C0000;  ///< inside the shared DRAM window
-/// SceKblParam: 0x100-byte record the second loader builds and the secure/non-secure
-/// kernel boot loaders read (wiki KBL_Param).  Two copies are documented: one in the
-/// power scratchpad (its DIP-switch field is pinned at 0x1F000080, so the record is
-/// at 0x1F000040) and one in secure DRAM ("0x4001FD00 - SceKblParam with magic not
-/// set" in the wiki's FW 3.60 Secure DRAM layout, right below SKBL).
-constexpr u32 kKblParamBase = 0x1F000040;
+/// SceKblParam: the 0x100-byte record the second loader builds at physical
+/// 0x1F000100 inside SPAD32K and the secure/non-secure kernel boot loaders read
+/// (wiki KBL_Param).  The base is what the loader's own builder uses - the
+/// disassembly at 0x41B4A loads `0x1F000100` and the record it writes matches
+/// the wiki's field offsets (DRAM base at +0x60, kprx_auth_sm at +0x90, ...),
+/// which was confirmed on a real run (docs/SYSCON.md 8.15).  The earlier
+/// 0x1F000040 came from reading the wiki's "fallback DIP switch buffer at
+/// physical 0x80" as the record's DIP field; it is 0xC0 too low and overlapped
+/// the loader's own header.
+constexpr u32 kKblParamBase = 0x1F000100;
 constexpr u32 kKblParamDram = 0x4001FD00;
 constexpr u32 kKblParamSize = 0x100;
 constexpr u32 kKblParamMagic = 0xCBAC03AAu;

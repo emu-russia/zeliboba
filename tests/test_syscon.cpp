@@ -289,12 +289,12 @@ ZLB_TEST(ernie_sc_eMMC_block_read_and_write) {
     std::vector<u8> count = le32(2);
     write_payload.insert(write_payload.end(), count.begin(), count.end());
     write_payload.insert(write_payload.end(), pattern.begin(), pattern.end());
-    const std::vector<u8> write_reply = ernie.dispatch_command(0x1101, write_payload);
+    const std::vector<u8> write_reply = ernie.dispatch_command(0x1181, write_payload);
     ZLB_EXPECT_EQ(static_cast<u32>(write_reply[0]), 0u);
 
     std::vector<u8> read_payload = le32(0x40);
     read_payload.insert(read_payload.end(), count.begin(), count.end());
-    const std::vector<u8> read_reply = ernie.dispatch_command(0x1100, read_payload);
+    const std::vector<u8> read_reply = ernie.dispatch_command(0x1180, read_payload);
     ZLB_EXPECT_EQ(static_cast<u32>(read_reply[0]), 0u);
     // The 4+32 reply truncates the payload to 32 bytes, which is the record size
     // the Ernie handlers use (0x0DD98 is a 4+32 byte buffer).
@@ -307,9 +307,9 @@ ZLB_TEST(ernie_sc_eMMC_block_read_and_write) {
     ZLB_EXPECT_TRUE(std::memcmp(direct.data(), pattern.data(), pattern.size()) == 0);
 
     // Partial payloads are rejected with error 0x02.
-    const std::vector<u8> short_read = ernie.dispatch_command(0x1100, le32(0));
+    const std::vector<u8> short_read = ernie.dispatch_command(0x1180, le32(0));
     ZLB_EXPECT_EQ(static_cast<u32>(short_read[0]), 0u);  // <8 bytes: card info reply
-    const std::vector<u8> short_write = ernie.dispatch_command(0x1101, le32(0));
+    const std::vector<u8> short_write = ernie.dispatch_command(0x1181, le32(0));
     ZLB_EXPECT_EQ(static_cast<u32>(short_write[0]), 0x02u);
 
     // Partition select + identity commands.
@@ -319,8 +319,88 @@ ZLB_TEST(ernie_sc_eMMC_block_read_and_write) {
     const std::vector<u8> cid = ernie.dispatch_command(0x1081, {});
     ZLB_EXPECT_EQ(static_cast<u32>(cid[0]), 0u);
     ZLB_EXPECT_TRUE(std::memcmp(cid.data() + 3, scratch.card.cid().data(), 16) == 0);
-    const std::vector<u8> csd = ernie.dispatch_command(0x1082, {});
-    ZLB_EXPECT_TRUE(std::memcmp(csd.data() + 3, scratch.card.csd().data(), 16) == 0);
+}
+
+// The NVS and the scratch pad are addressed as `u16 offset` + `u8 length`, and
+// the 1.04 second loader uses exactly two of those reads:
+//
+//   0x1082 [80 04 08]  -> NVS 0x480, 8 bytes (Qaf token / extra UART / safe mode)
+//   0x0090 [E0 00 20]  -> scratch pad 0xE0, 32 bytes (the CP DIP switch block)
+//
+// Both used to be answered with unrelated data (an eMMC CSD and an empty reply),
+// so this test pins the wire semantics down.
+ZLB_TEST(ernie_nvs_and_scratchpad_are_offset_length_stores) {
+    Bus bus;
+    bus.unmapped_reads_zero = true;
+    ErnieBlock ernie(bus, nullptr);
+    ernie.install();
+    ernie.set_running_firmware(false);
+
+    const auto le16 = [](u16 value) {
+        return std::vector<u8>{static_cast<u8>(value & 0xFF), static_cast<u8>(value >> 8)};
+    };
+
+    // An unprovisioned console: the wiki documents 0xFF for "Qaf token not set",
+    // "not safe mode" and "not update mode", so a fresh NVS reads as 0xFF.
+    std::vector<u8> read = le16(0x0480);
+    read.push_back(8);
+    const std::vector<u8> flags = ernie.dispatch_command(0x1082, read);
+    ZLB_EXPECT_EQ(static_cast<u32>(flags[0]), 0u);
+    ZLB_EXPECT_EQ(static_cast<u32>(flags[2]), 8u);
+    for (int i = 0; i < 8; ++i) ZLB_EXPECT_EQ(static_cast<u32>(flags[3 + i]), 0xFFu);
+
+    // A write goes back out through the same offset/length header.
+    std::vector<u8> write = le16(0x04A0);
+    write.push_back(2);
+    write.push_back(0x11);
+    write.push_back(0x22);
+    const std::vector<u8> written = ernie.dispatch_command(0x1083, write);
+    ZLB_EXPECT_EQ(static_cast<u32>(written[0]), 0u);
+
+    std::vector<u8> verify = le16(0x04A0);
+    verify.push_back(2);
+    const std::vector<u8> stored = ernie.dispatch_command(0x1082, verify);
+    ZLB_EXPECT_EQ(static_cast<u32>(stored[2]), 2u);
+    ZLB_EXPECT_EQ(static_cast<u32>(stored[3]), 0x11u);
+    ZLB_EXPECT_EQ(static_cast<u32>(stored[4]), 0x22u);
+
+    // A request beyond the store is refused instead of silently truncated.
+    std::vector<u8> far = le16(0xFFFF);
+    far.push_back(4);
+    ZLB_EXPECT_EQ(static_cast<u32>(ernie.dispatch_command(0x1082, far)[0]), 0x03u);
+
+    // Scratch pad 0xE0 is the SceDIPSW block: 0x20 bytes, the CP part unset and
+    // the release mode values in the second half.
+    std::vector<u8> dip = le16(0x00E0);
+    dip.push_back(0x20);
+    const std::vector<u8> switches = ernie.dispatch_command(0x0090, dip);
+    ZLB_EXPECT_EQ(static_cast<u32>(switches[0]), 0u);
+    ZLB_EXPECT_EQ(static_cast<u32>(switches[2]), 0x20u);
+    for (int i = 0; i < 16; ++i) ZLB_EXPECT_EQ(static_cast<u32>(switches[3 + i]), 0x00u);
+    ZLB_EXPECT_EQ(read_le32(switches, 3 + 0x18), 0x00080002u);  // debug control
+    ZLB_EXPECT_EQ(read_le32(switches, 3 + 0x1C), 0x20000000u);  // system control
+
+    // The scratch pad is writable (command 0x0091) -- the resume context pointer
+    // at +0xC is how the kernel hands the suspend buffer to the next boot.
+    std::vector<u8> resume = le16(0x000C);
+    resume.push_back(4);
+    resume.push_back(0xF0);
+    resume.push_back(0x0E);
+    resume.push_back(0x1F);
+    resume.push_back(0x41);
+    ZLB_EXPECT_EQ(static_cast<u32>(ernie.dispatch_command(0x0091, resume)[0]), 0u);
+
+    std::vector<u8> back = le16(0x000C);
+    back.push_back(4);
+    const std::vector<u8> saved = ernie.dispatch_command(0x0090, back);
+    ZLB_EXPECT_EQ(read_le32(saved, 3), 0x411F0EF0u);
+
+    // 0x1100 takes no payload (flags = 0x0000 in the USS-1001 table) and answers
+    // with the Ernie DownLoader version.
+    const std::vector<u8> version = ernie.dispatch_command(0x1100, {});
+    ZLB_EXPECT_EQ(static_cast<u32>(version[0]), 0u);
+    ZLB_EXPECT_EQ(static_cast<u32>(version[2]), 4u);
+    ZLB_EXPECT_EQ(read_le32(version, 3), 0x00130101u);
 }
 
 ZLB_TEST(ernie_sc_register_channel) {

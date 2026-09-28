@@ -690,6 +690,11 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
         const u32 target = static_cast<u32>(desc[4]) | (static_cast<u32>(desc[5]) << 8) |
                            (static_cast<u32>(desc[6]) << 16) | (static_cast<u32>(desc[7]) << 24);
 
+        if (sdif_trace()) {
+            std::fprintf(stderr, "[sdif] adma rec @0x%08X attr=0x%04X len=%u target=0x%08X (%u of %u moved)\n",
+                         record, attribute, length, target, adma_bytes_,
+                         static_cast<unsigned>(payload.size()));
+        }
         if ((attribute & 0x1u) == 0) {
             // No valid bit: the walk stops and the error status latches.
             if (sdif_trace()) {
@@ -699,23 +704,34 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
         }
         // Bits [5:4] are ACT: 0b10 transfers data, 0b00 is a no-op (and 0b11 a
         // link to another table, which no Vita driver uses).
-        if (((attribute >> 4) & 0x3u) == 0x2u && length != 0) {
-            if (bus->first_unmapped(target, length) != 0) {
+        //
+        // Length 0 means a full 64 KiB block, not an empty record: the second
+        // loader's multi-block read of the SELF header area builds the table
+        // `{0x21, 0, 0x5FFC0000} {0x21, 0, 0x5FFD0000} {0x21, 0, 0x5FFE0000}
+        // {0x23, 48640, 0x5FFF0000}` whose targets are exactly 64 KiB apart, and
+        // 3*65536 + 48640 equals the transfer size CMD23 asked for (479 blocks =
+        // 245248 bytes).  Treating those records as empty stopped the walk after
+        // 48640 bytes, the short transfer made the driver retry forever (round
+        // 153-10 in docs/SYSCON.md).
+        const u32 transfer_length = length == 0 ? 0x10000u : length;
+        if (((attribute >> 4) & 0x3u) == 0x2u && transfer_length != 0) {
+            if (bus->first_unmapped(target, transfer_length) != 0) {
                 if (sdif_trace()) {
-                    std::fprintf(stderr, "[sdif] adma: target 0x%08X len %u unmapped\n", target, length);
+                    std::fprintf(stderr, "[sdif] adma: target 0x%08X len %u unmapped\n", target,
+                                 transfer_length);
                 }
                 return false;
             }
             if (read) {
-                if (static_cast<size_t>(consumed) + length > payload.size()) return false;
-                bus->write_bytes(target, payload.data() + consumed, length);
+                if (static_cast<size_t>(consumed) + transfer_length > payload.size()) return false;
+                bus->write_bytes(target, payload.data() + consumed, transfer_length);
             } else {
                 const size_t base = sink->size();
-                sink->resize(base + length);
-                bus->read_bytes(target, sink->data() + base, length);
+                sink->resize(base + transfer_length);
+                bus->read_bytes(target, sink->data() + base, transfer_length);
             }
-            consumed += length;
-            adma_bytes_ += length;
+            consumed += transfer_length;
+            adma_bytes_ += transfer_length;
         }
         if ((attribute & 0x2u) != 0) break;  // END: last record of the table
         record += 8;

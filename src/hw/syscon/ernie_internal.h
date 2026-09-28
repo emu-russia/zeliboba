@@ -158,6 +158,110 @@ constexpr u8 kScResultOk = 0x00;
 constexpr u8 kScResultBusy = 0xFE;
 
 // ---------------------------------------------------------------------------
+// Ernie NVS and scratch pad
+// ---------------------------------------------------------------------------
+//
+// Two small stores the console reads over the SC channel.  Both are addressed
+// as `u16 offset` + `u8 length`; the request and the reply share the 4 + 32 byte
+// response record, so a transfer is capped at 32 bytes.
+//
+// Evidence (all from the wiki unless marked):
+//   * command 0x1082 is the NVS read -- the 1.04 second loader sends
+//     `80 04 08` (we see the same bytes in the SPI trace) and the decompiled
+//     3.60 loader calls `syscon_read_cmd_0x1082_ptr_0x480_into_gbuf`;
+//   * command 0x1083 carries the same header followed by data (NVS write; the
+//     wiki does not name it, the payload shape and the `flags` bit in the
+//     USS-1001 command table are the evidence);
+//   * command 0x0090/0x0091 are the scratch pad read/write.  The loader sends
+//     `E0 00 20`, i.e. offset 0xE0 length 0x20, which is exactly the
+//     `SceDIPSW dipsw` field of the documented `SceSysconScratchPad`.
+//
+// NVS layout the boot chain consumes (wiki "Ernie"):
+//   0x400..0x47F  Qaf token
+//   0x480         Qaf token flag        1 = token not set (area is 0xFF)
+//   0x481         extra UART flag       0x01 = extra UART only with a JIG dongle
+//   0x483         safe mode flags       0xFF = not safe mode
+//   0x486         MCEmu flag
+//   0x4A0         update mode           0xFF = not update mode
+//   0x4E0..0x4FF  KibanID (ASCII serial)
+// An unprovisioned console reads as 0xFF everywhere, which is what `reset()`
+// fills.  No dump in the workspace carries a real NVS, so a console built by
+// the model is "not provisioned" rather than impersonating one.
+
+/// The Ernie non-volatile store (an area of the MCU data flash).
+class NvsStore {
+public:
+    /// Visible from Kermit on 3.60 and later (the chip has more; the rest is
+    /// internal).  Old revisions have 0xC20, new ones 0xBA0.
+    static constexpr size_t kSize = 0xB60;
+
+    void reset() { bytes_.assign(kSize, 0xFF); }
+
+    size_t size() const { return bytes_.size(); }
+    const std::vector<u8>& bytes() const { return bytes_; }
+
+    /// Read `length` bytes at `offset`.  A request past the end of the store is
+    /// answered with the bytes that exist (the firmware never sees one); an
+    /// offset outside the store is an error.
+    bool read(u16 offset, size_t length, std::vector<u8>& out) const {
+        if (offset >= bytes_.size()) return false;
+        const size_t available = std::min<size_t>(length, bytes_.size() - offset);
+        out.assign(bytes_.begin() + offset, bytes_.begin() + offset + available);
+        return true;
+    }
+
+    bool write(u16 offset, const u8* data, size_t length) {
+        if (offset >= bytes_.size()) return false;
+        const size_t count = std::min<size_t>(length, bytes_.size() - offset);
+        std::copy(data, data + count, bytes_.begin() + offset);
+        return true;
+    }
+
+private:
+    std::vector<u8> bytes_ = std::vector<u8>(kSize, 0xFF);
+};
+
+/// The 0x100 byte scratch pad Ernie keeps across resets.
+class ScratchPad {
+public:
+    static constexpr size_t kSize = 0x100;
+    static constexpr u16 kResumeContextOffset = 0x000C;  ///< PA of the resume buffer
+    static constexpr u16 kDipSwitchOffset = 0x00E0;      ///< SceDIPSW, 0x20 bytes
+    static constexpr size_t kDipSwitchSize = 0x20;
+
+    /// The DIP switch block a retail console reports.  The wiki says the CP part
+    /// ("Set on DevKit having a CP.  Hence not set on Retail nor TestKit") is
+    /// unset, and lists the release mode values for the rest; the model writes
+    /// the same 0x20 bytes into `SceKblParam +0x40`, which is where the second
+    /// loader puts what it read here [model assumption].
+    static const std::array<u8, kDipSwitchSize>& retail_dip_switches();
+
+    ScratchPad() { reset(); }
+
+    void reset();
+
+    size_t size() const { return bytes_.size(); }
+    const std::array<u8, kSize>& bytes() const { return bytes_; }
+
+    bool read(u16 offset, size_t length, std::vector<u8>& out) const {
+        if (offset >= kSize) return false;
+        const size_t available = std::min<size_t>(length, kSize - offset);
+        out.assign(bytes_.begin() + offset, bytes_.begin() + offset + available);
+        return true;
+    }
+
+    bool write(u16 offset, const u8* data, size_t length) {
+        if (offset >= kSize) return false;
+        const size_t count = std::min<size_t>(length, kSize - offset);
+        std::copy(data, data + count, bytes_.begin() + offset);
+        return true;
+    }
+
+private:
+    std::array<u8, kSize> bytes_{};
+};
+
+// ---------------------------------------------------------------------------
 // SC registers
 // ---------------------------------------------------------------------------
 

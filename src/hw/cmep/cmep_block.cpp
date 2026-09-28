@@ -86,7 +86,7 @@ struct CmepBlock::Impl {
           sc_bridge(new ScBridgeDevice()),
           sc_xfer(new ScXferDevice()),
           storage(new CmepStorageDevice()),
-          sce_block(new SceBlockDevice()),
+          sce_block(new SceBlockDevice(&keys)),
           bignum(new BignumDevice(bus, owner)),
           bigmac(new BigmacDevice(bus, owner)),
           bigmac_mirror(new DeviceMirror(*bigmac, cmep::kBigmacBase + 0x1000, 0x3000)) {}

@@ -21,6 +21,24 @@ namespace {
 /// command whose handler consumes a payload, which is why the CMeP only posts
 /// descriptors with a control block for those.  The names are the functional
 /// model's identification; the handler addresses are evidence.
+///
+/// The names are *not* evidence.  Several of them were inferred from how the
+/// command numbers group, and three of those inferences are now contradicted by
+/// the wire traffic of the 1.04 second loader and by the wiki:
+///
+///   * 0x1082 is an NVS read (`u16 offset` + `u8 length`), not an eMMC CSD read
+///     -- the loader sends [80 04 08] and the decompiled 3.60 second loader
+///     calls `syscon_read_cmd_0x1082_ptr_0x480_into_gbuf`;
+///   * 0x1083 carries the same header followed by data (NVS write);
+///   * 0x0090/0x0091 are the Syscon scratch pad, not the fuel gauge -- the
+///     loader sends [E0 00 20], i.e. the `SceDIPSW dipsw` field;
+///   * 0x1100 takes no payload at all (flags = 0x0000 in this very table) and
+///     answers with the Ernie DL version, so it cannot be a block read.
+///
+/// The remaining members of the 0x1080/0x1101/0x1180..0x1185 group keep their
+/// old labels, but nothing in the dumps or the wiki supports them: the eMMC is
+/// wired to Kermit's SDIO0 controller and the second loader drives it directly,
+/// so treat those names as unverified.
 const ScCommandInfo kCommandTable[] = {
     {0x0000, 0x0000, 0x35C19, "get_status"},
     {0x0001, 0x0000, 0x35C41, "get_boot_info"},
@@ -42,7 +60,7 @@ const ScCommandInfo kCommandTable[] = {
     {0x0900, 0x0001, 0x373CF, "reset_device"},
     {0x0901, 0x0001, 0x37437, "suspend"},
     {0x0902, 0x0001, 0x3749F, "resume"},
-    {0x1100, 0x0000, 0x35B57, "storage_read"},
+    {0x1100, 0x0000, 0x35B57, "get_ernie_dl_version"},
     {0x1101, 0x0001, 0x35B8E, "storage_write"},
     {0x0100, 0x0001, 0x36132, "get_panel_state"},
     {0x0103, 0x0001, 0x361C5, "get_panel_state2"},
@@ -54,8 +72,8 @@ const ScCommandInfo kCommandTable[] = {
     {0x0084, 0x0000, 0x366D4, "get_rtc_alarm2"},
     {0x0085, 0x0000, 0x3670C, "get_rtc_alarm3"},
     {0x00C1, 0x0001, 0x368DB, "set_led"},
-    {0x0090, 0x0001, 0x36540, "get_gauge_reg"},
-    {0x0091, 0x0001, 0x365E0, "set_gauge_reg"},
+    {0x0090, 0x0001, 0x36540, "scratchpad_read"},
+    {0x0091, 0x0001, 0x365E0, "scratchpad_write"},
     {0x00A0, 0x0000, 0x36744, "get_gauge_status"},
     {0x00B2, 0x0001, 0x367E4, "set_power_hold"},
     {0x00C0, 0x0000, 0x36881, "get_power_state"},
@@ -78,8 +96,8 @@ const ScCommandInfo kCommandTable[] = {
     {0x098A, 0x0001, 0x3756B, "sleep_wake_reason"},
     {0x1080, 0x0001, 0x375CF, "emmc_init"},
     {0x1081, 0x0001, 0x375FC, "emmc_get_cid"},
-    {0x1082, 0x0001, 0x3764D, "emmc_get_csd"},
-    {0x1083, 0x0001, 0x37722, "emmc_get_ext_csd"},
+    {0x1082, 0x0001, 0x3764D, "nvs_read"},
+    {0x1083, 0x0001, 0x37722, "nvs_write"},
     {0x1180, 0x0001, 0x35749, "emmc_read"},
     {0x1181, 0x0001, 0x3578B, "emmc_write"},
     {0x1182, 0x0001, 0x35864, "emmc_erase"},
@@ -535,6 +553,32 @@ void ScChannel::publish_reply(u32 command, const std::vector<u8>& reply) {
         regs_.status_byte = reply[1];
         regs_.payload_length = reply[2];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scratch pad
+// ---------------------------------------------------------------------------
+
+const std::array<u8, ScratchPad::kDipSwitchSize>& ScratchPad::retail_dip_switches() {
+    // 0x00..0x0F  CP DIP switches: unset on Retail/TestKit (wiki "Syscon Scratch
+    //             Pad": the field is only set on a DevKit that has a CP).
+    // 0x10..0x1F  the release mode values the wiki lists for SceKblParam +0x50..
+    //             (+0x54 SDK, +0x58 shell, +0x5C debug, +0x60 system).
+    static const std::array<u8, kDipSwitchSize> block = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,  // SDK flags       = 0x00000000
+        0x00, 0x00, 0x00, 0x00,  // shell flags     = 0x00000000
+        0x02, 0x00, 0x08, 0x00,  // debug control   = 0x00080002
+        0x00, 0x00, 0x00, 0x20,  // system control  = 0x20000000
+    };
+    return block;
+}
+
+void ScratchPad::reset() {
+    bytes_.fill(0);
+    std::copy(retail_dip_switches().begin(), retail_dip_switches().end(),
+              bytes_.begin() + kDipSwitchOffset);
 }
 
 }  // namespace ernie
