@@ -784,31 +784,49 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // "uninitialised descriptor" wall (0x40033FF2, r3 = [r0+56] = 0x65486465,
     // docs/KBL.md rounds 143-150) shows.  Give each of those windows its own
     // physical page and see whether the boot gets past that wall.
-    // Measured: it does *not*.  With the experiment on, the loader stops at
-    // checkpoint 0x84 (instead of 0x86/0x87) with arm0 parked at 0x4003A01C and
-    // the MMU off, so the sharing is deliberate (the wiki's
-    // KBPMappingInfo.extraHigh: one physical page, several virtual windows) and
-    // the real defect is that the loader *writes objects* through those windows.
-    // Kept as a switchable instrument for the next round.
-    // ZLB_KBL_LOWALIAS=1 enables the experiment; it is off by default.
+    // Measured (round 156): splitting *all three* makes the boot worse, but
+    // splitting **only VA 0x12000** (the heap's window, L2[0x12]) takes the loader
+    // past the wall: it reaches checkpoint 0x8A instead of 0x87 and its walk
+    // count grows from 2.0M to 17.8M.  So the collision that matters is the one
+    // between the heap window and whatever else lives on physical page 0 (the
+    // class descriptors with their inline names start there), and the loader's
+    // memory map (0x400B2B30) really does carry a record with vbase 0x12000 and
+    // pbase 0.  What the *correct* page is (the record's own field, or a page the
+    // loader should have allocated) is still open; the knob exists to keep the
+    // two states one flag apart.
+    // ZLB_KBL_LOWALIAS=<list> where list is "all" or a comma separated set of L2
+    // indices ("12", "10,14", ...); unset/0 keeps the stock behaviour.
     static const bool lowalias_fix = [] {
         const char* value = std::getenv("ZLB_KBL_LOWALIAS");
         return value != nullptr && value[0] != '0';
     }();
+    // The knob takes a comma separated list of L2 indices to split off ("12",
+    // "12,14", "all"); the default keeps the measured-worse behaviour of fixing
+    // every one of them.
+    static const std::string lowalias_list = [] {
+        const char* value = std::getenv("ZLB_KBL_LOWALIAS");
+        return std::string(value != nullptr ? value : "");
+    }();
+    static const bool lowalias_all = lowalias_list.find("all") != std::string::npos;
     constexpr u32 kLowMapStorePc = 0x4003AD6Cu;
     if (lowalias_fix && pc == kLowMapStorePc && core < static_cast<u32>(kArmCoreCount)) {
         static std::array<u32, 0x100> pages{};
         static u32 next = 0x40140000u;   // just above the loader's own page tables
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
-            if (arm->r[3] == 0x45Fu && arm->r[4] < pages.size()) {
-                const u32 index = arm->r[4];
-                if (pages[index] == 0u) {
-                    pages[index] = next | 0x45Fu;
-                    next += 0x1000u;
+            const u32 index = arm->r[4];
+            const bool wanted = lowalias_all || index == 0x10u || index == 0x12u || index == 0x14u;
+            if (wanted && arm->r[3] == 0x45Fu && index < pages.size()) {
+                const std::string needle = format("%X", index);
+                if (lowalias_all || lowalias_list.find(needle) != std::string::npos) {
+                    if (pages[index] == 0u) {
+                        pages[index] = next | 0x45Fu;
+                        next += 0x1000u;
+                    }
+                    arm->r[3] = pages[index];
+                    ZLB_LOG_INFO("machine",
+                                 "low window L2[0x%02X] given its own page 0x%08X (diagnostic)", index,
+                                 pages[index] & 0xFFFFF000u);
                 }
-                arm->r[3] = pages[index];
-                ZLB_LOG_INFO("machine", "low window L2[0x%02X] given its own page 0x%08X (diagnostic)",
-                             index, pages[index] & 0xFFFFF000u);
             }
         }
     }
