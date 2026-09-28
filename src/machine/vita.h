@@ -355,9 +355,30 @@ private:
     /// Substitution (round 108): one fresh zeroed page out of the partition region
     /// for a class instance whose base field `[obj+0x14]` is the 0xFFFFFFFF sentinel.
     bool supply_kbl_instance_block(u32 core, u32& out_block);
-    /// Cursor (region byte offset, walks down) for `supply_kbl_instance_block`.
+    /// Cursor (arena byte offset, walks up) for `supply_kbl_instance_block`
+    /// (round 114: the instance pages come from the dedicated VA 0x01100000 arena).
     u32 instance_block_next_ = 0;
     u32 instance_blocks_supplied_ = 0;
+    /// How many times the instance base field `[obj+0x14]` was filled with the arena
+    /// VA at the getter entry (round 114).
+    u32 instance_base_fixes_ = 0;
+    /// Cursor (arena byte offset) for the region-allocator tree-node arena
+    /// (round 124: fresh red-black-tree nodes carved out of VA 0x01200000).
+    u32 tree_node_next_ = 0;
+    /// Number of tree nodes handed out by the region-allocator rebuild (round 124).
+    u32 tree_nodes_supplied_ = 0;
+    /// Number of SceSysmem heap-lookup substitutions (round 134).
+    u32 heap_lookup_fixes_ = 0;
+    /// Cursor (arena byte offset) for the SceSysmem lookup-object arena (round 134).
+    u32 lookup_object_next_ = 0;
+    /// Number of heap-pointer routing substitutions (round 135).
+    u32 heap_route_fixes_ = 0;
+    /// Number of barrier-decrement substitutions (round 136 diagnostics).
+    u32 barrier_decrements_ = 0;
+    /// Per-core "old" arrival value recorded by the barrier-decrement substitution
+    /// and replayed at 0x4003B3BA so the phase decision is not clobbered by the
+    /// shared initial stack (round 140).
+    u16 barrier_old_[kArmCoreCount] = {};
     /// Last ARM pc the boot-chain hook saw, per core (round 109 diagnostics).
     u32 last_arm_pc_[kArmCoreCount] = {};
     /// How many times the allocator entry got the heap object's cookie field stamped
@@ -370,6 +391,20 @@ private:
     u32 fatal_stub_hits_ = 0;
     /// Lines already emitted by the unfixable-fault diagnostic (round 112).
     u32 fault_trace_hits_ = 0;
+    /// Lines already emitted by the class-constructor diagnostic (round 114).
+    u32 ctor_trace_hits_ = 0;
+    /// Lines already emitted by the contended-spinlock diagnostic (round 115).
+    u32 lock_trace_hits_ = 0;
+    /// Lines already emitted by the object-manager lock diagnostic (round 116).
+    u32 objmgr_trace_hits_ = 0;
+    /// Lines already emitted by the SceUID lock diagnostic (round 119).
+    u32 sceuid_trace_hits_ = 0;
+    /// Lines already emitted by the region-tree diagnostic (round 120).
+    u32 tree_trace_hits_ = 0;
+    /// Lines already emitted by the region-tree stamp substitution (round 121).
+    u32 tree_fix_hits_ = 0;
+    /// Lines already emitted by the range-check diagnostic (round 123).
+    u32 rangechk_trace_hits_ = 0;
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;

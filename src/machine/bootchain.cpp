@@ -44,6 +44,42 @@ bool substitutions_enabled_static() {
     return !disabled;
 }
 
+/// Round 114: the class-instance arena.  The KBL's instance base field `[obj+0x14]`
+/// is never filled by the stage the model stands in for, so the getter 0x4002C1AC
+/// computes `[obj+0x14] + table[size_class]` from the 0xFFFFFFFF sentinel and the
+/// model must give it a real base.  The arena lives in the low kernel window above
+/// the KBL's hardcoded 0x01031000 base: VA 0x01100000, mapped (dram-abs) to
+/// PA 0x41100000+ - free DRAM above the KBL image (ends 0x40075B94) and the
+/// partition region.
+constexpr u32 kInstanceArenaVa = 0x01100000u;
+constexpr u32 kInstanceArenaSize = 0x00100000u;   // 1 MiB = 256 pages
+/// Tree-node arena for the region allocator rebuild (round 124): the sentinel and
+/// root it needs overlap the class list, so fresh nodes are carved out of a
+/// separate low-window page, mapped (dram-abs) to free DRAM above the KBL image.
+constexpr u32 kTreeNodeArenaVa = 0x01200000u;
+constexpr u32 kTreeNodeArenaSize = 0x00100000u;   // 1 MiB
+/// Lookup-object arena (round 134): fresh pages handed to the type-0x1000B object
+/// lookups in SceSysmem, mapped (dram-abs) to free DRAM above the other arenas.
+constexpr u32 kLookupArenaVa = 0x01300000u;
+constexpr u32 kLookupArenaSize = 0x00100000u;     // 1 MiB
+
+/// Install an L1 section descriptor for `va` (1 MiB-aligned) once, so direct
+/// translations (which do not consult the fault hook) see it as writable.  Uses
+/// the same section attributes the KBL itself puts on its DRAM entries.
+void ensure_arena_section(ArmCore* arm, Bus* bus, u32 va) {
+    if (arm == nullptr || bus == nullptr) return;
+    const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
+    const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
+    if ((bus->read32(l1_slot) & 3u) == 0u) {
+        const u32 section_pa = (0x40000000u + va) & 0xFFF00000u;
+        bus->write32(l1_slot, section_pa | 0x1158Eu);
+    }
+}
+
+void ensure_instance_arena(ArmCore* arm, Bus* bus) {
+    ensure_arena_section(arm, bus, kInstanceArenaVa);
+}
+
 /// How long the CMeP may keep running after the secure kernel's "done" jump while
 /// its second loader finishes the ARM boot context (see poll_boot_chain).
 constexpr u64 kCmepFinishBudget = 2000000;
@@ -373,8 +409,31 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     if (va >= 0x00100000u && va < 0x40000000u) {
         const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
         const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
-        if ((arm_bus_->read32(l1_slot) & 3u) != 0u) return false;   // already described
+        const u32 l1_desc = arm_bus_->read32(l1_slot);
         const u32 pa = 0x40000000u + va;
+        // Round 141: after round 110 installs the 1 MiB section, the KBL replaces it
+        // with its own coarse page table (L1 = 0x...01, typically L2 base PA 0 - the
+        // CMeP scratch mirror).  The section branch then bails out on the "already
+        // described" check and the access faults again.  Patch the L2 entry instead,
+        // mirroring the low-window L2 patch below with the same dram-abs rule.
+        if ((l1_desc & 3u) == 1u) {
+            const u32 l2_base = l1_desc & 0xFFFFFC00u;
+            const u32 l2_index = (va >> 12) & 0xFFu;
+            const u32 slot = l2_base + l2_index * 4u;
+            if ((arm_bus_->read32(slot) & 3u) != 0u) return false;   // already mapped
+            u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
+            if ((attributes & 3u) != 2u) attributes = 0x47Eu;        // small page, AP=11
+            arm_bus_->write32(slot, (pa & 0xFFFFF000u) | attributes);
+            ++boot_fault_fixes_;
+            ZLB_LOG_INFO("machine",
+                         "low kernel L2 mapping supplied: arm%u VA 0x%08X -> PA 0x%08X (attr 0x%03X) in L2 0x%08X[0x%02X] (%s)",
+                         core, va, pa, attributes, l2_base, l2_index,
+                         fetch ? "fetch" : (write ? "write" : "read"));
+            add_milestone("ARM low kernel L2 mapping supplied for VA 0x" + hex(va, 8) +
+                          " (development substitution)");
+            return true;
+        }
+        if ((l1_desc & 3u) != 0u) return false;   // already described (section)
         arm_bus_->write32(l1_slot, (pa & 0xFFF00000u) | 0x1158Eu);
         ++boot_fault_fixes_;
         ZLB_LOG_INFO("machine",
@@ -382,6 +441,28 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
                      core, va, pa, l1_base, (va >> 20) & 0xFFFu,
                      fetch ? "fetch" : (write ? "write" : "read"));
         add_milestone("ARM low kernel memory mapping supplied for VA 0x" + hex(va, 8) +
+                      " (development substitution)");
+        return true;
+    }
+
+    // Substitution (round 127): with TTBCR=2, VA >= 0x40000000 walks TTBR1, and the
+    // KBL only ever maps section 0x40000000 (its image) there.  Sections 0x40100000
+    // and 0x40200000 (the rest of its 3 MiB DRAM region) stay unmapped, so its
+    // page-clearing loop faults on 0x402F???? (`write section translation fault`).
+    // Supply the missing sections with the KBL's own attributes (0x1158E, the value
+    // in TTBR1 L1[0x400] = 0x4001158E) using the dram-abs rule (PA = VA).  The 3 MiB
+    // bound matches the KBL's hardcoded heap region {0x40000000, 0x300000}.
+    if (va >= 0x40000000u && va < 0x40300000u) {
+        const u32 l1_base = arm->mmu.ttbr1 & 0xFFFFC000u;
+        const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
+        if ((arm_bus_->read32(l1_slot) & 3u) != 0u) return false;   // already described
+        arm_bus_->write32(l1_slot, (va & 0xFFF00000u) | 0x1158Eu);
+        ++boot_fault_fixes_;
+        ZLB_LOG_INFO("machine",
+                     "TTBR1 DRAM section supplied: arm%u VA 0x%08X -> PA 0x%08X in L1 0x%08X[0x%03X] (%s)",
+                     core, va, va & 0xFFF00000u, l1_base, (va >> 20) & 0xFFFu,
+                     fetch ? "fetch" : (write ? "write" : "read"));
+        add_milestone("ARM TTBR1 DRAM section supplied for VA 0x" + hex(va, 8) +
                       " (development substitution)");
         return true;
     }
@@ -443,6 +524,162 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (core < static_cast<u32>(kArmCoreCount)) {
         previous_pc = last_arm_pc_[core];
         last_arm_pc_[core] = pc;
+    }
+    // Substitution (round 117): make the object manager lock (0x601C = 0x5F80+0x9c)
+    // a no-op.  Round 116 measured that only arm0 ever acquires it (20000 balanced
+    // acquire/release, zero non-arm0 entries), and the four-core deadlock is arm0
+    // re-entering that same lock inside its own critical section
+    // (0x4002B3E0 -> 0x4002B1C8 -> ... -> 0x4002B3E0), which the non-recursive
+    // spinlock cannot satisfy.  On hardware the object manager arrives pre-populated
+    // from the secure world, so this re-entrant path never runs.  With no other core
+    // contending for 0x601C, skipping the acquire is safe: the lock word stays 0 and
+    // the unlock (0x4003A224) is a no-op too.  ZLB_NO_SUBSTITUTION=1 disables it;
+    // ZLB_KBL_OBJMGR_NOLOCK=0 disables just this substitution.
+    static const bool objmgr_nolock = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_OBJMGR_NOLOCK");
+        return on == nullptr || on[0] != '0';
+    }();
+    if (objmgr_nolock && pc == 0x4003A1B0u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 lock = 0;
+                if (arm->get_register("r0", lock) && static_cast<u32>(lock) == 0x601Cu) {
+                    arm->set_register("r0", 0u);       // interrupt mask (I/F were 0)
+                    arm->set_pc(0x4003A1ECu);          // bx lr - skip the acquire
+                    ++boot_pc_fixes_;
+                    return true;                       // handled: do not execute the lock
+                }
+            }
+        }
+    }
+    // Substitution (round 119): the same trick for the SceUID/class-registration
+    // lock 0x12008 (object 0x12000 + 0x8).  Round 119 measured a single acquire from
+    // arm0 and no release - the word is already 0x80000000 (held) before the first
+    // acquisition, so the non-recursive spinlock 0x4003A28C spins forever.  arm0 is
+    // the only core that touches it, so skipping the acquire is safe; its unlock
+    // (0x4003A300) then writes 0 and leaves the word free.  Gated by the same
+    // ZLB_KBL_OBJMGR_NOLOCK / ZLB_NO_SUBSTITUTION flags.
+    if (objmgr_nolock && pc == 0x4003A28Cu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 lock = 0;
+                if (arm->get_register("r0", lock) && static_cast<u32>(lock) == 0x12008u) {
+                    arm->set_register("r0", 0u);       // interrupt mask
+                    arm->set_pc(0x4003A2C8u);          // bx lr - skip the acquire
+                    ++boot_pc_fixes_;
+                    return true;
+                }
+            }
+        }
+    }
+    // Substitution (round 136): the per-core rendezvous 0x4003B34C waits on
+    // `[obj+6] == core-id` with wfe (the master writes the field via the exclusive
+    // store 0x4003A3EC, the slaves spin in 0x4003B366).  After round 135 the master
+    // core is stuck at the four-core barrier, so the slaves wait forever.  Make the
+    // rendezvous a no-op: the loader's per-core setup is idempotent in this model
+    // (cores run round-robin, not truly in parallel), so no rendezvous is needed.
+    // Gated by the same ZLB_KBL_OBJMGR_NOLOCK / ZLB_NO_SUBSTITUTION flags.
+    if (objmgr_nolock && pc == 0x4003B34Cu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                arm->set_pc(arm->r[14] & ~1u);          // bx lr - skip the rendezvous
+                arm->set_register("THUMB", 1u);
+                ++boot_pc_fixes_;
+                return true;
+            }
+        }
+    }
+    // Substitution (round 136): the KBL's halfword exclusive store helper 0x4003A3EC
+    // (ldrexh/strexh) livelocks under the round-robin schedule (the reservation is
+    // cleared between the load and store), so the barrier never writes its counter.
+    // Make it a plain non-exclusive 16-bit store of r1 to [r0]: with no true
+    // parallel execution the exclusivity is unnecessary.  Same gate as the other
+    // round-136 substitutions.
+    if (objmgr_nolock && pc == 0x4003A3ECu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u32 pa = 0;
+                std::string fault;
+                if (arm->translate(arm->r[0], true, false, pa, fault)) {
+                    arm_bus_->write16(pa, static_cast<u16>(arm->r[1] & 0xFFFFu));
+                    arm->set_pc(arm->r[14] & ~1u);      // bx lr
+                    arm->set_register("THUMB", 1u);
+                    ++boot_pc_fixes_;
+                    return true;
+                }
+            }
+        }
+    }
+    // Substitution (round 136): the four-core barrier's arrive step is an exclusive
+    // halfword decrement (0x4003A41C: ldrexh/sub/strexh).  Under the model's
+    // round-robin core schedule the reservation keeps being cleared, so the counter
+    // [obj+4] stays at 4 and every core sits in the leave wait (0x4003B3D2).  Do the
+    // decrement non-exclusively at the call site 0x4003B3A6 (r6 = &[obj+4], r1 = 1)
+    // and skip the helper, returning the old value in r0 as the helper would.
+    // Gated by the same ZLB_KBL_OBJMGR_NOLOCK / ZLB_NO_SUBSTITUTION flags.
+    if (objmgr_nolock && pc == 0x4003B3A6u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                const u32 counter_va = arm->r[6];
+                u32 pa = 0;
+                std::string fault;
+                if (arm->translate(counter_va, true, false, pa, fault)) {
+                    const u32 old = arm_bus_->read16(pa);
+                    const u32 value = (old - 1u) & 0xFFFFu;
+                    arm_bus_->write16(pa, static_cast<u16>(value));
+                    arm->set_register("r0", old);
+                    arm->set_pc(0x4003B3AAu);          // skip blx 0x4003A41C
+                    barrier_old_[core] = static_cast<u16>(old & 0xFFFFu);
+                    ++boot_pc_fixes_;
+                    ++barrier_decrements_;
+                    if (barrier_decrements_ <= 64) {
+                        ZLB_LOG_INFO("machine", "barrier decrement arm%u: [0x%08X] %u -> %u",
+                                     core, counter_va, old, value);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    // Substitution (round 140): the four-core barrier saves its "old" arrival value
+    // on the stack (`strh.w r1,[sp,#6]` at 0x4003B3AE) and re-reads it at 0x4003B3BA
+    // to pick phase 1/phase 2.  The secondary cores still run on the shared initial
+    // stack (SP 0x3F00) here, so that halfword slot is clobbered between cores and
+    // the leader (old == 4) reads a follower's value, drops into the follower's
+    // phase-1 wait and never resets the counter - the whole barrier deadlocks with
+    // all four cores in the leave wait.  Replay the per-core value recorded above.
+    if (objmgr_nolock && pc == 0x4003B3BAu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                arm->set_register("r3", static_cast<u32>(barrier_old_[core]));
+                arm->set_pc(0x4003B3BEu);          // skip ldrh.w r3, [sp, #6]
+                arm->set_register("THUMB", 1u);
+                ++boot_pc_fixes_;
+                return true;
+            }
+        }
+    }
+    // Experiment (round 150): the region/partition method 0x40033FC8 dereferences
+    // [this+40] as an allocator pointer, but the class list it aliases is not fully
+    // registered (the field holds flags == 2), so the walk hits the class-name string
+    // "edHe" and faults.  Return success without doing the work so the caller moves
+    // on; gated by ZLB_KBL_ALLOC_NOOP=1 for easy toggling.
+    static const bool alloc_noop = [] {
+        const char* on = std::getenv("ZLB_KBL_ALLOC_NOOP");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (alloc_noop && pc == 0x40033FC8u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                arm->set_register("r0", 0u);
+                arm->set_pc(arm->r[14] & ~1u);
+                arm->set_register("THUMB", 1u);
+                ++boot_pc_fixes_;
+                return true;
+            }
+        }
     }
     // Round 94/95 measurements (docs/KBL.md round 95): every allocation the KBL
     // makes for itself calls the partition allocator 0x40032278 with flag 0x10.
@@ -719,7 +956,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (trace_pc != 0u && pc == trace_pc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
-                if (trace_pc_hits_ < 12u) {
+                if (trace_pc_hits_ < 64u) {
                     ++trace_pc_hits_;
                     u64 r[8] = {0}, lr = 0, sp = 0;
                     for (u32 i = 0; i < 8; ++i) {
@@ -737,6 +974,363 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                                  static_cast<u32>(r[4]), static_cast<u32>(r[5]),
                                  static_cast<u32>(r[6]), static_cast<u32>(r[7]));
                 }
+            }
+        }
+    }
+
+    // Diagnostic (round 114): the class constructor 0x4002A964 (`movs r1,#0` ...
+    // `str.w r2,[r3,#0x14]`) is reached through `blx [r6+0x34]` with r0 = r8 = the
+    // block the caller 0x40031654 is about to hand out.  Round 113 showed the fatal
+    // iteration hands the constructor r0 = 0x40060F20 - the current stack frame - so
+    // the +0x14 sentinel store clobbers the caller's saved LR.  Measured (round 114):
+    // the per-core block cache [cls+core*0x10+0x60] stays 0 the whole run, and the
+    // object instead comes from the region walk `r8 = [cls+0x3c]; r8 += stride`,
+    // stride = [cls+0x20], bounded by 0x4003CCC0([cls+0x1c], stride).  This dumps
+    // every constructor entry together with the region-walk state so the overrun
+    // into the stack can be named.  ZLB_KBL_CTOR_TRACE=1 enables it.
+    static const bool ctor_trace = [] { return std::getenv("ZLB_KBL_CTOR_TRACE") != nullptr; }();
+    if (ctor_trace && pc == 0x4002A96Cu && ctor_trace_hits_ < 200u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++ctor_trace_hits_;
+                const u32 obj = arm->r[0];
+                const u32 cls = arm->r[4];
+                auto rd = [&](u32 va, bool& ok) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(va, false, false, pa, fault)) {
+                        ok = false;
+                        return 0u;
+                    }
+                    ok = true;
+                    return arm_bus_->read32(pa);
+                };
+                bool ok = true;
+                const u32 base = rd(cls + 0x14u, ok);
+                const u32 size = rd(cls + 0x1Cu, ok);
+                const u32 cur = rd(cls + 0x3Cu, ok);
+                const u32 stride = rd(cls + 0x20u, ok);
+                const u32 cnt = rd(cls + 0x40u, ok);
+                const u32 f38 = rd(cls + 0x38u, ok);
+                const u32 klass = rd(cls + 0x04u, ok);
+                const bool suspect = obj >= 0x40000000u;
+                ZLB_LOG_INFO("machine",
+                             "ctor arm%u #%u obj=0x%08X cls=0x%08X lr=0x%08X sp=0x%08X | "
+                             "class=0x%08X base=0x%08X size=0x%08X stride=0x%08X cnt=0x%08X "
+                             "cur=0x%08X f38=0x%08X%s",
+                             core, ctor_trace_hits_, obj, cls, arm->r[14], arm->r[13], klass, base,
+                             size, stride, cnt, cur, f38, suspect ? "  <-- DRAM/STACK OBJ" : "");
+            }
+        }
+    }
+
+    // Diagnostic (round 115): the ARM-mode spinlock 0x4003A1B0 loops through the
+    // `ldrex [r0]` at 0x4003A1C0 (the `bne` at 0x4003A1E0 branches back there), so
+    // the loop head is 0x4003A1C0, not the blx entry.  When [r0] is non-zero the
+    // core spins on the `wfe` path.  Log every contended loop head (lock address +
+    // held value) to name the stuck lock.  ZLB_KBL_LOCK_TRACE=1 enables it.
+    static const bool lock_trace = [] { return std::getenv("ZLB_KBL_LOCK_TRACE") != nullptr; }();
+    if (lock_trace && pc == 0x4003A1C0u && lock_trace_hits_ < 24u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 lock = 0;
+                if (arm->get_register("r0", lock)) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (arm->translate(static_cast<u32>(lock), false, false, pa, fault)) {
+                        const u32 held = arm_bus_->read32(pa);
+                        if (held != 0u) {
+                            ++lock_trace_hits_;
+                            ZLB_LOG_INFO("machine",
+                                         "spinlock contended: arm%u lock=0x%08X held=0x%08X "
+                                         "r4=0x%08X (development diagnostic)",
+                                         core, static_cast<u32>(lock), held, arm->r[4]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Diagnostic (round 116): log the acquire/release of the object manager lock
+    // (0x601C = 0x5F80+0x9c) with the core id and the caller, so the acquire/release
+    // pairing names the core that holds the lock when the four-core deadlock forms.
+    // The acquire is the spinlock entry 0x4003A1B0, the release is 0x4003A224; both
+    // take r0 = the lock word.  ZLB_KBL_OBJMGR_TRACE=1 enables it.
+    static const bool objmgr_trace = [] { return std::getenv("ZLB_KBL_OBJMGR_TRACE") != nullptr; }();
+    if (objmgr_trace && (pc == 0x4003A1B0u || pc == 0x4003A224u)) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 lock = 0;
+                // arm0 owns the "allocate low kernel memory" loop (thousands of
+                // balanced entries), so cap its noise; the holder is a non-arm0 core.
+                if (arm->get_register("r0", lock) && static_cast<u32>(lock) == 0x601Cu &&
+                    (core != 0u || objmgr_trace_hits_ < 64u)) {
+                    ++objmgr_trace_hits_;
+                    ZLB_LOG_INFO("machine",
+                                 "objmgr %s arm%u lock=0x601C lr=0x%08X (development diagnostic)",
+                                 pc == 0x4003A1B0u ? "acquire" : "release", core, arm->r[14]);
+                }
+            }
+        }
+    }
+
+    // Diagnostic (round 119): the SceUID/class-registration lock is 0x12008
+    // (object 0x12000 + 0x8), acquired through the second spinlock 0x4003A28C
+    // (lock value 0x80000000) and released through 0x4003A300.  Log the
+    // acquire/release pairing with the core id so the holder of the stuck lock can
+    // be named.  ZLB_KBL_SCEUID_TRACE=1 enables it.
+    static const bool sceuid_trace = [] { return std::getenv("ZLB_KBL_SCEUID_TRACE") != nullptr; }();
+    if (sceuid_trace && (pc == 0x4003A28Cu || pc == 0x4003A300u) && sceuid_trace_hits_ < 128u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 lock = 0;
+                if (arm->get_register("r0", lock) && static_cast<u32>(lock) == 0x12008u) {
+                    ++sceuid_trace_hits_;
+                    ZLB_LOG_INFO("machine",
+                                 "sceuid %s arm%u lock=0x12008 lr=0x%08X (development diagnostic)",
+                                 pc == 0x4003A28Cu ? "acquire" : "release", core, arm->r[14]);
+                }
+            }
+        }
+    }
+
+    // Diagnostic (round 120): dump the partition region tree when the allocator
+    // 0x4002EE60 is entered.  r0 = the partition object; the tree head is at
+    // [obj+0x4C]+0xC and the walk follows [node+0x24] until it returns to the head.
+    // ZLB_KBL_TREE_TRACE=1 enables it.
+    static const bool tree_trace = [] { return std::getenv("ZLB_KBL_TREE_TRACE") != nullptr; }();
+    if (tree_trace && pc == 0x4002EE60u && tree_trace_hits_ < 16u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++tree_trace_hits_;
+                auto rd = [&](u32 va, bool& ok) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(va, false, false, pa, fault)) { ok = false; return 0u; }
+                    ok = true;
+                    return arm_bus_->read32(pa);
+                };
+                bool ok = true;
+                const u32 obj = arm->r[0];
+                const u32 part = rd(obj + 0x4Cu, ok);
+                const u32 head = rd(part + 0xCu, ok);
+                u32 node = rd(head + 0x24u, ok);
+                const u32 req_base = rd(obj + 0x8u, ok);
+                ZLB_LOG_INFO("machine",
+                             "region tree: arm%u obj=0x%08X part=0x%08X head=0x%08X root=0x%08X "
+                             "req_base=0x%08X req_size=0x%08X",
+                             core, obj, part, head, node, req_base, arm->r[1]);
+                for (u32 i = 0; i < 8 && ok && node != head; ++i) {
+                    const u32 base = rd(node + 0x18u, ok);
+                    const u32 size = rd(node + 0x14u, ok);
+                    const u32 next = rd(node + 0x24u, ok);
+                    ZLB_LOG_INFO("machine", "  node[%u] 0x%08X base=0x%08X size=0x%08X next=0x%08X",
+                                 i, node, base, size, next);
+                    node = next;
+                }
+            }
+        }
+    }
+
+    // Substitution (round 121): the partition region tree walked by 0x4002EE60 has a
+    // single garbage root node (measured base=5, size=0) because the secure world's
+    // memory map never arrives.  Stamp the root node with the model's DRAM region so
+    // the allocator has a region to hand out of.  ZLB_NO_SUBSTITUTION=1 disables it;
+    // ZLB_KBL_TREE_FIX=0 disables just this substitution.
+    static const bool tree_fix = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_TREE_FIX");
+        return on == nullptr || on[0] != '0';
+    }();
+    if (tree_fix && pc == 0x4002EE60u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                auto rd = [&](u32 va, bool& ok) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(va, false, false, pa, fault)) { ok = false; return 0u; }
+                    ok = true;
+                    return arm_bus_->read32(pa);
+                };
+                auto wr = [&](u32 va, u32 value) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(va, true, false, pa, fault)) return false;
+                    arm_bus_->write32(pa, value);
+                    return true;
+                };
+                bool ok = true;
+                const u32 obj = arm->r[0];
+                const u32 part = rd(obj + 0x4Cu, ok);
+                const u32 head = rd(part + 0xCu, ok);
+                const u32 root = rd(head + 0x24u, ok);
+                const u32 size = rd(root + 0x14u, ok);
+                if (ok && (root == head || size == 0u || size < 0x1000u)) {
+                    // Complete tree rebuild (round 124): the sentinel (head) overlaps the
+                    // class-registration list in physical memory (VA 0x12040 and 0x10040
+                    // both map to PA 0x40), so its +0x0C flag is corrupted to a non-zero
+                    // class id and the walk follows [head+0x00] straight into the class
+                    // list instead of the root at [head+0x24].  Each call carves a fresh
+                    // node out of a dedicated arena (VA 0x01200000) and installs it as a
+                    // single-node tree so the allocator's base==req_base (aligned) path
+                    // returns it; the tree empties again after the unlink, and the next
+                    // request is served the same way.
+                    const u32 req_base = rd(obj + 0x8u, ok);
+                    u32 req_size = static_cast<u32>(arm->r[1]);
+                    if (req_size == 0u || req_size > 0x100000u) req_size = 0x1000u;
+                    ensure_arena_section(arm, arm_bus_.get(), kTreeNodeArenaVa);
+                    u32 node = 0u;
+                    if (tree_node_next_ + 0x1000u <= kTreeNodeArenaSize) {
+                        node = kTreeNodeArenaVa + tree_node_next_;
+                        tree_node_next_ += 0x1000u;
+                    }
+                    if (node != 0u) {
+                        // Zero the node page (one page per node; fields used span +0x00..+0x24).
+                        for (u32 off = 0; off < 0x28u; off += 4u) wr(node + off, 0u);
+                        // Sentinel (head): flag 0 selects [head+0x24] as the root, left
+                        // link, self neighbour, zero base/size.
+                        wr(head + 0x0Cu, 0u);
+                        wr(head + 0x00u, node);
+                        wr(head + 0x20u, head);
+                        wr(head + 0x14u, 0u);
+                        wr(head + 0x18u, 0u);
+                        wr(head + 0x24u, node);
+                        // Fresh node: NIL children/parent/neighbours = head, black,
+                        // base/size = the requested block.
+                        wr(node + 0x00u, head);
+                        wr(node + 0x08u, head);
+                        wr(node + 0x0Cu, 0u);
+                        wr(node + 0x14u, req_size);
+                        wr(node + 0x18u, req_base);
+                        wr(node + 0x20u, head);
+                        wr(node + 0x24u, head);
+                        ++tree_nodes_supplied_;
+                        ++tree_fix_hits_;
+                        if (tree_fix_hits_ <= 8) {
+                            ZLB_LOG_INFO("machine",
+                                         "region tree rebuilt: head 0x%08X node 0x%08X base=0x%08X "
+                                         "size=0x%08X (was root 0x%08X size=0x%08X) (development substitution)",
+                                         head, node, req_base, req_size, root, size);
+                            add_milestone("KBL region tree rebuilt (development substitution)");
+                        }
+                    }
+                }
+            }
+        }
+        return false;    // the allocator still runs its own code
+    }
+
+    // Substitution (round 134): the SceSysmem heap lookup 0x4002C4D8 walks the
+    // object manager for `(type=0x0001000B, uid=r0)` and, on a miss, prints
+    // "sceKernelAllocHeapMemory failed(NULL)" (kprintf of the .rodata string
+    // 0x4005A9A4).  The heap object 0x5900 is created (round 130) but its SceUID is
+    // never allocated (empty registry 0x5A40), so every lookup sees uid == 0 and
+    // fails.  Stand in: when the uid is 0, return the created heap object directly
+    // so the allocator has a heap to carve out of.  ZLB_NO_SUBSTITUTION=1 disables
+    // it; ZLB_KBL_HEAP_LOOKUP=0 disables just this substitution.
+    static const bool heap_lookup_fix = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_HEAP_LOOKUP");
+        return on == nullptr || on[0] != '0';
+    }();
+    if (heap_lookup_fix && pc == 0x4002C4D8u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                // Hand back a fresh, zeroed page from the lookup arena: the four
+                // callers (0x4002E0FA/0x4002E108/0x4002E114/0x4002E120) link these
+                // objects together, so each needs its own writable address.
+                ensure_arena_section(arm, arm_bus_.get(), kLookupArenaVa);
+                u32 obj = 0u;
+                if (lookup_object_next_ + 0x1000u <= kLookupArenaSize) {
+                    obj = kLookupArenaVa + lookup_object_next_;
+                    lookup_object_next_ += 0x1000u;
+                }
+                if (obj != 0u) {
+                    for (u32 off = 0; off < 0x1000u; off += 4u) {
+                        u32 pa = 0;
+                        std::string fault;
+                        if (!arm->translate(obj + off, true, false, pa, fault)) { obj = 0u; break; }
+                        arm_bus_->write32(pa, 0u);
+                    }
+                }
+                if (obj != 0u) {
+                    arm->set_register("r0", obj);
+                    arm->set_pc(arm->r[14] & ~1u);          // return to the caller
+                    arm->set_register("THUMB", 1u);
+                    ++heap_lookup_fixes_;
+                    if (heap_lookup_fixes_ <= 4) {
+                        ZLB_LOG_INFO("machine",
+                                     "heap lookup substituted: arm%u -> object VA 0x%08X "
+                                     "(development substitution)",
+                                     core, obj);
+                        add_milestone("KBL heap lookup substituted (development substitution)");
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Experiment (round 122): bypass the region-tree allocator 0x4002EE60 entirely.
+    // Return success (r0=0) and hand back the requested base as the block, so the
+    // KBL can proceed past the empty red-black tree without a full tree model.
+    // ZLB_KBL_TREE_BYPASS=1 enables it (off by default).
+    static const bool tree_bypass = [] { return std::getenv("ZLB_KBL_TREE_BYPASS") != nullptr; }();
+    if (tree_bypass && pc == 0x4002EE60u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 obj = 0;
+                if (arm->get_register("r0", obj)) {
+                    auto rd = [&](u32 va, bool& ok) {
+                        u32 pa = 0;
+                        std::string fault;
+                        if (!arm->translate(va, false, false, pa, fault)) { ok = false; return 0u; }
+                        ok = true;
+                        return arm_bus_->read32(pa);
+                    };
+                    bool ok = true;
+                    const u32 req_base = rd(static_cast<u32>(obj) + 0x8u, ok);
+                    u32 pa = 0;
+                    std::string fault;
+                    if (ok && arm->translate(static_cast<u32>(obj) + 0x50u, true, false, pa, fault)) {
+                        arm_bus_->write32(pa, req_base);    // "block" = requested base
+                        arm->set_register("r0", 0u);        // success
+                        arm->set_pc(arm->r[14] & ~1u);      // return to the caller
+                        arm->set_register("THUMB", 1u);     // caller is Thumb
+                        return true;                        // handled
+                    }
+                }
+            }
+        }
+    }
+
+    // Diagnostic (round 123): dump the range-check inputs of the region allocator
+    // right before 0x4002EEA2 (the base comparison).  ZLB_KBL_RANGECHK_TRACE=1.
+    static const bool rangechk_trace = [] { return std::getenv("ZLB_KBL_RANGECHK_TRACE") != nullptr; }();
+    if (rangechk_trace && pc == 0x4002EE9Eu && rangechk_trace_hits_ < 8u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++rangechk_trace_hits_;
+                auto rd = [&](u32 va, bool& ok) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(va, false, false, pa, fault)) { ok = false; return 0u; }
+                    ok = true;
+                    return arm_bus_->read32(pa);
+                };
+                bool ok = true;
+                const u32 node = arm->r[4];
+                const u32 obj = arm->r[5];
+                const u32 base = rd(node + 0x18u, ok);
+                const u32 size = rd(node + 0x14u, ok);
+                const u32 req_base = rd(obj + 0x8u, ok);
+                ZLB_LOG_INFO("machine",
+                             "rangechk: arm%u node=0x%08X base=0x%08X size=0x%08X req_base=0x%08X "
+                             "r7(off)=0x%08X r8(reqsize)=0x%08X",
+                             core, node, base, size, req_base, arm->r[7], arm->r[8]);
             }
         }
     }
@@ -825,8 +1419,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 heap = 0;
-                if (arm->get_register("r0", heap) && heap >= 0x1000ull &&
-                    heap < 0x80000000ull) {
+                if (arm->get_register("r0", heap)) {
+                    // Round 135: route a garbage heap pointer (measured 0x4B656353 =
+                    // the first word of the string "SceKernel…" read little-endian, a
+                    // never-initialised [pool] word) to the real created heap 0x5900,
+                    // and zero its cookie so the 0x40034A16 comparison against the
+                    // (still zero) global cookie 0x400B2974 passes.
+                    const u32 hv = static_cast<u32>(heap);
+                    if (hv >= 0x10000u) {
+                        arm->set_register("r0", 0x00005900u);
+                        heap = 0x00005900ull;
+                        u32 field_pa = 0;
+                        std::string fault;
+                        if (arm->translate(0x00005900u + 0x24u, true, false, field_pa, fault)) {
+                            arm_bus_->write32(field_pa, 0u);
+                        }
+                        ++heap_route_fixes_;
+                        if (heap_route_fixes_ <= 8) {
+                            ZLB_LOG_INFO("machine",
+                                         "heap routed: arm%u 0x%08X -> 0x5900 (development substitution)",
+                                         core, hv);
+                            add_milestone("KBL heap routed to 0x5900 (development substitution)");
+                        }
+                    }
+                }
+                if (heap >= 0x1000ull && heap < 0x80000000ull) {
                     u32 cookie_pa = 0, field_pa = 0;
                     std::string fault;
                     if (arm->translate(kCookieVa, false, false, cookie_pa, fault)) {
@@ -857,35 +1474,76 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the allocator still runs its own code
     }
 
-    // Substitution (round 108): the getter at 0x4002C1AC builds the block pointer as
-    // `[obj+0x14] + table[..]` and the object the class-constructor loop passes in
-    // carries 0xFFFFFFFF in that base field (round 108.1 measured the store itself:
-    // R2 = 0, R3 = 0xFFFFFFFF = the value written).  Rather than skipping the store
-    // (which only hides the fault), give the caller a real, zeroed page out of the
-    // region the partition describes, so the loop's constructor works on memory the
-    // model actually owns.  Round 112: it hands out pages from the *region tail*,
-    // which the KBL's own allocator may also consider free (a double allocation is
-    // the prime suspect for the corrupted return address that now kills the run), so
-    // it can be switched off with ZLB_KBL_INSTANCE_BLOCK=0 while bisecting.
+    // Substitution (round 108, corrected round 114): the getter 0x4002C1AC builds
+    // the instance pointer as `[obj+0x14] + table[size_class]`.  The object's base
+    // field `[obj+0x14]` is the 0xFFFFFFFF sentinel the class constructor stores
+    // (round 108.1 measured the store itself), because the stage the model stands in
+    // for never fills it.  Round 114: the old stand-in replaced the getter *result*
+    // at 0x4002C1CC and only caught `0xFFFFFFFF + 0`; the table's non-zero entries
+    // are 0x1000/0x2000, so the sum wrapped to 0x0FFF/0x1FFF and the constructor
+    // loop walked into the low window and panicked on the heap-cookie check with a
+    // bogus heap object.  Fill the base field itself with the instance arena VA:
+    // the getter then returns arena + table[size_class], a valid per-class address.
+    // ZLB_NO_SUBSTITUTION=1 disables it; ZLB_KBL_INSTANCE_BLOCK=0 keeps only the
+    // result fallback below.
     static const bool supply_instance_blocks = [] {
         const char* value = std::getenv("ZLB_KBL_INSTANCE_BLOCK");
         return value == nullptr || value[0] != '0';
     }();
+    constexpr u32 kGetterEntryPc = 0x4002C1ACu;    // ldr r3,[r0,#0x30] - getter entry
+    if (supply_blocks && supply_instance_blocks && pc == kGetterEntryPc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ensure_instance_arena(arm, arm_bus_.get());
+                u64 obj = 0;
+                if (arm->get_register("r0", obj) && obj >= 0x1000ull && obj < 0x80000000ull) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (arm->translate(static_cast<u32>(obj) + 0x14u, true, false, pa, fault)) {
+                        const u32 base = arm_bus_->read32(pa);
+                        if (base == 0u || base == 0xFFFFFFFFu) {
+                            arm_bus_->write32(pa, kInstanceArenaVa);
+                            ++instance_base_fixes_;
+                            if (instance_base_fixes_ <= 4) {
+                                ZLB_LOG_INFO("machine",
+                                             "instance base filled: obj VA 0x%08X+0x14 = 0x%08X -> "
+                                             "arena 0x%08X (development substitution)",
+                                             static_cast<u32>(obj), base, kInstanceArenaVa);
+                                add_milestone("KBL instance base filled at VA 0x" +
+                                              hex(static_cast<u32>(obj), 8) +
+                                              " (development substitution)");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;    // the getter still runs, now reading a valid base
+    }
+
     constexpr u32 kGetterStorePc = 0x4002C1CCu;    // str r3,[r1] in the getter
     if (supply_blocks && supply_instance_blocks && pc == kGetterStorePc) {
+        // Result fallback.  The getter computes `[obj+0x14] + table[size_class]`;
+        // when the base field is the 0xFFFFFFFF sentinel (or obj is NULL so the
+        // field reads garbage) the sum is 0xFFFFFFFF + {0,0x1000,0x2000} =
+        // 0xFFFFFFFF / 0x0FFF / 0x1FFF - none of them page-aligned, and the latter
+        // two walk into the low window.  Any non-page-aligned result is therefore
+        // bogus; hand out the next arena page instead (0xFFFFFFFF & 0xFFF != 0, so
+        // the old sentinel check is subsumed).
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 value = 0;
-                if (arm->get_register("r3", value) && value == 0xFFFFFFFFull) {
+                if (arm->get_register("r3", value) &&
+                    (value == 0u || (value & 0xFFFull) != 0u)) {
                     u32 block = 0;
                     if (supply_kbl_instance_block(core, block)) {
                         arm->set_register("r3", block);
                         ++boot_pc_fixes_;
                         if (boot_pc_fixes_ <= 4) {
                             ZLB_LOG_INFO("machine",
-                                         "instance base getter: 0xFFFFFFFF -> block VA 0x%08X at "
+                                         "instance base getter: 0x%08llX -> block VA 0x%08X at "
                                          "pc=0x%08X (development substitution)",
-                                         block, pc);
+                                         static_cast<unsigned long long>(value), block, pc);
                             add_milestone("KBL instance base supplied at VA 0x" + hex(block, 8) +
                                           " (development substitution)");
                         }
@@ -1088,47 +1746,54 @@ bool Vita::supply_kbl_carve_state(u32 core, u32 pool_va, u32 size) {
     return true;
 }
 
-// Substitution body (round 108): hand out one zeroed page from the region the
-// partition describes, for a class instance whose base field the loader never fills
-// in.  The getter 0x4002C1AC returns `[obj+0x14] + table[..]` and the instance the
-// constructor loop passes carries 0xFFFFFFFF there, so the loop receives -1 and its
-// `str.w r1,[r8]` faults (round 108.1).  The page is taken from the region tail,
-// walking downwards while pages refuse a probe write (the loader maps the region
-// lazily), where the page-cache seeding also takes its blocks from.
+// Substitution body (round 108, fixed round 114): hand out one zeroed page for a
+// class instance whose base field the loader never fills in.  The getter
+// 0x4002C1AC returns `[obj+0x14] + table[..]` and the instance the constructor loop
+// passes carries 0xFFFFFFFF there, so the loop receives -1 and its `str.w r1,[r8]`
+// faults (round 108.1).
+//
+// Round 114: the original page source - the partition-region tail, walked down -
+// collides with the KBL's own memory: the region 0x40000000..0x40100000 also holds
+// the KBL image (ends 0x40075B94), its stack (~0x40060xxx), the class table
+// (0x400B0000) and the heap objects (0x400C1000).  Walking down from the tail
+// eventually handed the constructor a page inside the current stack frame, so the
+// constructor's `obj+0x14 = 0xFFFFFFFF` store overwrote the saved return address
+// and the run died on a fetch of 0xFFFFFFFE (round 113).  Pages now come from a
+// dedicated 1 MiB arena in the low kernel window (VA 0x01100000+, the section above
+// the KBL's hardcoded 0x01031000 base), mapped with the round-110 dram-abs rule to
+// PA 0x41100000+ - free DRAM above the KBL image and the partition region.
 bool Vita::supply_kbl_instance_block(u32 core, u32& out_block) {
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
     ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
     if (arm == nullptr) return false;
-    auto write_va = [&](u32 va, u32 value) {
+
+    constexpr u32 kPageSize = 0x1000u;
+    ensure_instance_arena(arm, arm_bus_.get());
+
+    u32& cursor = instance_block_next_;
+    if (cursor == 0u || cursor >= kInstanceArenaSize) cursor = 0u;   // 0 = arena not started
+    if (cursor + kPageSize > kInstanceArenaSize) return false;
+
+    const u32 block = kInstanceArenaVa + cursor;
+    cursor += kPageSize;
+
+    // Zero the page so the objects the loader builds inside it stay clean.
+    for (u32 offset = 0; offset < kPageSize; offset += 4u) {
         u32 pa = 0;
         std::string fault;
-        if (!arm->translate(va, true, false, pa, fault)) return false;
-        arm_bus_->write32(pa, value);
-        return true;
-    };
-    const u32 region_size = partition_region_size_;
-    if (region_size < 0x2000u) return false;
-    u32& cursor = instance_block_next_;
-    if (cursor == 0u || cursor > region_size) cursor = region_size - 0x1000u;
-    while (cursor >= 0x1000u) {
-        cursor -= 0x1000u;
-        const u32 block = partition_region_base_ + cursor;
-        bool usable = write_va(block, 0u);      // probe: also zeroes the first word
-        for (u32 offset = 4u; usable && offset < 0x100u; offset += 4u) {
-            usable = write_va(block + offset, 0u);
-        }
-        if (!usable) continue;                  // unmapped: try the page below
-        out_block = block;
-        ++instance_blocks_supplied_;
-        if (instance_blocks_supplied_ <= 4) {
-            ZLB_LOG_INFO("machine",
-                         "instance block supplied: arm%u VA 0x%08X (region 0x%08X+0x%X) "
-                         "(development substitution)",
-                         core, block, partition_region_base_, cursor);
-        }
-        return true;
+        if (!arm->translate(block + offset, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, 0u);
     }
-    return false;
+
+    out_block = block;
+    ++instance_blocks_supplied_;
+    if (instance_blocks_supplied_ <= 4) {
+        ZLB_LOG_INFO("machine",
+                     "instance block supplied: arm%u VA 0x%08X (arena VA 0x%08X + 0x%X, PA 0x%08X) "
+                     "(development substitution)",
+                     core, block, kInstanceArenaVa, cursor - kPageSize, 0x40000000u + block);
+    }
+    return true;
 }
 
 // Substitution body: put free blocks of the requested class into the calling

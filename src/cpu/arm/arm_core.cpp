@@ -816,6 +816,22 @@ void ArmCore::execute_arm() {
         if ((instr & 0x0FFF0F00u) == 0x03200000u) {
             const u32 hint = instr & 0xFFu;
             if (hint <= 4u || hint == 0xF0u) {
+                if (hint == 2u) {          // WFE: sleep until SEV (round 140)
+                    write_r15(cur_instr_addr_ + 4u);
+                    if (!event_pending_) {
+                        wfe_waiting_ = true;
+                        halted = true;
+                        halt_reason = "wfe";
+                    } else {
+                        event_pending_ = false;
+                    }
+                    return;
+                }
+                if (hint == 4u) {          // SEV: wake every waiting core
+                    write_r15(cur_instr_addr_ + 4u);
+                    if (sev_hook) sev_hook();
+                    return;
+                }
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
@@ -1853,7 +1869,7 @@ void ArmCore::decode_arm_extra_load_store(u32 instr) {
             mem_write_double(addr, value);
             if (pending_fault_ != arm::FaultKind::None) return;
         }
-        if (w && rn != 15) r[rn] = writeback;
+        if (((p && w) || (!p && !w)) && rn != 15) r[rn] = writeback;
         write_r15(cur_instr_addr_ + 4u);
         return;
     }
@@ -1882,7 +1898,12 @@ void ArmCore::decode_arm_extra_load_store(u32 instr) {
         if (pending_fault_ != arm::FaultKind::None) return;
     }
 
-    if (w) r[rn] = writeback;
+    // Write-back: pre-indexed (P=1, W=1) or post-indexed (P=0, W=0).  P=0, W=1 is
+    // the unprivileged (T) form and must NOT write back, and P=1, W=0 is the plain
+    // offset form.  Only testing W missed the post-indexed case, so `strb r2,
+    // [r12], #1` never advanced r12 and the KBL's byte-copy loop at 0x4003CA6C
+    // became a fixed point (round 143).
+    if ((p && w) || (!p && !w)) r[rn] = writeback;
     write_r15(cur_instr_addr_ + 4u);
 }
 
@@ -1947,7 +1968,12 @@ void ArmCore::execute_arm_load_store(u32 instr, bool immediate) {
         if (pending_fault_ != arm::FaultKind::None) return;
     }
 
-    if (w) r[rn] = writeback;
+    // Write-back: pre-indexed (P=1, W=1) or post-indexed (P=0, W=0).  P=0, W=1 is
+    // the unprivileged (T) form and must NOT write back, and P=1, W=0 is the plain
+    // offset form.  Only testing W missed the post-indexed case, so `strb r2,
+    // [r12], #1` never advanced r12 and the KBL's byte-copy loop at 0x4003CA6C
+    // became a fixed point (round 143).
+    if ((p && w) || (!p && !w)) r[rn] = writeback;
     write_r15(cur_instr_addr_ + 4u);
 }
 
@@ -2054,6 +2080,22 @@ void ArmCore::execute_arm_unconditional(u32 instr) {
     if ((instr & 0x0FFF0F00u) == 0x03200000u) {
         const u32 hint = instr & 0xFFu;
         if (hint <= 4u || hint == 0xF0u) {
+            if (hint == 2u) {          // WFE: sleep until SEV (round 140)
+                write_r15(cur_instr_addr_ + 4u);
+                if (!event_pending_) {
+                    wfe_waiting_ = true;
+                    halted = true;
+                    halt_reason = "wfe";
+                } else {
+                    event_pending_ = false;
+                }
+                return;
+            }
+            if (hint == 4u) {          // SEV: wake every waiting core
+                write_r15(cur_instr_addr_ + 4u);
+                if (sev_hook) sev_hook();
+                return;
+            }
             write_r15(cur_instr_addr_ + 4u);
             return;
         }
@@ -3212,7 +3254,23 @@ void ArmCore::thumb_misc16(u32 i) {
         const u32 mask = i & 0xFu;
         const u32 firstcond = (i >> 4) & 0xFu;
         if (mask == 0u) {
-            // NOP / YIELD / WFE / WFI / SEV / DBG.
+            // NOP / YIELD / WFE / WFI / SEV / DBG (hint = bits [7:4]).
+            if (firstcond == 2u) {     // WFE: sleep until SEV (round 140)
+                write_r15(cur_instr_addr_ + 2u);
+                if (!event_pending_) {
+                    wfe_waiting_ = true;
+                    halted = true;
+                    halt_reason = "wfe";
+                } else {
+                    event_pending_ = false;
+                }
+                return;
+            }
+            if (firstcond == 4u) {     // SEV: wake every waiting core
+                write_r15(cur_instr_addr_ + 2u);
+                if (sev_hook) sev_hook();
+                return;
+            }
             write_r15(cur_instr_addr_ + 2u);
             return;
         }
@@ -3894,6 +3952,29 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         return;
     }
 
+    // Table branch (TBB/TBH): hw1 = 0xE8D0 | Rn, hw2 = 0xF000 | (TBH ? 0x10 : 0) | Rm.
+    // The KBL's switch statements are `tbb [pc, rX]`; treating them as undefined made
+    // the table bytes execute as code and corrupted the loop register (round 118).
+    // NOTE: TBB shares hw1<15:4> (0xE8D) with LDREXB/LDREXH below, so it must be
+    // checked first - the second halfword differs (TBB hw2<15:12> = 0xF, LDREX = 0x0).
+    if ((hw1 & 0xFFF0u) == 0xE8D0u && (hw2 & 0xFFE0u) == 0xF000u) {
+        const int rn_index = static_cast<int>(hw1 & 0xFu);
+        const int rm_index = static_cast<int>(hw2 & 0xFu);
+        const bool half = (hw2 & 0x10u) != 0u;    // TBH (halfword table) vs TBB (byte table)
+        const u32 base = (rn_index == 15) ? (cur_instr_addr_ + 4u) : r[rn_index];
+        const u32 index = r[rm_index];
+        u32 entry;
+        if (half) {
+            entry = mem_read_half(base + index * 2u);
+        } else {
+            entry = mem_read_byte(base + index);
+        }
+        if (pending_fault_ != arm::FaultKind::None) return;
+        const u32 target = cur_instr_addr_ + 4u + 2u * entry;
+        branch_to(target | 1u);   // TBB/TBH always target Thumb state
+        return;
+    }
+
     if (db && !u && !((hw1 & 0xFFF0u) == 0xE8C0u || (hw1 & 0xFFF0u) == 0xE8D0u)) {
         undefined("T32 exclusive byte");
         return;
@@ -3927,12 +4008,6 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
             r[rt] = half ? (value & 0xFFFFu) : (value & 0xFFu);
         }
         write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-
-    // Table branch (TBB/TBH) is not decoded by the reference core.
-    if (u && !db && w && hw2 == 0x0000u) {
-        undefined("T32 table branch");
         return;
     }
 

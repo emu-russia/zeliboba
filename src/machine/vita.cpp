@@ -142,6 +142,11 @@ void Vita::build_buses() {
     arm_bus_->add_ram_alias("arm_priv", kermit::kScuBase, kermit::kScuSize, dram_.data(),
                             "physical DRAM window (kernel boot loader and kernel image)");
     arm_bus_->add_ram("arm_dram", 0x04000000, kermit::kDramBase, "main DRAM (64 MiB module window)");
+    // Round 142: the KBL maps VA 0x1C000000 identity onto the 2 MiB Scratchpad SRAM
+    // (L1[0x1C0] = 0x1C01158E) and uses it as a work buffer; without the backing RAM
+    // its byte-copy/bignum loop reads zeroes back and never advances.
+    arm_bus_->add_ram("arm_scratchpad", kermit::kScratchpadSramSize, kermit::kScratchpadSramBase,
+                      "Scratchpad SRAM (SLSK image, display/camera, PSP eDRAM, BSOD)");
     // 0x50000000 is inside the 512 MiB DRAM window (the wiki puts the ARZL-compressed
     // NSKBL at 0x50000000 and the uncompressed one at 0x51000000), so no separate
     // staging block is mapped there any more.
@@ -204,6 +209,21 @@ void Vita::build_cores() {
             // Vita::satisfy_arm_boot_fault).
             arm->fault_hook = [this](u32 id, u32 va, bool write, bool fetch) {
                 return satisfy_arm_boot_fault(id, va, write, fetch);
+            };
+            // SEV (round 140) wakes every WFE-waiting core: the KBL's barrier spins
+            // on WFE until another core's SEV, and instruction-level round-robin
+            // otherwise races the sense-reversing counter.
+            arm->sev_hook = [this]() {
+                for (size_t k = 0; k < kArmCoreCount; ++k) {
+                    if (ArmCore* other = dynamic_cast<ArmCore*>(arm_cores_[k].get())) {
+                        other->event_pending_ = true;
+                        if (other->wfe_waiting_) {
+                            other->wfe_waiting_ = false;
+                            other->halted = false;
+                            other->halt_reason.clear();
+                        }
+                    }
+                }
             };
         }
     }

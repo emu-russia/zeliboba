@@ -720,6 +720,11 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     // treatment the CMeP's unidentified 0xE0100000 gets.
     d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE8000", 0xE8000000, 0x1000));
     d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE20B6", 0xE20B6000, 0x1000));
+    // Round 142: 0x1D000000 is the hardware /dev/null window (wiki Physical_Memory):
+    // SceMsif drains its data stream here.  An empty RegisterBlock is exactly that -
+    // reads return 0 (no defined register) and writes are dropped.
+    d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.Null", kermit::kNullDeviceBase,
+                                                             kermit::kNullDeviceSize));
     d.dma = static_cast<kermit::DmaController*>(kermit::detail::find_device(d.bus, "Kermit.DMA"));
     d.display = static_cast<kermit::DisplayController*>(kermit::detail::find_device(d.bus, "Kermit.Display"));
     d.syscon_bridge = static_cast<kermit::SysconBridge*>(kermit::detail::find_device(d.bus, "Kermit.Syscon"));

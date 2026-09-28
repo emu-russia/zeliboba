@@ -25,6 +25,13 @@ constexpr u32 kSramBase = 0x1F000000;
 constexpr u32 kSramSize = 0x40000;
 constexpr u32 kDramBase = 0x80000000;
 constexpr u32 kDramSize = 0x04000000;  // 64 MiB window used by the boot chain
+constexpr u32 kScratchpadSramBase = 0x1C000000;  ///< Scratchpad SRAM (wiki Physical_Memory):
+                                                  ///< first loader, CMeP vectors, SLSK image,
+                                                  ///< display/camera SRAM, PSP eDRAM, BSOD SRAM
+constexpr u32 kScratchpadSramSize = 0x00200000;  ///< 2 MiB
+constexpr u32 kNullDeviceBase = 0x1D000000;      ///< hardware /dev/null: reads return 0,
+                                                  ///< writes are dropped (SceMsif drain window)
+constexpr u32 kNullDeviceSize = 0x00001000;      ///< 4 KiB
 constexpr u32 kScuBase = 0x40000000;   ///< private/secure window; the kernel boot loader
                                         ///< ELF is linked at 0x40020000 and runs with the MMU off
 constexpr u32 kPeripheralWindowSize = 0x00010000;  ///< MPCore peripheral block (SCU/GIC/timers)

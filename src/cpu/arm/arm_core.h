@@ -89,6 +89,16 @@ public:
     /// instead of raising the abort.  Returning false keeps the normal path.
     std::function<bool(u32 core, u32 va, bool write, bool fetch)> fault_hook;
 
+    /// Optional hook called when this core executes SEV; the machine uses it to
+    /// wake every WFE-waiting core (round 140: the barrier's sense-reversing wait
+    /// races under instruction-level round-robin, so WFE must sleep until SEV).
+    std::function<void()> sev_hook;
+
+    /// Set when this core is blocked in WFE (wait for event); cleared by SEV.
+    bool wfe_waiting_ = false;
+    /// ARM event register: SEV sets it, WFE consumes it (and skips blocking).
+    bool event_pending_ = false;
+
     /// MMU lookup for one access, giving `fault_hook` one chance to fix a miss.
     arm::MmResult translate_or_fix(u32 va, bool write, bool fetch);
 

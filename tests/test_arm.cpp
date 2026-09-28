@@ -503,6 +503,49 @@ ZLB_TEST(thumb_cbz_and_tbb_free_cbnz) {
     ZLB_EXPECT_EQ(f.reg(2), 2u);
 }
 
+ZLB_TEST(thumb_tbb_table_branch_byte) {
+    Fixture f;
+    // tbb [pc, r0] at kCodeBase; the byte table follows at kCodeBase+4.
+    f.load_halfwords(kCodeBase, { 0xE8DFu, 0xF000u });   // tbb [pc, r0]
+    f.bus.write8(kCodeBase + 4u, 2);                     // entry[0] = 2
+    f.bus.write8(kCodeBase + 5u, 3);                     // entry[1] = 3
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(0, 0);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 8u);       // +4 + 2*2
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+
+    Fixture g;
+    g.load_halfwords(kCodeBase, { 0xE8DFu, 0xF000u });
+    g.bus.write8(kCodeBase + 4u, 2);
+    g.bus.write8(kCodeBase + 5u, 3);
+    g.cpu.reset(kCodeBase | 1u);
+    g.set_reg(0, 1);
+    g.cpu.step();
+    ZLB_EXPECT_EQ(g.cpu.get_pc(), kCodeBase + 10u);      // +4 + 2*3
+}
+
+ZLB_TEST(thumb_tbh_table_branch_halfword) {
+    Fixture f;
+    // tbh [pc, r0, lsl #1] at kCodeBase; the halfword table follows.
+    f.load_halfwords(kCodeBase, { 0xE8DFu, 0xF010u });   // tbh [pc, r0, lsl #1]
+    f.bus.write16(kCodeBase + 4u, 2);                    // entry[0] = 2
+    f.bus.write16(kCodeBase + 6u, 3);                    // entry[1] = 3
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(0, 0);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 8u);       // +4 + 2*2
+
+    Fixture g;
+    g.load_halfwords(kCodeBase, { 0xE8DFu, 0xF010u });
+    g.bus.write16(kCodeBase + 4u, 2);
+    g.bus.write16(kCodeBase + 6u, 3);
+    g.cpu.reset(kCodeBase | 1u);
+    g.set_reg(0, 1);
+    g.cpu.step();
+    ZLB_EXPECT_EQ(g.cpu.get_pc(), kCodeBase + 10u);      // +4 + 2*3
+}
+
 // ===========================================================================
 // IT blocks
 // ===========================================================================
@@ -2764,7 +2807,7 @@ ZLB_TEST(arm_ldr_str_addressing_modes) {
     // Pre-indexed positive, pre-indexed negative, post-indexed and writeback.
     f.load(kCodeBase, {
                           arm_ldr_str_imm(0xE, false, false, 1, 0, 8),                     // str r0, [r1, #8]
-                          arm_ldr_str_imm(0xE, true, false, 1, 2, 8, false, false, true),  // ldr r2, [r1], #-8
+                          arm_ldr_str_imm(0xE, true, false, 1, 2, 8, false, false, false), // ldr r2, [r1], #-8 (post-index: P=0, W=0)
                           arm_ldr_str_imm(0xE, true, false, 1, 3, 4, true, false, true),   // ldr r3, [r1, #-4]!
                           arm_ldr_str_imm(0xE, true, false, 1, 4, 16),                     // ldr r4, [r1, #16]
                       });
@@ -2872,7 +2915,7 @@ ZLB_TEST(arm_extra_load_store_halfword) {
     Fixture f;
     // strh r0, [r1, #4] ; ldrh r2, [r1], #2 ; ldrh r3, [r4, r5] ; strh r6, [r1, #-2]!
     f.load(kCodeBase, {a32_extra_ls(0xE, false, false, true, true, 1, 0, 4),
-                       a32_extra_ls(0xE, true, false, true, true, 1, 2, 2, false, true, true),
+                       a32_extra_ls(0xE, true, false, true, true, 1, 2, 2, false, true, false),
                        a32_extra_ls(0xE, true, false, true, false, 4, 3, 5),
                        a32_extra_ls(0xE, false, false, true, true, 1, 6, 2, true, false, true)});
     f.cpu.reset(kCodeBase);
