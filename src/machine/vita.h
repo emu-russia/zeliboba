@@ -363,11 +363,20 @@ private:
     /// How many times the allocator entry got the heap object's cookie field stamped
     /// (round 110 substitution).
     u32 cookie_stamps_ = 0;
+    /// Lines already emitted by the ZLB_KBL_TRACE_PC diagnostic (round 111).
+    u32 trace_pc_hits_ = 0;
+    /// Lines already emitted by the fatal-stub diagnostic (round 111): the stubs end
+    /// in `b .`, so without the cap the log grows without bound.
+    u32 fatal_stub_hits_ = 0;
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;
     u32 partition_supplied_ = 0;
     u32 class_tables_supplied_ = 0;
+    /// VA of the class table the model created (round 111): the loader zeroes the
+    /// pointer slot after the first supply, so it is restored from this instead of
+    /// allocating a second table.
+    u32 class_table_va_ = 0;
     u32 partition_block_next_[2] = {0x00070000u, 0x000B0000u};  ///< cursor + class-table cursor
     u32 partition_region_base_ = 0x40000000u;
     u32 partition_region_size_ = 0x00300000u;

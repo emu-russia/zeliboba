@@ -506,6 +506,58 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the instruction still has to run
     }
 
+    // Round 111: the loader's own class-descriptor loop overwrites the slot *after*
+    // the substitution above ran.  The trace
+    //     ZLB_KBL_TRACE_PC=0x4002ADB8  ->  from pc=0x4002ADB6 lr=0x4002B153,
+    //                                      r4 = 0x14000/0x14020/0x14040/0x14060,
+    //                                      r1 = 0
+    //     ZLB_KBL_TRACE_PC=0x4002B14E  ->  r0 = the same 0x140xx, r1 = 0 (from the
+    //                                      caller's *stack local* [r4+0x10])
+    // shows four class descriptors (VA 0x14000 + n*0x20, i.e. PA 0x400B2900 + n*0x20)
+    // whose +0x1C table pointer the loader sets to 0 because the local that should
+    // carry the table pointer is zero.  Supply the table again right before the
+    // registration loop reads the pointer, so the loop does not lock NULL:
+    //     0x4002BFB8  ldrls r2,[r2]        ; r2 = [0x400B291C]
+    //     0x4002BFBC  addls.w sb, r2, r3, lsl #2
+    //     0x4002BFC2  blx 0x4003A28C       ; lock(&table[class])
+    // `supply_kbl_class_table` is a no-op when the field is already non-zero, so this
+    // only stands in where the loader left nothing.  ZLB_KBL_CLASS_TABLE=0 disables it.
+    constexpr u32 kClassTableReadPc = 0x4002BFB8u;
+    if (supply_blocks && supply_class_table && pc == kClassTableReadPc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                // Reuse the table the first supply created: by this point the loader
+                // has rebuilt its page tables, so re-deriving the region through VA
+                // 0x51C0 can return garbage and the allocator inside
+                // supply_kbl_class_table then probes its way into the *low* window
+                // (measured: it once "supplied" a table at VA 0x0004705F and the
+                // registration loop faulted).  Only the very first supply allocates.
+                bool done = false;
+                if (class_table_va_ != 0u) {
+                    // Write the *table address* into the *pointer slot* - translating
+                    // the table's own VA here would overwrite the table's first word
+                    // with its own address and the registration loop would then spin
+                    // on a lock value of 0x400B0000 (measured, round 111).
+                    u32 pa = 0;
+                    std::string fault;
+                    if (arm->translate(kClassTableGlobal, true, false, pa, fault)) {
+                        arm_bus_->write32(pa, class_table_va_);
+                        done = true;
+                        ++class_tables_supplied_;
+                        if (class_tables_supplied_ <= 6) {
+                            ZLB_LOG_INFO("machine",
+                                         "class table restored at VA 0x%08X (global 0x%08X) "
+                                         "(development substitution)",
+                                         class_table_va_, kClassTableGlobal);
+                        }
+                    }
+                }
+                if (!done) supply_kbl_class_table(core);
+            }
+        }
+        return false;    // the load still has to run
+    }
+
     // Substitution (round 94): restore the ARM exception vectors at the mapping the
     // KBL installed.  The KBL points VBAR at VA 0x16100 and maps that VA onto its
     // own DRAM page (`vpa 0x16100` = PA 0x40000100), where its copy is incomplete
@@ -609,6 +661,41 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             }
         }
     }
+    // Generic diagnostic (round 111): ZLB_KBL_TRACE_PC=<hex> logs the first few times
+    // the ARM reaches that pc, together with the pc that led there and the register
+    // file.  Rounds 109/110 showed this is the only way to name the branch that
+    // enters one of the KBL's shared stubs (panic 0x4003596E, fatal codes 0x40021998+)
+    // or a store that overwrites a pointer (0x4002ADB8).
+    static const u32 trace_pc = [] {
+        const char* value = std::getenv("ZLB_KBL_TRACE_PC");
+        if (value == nullptr) return 0u;
+        return static_cast<u32>(std::strtoul(value, nullptr, 16));
+    }();
+    if (trace_pc != 0u && pc == trace_pc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                if (trace_pc_hits_ < 12u) {
+                    ++trace_pc_hits_;
+                    u64 r[8] = {0}, lr = 0, sp = 0;
+                    for (u32 i = 0; i < 8; ++i) {
+                        arm->get_register("r" + std::to_string(i), r[i]);
+                    }
+                    arm->get_register("r14", lr);
+                    arm->get_register("r13", sp);
+                    ZLB_LOG_INFO("machine",
+                                 "trace pc=0x%08X arm%u from pc=0x%08X lr=0x%08X sp=0x%08X "
+                                 "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X "
+                                 "r6=0x%08X r7=0x%08X",
+                                 pc, core, previous_pc, static_cast<u32>(lr), static_cast<u32>(sp),
+                                 static_cast<u32>(r[0]), static_cast<u32>(r[1]),
+                                 static_cast<u32>(r[2]), static_cast<u32>(r[3]),
+                                 static_cast<u32>(r[4]), static_cast<u32>(r[5]),
+                                 static_cast<u32>(r[6]), static_cast<u32>(r[7]));
+                }
+            }
+        }
+    }
+
     // Same diagnostic (round 110) for the KBL's "fatal code" stubs: the block around
     // 0x40021998 is a table of them
     //     0x40021998  push {r3,lr} / movs r0,#0x8A / bl 0x40036998 / b .
@@ -617,9 +704,10 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // check failed.  The previous pc is the branch that entered the stub - i.e. the
     // failing test.  ZLB_KBL_PANIC_TRACE=1 enables it.
     if (panic_trace && pc >= 0x40021998u && pc <= 0x400219D0u &&
-        (pc & 3u) == 0u) {
+        (pc & 3u) == 0u && fatal_stub_hits_ < 12u) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++fatal_stub_hits_;   // the stub ends in `b .`: cap the output
                 u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0, lr = 0;
                 arm->get_register("r0", r0);
                 arm->get_register("r1", r1);
@@ -849,7 +937,13 @@ bool Vita::supply_kbl_class_table(u32 core) {
     if (!pool_ok || pool_va == 0u) pool_va = 0x000051C0u;
     const u32 region_base = read_va(pool_va + 0x18u, ok);
     const u32 region_size = read_va(pool_va + 0x1Cu, ok);
-    if (!ok || region_base == 0u || region_size < 0x2000u) return false;
+    // The region must be DRAM: once the loader has rebuilt its page tables the pool
+    // VA can resolve to something unrelated, and without this check the probing loop
+    // below walks down into the mapped low window and "succeeds" there (round 111).
+    if (!ok || region_base < 0x40000000u || region_base >= 0x80000000u ||
+        region_size < 0x2000u || region_size > 0x40000000u) {
+        return false;
+    }
 
     constexpr u32 kTableBytes = 8u * 0x14u;
     u32& cursor = partition_block_next_[1];
@@ -866,6 +960,7 @@ bool Vita::supply_kbl_class_table(u32 core) {
         if (writable) {
             if (!write_va(kClassTableGlobalVa, table)) return false;
             cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
+            class_table_va_ = table;    // remember it: the loader zeroes the slot later
             ++class_tables_supplied_;
             ZLB_LOG_INFO("machine",
                          "class table supplied at VA 0x%08X (global 0x%08X, %u entries) "
