@@ -798,14 +798,14 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // indices ("12", "10,14", ...); unset/0 keeps the stock behaviour.
     static const bool lowalias_fix = [] {
         const char* value = std::getenv("ZLB_KBL_LOWALIAS");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     // The knob takes a comma separated list of L2 indices to split off ("12",
-    // "12,14", "all"); the default keeps the measured-worse behaviour of fixing
-    // every one of them.
+    // "10,14", "all"); the default is the heap window alone, which is the one
+    // combination that carries the loader past the wall (round 156).
     static const std::string lowalias_list = [] {
         const char* value = std::getenv("ZLB_KBL_LOWALIAS");
-        return std::string(value != nullptr ? value : "");
+        return std::string(value != nullptr ? value : "12");
     }();
     static const bool lowalias_all = lowalias_list.find("all") != std::string::npos;
     constexpr u32 kLowMapStorePc = 0x4003AD6Cu;
@@ -1957,7 +1957,23 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
     u32 cursor = next;
     while (written < blocks && cursor >= 0x1000u) {
         const u32 block = partition_region_base_ + cursor;
-        if (!write_va(block, 0u)) {
+        // Each page the partition hands out carries *its own physical page number*
+        // in the first word: the heap builder reads it back as `[block] << 12`
+        // (0x40031C32 -> 0x4003223C) to learn the physical base of the window it is
+        // about to map, so the loader's own carve path must have written it.  The
+        // substitution therefore offers to write it too (ZLB_KBL_PAGENUM=1).
+        //
+        // Measured (round 157): with the page numbers written, *all three* low
+        // windows (VA 0x10000/0x12000/0x14000) end up on their own block pages and
+        // the boot stops earlier (checkpoint 0x84 instead of 0x87) - i.e. some of
+        // those windows are expected to alias physical page 0, where the class
+        // descriptors live.  Off by default; the knob is the switch between the two
+        // readings of the loader's page bookkeeping.
+        static const bool write_page_number = [] {
+            const char* value = std::getenv("ZLB_KBL_PAGENUM");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (!write_va(block, write_page_number ? (block >> 12u) : 0u)) {
             // Not mapped writable yet: skip this page and try the one below.
             cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
             continue;
