@@ -360,6 +360,9 @@ private:
     u32 instance_blocks_supplied_ = 0;
     /// Last ARM pc the boot-chain hook saw, per core (round 109 diagnostics).
     u32 last_arm_pc_[kArmCoreCount] = {};
+    /// How many times the allocator entry got the heap object's cookie field stamped
+    /// (round 110 substitution).
+    u32 cookie_stamps_ = 0;
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
     u32 partition_blocks_per_class_ = 4;

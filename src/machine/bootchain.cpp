@@ -277,8 +277,9 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
         return value != nullptr && value[0] != '0';
     }();
     if (disabled) return false;
-    if (va >= 0x00100000u) return false;
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    // VA >= 1 MiB is handled by the section-level branch below (round 110); the
+    // L2 walk after it only ever runs for the inherited low window.
 
     // Which physical address the low window holds is the open question here: the
     // wiki pins the SPAD32K alias at 0x0 and the "MeP boot" mirror of the CMeP SRAM
@@ -309,7 +310,39 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
     if (!arm || !arm->mmu.enabled()) return false;
 
+    // Substitution (round 110): the KBL also keeps a *low* kernel memory area that
+    // its own tables never map.  Measured: the class method 0x4002B3DC is called
+    // from 0x4002BC4E as `f(obj, 0, size, 0x01031000)` - the base is a literal
+    // (`mov.w r3,#0x1000; movt r3,#0x103` at 0x4002BC42) - and its first store is
+    // `str r4,[r6,#4]` at 0x4002B422 with r6 = 0x01040000, so the first access to
+    // VA 0x01040000 raises a *section translation fault* (DFSR = 0x805,
+    // DFAR = 0x01040004), the KBL's own abort handler reports fatal code 0x8A and
+    // hangs at 0x400219A0.  VA 0x01000000 lives in the TTBR0 range, and the KBL's
+    // L1 entry for it (0x40108040) is not a table, so at 1 MiB granularity there is
+    // nothing to patch - install a section descriptor for the whole 1 MiB, mapping
+    // the VA into DRAM with the same `dram-abs` rule the low window uses
+    // (PA = 0x40000000 + VA, i.e. 0x41031000 - free DRAM: the KBL image ends at
+    // 0x40075B94 and the partition region at 0x40300000).  The attribute bits are
+    // the KBL's own section attributes (0x1158E, the value in its TTBR1 entries).
+    // ZLB_NO_SUBSTITUTION=1 disables it.
+    if (va >= 0x00100000u && va < 0x40000000u) {
+        const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
+        const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
+        if ((arm_bus_->read32(l1_slot) & 3u) != 0u) return false;   // already described
+        const u32 pa = 0x40000000u + va;
+        arm_bus_->write32(l1_slot, (pa & 0xFFF00000u) | 0x1158Eu);
+        ++boot_fault_fixes_;
+        ZLB_LOG_INFO("machine",
+                     "low kernel memory mapping supplied: arm%u VA 0x%08X -> PA 0x%08X in L1 0x%08X[0x%03X] (%s)",
+                     core, va, pa, l1_base, (va >> 20) & 0xFFFu,
+                     fetch ? "fetch" : (write ? "write" : "read"));
+        add_milestone("ARM low kernel memory mapping supplied for VA 0x" + hex(va, 8) +
+                      " (development substitution)");
+        return true;
+    }
+
     // Walk the core's own TTBR0: L1 -> coarse L2, the layout the KBL installs.
+    if (va >= 0x00100000u) return false;   // only the low window reaches the L2 walk
     const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
     const u32 l1_entry = arm_bus_->read32(l1_base + ((va >> 20) & 0xFFFu) * 4u);
     if ((l1_entry & 3u) != 1u) return false;                    // not a coarse table
@@ -453,7 +486,18 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // disables it.
     constexpr u32 kClassTableGlobal = 0x400B291Cu;
     constexpr u32 kSystemInitPc = 0x4002BB32u;   // `str r1,[r5]` in the manager builder
-    if (supply_blocks && pc == kSystemInitPc) {
+    // Round 110: with the memory walls behind it the KBL now runs the *whole* manager
+    // builder and zeroes this field itself (`str r1,[r4,#0x1C]` at 0x4002ADB8, where
+    // r4 = 0x400B2900 and +0x1C = the very slot our substitution fills), so the two
+    // writes race and the registration loop ends up locking a NULL pointer
+    // (pc 0x4003A28C, R0 = 0, LR = 0x4002BFC7).  The substitution can therefore be
+    // switched off with ZLB_KBL_CLASS_TABLE=0 to see whether the loader builds the
+    // table on its own now.
+    static const bool supply_class_table = [] {
+        const char* value = std::getenv("ZLB_KBL_CLASS_TABLE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (supply_blocks && supply_class_table && pc == kSystemInitPc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 supply_kbl_class_table(core);
@@ -541,8 +585,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // and never consults it).  Log the operands and the arena so the failing input
     // is visible without another debugging session.
     static const bool panic_trace = [] { return std::getenv("ZLB_KBL_PANIC_TRACE") != nullptr; }();
-    if (panic_trace && pc == 0x4003596Eu) {
-        if (core < static_cast<u32>(kArmCoreCount)) {
+    if (panic_trace && pc == 0x4003596Eu) {        if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, lr = 0, sp = 0;
                 arm->get_register("r0", r0);
@@ -563,6 +606,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                              static_cast<u32>(r0), static_cast<u32>(r1), static_cast<u32>(r2),
                              static_cast<u32>(r3), static_cast<u32>(r4), static_cast<u32>(r5),
                              static_cast<u32>(r6), static_cast<u32>(r7));
+            }
+        }
+    }
+    // Same diagnostic (round 110) for the KBL's "fatal code" stubs: the block around
+    // 0x40021998 is a table of them
+    //     0x40021998  push {r3,lr} / movs r0,#0x8A / bl 0x40036998 / b .
+    //     0x400219A4  … r0 = 0x8B …, 0x400219B8 … r0 = 0x8C …
+    // and every one of them ends in `b .`, so the pc alone says nothing about which
+    // check failed.  The previous pc is the branch that entered the stub - i.e. the
+    // failing test.  ZLB_KBL_PANIC_TRACE=1 enables it.
+    if (panic_trace && pc >= 0x40021998u && pc <= 0x400219D0u &&
+        (pc & 3u) == 0u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0, lr = 0;
+                arm->get_register("r0", r0);
+                arm->get_register("r1", r1);
+                arm->get_register("r2", r2);
+                arm->get_register("r3", r3);
+                arm->get_register("r14", lr);
+                ZLB_LOG_INFO("machine",
+                             "KBL fatal stub arm%u: entered from pc=0x%08X lr=0x%08X "
+                             "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X",
+                             core, previous_pc, static_cast<u32>(lr), static_cast<u32>(r0),
+                             static_cast<u32>(r1), static_cast<u32>(r2), static_cast<u32>(r3));
             }
         }
     }
@@ -604,6 +672,57 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // instruction level, which `runm` (whole slices) does - and it deadlocks under
     // the debugger's `run`, which single-steps the cores and never consults this
     // hook at all (see docs/KBL.md round 109).  No substitution is needed here.
+
+    // Substitution (round 110): the KBL's allocator entry validates its heap object
+    //      40034A0C  ldr r2,[r0,#0x24]        ; the object's cookie field
+    //      40034A12  ldr r3,[r6=0x400B2974]   ; the KBL's build cookie (round 109.6)
+    //      40034A16  cmp r2,r3
+    //      40034A18  bne.w 0x4003596E         ; -> the panic stub
+    // and the heap object the loader builds for itself (VA 0x400C1000) never gets
+    // +0x24 written: a write trap over 0x400C1000-0x400C1040 lists every store its
+    // constructor makes (+8, +0xC, +0xE, +0x10, +0x14 = 0xFFFFFFFF, +0x20, +0x28 …
+    // +0x3C) and +0x24 is not among them, so the field stays 0 and the second
+    // validation (the first one runs before the cookie exists, when both sides are
+    // 0) fails.  Stand in for whatever is supposed to leave that stamp: when the
+    // allocator entry is entered with a zero cookie field and the global cookie is
+    // already set, write the cookie in.  ZLB_NO_SUBSTITUTION=1 disables it.
+    constexpr u32 kAllocEntryPc = 0x40034A00u;
+    constexpr u32 kCookieVa = 0x400B2974u;
+    if (supply_blocks && pc == kAllocEntryPc) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                u64 heap = 0;
+                if (arm->get_register("r0", heap) && heap >= 0x1000ull &&
+                    heap < 0x80000000ull) {
+                    u32 cookie_pa = 0, field_pa = 0;
+                    std::string fault;
+                    if (arm->translate(kCookieVa, false, false, cookie_pa, fault)) {
+                        const u32 cookie = arm_bus_->read32(cookie_pa);
+                        if (cookie != 0u &&
+                            arm->translate(static_cast<u32>(heap) + 0x24u, true, false,
+                                           field_pa, fault)) {
+                            const u32 current = arm_bus_->read32(field_pa);
+                            if (current == 0u) {
+                                arm_bus_->write32(field_pa, cookie);
+                                ++cookie_stamps_;
+                                if (cookie_stamps_ <= 8) {
+                                    ZLB_LOG_INFO("machine",
+                                                 "heap cookie stamped: VA 0x%08X+0x24 = 0x%08X "
+                                                 "(heap 0x%08X) (development substitution)",
+                                                 static_cast<u32>(heap), cookie,
+                                                 static_cast<u32>(heap));
+                                    add_milestone("KBL heap cookie stamped at VA 0x" +
+                                                  hex(static_cast<u32>(heap), 8) +
+                                                  " (development substitution)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;    // the allocator still runs its own code
+    }
 
     // Substitution (round 108): the getter at 0x4002C1AC builds the block pointer as
     // `[obj+0x14] + table[..]` and the object the class-constructor loop passes in
