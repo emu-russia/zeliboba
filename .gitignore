@@ -9,3 +9,6 @@ out/
 *.bin.tmp
 third_party/SDL3-devel-VC.zip
 .vs/
+
+# Visual Studio per-user project settings (*.vcxproj.user)
+*.vcxproj.user

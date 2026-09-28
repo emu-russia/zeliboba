@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="msvc\zeliboba_ui.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{e0356038-dc26-5b8a-900d-299162d00bfd}" DefaultStartup="true">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+  <Project Path="msvc\zeliboba.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{c510a301-e7c6-5ecf-84d4-651a570e1d40}">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+  <Project Path="msvc\zeliboba_core.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{479d63e3-6381-5e7e-acf7-f485a448ddf4}" />
+  <Project Path="msvc\zlb_tests.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{5ebfeaf6-a19b-57c6-9827-a083c78e1a1e}">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+  <Project Path="msvc\emmc_rebuild.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{dcb21e56-d9b1-5caa-9588-69e0464cc08c}">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+  <Project Path="msvc\zdis.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{964984ab-12e3-5845-bd5f-6d6a7283b825}">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+  <Project Path="msvc\arm_probe.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="{4057f3e1-278a-5140-93fb-e310ce4a3358}">
+    <BuildDependency Project="msvc\zeliboba_core.vcxproj" />
+  </Project>
+</Solution>

@@ -1,5 +1,7 @@
 # zeliboba
 
+![zeliboba](artwork/png/zeliboba-banner.png)
+
 Низкоуровневый эмулятор PlayStation Vita на C++20 с бэкендом SDL3, отладчиком и
 реконструированным образом eMMC. Цель первого этапа — довести загрузку прошивки
 **1.04** до ядра (Kernel), а не до Live Area.
@@ -41,6 +43,7 @@ Ernie (RL78 syscon)  -> питание/сброс/RTC/SC-канал/eMMC-хос�
 | Машина и цепочка загрузки | `src/machine/` | готово |
 | Отладчик (CLI + API) | `src/debug/` | готово |
 | SDL3-фронтенд | `src/ui/` | готово, оффскрин-скриншоты |
+| Арт: иконка, логотип, талисман | `artwork/` | генерируется скриптом |
 
 ## Сборка
 
@@ -56,6 +59,20 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Tests       # + самот
 
 Результат: `build/bin/zeliboba.exe` (консольный отладчик), `build/bin/zeliboba_ui.exe`
 (SDL3), `build/bin/zlb_tests.exe`, `build/bin/emmc_rebuild.exe`, `build/bin/zdis.exe`.
+
+### Visual Studio 2026
+
+В корне лежит готовое решение — `zeliboba.slnx` (и эквивалентный классический
+`zeliboba.sln`), CMake для работы в IDE не нужен:
+
+```powershell
+msbuild zeliboba.slnx -p:Configuration=Release -p:Platform=x64 -m
+```
+
+Стартовый проект — `zeliboba_ui`, так что **F5** сразу собирает и запускает
+эмулятор. Список исходников в проектах задан масками, поэтому новые `.cpp`
+подхватываются автоматически, а вывод идёт в тот же `build/bin`, что и у
+CMake-сборки. Подробности — `msvc/README.md`.
 
 ## Запуск
 
@@ -121,6 +138,22 @@ log <level>
 `ernie-master/`, `Sony_Vita_Sdk_0945-YLoD/`. Никакие сторонние эмуляторы не
 использовались.
 
+## Графика
+
+Талисман проекта — **Зелибоба**, синий пушистый дух двора из российской
+«Улицы Сезам»: длинная морда, висячие уши, тяжёлые брови, длинный конический
+нос, белые кроссовки и коллекция галстуков. Портрет, иконка, логотип и баннер
+целиком рисуются скриптом:
+
+```bash
+python3 artwork/make_artwork.py     # fonttools + cairosvg + Pillow
+```
+
+Иконка попадает и в `.exe` (через `src/zeliboba.rc` и `src/ui/zeliboba_ui.rc`),
+и в окно SDL3 (`src/ui/zeliboba_icon_pixels.h` → `SDL_SetWindowIcon`). Палитра
+взята из `src/ui/ui.h`, поэтому арт и интерфейс выглядят как одно целое.
+Описание персонажа, состав файлов и палитра — в `artwork/README.md`.
+
 ## Документация
 
 * `docs/ARCHITECTURE.md` — устройство эмулятора и контракты между модулями
@@ -131,6 +164,8 @@ log <level>
 * `docs/VENEZIA.md` — план по движку Venezia (MPE, IVC2)
 * `docs/GPU.md` — план по PowerVR SGX543 и выводу Live Area
 * `docs/DEVELOPMENT.md` — контракты для разработки
+* `artwork/README.md` — талисман, палитра, состав арта и его генерация
+* `msvc/README.md` — решение Visual Studio 2026
 
 ## Скриншоты
 

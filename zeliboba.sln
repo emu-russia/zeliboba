@@ -1,0 +1,78 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.0.12217.157
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "zeliboba_ui", "msvc\zeliboba_ui.vcxproj", "{E0356038-DC26-5B8A-900D-299162D00BFD}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "zeliboba", "msvc\zeliboba.vcxproj", "{C510A301-E7C6-5ECF-84D4-651A570E1D40}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "zeliboba_core", "msvc\zeliboba_core.vcxproj", "{479D63E3-6381-5E7E-ACF7-F485A448DDF4}"
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "zlb_tests", "msvc\zlb_tests.vcxproj", "{5EBFEAF6-A19B-57C6-9827-A083C78E1A1E}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "emmc_rebuild", "msvc\emmc_rebuild.vcxproj", "{DCB21E56-D9B1-5CAA-9588-69E0464CC08C}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "zdis", "msvc\zdis.vcxproj", "{964984AB-12E3-5845-BD5F-6D6A7283B825}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Project("8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942") = "arm_probe", "msvc\arm_probe.vcxproj", "{4057F3E1-278A-5140-93FB-E310CE4A3358}"
+	ProjectSection(ProjectDependencies) = postProject
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4} = {479D63E3-6381-5E7E-ACF7-F485A448DDF4}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E0356038-DC26-5B8A-900D-299162D00BFD}.Debug|x64.ActiveCfg = Debug|x64
+		{E0356038-DC26-5B8A-900D-299162D00BFD}.Debug|x64.Build.0 = Debug|x64
+		{E0356038-DC26-5B8A-900D-299162D00BFD}.Release|x64.ActiveCfg = Release|x64
+		{E0356038-DC26-5B8A-900D-299162D00BFD}.Release|x64.Build.0 = Release|x64
+		{C510A301-E7C6-5ECF-84D4-651A570E1D40}.Debug|x64.ActiveCfg = Debug|x64
+		{C510A301-E7C6-5ECF-84D4-651A570E1D40}.Debug|x64.Build.0 = Debug|x64
+		{C510A301-E7C6-5ECF-84D4-651A570E1D40}.Release|x64.ActiveCfg = Release|x64
+		{C510A301-E7C6-5ECF-84D4-651A570E1D40}.Release|x64.Build.0 = Release|x64
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4}.Debug|x64.ActiveCfg = Debug|x64
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4}.Debug|x64.Build.0 = Debug|x64
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4}.Release|x64.ActiveCfg = Release|x64
+		{479D63E3-6381-5E7E-ACF7-F485A448DDF4}.Release|x64.Build.0 = Release|x64
+		{5EBFEAF6-A19B-57C6-9827-A083C78E1A1E}.Debug|x64.ActiveCfg = Debug|x64
+		{5EBFEAF6-A19B-57C6-9827-A083C78E1A1E}.Debug|x64.Build.0 = Debug|x64
+		{5EBFEAF6-A19B-57C6-9827-A083C78E1A1E}.Release|x64.ActiveCfg = Release|x64
+		{5EBFEAF6-A19B-57C6-9827-A083C78E1A1E}.Release|x64.Build.0 = Release|x64
+		{DCB21E56-D9B1-5CAA-9588-69E0464CC08C}.Debug|x64.ActiveCfg = Debug|x64
+		{DCB21E56-D9B1-5CAA-9588-69E0464CC08C}.Debug|x64.Build.0 = Debug|x64
+		{DCB21E56-D9B1-5CAA-9588-69E0464CC08C}.Release|x64.ActiveCfg = Release|x64
+		{DCB21E56-D9B1-5CAA-9588-69E0464CC08C}.Release|x64.Build.0 = Release|x64
+		{964984AB-12E3-5845-BD5F-6D6A7283B825}.Debug|x64.ActiveCfg = Debug|x64
+		{964984AB-12E3-5845-BD5F-6D6A7283B825}.Debug|x64.Build.0 = Debug|x64
+		{964984AB-12E3-5845-BD5F-6D6A7283B825}.Release|x64.ActiveCfg = Release|x64
+		{964984AB-12E3-5845-BD5F-6D6A7283B825}.Release|x64.Build.0 = Release|x64
+		{4057F3E1-278A-5140-93FB-E310CE4A3358}.Debug|x64.ActiveCfg = Debug|x64
+		{4057F3E1-278A-5140-93FB-E310CE4A3358}.Debug|x64.Build.0 = Debug|x64
+		{4057F3E1-278A-5140-93FB-E310CE4A3358}.Release|x64.ActiveCfg = Release|x64
+		{4057F3E1-278A-5140-93FB-E310CE4A3358}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {B4285EF5-91E2-52E7-B0E7-57F456439228}
+	EndGlobalSection
+EndGlobal

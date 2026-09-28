@@ -16,6 +16,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# The executables carry the artwork from artwork/make_artwork.py as a Windows
+# icon resource, so the resource compiler has to be available.
+if(MSVC)
+    enable_language(RC)
+endif()
+
 option(ZLB_BUILD_TOOLS   "Build command line tools (emmc_rebuild, zdis)" ON)
 option(ZLB_BUILD_TESTS   "Build self tests"                              ON)
 option(ZLB_ENABLE_SDL3   "Build the SDL3 frontend (falls back to headless when unavailable)" ON)
@@ -100,6 +106,10 @@ target_compile_definitions(zeliboba_core PUBLIC
 # ---------------------------------------------------------------------------
 add_executable(zeliboba "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 target_link_libraries(zeliboba PRIVATE zeliboba_core)
+if(MSVC)
+    # artwork/zeliboba.ico + version info (src/zeliboba.rc)
+    target_sources(zeliboba PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/zeliboba.rc")
+endif()
 
 # ---------------------------------------------------------------------------
 # zeliboba_ui (SDL3 frontend), only when SDL3 is present
@@ -111,6 +121,11 @@ if(ZLB_SDL3_AVAILABLE)
         add_executable(zeliboba_ui ${ZLB_UI_SOURCES})
         target_link_libraries(zeliboba_ui PRIVATE zeliboba_core SDL3::SDL3)
         target_compile_definitions(zeliboba_ui PRIVATE ZLB_HAVE_SDL3=1)
+        if(MSVC)
+            # artwork/zeliboba.ico + version info (src/ui/zeliboba_ui.rc)
+            target_sources(zeliboba_ui PRIVATE
+                           "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/zeliboba_ui.rc")
+        endif()
         # SDL3 is loaded at runtime: keep the DLL next to the executables so the
         # frontend runs straight from the build tree.
         add_custom_command(TARGET zeliboba_ui POST_BUILD

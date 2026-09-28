@@ -21,6 +21,7 @@
 #include "hw/emmc.h"
 #include "hw/soc.h"
 #include "ui/ui.h"
+#include "ui/zeliboba_icon_pixels.h"
 
 namespace zlb {
 
@@ -531,6 +532,19 @@ bool UiApp::init_window() {
                     "offscreen capture\n");
         startup_note_ = reason;
         return false;
+    }
+
+    // Zeliboba, the blue fur spirit of the yard: the window/taskbar icon from
+    // artwork/make_artwork.py (the pixels are embedded, no file to find).
+    if (SDL_Surface* icon = SDL_CreateSurfaceFrom(
+            ui_artwork::kWindowIconWidth, ui_artwork::kWindowIconHeight,
+            SDL_PIXELFORMAT_ARGB8888,
+            const_cast<u32*>(ui_artwork::kWindowIconPixels),
+            ui_artwork::kWindowIconWidth * static_cast<int>(sizeof(u32)))) {
+        SDL_SetWindowIcon(window_, icon);
+        SDL_DestroySurface(icon);
+    } else {
+        std::printf("zeliboba_ui: window icon unavailable: %s\n", SDL_GetError());
     }
 
     renderer_ = SDL_CreateRenderer(window_, nullptr);

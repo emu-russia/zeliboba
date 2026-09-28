@@ -1,0 +1,40 @@
+// zeliboba - Windows resources for the console frontend / debugger.
+//
+// The icon comes from artwork/make_artwork.py (artwork/zeliboba.ico is a
+// multi-resolution ICO: 16..256 px, so Explorer, the taskbar and Alt-Tab each
+// get the right size).
+#include <windows.h>
+
+#define IDI_ZELIBOBA 101
+
+IDI_ZELIBOBA ICON "..\\artwork\\zeliboba.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "zeliboba"
+            VALUE "FileDescription",  "zeliboba - PlayStation Vita emulator (debugger)"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "zeliboba"
+            VALUE "LegalCopyright",   "Built from open documentation on the device"
+            VALUE "OriginalFilename", "zeliboba.exe"
+            VALUE "ProductName",      "zeliboba"
+            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "Comments",         "CMeP / Cortex-A9 / Ernie, firmware 1.04 bring-up"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
