@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  zeliboba - settings shared by every project in the VS2026 solution.
+
+  This file lives in msvc/ on purpose: MSBuild only picks it up for the
+  projects in this directory, so it can never leak into the CMake-generated
+  tree under build/.
+
+  The two path macros are passed with FORWARD slashes because they end up
+  inside C++ string literals (ZLB_ROOT_DIR="C:/..."), where a backslash would
+  be read as an escape sequence.
+-->
+<Project>
+
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <ZlbRootDirFs>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))</ZlbRootDirFs>
+    <ZlbWorkspaceDirFs>$([System.IO.Path]::GetFullPath('$(ZlbRootDirFs)\..'))</ZlbWorkspaceDirFs>
+    <ZlbRootDir>$(ZlbRootDirFs.Replace('\','/'))</ZlbRootDir>
+    <ZlbWorkspaceDir>$(ZlbWorkspaceDirFs.Replace('\','/'))</ZlbWorkspaceDir>
+    <ZlbSrcDir>$(ZlbRootDirFs)\src</ZlbSrcDir>
+    <ZlbArtworkDir>$(ZlbRootDirFs)\artwork</ZlbArtworkDir>
+    <ZlbSdl3Dir>$(ZlbRootDirFs)\third_party\SDL3-devel-VC</ZlbSdl3Dir>
+    <!-- the same layout the CMake build and verify.ps1 expect -->
+    <ZlbOutDir>$(ZlbRootDirFs)\build\bin\</ZlbOutDir>
+    <ZlbLibDir>$(ZlbRootDirFs)\build\lib\</ZlbLibDir>
+    <ZlbIntDir>$(ZlbRootDirFs)\build\msvc\$(Configuration)\$(MSBuildProjectName)\</ZlbIntDir>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <OutDir>$(ZlbOutDir)</OutDir>
+    <IntDir>$(ZlbIntDir)</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <SDLCheck>false</SDLCheck>
+      <AdditionalIncludeDirectories>$(ZlbSrcDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- keep the interpreter honest: no fast-math style reassociation -->
+      <AdditionalOptions>/utf-8 /permissive- /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NOMINMAX;WIN32_LEAN_AND_MEAN;ZLB_ROOT_DIR="$(ZlbRootDir)";ZLB_WORKSPACE_DIR="$(ZlbWorkspaceDir)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <Lib>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Lib>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+</Project>
