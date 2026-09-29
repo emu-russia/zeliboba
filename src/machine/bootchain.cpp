@@ -1508,6 +1508,36 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 208): the class-magic check.  0x5100EEBE loads obj->[0x24]
+    // and compares it with the global [0x5113B604], jumping to the fatal sink when
+    // they differ (docs/NSKBL.md 8.44).  The object that trips it (0x4010047E) never
+    // went through NSKBL's class constructor, so its field is not the expected magic;
+    // copy the global into the field at the check's entry, which is what the
+    // constructor would have written.  ZLB_NSKBL_MAGIC=1 enables it.
+    static const bool magic_fix = [] {
+        const char* value = std::getenv("ZLB_NSKBL_MAGIC");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (magic_fix && pc == 0x5100EEA8u && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 object = static_cast<u32>(arm->r[0]);
+            const u32 expected = arm_bus_->read32(0x5113B604u);
+            const u32 actual = (object != 0u) ? arm_bus_->read32(object + 0x24u) : 0u;
+            if (object != 0u && actual != expected) {
+                arm_bus_->write32(object + 0x24u, expected);
+                ++boot_pc_fixes_;
+                if (magic_fixes_ < 6u) {
+                    ++magic_fixes_;
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL class magic aligned on object 0x%08X: 0x%08X -> "
+                                 "0x%08X (development substitution)",
+                                 object, actual, expected);
+                    add_milestone("NSKBL class magic aligned (development substitution)");
+                }
+            }
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own

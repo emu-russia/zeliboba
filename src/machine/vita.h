@@ -491,6 +491,8 @@ private:
     /// Round 180: blocks handed to NSKBL's allocator from the model's heap arena when
     /// the map object's heap pointer (map->[0x8C]) is zero (ZLB_NSKBL_HEAP).
     /// Round 197: free physical pages handed to NSKBL's kernel partition.
+    /// Round 208: class-magic alignments made by the model.
+    u32 magic_fixes_ = 0;
     u32 nskbl_physpool_next_ = 0;
     u32 nskbl_physpool_fills_ = 0;
     u32 nskbl_heap_next_ = 0;
