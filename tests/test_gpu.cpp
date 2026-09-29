@@ -119,6 +119,37 @@ ZLB_TEST(sgx_kick_reads_the_command_queue_from_guest_memory) {
     ZLB_EXPECT_EQ(f.sgx.queue_read_offset(), 0x10u);
 }
 
+ZLB_TEST(sgx_mmu_translates_through_the_modelled_page_table) {
+    Fixture f;
+    const u32 table = kermit::kDramBase + 0x4000u;
+    const u32 va = 0x00123000u;
+    const u32 pa_page = 0x00555000u;
+
+    // Disabled (or without a table) every lookup faults.
+    ZLB_EXPECT_EQ(f.sgx.translate(va), kermit::kSgxMmuFault);
+    ZLB_EXPECT_EQ(f.sgx.faults(), 1u);
+
+    // Install one valid entry: {page, flags} indexed by va >> 12.
+    f.bus.write32(table + (va >> 12) * 8u, pa_page);
+    f.bus.write32(table + (va >> 12) * 8u + 4u, kermit::kSgxMmuEntryValid);
+    f.write(kermit::kSgxMmuDirBase, table);
+    f.write(kermit::kSgxMmuControl, 1u);
+
+    ZLB_EXPECT_EQ(f.sgx.translate(va + 0x234u), pa_page + 0x234u);
+    ZLB_EXPECT_EQ(f.sgx.faults(), 1u);   // still only the first lookup faulted
+
+    // An unmapped page in the same table still faults.
+    ZLB_EXPECT_EQ(f.sgx.translate(va + 0x2000u), kermit::kSgxMmuFault);
+    ZLB_EXPECT_EQ(f.sgx.faults(), 2u);
+
+    // Invalidation is counted and STATUS reports {faults, translations}.
+    f.write(kermit::kSgxMmuInvalidate, 1u);
+    ZLB_EXPECT_EQ(f.sgx.invalidations(), 1u);
+    const u32 status = f.read(kermit::kSgxMmuStatus);
+    ZLB_EXPECT_EQ(status & 0xFFFFu, 2u);
+    ZLB_EXPECT_EQ(status >> 16, static_cast<u32>(f.sgx.translations()));
+}
+
 ZLB_TEST(sgx_reset_returns_the_window_to_power_on) {
     Fixture f;
     f.write(kermit::kSgxQueueBase, 0x40000000u);

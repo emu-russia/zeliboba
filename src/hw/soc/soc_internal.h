@@ -995,6 +995,21 @@ constexpr u32 kSgxQueueRead = 0x0030;     ///< consumer offset (model)
 constexpr u32 kSgxIrqStatus = 0x0040;     ///< read: pending interrupt bits
 constexpr u32 kSgxIrqClear = 0x0044;      ///< write 1 to a bit to clear it
 
+/// GPU MMU registers of the model. The SGX has its own page table walker; the
+/// firmware side was not recovered, so the layout below is the model's contract
+/// and is documented here in one place:
+///   * MMU_DIR_BASE points at a table of 8 byte entries {u32 page, u32 flags},
+///     indexed by a >> 12 (bit 0 of flags = valid),
+///   * MMU_CONTROL bit 0 enables translation,
+///   * writing 1 into MMU_INVALIDATE drops the model's cached translations,
+///   * MMU_STATUS reports {faults, translations} as two halfwords.
+constexpr u32 kSgxMmuDirBase = 0x0100;
+constexpr u32 kSgxMmuControl = 0x0104;
+constexpr u32 kSgxMmuInvalidate = 0x0108;
+constexpr u32 kSgxMmuStatus = 0x010C;
+constexpr u32 kSgxMmuEntryValid = 1u << 0;
+constexpr u32 kSgxMmuFault = 0xFFFFFFFFu;
+
 /// Event bits of the model (the SGX reports TA/3D completion separately).
 constexpr u32 kSgxEventTa = 1u << 0;      ///< a kick was accepted
 constexpr u32 kSgxEvent3d = 1u << 1;      ///< the queue was drained
@@ -1026,6 +1041,14 @@ public:
     u64 queue_bytes() const { return queue_bytes_; }
     /// First command words of the last kick, as read from guest memory.
     const std::vector<u32>& last_words() const { return last_words_; }
+
+    /// GPU MMU: translate a device virtual address through the modelled table.
+    /// Returns kSgxMmuFault when translation is disabled, the entry is invalid
+    /// or the walk fails; every attempt is counted.
+    u32 translate(u32 va);
+    u64 translations() const { return translations_; }
+    u64 faults() const { return faults_; }
+    u64 invalidations() const { return invalidations_; }
     u64 commands() const { return commands_; }
     u32 queue_base() const { return queue_base_; }
     u32 queue_size() const { return queue_size_; }
@@ -1048,6 +1071,11 @@ private:
     std::function<void(u32, bool)> irq_;
     std::vector<u32> last_words_;   ///< first words of the last consumed kick
     u64 queue_bytes_ = 0;
+    u32 mmu_dir_base_ = 0;
+    u32 mmu_control_ = 0;
+    u64 translations_ = 0;
+    u64 faults_ = 0;
+    u64 invalidations_ = 0;
     u32 events_ = 0;
     u32 event_enable_ = 0;
     u32 irq_status_ = 0;

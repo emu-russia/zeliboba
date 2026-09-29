@@ -37,6 +37,10 @@ Sgx::Sgx(std::string name, u32 base, u32 size, Bus& bus)
     define(kSgxQueueRead, "SGX_QUEUE_READ", 0);
     define(kSgxIrqStatus, "SGX_IRQ_STATUS", 0);
     define(kSgxIrqClear, "SGX_IRQ_CLEAR", 0);
+    define(kSgxMmuDirBase, "SGX_MMU_DIR_BASE", 0);
+    define(kSgxMmuControl, "SGX_MMU_CONTROL", 0);
+    define(kSgxMmuInvalidate, "SGX_MMU_INVALIDATE", 0);
+    define(kSgxMmuStatus, "SGX_MMU_STATUS", 0);
 }
 
 void Sgx::reset() {
@@ -51,8 +55,31 @@ void Sgx::reset() {
     queue_read_ = 0;
     kicks_ = 0;
     commands_ = 0;
+    queue_bytes_ = 0;
+    last_words_.clear();
+    mmu_dir_base_ = 0;
+    mmu_control_ = 0;
+    translations_ = 0;
+    faults_ = 0;
+    invalidations_ = 0;
     irq_line_ = false;
     if (irq_) irq_(0, false);
+}
+
+u32 Sgx::translate(u32 va) {
+    ++translations_;
+    if ((mmu_control_ & 1u) == 0u || mmu_dir_base_ == 0u) {
+        ++faults_;
+        return kSgxMmuFault;
+    }
+    const u32 entry = mmu_dir_base_ + (va >> 12) * 8u;
+    const u32 page = bus_.read32(entry);
+    const u32 flags = bus_.read32(entry + 4u);
+    if ((flags & kSgxMmuEntryValid) == 0u) {
+        ++faults_;
+        return kSgxMmuFault;
+    }
+    return page | (va & 0xFFFu);
 }
 
 void Sgx::tick(u64 cycles) {
@@ -101,6 +128,10 @@ u64 Sgx::read_word(u32 offset, u64 stored) {
         case kSgxEventStatus: return events_;
         case kSgxQueueRead: return queue_read_;
         case kSgxIrqStatus: return irq_status_;
+        case kSgxMmuDirBase: return mmu_dir_base_;
+        case kSgxMmuControl: return mmu_control_;
+        case kSgxMmuStatus:
+            return (faults_ & 0xFFFFu) | ((translations_ & 0xFFFFu) << 16);
         default: return stored;
     }
 }
@@ -135,6 +166,15 @@ void Sgx::write_word(u32 offset, u64 value) {
             }
             return;
         }
+        case kSgxMmuDirBase:
+            mmu_dir_base_ = static_cast<u32>(value);
+            return;
+        case kSgxMmuControl:
+            mmu_control_ = static_cast<u32>(value);
+            return;
+        case kSgxMmuInvalidate:
+            if ((static_cast<u32>(value) & 1u) != 0u) ++invalidations_;
+            return;
         case kSgxIrqClear:
             irq_status_ &= ~static_cast<u32>(value);
             poke(kSgxIrqStatus, irq_status_);
@@ -157,6 +197,11 @@ void Sgx::describe(std::vector<std::string>& lines) const {
                            kSgxCoreRevisionValue));
     lines.push_back(format("queue base 0x%08X size %u write %u read %u", queue_base_,
                            queue_size_, queue_write_, queue_read_));
+    lines.push_back(format("mmu dir 0x%08X control 0x%X translations %llu faults %llu invalidations %llu",
+                           mmu_dir_base_, mmu_control_,
+                           static_cast<unsigned long long>(translations_),
+                           static_cast<unsigned long long>(faults_),
+                           static_cast<unsigned long long>(invalidations_)));
     lines.push_back(format("kicks %llu commands %llu events 0x%X enable 0x%X irq 0x%X",
                            static_cast<unsigned long long>(kicks_),
                            static_cast<unsigned long long>(commands_), events_,
