@@ -177,8 +177,7 @@ void Vita::build_buses() {
     // peripheral block no longer shadows this window (see kermit::kScuBase) - the
     // KBL keeps its exception/monitor vector page at PA 0x40000100 and the monitor
     // table at PA 0x40000140.
-    arm_bus_->add_ram_alias("arm_priv", kermit::kDramWindowBase, kermit::kScuSize, dram_.data(),
-                            "physical DRAM window (kernel boot loader and kernel image)");
+    arm_bus_->add_ram_alias("arm_priv", kermit::kDramWindowBase, kermit::kScuSize, dram_.data(),                            "physical DRAM window (kernel boot loader and kernel image)");
     arm_bus_->add_ram("arm_dram", 0x04000000, kermit::kDramBase, "main DRAM (64 MiB module window)");
     // Round 142: the KBL maps VA 0x1C000000 identity onto the 2 MiB Scratchpad SRAM
     // (L1[0x1C0] = 0x1C01158E) and uses it as a work buffer; without the backing RAM
