@@ -476,7 +476,7 @@ private:
     /// ran" takes seconds instead of a breakpoint session.
     u32 arm_cov_base_ = 0x51000000u;
     u32 arm_cov_size_ = 0x00040000u;   ///< 256 KiB of VA space (covers the NSKBL image)
-    u32 arm_cov_gran_ = 16u;           ///< bytes per bit
+    u32 arm_cov_gran_ = 2u;            ///< bytes per bit (2 = one Thumb instruction)
     std::vector<u8> arm_cov_bits_;
     void arm_cov_mark(u32 pc);
     /// Round 166: pages handed to NSKBL's object constructor when the pool pointer is

@@ -87,6 +87,13 @@ void Vita::arm_cov_mark(u32 pc) {
     }();
     if (!enabled) return;
     if (arm_cov_bits_.empty()) {
+        // 2 bytes per bit = one Thumb instruction: at 16 bytes the "did this site execute"
+        // question answered yes whenever *any* address in the block ran, which made the
+        // missed-edge scan report calls that never happened (round 167).
+        if (const char* gran = std::getenv("ZLB_ARM_COV_GRAN")) {
+            const u32 value = static_cast<u32>(std::strtoul(gran, nullptr, 0));
+            if (value >= 2u && value <= 64u) arm_cov_gran_ = value;
+        }
         const size_t bits = arm_cov_size_ / arm_cov_gran_;
         arm_cov_bits_.assign((bits + 7u) / 8u, 0u);
         ZLB_LOG_INFO("machine", "ARM coverage armed: 0x%08X-0x%08X, %u bytes per bit",
