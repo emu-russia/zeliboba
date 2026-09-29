@@ -209,3 +209,14 @@ layout объект кучи) барьеры замыкают, но упираю
 `os0:kd/psp2bootconfig.skprx` (`0x510281E4`), пути `os0`/`%s:kd/%s`, загрузка
 `SceKernelBootimage` и kd-модулей — в образе есть, но выполняется уже после
 успешной инициализации памяти.
+
+
+### Итог цикла (раунд 195, 30/30)
+
+Цепочка доведена до стадии `0xA7` внутри NSKBL: от Syscon/CMeP через
+first_loader → second_loader → secure_kernel → SKBL → NSKBL, с баннером NSKBL в
+консоли (`Starting PSP2 Kernel Boot Loader [0x01040011]: 300`) и без ложного Safe
+Mode. Дальше нужна инициализация кучи NSKBL — единственная стена; всё, что идёт
+после (`os0:kd/psp2bootconfig.skprx`, `SceKernelBootimage`, kd-модули, затем
+`vs0` и `shell.self`), в образе есть, но выполняется уже после неё. Подробности и
+измерения — `docs/NSKBL.md` §8.21-8.32.
