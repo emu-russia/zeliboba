@@ -1213,7 +1213,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // search is entered from the resolver 0x51004AD0 (measured: trace of
     // 0x5100B82C shows r0 = 0 coming from 0x51004A0A), which happens before the
     // allocator entry 0x5100D418, so install the object at the resolver too.
-    if (nskbl_heap && (pc == 0x51004AD0u || pc == 0x5100D418u)) {
+    if (nskbl_heap && (pc == 0x51004AD0u || pc == 0x51004C7Eu || pc == 0x5100D418u)) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 const u32 map_global_va = 0x5113B5ACu;
@@ -1232,7 +1232,8 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                     const u32 word = arm_bus_->read32(sp + i * 4u);
                     from_installer = word >= 0x51007E70u && word < 0x51008400u;
                 }
-                if (heap == 0u && (pc == 0x51004AD0u || from_installer)) {
+                if (heap == 0u &&
+                    (pc == 0x51004AD0u || pc == 0x51004C7Eu || from_installer)) {
                     ensure_arena_section(arm, arm_bus_.get(), kHeapArenaVa);
                     // Round 193: build a heap that the *firmware's own* search accepts,
                     // so no call has to be skipped.  With granule = 1 (heap+0x20) and
