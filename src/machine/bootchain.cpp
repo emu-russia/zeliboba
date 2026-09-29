@@ -1432,6 +1432,37 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Experiment (round 200): the sysroot path asks the kernel physical partition for
+    // a 64 KiB range (0x5100576A) and gets 0x80020005 back, so it exits at 0x51005718
+    // and SceKernelSysrootClass is never registered (docs/NSKBL.md 8.36).  Treat the
+    // request as satisfied at the return point: clear the error and put a frame-number
+    // descriptor into the caller's out slot.  Same opt-in switch as the range supplier.
+    if (physpool && pc == 0x5100576Eu && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const s32 result = static_cast<s32>(arm->r[0]);
+            if (result < 0) {
+                constexpr u32 kExperimentBase = 0x41500000u;
+                const u32 descriptor_va =
+                    (kExperimentBase - 0x40000000u) + 0x90000u +
+                    (nskbl_physpool_next_ & 0x3FFu) * 4u;
+                const u32 page = kExperimentBase + (nskbl_physpool_next_ & 0xFFu) * 0x1000u;
+                arm_bus_->write32(descriptor_va, page >> 12);
+                const u32 out_slot = static_cast<u32>(arm->r[13]) + 0x1Cu;
+                arm_bus_->write32(out_slot, descriptor_va);
+                arm->set_register("r0", 0u);
+                ++nskbl_physpool_fills_;
+                if (nskbl_physpool_fills_ < 6u) {
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL range request for 0x%08X treated as satisfied "
+                                 "(descriptor 0x%08X, out slot 0x%08X; development "
+                                 "substitution)",
+                                 static_cast<u32>(arm->r[7]), descriptor_va, out_slot);
+                    add_milestone("NSKBL range request satisfied (development substitution)");
+                }
+            }
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own
