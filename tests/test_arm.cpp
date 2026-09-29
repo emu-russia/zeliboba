@@ -2911,6 +2911,26 @@ ZLB_TEST(arm_ldrb_strb) {
     ZLB_EXPECT_EQ(f.bus.read8(kDataBase + 1), 0x99u);
 }
 
+ZLB_TEST(arm_ldm_with_pc_in_list_still_writes_back) {
+    Fixture f;
+    // ldmia sp!, {r4-r11, pc} - the encoding kernel_boot_loader's arzl decoder
+    // returns with (0x4003C484).  ARM applies the base write-back even when r15 is
+    // in the list; round 159: skipping it left the decoder's caller with sp 0x24
+    // too low, and its `pop {…,pc}` then returned into garbage.
+    f.load(kCodeBase, {0xE8BD8FF0u});
+    f.cpu.reset(kCodeBase);
+    const u32 sp = kDataBase + 0x40u;
+    f.set_reg(13, sp);
+    for (u32 i = 0; i < 8u; ++i) f.bus.write32(sp + i * 4u, 0x1000u + i);
+    f.bus.write32(sp + 32u, kCodeBase + 0x100u);
+
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(13), sp + 36u);          // the write-back happened
+    ZLB_EXPECT_EQ(f.reg(4), 0x1000u);
+    ZLB_EXPECT_EQ(f.reg(11), 0x1007u);
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 0x100u);
+}
+
 ZLB_TEST(arm_extra_load_store_halfword) {
     Fixture f;
     // strh r0, [r1, #4] ; ldrh r2, [r1], #2 ; ldrh r3, [r4, r5] ; strh r6, [r1, #-2]!

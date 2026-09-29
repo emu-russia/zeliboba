@@ -2046,6 +2046,12 @@ void ArmCore::execute_arm_load_store_multiple(u32 instr) {
 
     if (l && (list & 0x8000u) != 0) {
         const u32 target = r[15];
+        // The write-back happens even when r15 is in the list: `ldmia sp!,
+        // {r4-r11,pc}` must both branch and leave sp 36 bytes higher.  Round 159:
+        // skipping it here made kernel_boot_loader's arzl decoder (0x4003C484)
+        // return with sp 0x24 too low, which derailed the frame of its caller
+        // (the boot-setup stage) into a `pop {…,pc}` that took 0.
+        if (w && rn != 15) r[rn] = new_base;
         if (s) {
             exception_return(target);
             return;

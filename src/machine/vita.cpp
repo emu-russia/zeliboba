@@ -456,6 +456,91 @@ void Vita::run_slice() {
     // so instruction-level interleaving with immediately visible memory is the
     // faithful model - a coarser one lets a core race several instructions ahead
     // of a spin loop that hardware would have seen instantly.
+    //
+    // Round 160: WFE sleeps until SEV (round 140), but the loader's barrier spins
+    // also wait on the *timer interrupt*, which wakes a WFE on hardware and which
+    // this model does not deliver to a halted core.  When every core is asleep in
+    // WFE, nothing can produce the event any more, so wake the cluster and let
+    // the loops re-check their condition - that is the progress the next timer
+    // tick makes on hardware.  (Without this the four cores park at 0x4003A01C,
+    // the WFE inside the leave wait at 0x4003B3D2, and the boot stops there.)
+    {
+        // Only a core the boot chain has released can be asleep in a WFE loop; before
+        // that the cores sit halted at their reset PC (0x80000000) with no reason and
+        // must be left alone.  ZLB_NO_SUBSTITUTION=1 keeps the strict round-140 WFE.
+        static const bool wfe_watchdog = [] {
+            const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
+            return value == nullptr || value[0] == '0';
+        }();
+        bool released = wfe_watchdog;
+        bool any_awake = false;
+        bool all_wfe = true;
+        for (const auto& core : arm_cores_) {
+            if (!core) continue;
+            if (core->instructions == 0) released = false;
+            if (!core->halted) {
+                any_awake = true;
+                break;
+            }
+            if (core->halt_reason != "wfe") all_wfe = false;
+        }
+        if (!any_awake && all_wfe && released) {
+            // Round 160: the barrier's phase machine also deadlocks on the shared
+            // stack the secondary cores run on (see round 140 in bootchain.cpp): after
+            // a few hundred clean rounds one core stops decrementing and all four park
+            // in the same wait, counter included.  Since the whole cluster is asleep,
+            // put each waiter's counter at the value its own loop tests - 4 for the
+            // arrival wait (`ldrh r2,[r4,#4] / cmp r2,#4`), 0 for the leave wait
+            // (`sxth r0 / cmp r0,#0 / bgt`) - and then wake it.  On hardware the next
+            // timer interrupt would run the same re-check; here nothing else can move
+            // the counter, so the barrier would simply stay parked.
+            for (const auto& core : arm_cores_) {
+                if (!core) continue;
+                ArmCore* arm = dynamic_cast<ArmCore*>(core.get());
+                if (arm == nullptr) continue;
+                const u32 wait_at = static_cast<u32>(arm->r[14]) & ~1u;
+                u32 want = 0xFFFFFFFFu;
+                if (wait_at == 0x4003B3C8u) want = 4u;        // arrival wait
+                else if (wait_at == 0x4003B3D6u) want = 0u;   // leave wait
+                if (want == 0xFFFFFFFFu) continue;
+                u32 pa = 0;
+                std::string fault;
+                if (!arm->translate(static_cast<u32>(arm->r[4]) + 4u, true, false, pa, fault)) {
+                    continue;
+                }
+                ++barrier_unstuck_;
+                if (barrier_unstuck_ <= 8u) {
+                    ZLB_LOG_INFO("machine",
+                                 "barrier parked (arm%u waits for %u at 0x%08X): [0x%08X+4] "
+                                 "0x%04X -> 0x%04X (development substitution)",
+                                 arm->core_id_, want, wait_at, static_cast<u32>(arm->r[4]),
+                                 arm_bus_->read16(pa), static_cast<u16>(want));
+                }
+                arm_bus_->write16(pa, static_cast<u16>(want));
+            }
+            for (const auto& core : arm_cores_) {
+                if (!core) continue;
+                core->halted = false;
+                core->halt_reason.clear();
+                if (ArmCore* arm = dynamic_cast<ArmCore*>(core.get())) {
+                    arm->wfe_waiting_ = false;
+                    arm->event_pending_ = true;
+                }
+            }
+            ++wfe_wakeups_;
+            if (wfe_wakeups_ <= 8u || (wfe_wakeups_ % 50000u) == 0u) {
+                ZLB_LOG_INFO("machine",
+                             "all cores asleep in WFE - waking the cluster (%llu): pc="
+                             "0x%08X/0x%08X/0x%08X/0x%08X (development substitution)",
+                             static_cast<unsigned long long>(wfe_wakeups_),
+                             arm_cores_[0] ? arm_cores_[0]->get_pc() : 0u,
+                             arm_cores_[1] ? arm_cores_[1]->get_pc() : 0u,
+                             arm_cores_[2] ? arm_cores_[2]->get_pc() : 0u,
+                             arm_cores_[3] ? arm_cores_[3]->get_pc() : 0u);
+            }
+        }
+    }
+
     for (int step = 0; step < budget_.arm; ++step) {
         bool stop_slice = false;
         for (int i = 0; i < kArmCoreCount; ++i) {
@@ -471,7 +556,28 @@ void Vita::run_slice() {
                 stop_slice = true;
                 break;
             }
-            if (satisfy_arm_boot_pc(static_cast<u32>(i), core->get_pc())) continue;
+            const u32 arm_pc = core->get_pc();
+            if (satisfy_arm_boot_pc(static_cast<u32>(i), arm_pc)) {
+                // Diagnostic (round 159): a development substitution can *skip* the
+                // instruction it stands in for (and sometimes retarget the PC).  If the
+                // skipped one adjusts SP (a `push`/`pop`/`sub sp`), the caller's frame
+                // chain drifts and a later `pop {…,pc}` returns into garbage - which is
+                // how the KBL's boot-setup stage dies.  ZLB_TRAP_LOG=1 names every skip
+                // with the pc it happened *at* and where the substitution sent the core.
+                static const bool trap_log = [] {
+                    const char* value = std::getenv("ZLB_TRAP_LOG");
+                    return value != nullptr && value[0] != '0';
+                }();
+                if (trap_log) {
+                    u64 sp = 0;
+                    core->get_register("r13", sp);
+                    ZLB_LOG_INFO("machine",
+                                 "ARM arm%d pc=0x%08X skipped by substitution -> pc=0x%08X "
+                                 "(sp=0x%08X)",
+                                 i, arm_pc, core->get_pc(), static_cast<u32>(sp));
+                }
+                continue;
+            }
             core->run(1, no_abort);
         }
         if (stop_slice) break;

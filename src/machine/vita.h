@@ -331,6 +331,14 @@ private:
     u32 pc_trace_hi_ = 0;
     bool pc_trace_enabled_ = false;
 
+    /// Round 160: how many times the cluster was woken out of an all-WFE sleep
+    /// (see the watchdog in run_slice: the loader's barrier spins also wait on the
+    /// timer interrupt, which this model does not deliver to a halted core).
+    u64 wfe_wakeups_ = 0;
+    /// Round 160: how many parked barrier counters the same watchdog put back to
+    /// the value the waiting core's loop tests.
+    u64 barrier_unstuck_ = 0;
+
     /// Development substitution for the page tables the stage *before*
     /// kernel_boot_loader leaves behind.  The ARM boot ROM / the second loader's
     /// 0xC0-byte reset vector are not in the dumps, so the model cannot reproduce
