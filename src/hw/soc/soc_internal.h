@@ -1013,7 +1013,7 @@ constexpr u32 kSgxCoreRevisionValue = 0x00000100;
 /// parsed here yet (that is the GXM step of docs/GPU.md).
 class Sgx : public RegisterBlock {
 public:
-    Sgx(std::string name, u32 base, u32 size);
+    Sgx(std::string name, u32 base, u32 size, Bus& bus);
 
     void reset() override;
     void tick(u64 cycles) override;
@@ -1022,6 +1022,10 @@ public:
     bool irq_line() const { return irq_line_; }
 
     u64 kicks() const { return kicks_; }
+    /// Bytes the model consumed from the command queue (published by the driver).
+    u64 queue_bytes() const { return queue_bytes_; }
+    /// First command words of the last kick, as read from guest memory.
+    const std::vector<u32>& last_words() const { return last_words_; }
     u64 commands() const { return commands_; }
     u32 queue_base() const { return queue_base_; }
     u32 queue_size() const { return queue_size_; }
@@ -1040,7 +1044,10 @@ private:
     /// Complete one kick: raise the completion events and advance the consumer.
     void complete_kick();
 
+    Bus& bus_;
     std::function<void(u32, bool)> irq_;
+    std::vector<u32> last_words_;   ///< first words of the last consumed kick
+    u64 queue_bytes_ = 0;
     u32 events_ = 0;
     u32 event_enable_ = 0;
     u32 irq_status_ = 0;

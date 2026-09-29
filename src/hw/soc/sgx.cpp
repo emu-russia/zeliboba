@@ -22,7 +22,8 @@
 
 namespace zlb::kermit {
 
-Sgx::Sgx(std::string name, u32 base, u32 size) : RegisterBlock(std::move(name), base, size) {
+Sgx::Sgx(std::string name, u32 base, u32 size, Bus& bus)
+    : RegisterBlock(std::move(name), base, size), bus_(bus) {
     define(kSgxCoreId, "SGX_CORE_ID", kSgxCoreIdValue);
     define(kSgxCoreRevision, "SGX_CORE_REVISION", kSgxCoreRevisionValue);
     define(kSgxCoreStatus, "SGX_CORE_STATUS", 0);
@@ -67,11 +68,21 @@ void Sgx::refresh_irq() {
 }
 
 void Sgx::complete_kick() {
-    // The driver published QUEUE_WRITE bytes of commands; consume them.
+    // The driver published QUEUE_WRITE bytes of commands; consume them.  The bytes
+    // are read out of guest memory here (the queue lives in DRAM), which is what
+    // makes this a command-queue model rather than a set of counters: the first
+    // words of every kick are kept for the debugger and for the GXM parser that
+    // comes next (docs/GPU.md step 3).
     const u32 published = queue_write_;
+    last_words_.clear();
     if (queue_size_ != 0u) {
         const u32 consumed = (published >= queue_read_) ? (published - queue_read_) : 0u;
-        commands_ += consumed / 16u;   // the model counts 16-byte command units
+        const u32 usable = (consumed > queue_size_) ? queue_size_ : consumed;
+        queue_bytes_ += usable;
+        commands_ += usable / 16u;   // the model counts 16-byte command units
+        for (u32 offset = 0; offset + 4u <= usable && last_words_.size() < 8u; offset += 4u) {
+            last_words_.push_back(bus_.read32(queue_base_ + queue_read_ + offset));
+        }
     }
     queue_read_ = published;
     poke(kSgxQueueRead, queue_read_);

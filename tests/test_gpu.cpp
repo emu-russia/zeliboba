@@ -1,4 +1,4 @@
-﻿// zeliboba - unit tests for the modelled PowerVR SGX window (src/hw/soc/sgx.cpp).
+// zeliboba - unit tests for the modelled PowerVR SGX window (src/hw/soc/sgx.cpp).
 //
 // The device is the register interface the GPU driver will talk to (task part 2
 // of the Live Area goal, docs/GPU.md).  The tests pin down the contract the rest
@@ -13,11 +13,15 @@ using namespace zlb;
 namespace {
 
 struct Fixture {
-    kermit::Sgx sgx{"SGX", kermit::kSgxBase, kermit::kSgxSize};
+    std::unique_ptr<Bus> bus_owner = std::make_unique<Bus>();
+    Bus& bus = *bus_owner;
+    kermit::Sgx sgx{"SGX", kermit::kSgxBase, kermit::kSgxSize, bus};
     bool irq_seen = false;
     bool irq_level = false;
 
     Fixture() {
+        bus.unmapped_reads_zero = true;
+        bus.add_ram("dram", 0x100000, kermit::kDramBase, "sgx test dram");
         sgx.reset();
         sgx.set_irq_callback([this](u32 id, bool level) {
             (void)id;
@@ -91,6 +95,28 @@ ZLB_TEST(sgx_kick_raises_the_irq_line_only_when_enabled) {
     ZLB_EXPECT_FALSE(f.irq_level);
     ZLB_EXPECT_FALSE(f.sgx.irq_line());
     ZLB_EXPECT_EQ(f.read(kermit::kSgxIrqStatus), 0u);
+}
+
+ZLB_TEST(sgx_kick_reads_the_command_queue_from_guest_memory) {
+    Fixture f;
+    // Put a recognisable command stream in DRAM: four 16-byte command units.
+    const u32 queue = kermit::kDramBase + 0x8000u;
+    const u32 words[4] = {0xDEADBEEFu, 0x00000011u, 0x12345678u, 0xA5A5A5A5u};
+    for (u32 i = 0; i < 4u; ++i) {
+        f.bus.write32(queue + i * 4u, words[i]);
+    }
+
+    f.write(kermit::kSgxQueueBase, queue);
+    f.write(kermit::kSgxQueueSize, 0x1000u);
+    f.write(kermit::kSgxQueueWrite, 0x10u);   // one 16-byte command unit published
+    f.write(kermit::kSgxQueueControl, 1u);
+
+    ZLB_EXPECT_EQ(f.sgx.commands(), 1u);
+    ZLB_EXPECT_EQ(f.sgx.queue_bytes(), 0x10u);
+    ZLB_EXPECT_EQ(f.sgx.last_words().size(), 4u);
+    ZLB_EXPECT_EQ(f.sgx.last_words()[0], 0xDEADBEEFu);
+    ZLB_EXPECT_EQ(f.sgx.last_words()[2], 0x12345678u);
+    ZLB_EXPECT_EQ(f.sgx.queue_read_offset(), 0x10u);
 }
 
 ZLB_TEST(sgx_reset_returns_the_window_to_power_on) {

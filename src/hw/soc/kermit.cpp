@@ -680,7 +680,7 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     // command buffers themselves and the OpenGL side come next (docs/GPU.md).
     // Its interrupt line is deliberately left unattached until the GPU driver's
     // own interrupt id is recovered from the firmware.
-    d.bus.add_device(std::make_unique<kermit::Sgx>("Kermit.SGX", kermit::kSgxBase, kermit::kSgxSize));
+    d.bus.add_device(std::make_unique<kermit::Sgx>("Kermit.SGX", kermit::kSgxBase, kermit::kSgxSize, d.bus));
 
     // Resolve the accessors by name, so this constructor stays the only place
     // that knows which device object corresponds to which member.
