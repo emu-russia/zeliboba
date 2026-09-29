@@ -1237,6 +1237,35 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                         arm_bus_->write32(block + offset, 0u);
                     }
                     nskbl_heap_next_ += step;
+                    // Also give the map a real heap *object* (layout measured in
+                    // docs/NSKBL.md 8.29: +0x1C base, +0x20 granule, +0x32 class count,
+                    // +0x34 class table), because later code inspects the heap - the
+                    // sanity check at 0x5100FE0E compares a block field against a value
+                    // that comes from the heap, and with map->[0x8C] still zero that
+                    // check panics (round 180/184 measurement).
+                    if (nskbl_heap_supplies_ == 0u) {
+                        const u32 heap_obj = kHeapArenaVa + 0x1000u;
+                        const u32 class_table = kHeapArenaVa + 0x2000u;
+                        const u32 classes = 256u;
+                        for (u32 i = 0; i < 0x100u; ++i) {
+                            arm_bus_->write32(heap_obj + i * 4u, 0u);
+                        }
+                        for (u32 i = 0; i < classes; ++i) {
+                            arm_bus_->write32(class_table + i * 4u, 0xFFFFFFFFu);
+                        }
+                        arm_bus_->write32(heap_obj + 0x1Cu, kHeapArenaVa + 0x4000u);
+                        arm_bus_->write16(heap_obj + 0x20u, 16u);
+                        arm_bus_->write16(heap_obj + 0x32u, static_cast<u16>(classes));
+                        arm_bus_->write32(heap_obj + 0x34u, class_table);
+                        arm_bus_->write32(map_pa + 0x8Cu, heap_obj);
+                        nskbl_heap_next_ = 0x4000u;
+                        ZLB_LOG_INFO("machine",
+                                     "NSKBL heap object 0x%08X installed at map+0x8C "
+                                     "(base 0x%08X, granule 16, %u classes; development "
+                                     "substitution)",
+                                     heap_obj, kHeapArenaVa + 0x4000u, classes);
+                        add_milestone("NSKBL heap object installed (development substitution)");
+                    }
                     arm->set_register("r0", block);
                     arm->set_pc(0x5100D41Cu);              // return from 0x5100567C
                     arm->set_register("THUMB", 1u);
