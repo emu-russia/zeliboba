@@ -33,7 +33,7 @@ Stage 1 **не достигнут**: ARM доходит до исполнени�
 | Secure kernel (0x800000) | грузится по своему адресу компоновки, проходит стартовые проверки keyring/sysctl/версии, рукопожатие 0x9/0x101/0x102/0x106 |
 | Отпускание ARM | по «done»-прыжку secure kernel: `release_soc()` → `ARM started on kernel_boot_loader at 0x40020000` |
 | ARM KBL | исполняется на всех четырёх ядрах (барьер 0x4003B384), печатает баннер и «Safe Mode : [ YES ]» |
-| NSKBL | обычный прогон: KBL проходит всю стадию boot-setup (`0x88`), **сам распаковывает NSKBL** (`sceArlzDecode` 0x4003C330 + `sceArlzArmFilter` 0x4003CB40: поток `0x50000004` → `0x51000000`), рапортует **чекпойнт `0x89`** и уходит в Non-Secure через `0x40021AE0` (`SCR.NS=1`); стена — вход в NS (ядра в мусорных PC) — `docs/NSKBL.md` §7.6. Стадия `stage nskbl` по-прежнему доводит NSKBL до чекпойнта `0xA1` (self-тест `machine_nskbl_stage_decodes_the_non_secure_loader`); там стена — secure-вызов `smc`/`r12=0x103` |
+| NSKBL | **обычный прогон доводит NSKBL до чекпойнта `0xA1`** (раунд 161): KBL проходит стадию boot-setup (`0x88`), сам распаковывает NSKBL (`sceArlzDecode` 0x4003C330 + `sceArlzArmFilter` 0x4003CB40: поток `0x50000004` → `0x51000000`), рапортует `0x89` и передаёт управление в Non-Secure через `0x40021AE0` (`SCR.NS=1`) — `docs/NSKBL.md` §7.6-7.7. Стадия `stage nskbl` тоже доходит до `0xA1` (self-тест `machine_nskbl_stage_decodes_the_non_secure_loader`); дальше NSKBL уходит в Monitor-режим, и стена — secure-вызов `smc`/`r12=0x103` |
 | Консоль прошивки | команда `console`/`uart` показывает вывод KBL (регистр данных `+0x70` блоков 0xE2030000/0xE2040000) |
 | Отладчик | `run/runm/step/until/bp/bpc/bpl/watch/wpl/regs/dis/mem/poke/save/trace/devices/map/devget/devset/emmc/gpo/console/bootctx/faults/boot/stage/keyring/info/load/log` |
 | SDL3-фронтенд | `zeliboba_ui` (видео/звук/ввод), скриншоты через `--screenshot` |
@@ -65,9 +65,15 @@ Stage 1 **не достигнут**: ARM доходит до исполнени�
    целиком: KBL **сам** вызывает `sceArlzDecode`/`sceArlzArmFilter`
    (`0x4002058E`/`0x4002059E`, поток `0x50000004` → `0x51000000`), пишет
    **чекпойнт `0x89`** и уходит в Non-Secure через ARM-помощник `0x40021AE0`
-   (`SCR.NS = 1`). Текущая стена — сам вход в NS: ядра оказываются в мусорных
-   адресах (`0x31C` с недопустимым режимом CPSR, `0x34`, `0x3EE4`), NSKBL на
-   `0x51000000` пока не подтверждён (`docs/NSKBL.md` §7.5-7.6).
+   (`SCR.NS = 1`). **Раунд 161**: «стена входа в NS» тоже оказалась ошибкой ядра —
+   `RFE` грузил `PC` и `CPSR` в обратном порядке (`CPSR ← [addr]`, `PC ← [addr+4]`),
+   поэтому `rfeia sp!` на `0x40021AFC` клал в CPSR `0x51000000` и прыгал на `0x93`.
+   После исправления (PC из адресуемого слова, CPSR из следующего; тест
+   `arm_rfe_restores_cpsr_and_pc` переписан) **NSKBL запускается естественным
+   путём**: `trace pc=0x51000000 … from pc=0x40021AFC`, `SCR=0x5`, и прогон
+   рапортует **чекпойнт `0xA1`** («NSKBL: core 0 (non-secure) pre-init complete»).
+   Цепочка first_loader → second_loader → secure_kernel → ARM KBL → NSKBL
+   проходится без команд `stage` (`docs/NSKBL.md` §7.5-7.7).
 1. **ARM boot-контекст пуст.** Вторая стадия либо копирует контекст из DRAM
    (0x40000000) в scratch (`memcpy` 0x40A86), либо идёт по «холодной» ветке
    0x40858 — выбор делает бит 7 слова, полученного от syscon командой 0x0010
@@ -316,6 +322,7 @@ $env:ZLB_NO_SUBSTITUTION=1
 сторож сна кластера (все ядра в `wfe` и запаркованный счётчик барьера). Теперь
 стадия проходит целиком: `sceArlzDecode`/`sceArlzArmFilter` вызываются самим KBL
 (`0x4002058E`/`0x4002059E`), рапортуется чекпойнт `0x89`, и управление уходит в
-Non-Secure через `0x40021AE0` (`SCR.NS = 1`). Текущая стена — вход в NS: ядра
-оказываются в `0x31C` (режим CPSR недопустим), `0x34`, `0x3EE4`
-(`docs/NSKBL.md` §7.6).
+Non-Secure через `0x40021AE0` (`SCR.NS = 1`). **Раунд 161**: причина мусорных PC
+после передачи — `RFE` в ядре грузил `PC` и `CPSR` в обратном порядке; после
+исправления NSKBL стартует на `0x51000000` и прогон рапортует **чекпойнт `0xA1`**
+(`docs/NSKBL.md` §7.6-7.7).

@@ -2268,14 +2268,19 @@ void ArmCore::decode_arm_rfe_srs(u32 instr) {
     const int rn = static_cast<int>((instr >> 16) & 0xFu);
 
     if (rfe) {
-        // RFE: load PC and CPSR from the exception return state.
+        // RFE: PC comes from the addressed word and CPSR from the next one (ARM ARM
+        // A8.8.100: R[15] = MemA[address], CPSR = MemA[address + 4]).  Round 161: the
+        // two were swapped, so kernel_boot_loader's non-secure entry (0x40021AFC,
+        // `rfeia sp!` with the target 0x51000000 at [sp] and CPSR 0x93 at [sp+4])
+        // loaded CPSR = 0x51000000 and PC = 0x93, and the cluster ended up executing
+        // the low window in an invalid mode instead of entering NSKBL.
         const u32 base_addr = read_reg(rn);
         u32 addr;
         if (u) addr = p ? base_addr + 4u : base_addr;
         else addr = p ? base_addr - 4u : base_addr - 8u;
-        const u32 new_cpsr = mem_read_word(addr, false);
+        const u32 new_pc = mem_read_word(addr, false);
         if (pending_fault_ != arm::FaultKind::None) return;
-        const u32 new_pc = mem_read_word(addr + 4u, false);
+        const u32 new_cpsr = mem_read_word(addr + 4u, false);
         if (pending_fault_ != arm::FaultKind::None) return;
         if (w && rn != 15) r[rn] = u ? base_addr + 8u : base_addr - 8u;
         exception_return_with_cpsr(new_pc & ~3u, new_cpsr);

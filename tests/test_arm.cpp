@@ -3367,10 +3367,14 @@ ZLB_TEST(arm_cps_and_setend) {
 
 ZLB_TEST(arm_rfe_restores_cpsr_and_pc) {
     Fixture f;
-    // RFEIA r0 loads CPSR from [r0] and PC from [r0 + 4].
+    // RFEIA r0 loads PC from [r0] and CPSR from [r0 + 4].  Round 161: the two were
+    // the other way round, and kernel_boot_loader's non-secure entry
+    // (0x40021AFC, `rfeia sp!` with the target 0x51000000 at [sp] and CPSR 0x93 at
+    // [sp+4]) then loaded CPSR = 0x51000000 and PC = 0x93 instead of handing over to
+    // NSKBL - the real firmware is the evidence for this word order.
     f.load(kCodeBase, {0xF8900A00u});
-    f.bus.write32(kDataBase, 0x0000001Fu);                 // System mode, no flags
-    f.bus.write32(kDataBase + 4u, kCodeBase + 0x80u);
+    f.bus.write32(kDataBase, kCodeBase + 0x80u);
+    f.bus.write32(kDataBase + 4u, 0x0000001Fu);            // System mode, no flags
     f.cpu.reset(kCodeBase);
     f.set_reg(0, kDataBase);
     f.cpu.step();
@@ -3379,9 +3383,11 @@ ZLB_TEST(arm_rfe_restores_cpsr_and_pc) {
     ZLB_EXPECT_FALSE(f.cpu.thumb);
 
     // SRSDB sp!, #0x1F stores the current (System mode encoding -> the active)
-    // CPSR and LR. SRS and RFE share the addressing rule (ARM ARM A8.8.160):
-    // with U = 0, P = 1 the two words go to base-4 and base, and the base is
-    // written back as base-8.
+    // CPSR and LR.  Note (round 161): this still uses the order the model always
+    // had - CPSR at base-4, LR at base, SP = base-8 - while RFE now loads PC from
+    // the addressed word.  The two are therefore *not* a round-tripping pair any
+    // more; SRS is not exercised anywhere in the 1.04 boot (the non-secure entry
+    // pushes its frame by hand), so it is left as it is rather than re-guessed.
     f.load(kCodeBase, {0xF96D001Fu});
     f.cpu.reset(kCodeBase);
     f.set_reg(13, kDataBase + 0x100u);
