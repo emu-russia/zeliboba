@@ -1477,10 +1477,19 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         const char* value = std::getenv("ZLB_NSKBL_LOWWIN");
         return value != nullptr && value[0] != '0';
     }();
-    if (lowwin_fix && (pc == 0x510002E4u || pc == 0x5100B4E2u) && core < static_cast<u32>(kArmCoreCount)) {
+    if (lowwin_fix && (pc == 0x510002E4u || pc == 0x5100B41Cu) && core < static_cast<u32>(kArmCoreCount)) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
             const u32 l1_desc = arm_bus_->read32(l1_base);
+            // Round 205: report the entry itself, so the case where the fix does
+            // not apply (or where the tables were rebuilt) is visible in the log.
+            if (pc == 0x5100B41Cu) {
+                ZLB_LOG_INFO("machine",
+                             "NSKBL low window probe: TTBR0 0x%08X L1 0x%08X type %u "
+                             "(L2/L1 base 0x%08X)",
+                             static_cast<u32>(arm->mmu.ttbr0), l1_desc,
+                             l1_desc & 3u, l1_desc & 0xFFFFFC00u);
+            }
             if ((l1_desc & 3u) == 1u) {
                 const u32 l2_base = l1_desc & 0xFFFFFC00u;
                 u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
