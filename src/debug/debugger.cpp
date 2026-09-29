@@ -48,6 +48,18 @@ std::string boot_checkpoint_text(u32 value) {
         case 0xA7: return "NSKBL: nothing since 0xA6";
         case 0xA8: return "NSKBL: boot setup complete, kernel loading";
         case 0xA9: return "NSKBL: kernel pre-init done, before first external load";
+        // 0xAA..0xAF are the NSKBL *fatal* checkpoints: the panic handlers sit in a
+        // cluster at 0x51000C3C..0x51000C98, each doing `movs r0,#code`,
+        // `bl 0x51010F98` (the GPO writer) and then `b .`.  Measured dumps before the
+        // hang: 0xAB reads SPSR, 0xAC reads IFSR/DFAR/IFAR, 0xAD reads DFSR (this is
+        // the one a data abort reaches - the model hit it at 0x51000C80 with
+        // DFAR = 0x4B656350), 0xAA/0xAE/0xAF dump nothing.
+        case 0xAA: return "NSKBL: fatal checkpoint (panic handler 0x51000C3E)";
+        case 0xAB: return "NSKBL: fatal checkpoint (reads SPSR)";
+        case 0xAC: return "NSKBL: fatal checkpoint (reads IFSR/DFAR/IFAR)";
+        case 0xAD: return "NSKBL: fatal checkpoint: data abort (reads DFSR)";
+        case 0xAE: return "NSKBL: fatal checkpoint (panic handler 0x51000C86)";
+        case 0xAF: return "NSKBL: fatal checkpoint (panic handler 0x51000C92)";
         default: break;
     }
     if (value >= 0x40 && value < 0x80) {

@@ -455,6 +455,8 @@ private:
     u32 trace_zero_hits_ = 0;
     /// Round 164: how many secondary cores got their own stage stack.
     u32 core_stack_biases_ = 0;
+    /// Round 165: NSKBL spinlock acquires skipped at a bogus (low) lock address.
+    u32 nskbl_lock_skips_ = 0;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

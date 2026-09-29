@@ -1073,6 +1073,44 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
+    // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
+    // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own
+    // memory-map object at PA 0x40304900, whose +0x64 stays zero), passes 0 to the
+    // setter 0x5100B41C, and the lock then lands at VA 0x28 - the low boot page, where
+    // the KBL left its own scratch value 0x4680 (write trap: pc 0x4002CE90, many times)
+    // - so `ldrex/strex` can never acquire it and all cores sit in WFE
+    // (docs/NSKBL.md 8.6).  On hardware the list head is not NULL, so the lock lands on
+    // a real object.  Skip the acquire when the lock address is below the first page,
+    // the same treatment the KBL's own locks get.  ZLB_NSKBL_NOLOCK=0 and
+    // ZLB_NO_SUBSTITUTION=1 disable it.
+    static const bool nskbl_nolock = [] {
+        const char* value = std::getenv("ZLB_NSKBL_NOLOCK");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (nskbl_nolock && pc == 0x51014970u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                if (static_cast<u32>(arm->r[0]) < 0x1000u) {
+                    arm->set_pc(arm->r[14] & ~1u);          // bx lr - skip the acquire
+                    arm->set_register("THUMB", 1u);
+                    ++boot_pc_fixes_;
+                    if (nskbl_lock_skips_ < 8u) {
+                        ++nskbl_lock_skips_;
+                        ZLB_LOG_INFO("machine",
+                                     "NSKBL spinlock skipped at bogus address 0x%08X (arm%u, "
+                                     "development substitution)",
+                                     static_cast<u32>(arm->r[0]), core);
+                        add_milestone("NSKBL spinlock skipped at a bogus address (development "
+                                      "substitution)");
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
     // Substitution (round 164, default on): the KBL hands every *secondary* core the
     // same stage stack (0x4000 - measured with a write trap on its per-core
     // structures at 0x40020Bxx/0x400207B0), so the three secondaries run the whole
