@@ -1073,6 +1073,44 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 166): NSKBL's object constructor 0x5100B41C is handed the
+    // pool/container for the requested size class, which the getter 0x5100B6E4 reads
+    // from the map object (`[[0x5113B5AC] + 0x5C/0x64/0x6C]` for types 20/40/80).  The
+    // model's map object has those fields zero: the code that builds the pools (the
+    // list builders around 0x51009516) is never executed - a 0x51009518-0x51009548 PC
+    // trap sees no hit in the whole run - so the constructor gets r0 = 0, dereferences
+    // NULL, spills into NSKBL's low page and the following `ldr r8,[r4,#12]` reads the
+    // garbage 0x4B656350 whose dereference raises a section translation fault and
+    // panics with 0xAD (docs/NSKBL.md 8.7).  On hardware that pool exists, so hand the
+    // constructor a page from the model's instance arena instead.  ZLB_NSKBL_POOL=0
+    // and ZLB_NO_SUBSTITUTION=1 disable it.
+    static const bool nskbl_pool = [] {
+        const char* value = std::getenv("ZLB_NSKBL_POOL");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (nskbl_pool && pc == 0x5100B41Cu) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                if (static_cast<u32>(arm->r[0]) == 0u && nskbl_pool_next_ + 0x1000u <= kInstanceArenaSize) {
+                    ensure_arena_section(arm, arm_bus_.get(), kInstanceArenaVa);
+                    const u32 block = kInstanceArenaVa + nskbl_pool_next_;
+                    nskbl_pool_next_ += 0x1000u;
+                    arm->set_register("r0", block);
+                    ++boot_pc_fixes_;
+                    if (nskbl_pool_supplies_ < 8u) {
+                        ++nskbl_pool_supplies_;
+                        ZLB_LOG_INFO("machine",
+                                     "NSKBL object pool supplied at 0x%08X (arm%u, r0 was 0; "
+                                     "development substitution)",
+                                     block, core);
+                        add_milestone("NSKBL object pool supplied (development substitution)");
+                    }
+                }
+            }
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own

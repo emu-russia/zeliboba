@@ -457,6 +457,10 @@ private:
     u32 core_stack_biases_ = 0;
     /// Round 165: NSKBL spinlock acquires skipped at a bogus (low) lock address.
     u32 nskbl_lock_skips_ = 0;
+    /// Round 166: pages handed to NSKBL's object constructor when the pool pointer is
+    /// NULL (the map object's container fields are empty in the model).
+    u32 nskbl_pool_next_ = 0;
+    u32 nskbl_pool_supplies_ = 0;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the
