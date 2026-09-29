@@ -1073,6 +1073,15 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Round 167 note (not enabled): handing the empty map slot 0xD8 a fresh arena page
+    // looks like the pool fix, but it *misroutes* the flow: the device open then proceeds
+    // with a zero-filled container, and the coverage map (ZLB_ARM_COV=1 + the debugger's
+    // `cov`) shows the descriptor init at 0x5100E850-0x5100EEA0 is then never executed,
+    // while without the substitution it runs and the run instead dies on the class-magic
+    // check with obj = NULL (docs/NSKBL.md 8.9).  The real gap is that NSKBL's container
+    // builders (the never-executed pages 0x51007000-0x51009000) do not run at all, so the
+    // faithful state is the unsubstituted one.
+
     // Substitution (round 166): NSKBL's object constructor 0x5100B41C is handed the
     // pool/container for the requested size class, which the getter 0x5100B6E4 reads
     // from the map object (`[[0x5113B5AC] + 0x5C/0x64/0x6C]` for types 20/40/80).  The

@@ -77,6 +77,34 @@ Vita::Vita() = default;
 Vita::~Vita() = default;
 
 // ---------------------------------------------------------------------------
+// Tooling: ARM PC coverage (ZLB_ARM_COV=1, printed by the debugger's `cov`)
+// ---------------------------------------------------------------------------
+
+void Vita::arm_cov_mark(u32 pc) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ZLB_ARM_COV");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (!enabled) return;
+    if (arm_cov_bits_.empty()) {
+        const size_t bits = arm_cov_size_ / arm_cov_gran_;
+        arm_cov_bits_.assign((bits + 7u) / 8u, 0u);
+        ZLB_LOG_INFO("machine", "ARM coverage armed: 0x%08X-0x%08X, %u bytes per bit",
+                     arm_cov_base_, arm_cov_base_ + arm_cov_size_, arm_cov_gran_);
+    }
+    if (pc < arm_cov_base_ || pc >= arm_cov_base_ + arm_cov_size_) return;
+    const u32 index = (pc - arm_cov_base_) / arm_cov_gran_;
+    arm_cov_bits_[index >> 3] |= static_cast<u8>(1u << (index & 7u));
+}
+
+bool Vita::arm_cov_executed(u32 addr) const {
+    if (arm_cov_bits_.empty()) return false;
+    if (addr < arm_cov_base_ || addr >= arm_cov_base_ + arm_cov_size_) return false;
+    const u32 index = (addr - arm_cov_base_) / arm_cov_gran_;
+    return (arm_cov_bits_[index >> 3] & static_cast<u8>(1u << (index & 7u))) != 0;
+}
+
+// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -560,6 +588,7 @@ void Vita::run_slice() {
                 break;
             }
             const u32 arm_pc = core->get_pc();
+            arm_cov_mark(arm_pc);
             if (satisfy_arm_boot_pc(static_cast<u32>(i), arm_pc)) {
                 // Diagnostic (round 159): a development substitution can *skip* the
                 // instruction it stands in for (and sometimes retarget the PC).  If the

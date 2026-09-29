@@ -263,6 +263,19 @@ public:
     /// Records a boot-chain event; visible in the debugger and in the report.
     void log_event(const std::string& text);
 
+    // ------------------------------------------------------------------
+    // ARM PC coverage (round 167 tooling)
+    // ------------------------------------------------------------------
+
+    /// True when the address's coverage bit is set (see arm_cov_mark).
+    bool arm_cov_executed(u32 addr) const;
+    u32 arm_cov_base() const { return arm_cov_base_; }
+    u32 arm_cov_size() const { return arm_cov_size_; }
+    u32 arm_cov_granularity() const { return arm_cov_gran_; }
+    bool arm_cov_armed() const { return !arm_cov_bits_.empty(); }
+    /// Raw bitmap (for `cov save`), one bit per arm_cov_granularity() bytes.
+    const std::vector<u8>& arm_cov_bytes() const { return arm_cov_bits_; }
+
 private:
     void build_buses();
     void build_devices();
@@ -457,10 +470,20 @@ private:
     u32 core_stack_biases_ = 0;
     /// Round 165: NSKBL spinlock acquires skipped at a bogus (low) lock address.
     u32 nskbl_lock_skips_ = 0;
+    /// Round 167 tooling: ARM PC coverage - one bit per `arm_cov_gran_` bytes of the VA
+    /// range starting at `arm_cov_base_`.  ZLB_ARM_COV=1 arms it and the debugger's
+    /// `cov` command prints the executed/unexecuted map, so "which NSKBL function never
+    /// ran" takes seconds instead of a breakpoint session.
+    u32 arm_cov_base_ = 0x51000000u;
+    u32 arm_cov_size_ = 0x00040000u;   ///< 256 KiB of VA space (covers the NSKBL image)
+    u32 arm_cov_gran_ = 16u;           ///< bytes per bit
+    std::vector<u8> arm_cov_bits_;
+    void arm_cov_mark(u32 pc);
     /// Round 166: pages handed to NSKBL's object constructor when the pool pointer is
     /// NULL (the map object's container fields are empty in the model).
     u32 nskbl_pool_next_ = 0;
     u32 nskbl_pool_supplies_ = 0;
+    /// Round 167: map-object container slots handed out by the model.
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

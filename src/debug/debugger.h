@@ -163,6 +163,9 @@ private:
     std::string cmd_emmc(const std::vector<std::string>& args);
     std::string cmd_boot(const std::vector<std::string>& args);
     std::string cmd_faults(const std::vector<std::string>& args);
+    /// Round 167: ARM PC coverage map (ZLB_ARM_COV=1): per-page hit counts plus the
+    /// longest unexecuted runs, so "which function never ran" is one command away.
+    std::string cmd_cov(const std::vector<std::string>& args);
     std::string cmd_keyring(const std::vector<std::string>& args);
     std::string cmd_image(const std::vector<std::string>& args);
     std::string cmd_log(const std::vector<std::string>& args);
