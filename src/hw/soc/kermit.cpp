@@ -675,6 +675,13 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.bus.add_device(std::make_unique<kermit::Spi>("Kermit.Spi1", kermit::kSpi1Base, kermit::kSpiSize, 1));
     d.bus.add_device(std::make_unique<kermit::Spi>("Kermit.Spi2", kermit::kSpi2Base, kermit::kSpiSize, 2));
 
+    // PowerVR SGX register window (task part 2 of the Live Area goal). The window
+    // identifies itself and implements the command-queue kick handshake; the
+    // command buffers themselves and the OpenGL side come next (docs/GPU.md).
+    // Its interrupt line is deliberately left unattached until the GPU driver's
+    // own interrupt id is recovered from the firmware.
+    d.bus.add_device(std::make_unique<kermit::Sgx>("Kermit.SGX", kermit::kSgxBase, kermit::kSgxSize));
+
     // Resolve the accessors by name, so this constructor stays the only place
     // that knows which device object corresponds to which member.
     d.scu = static_cast<kermit::ScuRegisters*>(kermit::detail::find_device(d.bus, "Kermit.SCU"));

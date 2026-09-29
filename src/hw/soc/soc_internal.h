@@ -963,3 +963,95 @@ inline u64 merge_register_bytes(u64 stored, u64 value, u32 offset, u32 base, uns
 }
 
 }  // namespace zlb::kermit
+
+namespace zlb::kermit {
+
+// ---------------------------------------------------------------------------
+// PowerVR SGX543MP4+ register window (round 187, task part 2)
+// ---------------------------------------------------------------------------
+
+/// Base of the SGX register window. ASSUMPTION: no firmware module yields this
+/// address directly - `libgpu_es4.elf` is a user library that reaches the GPU
+/// through kernel services, and the kernel side was not recovered - so the
+/// model puts it in the free part of the ARM peripheral space next to the other
+/// model-only windows (DMA 0xE2060000, display 0xE2100000). The offsets below
+/// are the model's own contract until a firmware-derived map replaces them;
+/// they are named so that the whole map can be corrected in one place.
+constexpr u32 kSgxBase = 0xE2400000;
+constexpr u32 kSgxSize = 0x1000;
+
+/// Register offsets of the model's SGX window.
+constexpr u32 kSgxCoreId = 0x0000;        ///< read: identification (0x54354305)
+constexpr u32 kSgxCoreRevision = 0x0004;  ///< read: revision
+constexpr u32 kSgxCoreStatus = 0x0008;    ///< read: busy flags (model: 0)
+constexpr u32 kSgxEventStatus = 0x0010;   ///< read: completed/queued events
+constexpr u32 kSgxEventClear = 0x0014;    ///< write 1 to a bit to clear it
+constexpr u32 kSgxEventEnable = 0x0018;   ///< bits that raise the IRQ line
+constexpr u32 kSgxQueueBase = 0x0020;     ///< physical base of the command queue
+constexpr u32 kSgxQueueSize = 0x0024;     ///< queue size in bytes
+constexpr u32 kSgxQueueControl = 0x0028;  ///< bit 0 enable; write 1 = kick
+constexpr u32 kSgxQueueWrite = 0x002C;    ///< producer offset (written by the driver)
+constexpr u32 kSgxQueueRead = 0x0030;     ///< consumer offset (model)
+constexpr u32 kSgxIrqStatus = 0x0040;     ///< read: pending interrupt bits
+constexpr u32 kSgxIrqClear = 0x0044;      ///< write 1 to a bit to clear it
+
+/// Event bits of the model (the SGX reports TA/3D completion separately).
+constexpr u32 kSgxEventTa = 1u << 0;      ///< a kick was accepted
+constexpr u32 kSgxEvent3d = 1u << 1;      ///< the queue was drained
+constexpr u32 kSgxEventErr = 1u << 2;     ///< a malformed command was seen
+
+/// Identity values the window reports. The SGX543MP4+ identification register is
+/// a documented PowerVR constant in the 0x543543xx family; the exact low byte is
+/// an ASSUMPTION of this model.
+constexpr u32 kSgxCoreIdValue = 0x54354305;
+constexpr u32 kSgxCoreRevisionValue = 0x00000100;
+
+/// The modelled SGX block: a register window plus the command-queue handshake.
+/// A kick (write 1 into QUEUE_CONTROL) is completed synchronously - the model
+/// has no shader pipeline yet - and sets EVENT_TA | EVENT_3D, which the enable
+/// mask turns into an interrupt request. Command buffers themselves are not
+/// parsed here yet (that is the GXM step of docs/GPU.md).
+class Sgx : public RegisterBlock {
+public:
+    Sgx(std::string name, u32 base, u32 size);
+
+    void reset() override;
+    void tick(u64 cycles) override;
+
+    void set_irq_callback(std::function<void(u32, bool)> callback) { irq_ = std::move(callback); }
+    bool irq_line() const { return irq_line_; }
+
+    u64 kicks() const { return kicks_; }
+    u64 commands() const { return commands_; }
+    u32 queue_base() const { return queue_base_; }
+    u32 queue_size() const { return queue_size_; }
+    u32 queue_write_offset() const { return queue_write_; }
+    u32 queue_read_offset() const { return queue_read_; }
+
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+protected:
+    u64 read_word(u32 offset, u64 stored) override;
+    void write_word(u32 offset, u64 value) override;
+
+private:
+    void refresh_irq();
+    /// Complete one kick: raise the completion events and advance the consumer.
+    void complete_kick();
+
+    std::function<void(u32, bool)> irq_;
+    u32 events_ = 0;
+    u32 event_enable_ = 0;
+    u32 irq_status_ = 0;
+    u32 queue_base_ = 0;
+    u32 queue_size_ = 0;
+    u32 queue_control_ = 0;
+    u32 queue_write_ = 0;
+    u32 queue_read_ = 0;
+    u64 kicks_ = 0;
+    u64 commands_ = 0;
+    bool irq_line_ = false;
+};
+
+}  // namespace zlb::kermit
