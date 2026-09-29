@@ -1523,7 +1523,20 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 object = static_cast<u32>(arm->r[0]);
             const u32 expected = arm_bus_->read32(0x5113B604u);
             const u32 actual = (object != 0u) ? arm_bus_->read32(object + 0x24u) : 0u;
-            if (object != 0u && actual != expected) {
+            if (object != 0u && expected == 0u && actual != 0u) {
+                // The global class magic is never initialised in the model (write trap:
+                // only the zeroing at 0x510008F8), so publish the magic the object
+                // already carries - what NSKBL's own class initialisation would have done.
+                arm_bus_->write32(0x5113B604u, actual);
+                ++boot_pc_fixes_;
+                if (magic_fixes_ < 6u) {
+                    ++magic_fixes_;
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL class magic global set to 0x%08X from object 0x%08X "
+                                 "(development substitution)", actual, object);
+                    add_milestone("NSKBL class magic global set (development substitution)");
+                }
+            } else if (object != 0u && actual != expected) {
                 arm_bus_->write32(object + 0x24u, expected);
                 ++boot_pc_fixes_;
                 if (magic_fixes_ < 6u) {
