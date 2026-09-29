@@ -1526,21 +1526,27 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             // Round 210: publish the magic on *both* sides - the global (which NSKBL
             // never initialises in the model) and the object's field - so the check at
             // 0x5100EEBE cannot fail for either reason.
-            if (object != 0u && expected == 0u && actual != 0u) {
-                arm_bus_->write32(object + 0x24u, actual);
-            }
-            if (object != 0u && expected == 0u && actual != 0u) {
+            // Round 211: align on *every* entry.  The scan of branches into the fatal
+            // tail shows that only 0x5100EEC0 (this magic `bne`) ever executes, and the
+            // earlier version only acted while the global was still zero, so later
+            // objects kept failing the comparison.
+            if (object != 0u && actual != expected) {
                 // The global class magic is never initialised in the model (write trap:
                 // only the zeroing at 0x510008F8), so publish the magic the object
                 // already carries - what NSKBL's own class initialisation would have done.
+                // Round 211b: publish the global first (NSKBL never initialises it in
+                // the model), then align the object's field - doing it the other way
+                // round left the two sides different.
                 arm_bus_->write32(0x5113B604u, actual);
+                arm_bus_->write32(object + 0x24u, actual);
                 ++boot_pc_fixes_;
                 if (magic_fixes_ < 6u) {
                     ++magic_fixes_;
                     ZLB_LOG_INFO("machine",
-                                 "NSKBL class magic global set to 0x%08X from object 0x%08X "
-                                 "(development substitution)", actual, object);
-                    add_milestone("NSKBL class magic global set (development substitution)");
+                                 "NSKBL class magic published as 0x%08X (object 0x%08X, was "
+                                 "0x%08X vs global 0x%08X; development substitution)",
+                                 actual, object, actual, expected);
+                    add_milestone("NSKBL class magic published (development substitution)");
                 }
             } else if (object != 0u && actual != expected) {
                 arm_bus_->write32(object + 0x24u, expected);
