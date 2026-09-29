@@ -1403,7 +1403,13 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                         for (u32 offset = 0; offset < 0x1000u; offset += 4u) {
                             arm_bus_->write32(page + offset, 0u);
                         }
-                        arm_bus_->write32(record + 4u + slot * 4u, page);
+                        // The consumer (0x5100C010) does `r0 = *value; r0 <<= 12`, so
+                        // the record holds the address of a word with the frame number.
+                        const u32 descriptor_va =
+                            (kPhysPoolBase - 0x40000000u) + 0x80000u +
+                            (nskbl_physpool_next_ + slot) * 4u;
+                        arm_bus_->write32(descriptor_va, page >> 12);
+                        arm_bus_->write32(record + 4u + slot * 4u, descriptor_va);
                     }
                     nskbl_physpool_next_ += kPhysPoolPages;
                     filled = true;
