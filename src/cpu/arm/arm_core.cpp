@@ -579,6 +579,42 @@ void ArmCore::undefined(const char* why) {
 }
 
 void ArmCore::branch_to(u32 target) {
+    // Diagnostic (round 168): every branch - immediate or computed - funnels through
+    // here, so this is where "how did NSKBL reach that function" can be answered.
+    // ZLB_ARM_BRANCH_LOG=1 logs the first entries into the NSKBL boot-stage cluster
+    // (0x51000000-0x51000E00); ZLB_ARM_BRANCH_LOG=<lo>-<hi> logs entries into that
+    // range instead, together with the site and LR, which names the dispatcher.
+    static const bool branch_log = [] {
+        const char* value = std::getenv("ZLB_ARM_BRANCH_LOG");
+        return value != nullptr && value[0] != '0';
+    }();
+    static const u32 branch_lo = [] {
+        const char* value = std::getenv("ZLB_ARM_BRANCH_LOG");
+        if (value != nullptr && value[0] != '0' && value[0] != '1') {
+            return static_cast<u32>(std::strtoul(value, nullptr, 16));
+        }
+        return 0x51000000u;
+    }();
+    static const u32 branch_hi = [] {
+        const char* value = std::getenv("ZLB_ARM_BRANCH_LOG");
+        if (value != nullptr && value[0] != '0' && value[0] != '1') {
+            const char* dash = std::strchr(value, '-');
+            if (dash != nullptr) return static_cast<u32>(std::strtoul(dash + 1, nullptr, 16));
+        }
+        return 0x51000E00u;
+    }();
+    if (branch_log) {
+        static u32 hits = 0;
+        const u32 flat = target & ~1u;
+        if (hits < 200u && cur_instr_addr_ >= 0x51000000u && cur_instr_addr_ < 0x51030000u &&
+            flat >= branch_lo && flat < branch_hi) {
+            ++hits;
+            ZLB_LOG_INFO("cpu", "branch arm%u %08X -> %08X (%s, lr=0x%08X)", core_id_,
+                         cur_instr_addr_, target,
+                         r[14] == cur_instr_addr_ + 4u ? "call" : "jump",
+                         static_cast<u32>(r[14]));
+        }
+    }
     thumb = (target & 1u) != 0u;
     if (thumb) cpsr |= arm::kFlagT;
     else cpsr &= ~arm::kFlagT;
