@@ -734,6 +734,9 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
                                                              kermit::kNullDeviceSize));
     d.dma = static_cast<kermit::DmaController*>(kermit::detail::find_device(d.bus, "Kermit.DMA"));
     d.display = static_cast<kermit::DisplayController*>(kermit::detail::find_device(d.bus, "Kermit.Display"));
+    // The display scans its framebuffer out of guest memory (round 191), so it
+    // needs the bus the buffers live on.
+    if (d.display != nullptr) d.display->set_bus(&d.bus);
     d.syscon_bridge = static_cast<kermit::SysconBridge*>(kermit::detail::find_device(d.bus, "Kermit.Syscon"));
 
     d.global_timer->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });

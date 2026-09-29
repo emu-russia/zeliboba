@@ -811,6 +811,16 @@ public:
     /// Called after every completed frame (used by tests and the debugger).
     void set_frame_callback(std::function<void()> callback) { frame_callback_ = std::move(callback); }
 
+    /// The bus the controller scans the framebuffer out of (round 191). A real
+    /// display block reads the buffer from memory, so the model does the same:
+    /// `scanout_from_guest()` copies `stride * height` bytes from the active
+    /// buffer's guest physical address into the host image the panel reads.
+    /// Writing DMA_CONTROL bit 0 triggers it, which is the sequence the kernel
+    /// driver uses ("program the buffer, then start the transfer").
+    void set_bus(Bus* bus) { bus_ = bus; }
+    void scanout_from_guest();
+    u64 scanouts() const { return scanouts_; }
+
     enum class Format : u32 { Rgb565 = 0, Rgba8888 = 1 };
     static size_t bytes_per_pixel(Format format) { return format == Format::Rgb565 ? 2u : 4u; }
 
@@ -830,6 +840,8 @@ private:
 
     int panel_width_;
     int panel_height_;
+    Bus* bus_ = nullptr;      ///< source of the framebuffer scan-out
+    u64 scanouts_ = 0;        ///< number of completed scan-outs
     std::array<Buffer, 2> buffers_;
     u32 active_ = 0;
     u32 control_ = 0;

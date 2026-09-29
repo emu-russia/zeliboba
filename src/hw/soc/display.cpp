@@ -186,11 +186,34 @@ void DisplayController::write(u32 address, unsigned size, u64 value) {
                machine's DMA engine, never through a host pointer. */
             return;
         case kDmaControl:
-            if (value32 & 1u) status_ |= kStFlipped;
+            if (value32 & 1u) {
+                status_ |= kStFlipped;
+                scanout_from_guest();
+            }
             return;
         default:
             return;
     }
+}
+
+void DisplayController::scanout_from_guest() {
+    if (bus_ == nullptr) return;
+    Buffer& buffer = buffers_[active_];
+    if (buffer.address == 0u || buffer.pixels.empty()) return;
+    const size_t stride = static_cast<size_t>(buffer.stride);
+    const size_t needed = stride * static_cast<size_t>(buffer.height);
+    if (buffer.pixels.size() < needed) buffer.pixels.resize(needed, 0);
+    for (size_t row = 0; row < static_cast<size_t>(buffer.height); ++row) {
+        const u32 source = buffer.address + static_cast<u32>(row * stride);
+        u8* destination = buffer.pixels.data() + row * stride;
+        for (size_t column = 0; column < stride; ++column) {
+            destination[column] = bus_->read8(source + static_cast<u32>(column));
+        }
+    }
+    ++scanouts_;
+    ++frame_counter_;
+    status_ |= kStVsync;
+    if (frame_callback_) frame_callback_();
 }
 
 void DisplayController::tick(u64 cycles) {

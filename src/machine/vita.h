@@ -278,7 +278,10 @@ public:
 
 private:
     void build_buses();
-    void build_devices();
+    /// Round 191: optional GPU/display self-test (ZLB_GPU_SELFTEST=1) that puts a
+    /// synthetic frame into the display controller so the SDL3 Panel tab has an
+    /// image while the kernel display driver is out of reach.
+    void apply_gpu_selftest();    void build_devices();
     void build_cores();
     void wire_bridges();
 

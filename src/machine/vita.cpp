@@ -12,7 +12,7 @@
 #include "cpu/mep/mep_core.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
-#include "hw/soc.h"
+#include "hw/soc/soc_internal.h"
 #include "hw/syscon.h"
 
 namespace zlb {
@@ -418,7 +418,6 @@ bool Vita::fit_parts() {
 void Vita::reset(bool cold) {
     if (!built_) build();
     configure_arm_pc_trace();
-
     arm_bus_->reset();
     cmep_bus_->reset();
     syscon_bus_->reset();
@@ -452,7 +451,73 @@ void Vita::reset(bool cold) {
     kernel_running_ = false;
     milestones_.clear();
     events_.clear();
+
+    // GPU/display self-test (round 191, ZLB_GPU_SELFTEST=1, off by default).
+    // It is not part of the boot: it fills a scratch framebuffer with colour bars,
+    // programs the display controller exactly as a driver would (buffer address,
+    // stride, size, format, enable) and starts the scan-out, so the SDL3 Panel tab
+    // has a real image to show while the kernel-side display driver is still out
+    // of reach.  See docs/GPU.md, round 191.
+    apply_gpu_selftest();
+
     ZLB_LOG_INFO("machine", "power-on reset");
+}
+
+void Vita::apply_gpu_selftest() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ZLB_GPU_SELFTEST");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (!enabled || arm_bus_ == nullptr) return;
+    auto* display = dynamic_cast<kermit::DisplayController*>(
+        arm_bus_->find_device(kermit::kDisplayBase));
+    if (display == nullptr) return;
+
+    // Scratch framebuffer in free DRAM (well above KBL image, partition region and
+    // the model arenas, which end at PA 0x41400000).
+    constexpr u32 kSelfTestBase = 0x01600000u;   // VA 0x01600000
+    constexpr u32 kSelfTestPa = 0x41600000u;     // dram-abs mapping used by the arenas
+    constexpr int kWidth = 960;
+    constexpr int kHeight = 544;
+    constexpr u32 kStride = kWidth * 2u;
+
+    for (int y = 0; y < kHeight; ++y) {
+        for (int x = 0; x < kWidth; ++x) {
+            // Eight vertical colour bars plus a dark border, in RGB565.
+            u16 pixel = 0x0000;
+            if (x >= 4 && x < kWidth - 4 && y >= 4 && y < kHeight - 4) {
+                const u32 bar = static_cast<u32>(x - 4) * 8u / static_cast<u32>(kWidth - 8);
+                switch (bar) {
+                    case 0: pixel = 0xFFFF; break;   // white
+                    case 1: pixel = 0xFFE0; break;   // yellow
+                    case 2: pixel = 0x07FF; break;   // cyan
+                    case 3: pixel = 0x07E0; break;   // green
+                    case 4: pixel = 0xF81F; break;   // magenta
+                    case 5: pixel = 0xF800; break;   // red
+                    case 6: pixel = 0x001F; break;   // blue
+                    default: pixel = 0x0000; break;  // black
+                }
+            }
+            arm_bus_->write16(kSelfTestPa + static_cast<u32>(y) * kStride +
+                                  static_cast<u32>(x) * 2u,
+                              pixel);
+        }
+    }
+
+    display->write(kermit::kDisplayBase + 0x08u, 4, kSelfTestPa);       // FRAMEBUFFER0
+    display->write(kermit::kDisplayBase + 0x10u, 4, kStride);           // STRIDE
+    display->write(kermit::kDisplayBase + 0x14u, 4,
+                   (static_cast<u32>(kHeight) << 16) | static_cast<u32>(kWidth));  // SIZE
+    display->write(kermit::kDisplayBase + 0x18u, 4, 0u);               // FORMAT = RGB565
+    display->write(kermit::kDisplayBase + 0x1Cu, 4, 0u);               // ACTIVE = 0
+    display->write(kermit::kDisplayBase + 0x00u, 4, 1u);               // CONTROL: enable
+    display->write(kermit::kDisplayBase + 0x34u, 4, 1u);               // DMA_CONTROL: scan out
+    ZLB_LOG_INFO("machine",
+                 "GPU self-test frame: %dx%d RGB565 at 0x%08X (VA 0x%08X), scan-outs %llu "
+                 "(ZLB_GPU_SELFTEST=1; development switch, not Live Area)",
+                 kWidth, kHeight, kSelfTestPa, kSelfTestBase,
+                 static_cast<unsigned long long>(display->scanouts()));
+    add_milestone("GPU self-test frame written to the display buffer");
 }
 
 // ---------------------------------------------------------------------------
