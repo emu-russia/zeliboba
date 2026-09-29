@@ -1465,6 +1465,40 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 204): NSKBL's low window page table.  The kernel boot
+    // loader leaves VA 0x30000 described as a 64 KiB large page based at physical
+    // 0x00000000; the model does not back that physical range, so NSKBL's object
+    // writes there (pc 0x5100B4E2) abort as a bus error - and because the address
+    // *is* mapped, the fault hook never runs (docs/NSKBL.md 8.39/8.40).  Fix the
+    // mapping instead: on NSKBL's first instruction rewrite L2 indices 0x30-0x3F as
+    // small pages pointing at PA = VA + 0x40300000, the low-window rule the rest of
+    // the model already assumes.  ZLB_NSKBL_LOWWIN=1 enables it.
+    static const bool lowwin_fix = [] {
+        const char* value = std::getenv("ZLB_NSKBL_LOWWIN");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (lowwin_fix && (pc == 0x510002E4u || pc == 0x5100B4E2u) && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
+            const u32 l1_desc = arm_bus_->read32(l1_base);
+            if ((l1_desc & 3u) == 1u) {
+                const u32 l2_base = l1_desc & 0xFFFFFC00u;
+                u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
+                if ((attributes & 3u) != 2u) attributes = 0x47Eu;   // small page, AP=11
+                for (u32 index = 0x30u; index <= 0x3Fu; ++index) {
+                    const u32 va = index << 12;
+                    arm_bus_->write32(l2_base + index * 4u,
+                                      ((va + 0x40300000u) & 0xFFFFF000u) | attributes);
+                }
+                ++boot_pc_fixes_;
+                ZLB_LOG_INFO("machine",
+                             "NSKBL low window remapped: VA 0x30000-0x3FFFF -> PA 0x40300000+ "
+                             "(L2 0x%08X, development substitution)", l2_base);
+                add_milestone("NSKBL low window remapped (development substitution)");
+            }
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own
