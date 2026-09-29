@@ -412,52 +412,6 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     // 0x40075B94 and the partition region at 0x40300000).  The attribute bits are
     // the KBL's own section attributes (0x1158E, the value in its TTBR1 entries).
     // ZLB_NO_SUBSTITUTION=1 disables it.
-    // Round 202: NSKBL's low window.  With the heap finally created (round 200) the
-    // flow writes to VA 0x30000 (`pc = 0x5100B4E2`, inside the object constructor's
-    // neighbourhood) and aborts, because that page is not described in the page
-    // tables the KBL left behind - and it is *below* the 1 MiB branch below.  NSKBL's
-    // low window maps VA 0x0-0x3FFFF to PA 0x40300000+ (the rule the model already
-    // uses for the map object, the boot config and the range table), so describe the
-    // faulting page that way.  Only once NSKBL is running: during the KBL stage the
-    // same VA range belongs to the loader's own layout.
-    if (va < 0x40000u && arm->pc >= 0x51000000u) {
-        const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
-        const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
-        const u32 l1_desc = arm_bus_->read32(l1_slot);
-        const u32 pa = va + 0x40300000u;
-        if ((l1_desc & 3u) == 1u) {
-            const u32 l2_base = l1_desc & 0xFFFFFC00u;
-            const u32 l2_index = (va >> 12) & 0xFFu;
-            const u32 slot = l2_base + l2_index * 4u;
-            if ((arm_bus_->read32(slot) & 3u) == 0u) {
-                u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
-                if ((attributes & 3u) != 2u) attributes = 0x47Eu;   // small page, AP=11
-                arm_bus_->write32(slot, (pa & 0xFFFFF000u) | attributes);
-                ++boot_fault_fixes_;
-                if (boot_fault_fixes_ <= 4u) {
-                    ZLB_LOG_INFO("machine",
-                                 "NSKBL low-window page described: VA 0x%08X -> PA 0x%08X "
-                                 "(development substitution)", va & 0xFFFFF000u,
-                                 pa & 0xFFFFF000u);
-                    add_milestone("NSKBL low-window page described (development substitution)");
-                }
-                return true;
-            }
-        } else if ((l1_desc & 3u) == 0u || (l1_desc & 3u) == 2u) {
-            // No coarse table (or a section): describe the whole 1 MiB block with a
-            // section, using the KBL's own section attributes.  This is the same rule
-            // the rest of the model assumes for NSKBL's low window (VA 0x0-0x3FFFF ->
-            // PA 0x40300000+), and it is only installed once NSKBL is running.
-            arm_bus_->write32(l1_slot, 0x40300000u | 0x1158Eu);
-            ++boot_fault_fixes_;
-            ZLB_LOG_INFO("machine",
-                         "NSKBL low-window section installed: VA 0x%08X -> PA 0x%08X "
-                         "(development substitution)", va & 0xFFF00000u, 0x40300000u);
-            add_milestone("NSKBL low-window section installed (development substitution)");
-            return true;
-        }
-    }
-
     if (va >= 0x00100000u && va < 0x40000000u) {
         const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
         const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
