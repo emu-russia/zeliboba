@@ -1537,21 +1537,26 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the allocator still runs its own code
     }
 
-    // Substitution (round 108, corrected round 114): the getter 0x4002C1AC builds
-    // the instance pointer as `[obj+0x14] + table[size_class]`.  The object's base
-    // field `[obj+0x14]` is the 0xFFFFFFFF sentinel the class constructor stores
-    // (round 108.1 measured the store itself), because the stage the model stands in
-    // for never fills it.  Round 114: the old stand-in replaced the getter *result*
-    // at 0x4002C1CC and only caught `0xFFFFFFFF + 0`; the table's non-zero entries
-    // are 0x1000/0x2000, so the sum wrapped to 0x0FFF/0x1FFF and the constructor
-    // loop walked into the low window and panicked on the heap-cookie check with a
-    // bogus heap object.  Fill the base field itself with the instance arena VA:
-    // the getter then returns arena + table[size_class], a valid per-class address.
-    // ZLB_NO_SUBSTITUTION=1 disables it; ZLB_KBL_INSTANCE_BLOCK=0 keeps only the
-    // result fallback below.
+    // Substitution (round 108, corrected round 114, turned off by default in round 158):
+    // the getter 0x4002C1AC builds the instance pointer as `[obj+0x14] + table[size_class]`.
+    // The object's base field `[obj+0x14]` is the 0xFFFFFFFF sentinel the class
+    // constructor stores (round 108.1 measured the store itself), because the stage the
+    // model stands in for never fills it.  Round 114: the old stand-in replaced the
+    // getter *result* at 0x4002C1CC and only caught `0xFFFFFFFF + 0`; the table's
+    // non-zero entries are 0x1000/0x2000, so the sum wrapped to 0x0FFF/0x1FFF.
+    //
+    // Round 158 found that *filling* the base with the model's instance arena is what
+    // kept the loader out of its own boot-setup stage: with the arena in place the
+    // heap's block field `[heap+0x38]` ends up on an arena page whose +0x1C carries the
+    // class signature 0xD2519E9B, the class method 0x40031654 is entered with that
+    // signature as `this` and the run dies on the data abort at 0x40031674 - before the
+    // KBL ever reaches checkpoint 0x88.  Leaving the sentinel alone lets the loader
+    // take its own path: it enters the boot-setup stage 0x400204A8 on all four cores,
+    // reports checkpoint 0x88 and calls the NSKBL loader from there.  The arena is
+    // therefore *off* by default now; ZLB_KBL_INSTANCE_BLOCK=1 restores round 114.
     static const bool supply_instance_blocks = [] {
         const char* value = std::getenv("ZLB_KBL_INSTANCE_BLOCK");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     constexpr u32 kGetterEntryPc = 0x4002C1ACu;    // ldr r3,[r0,#0x30] - getter entry
     if (supply_blocks && supply_instance_blocks && pc == kGetterEntryPc) {
