@@ -1255,6 +1255,38 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 184): NSKBL's boot-mode gate 0x51010F14 reads the byte at
+    // boot_config[0x33] and treats 0xFF as "the boot configuration is valid"; anything
+    // else sends it down the path that prints ".Safe Mode : [ YES ]" (docs/NSKBL.md
+    // 8.26-8.27).  Nothing in the model ever fills that byte - the whole structure at
+    // VA 0x47C0 is zeroed by NSKBL's own initialiser and no CPU store or DMA to it
+    // exists - so the machine sits in the first-boot/safe path forever.  A console that
+    // booted before has this marker persisted, so stamping it stands in for "the boot
+    // configuration is valid" and is on by default (ZLB_NSKBL_BOOTCFG=0 disables it).
+    // Measured effect: the mode gate 0x51010F14 returns 0 instead of 1, the safe-mode
+    // print (0x5100100E/0x51001022) no longer runs, and ~600 more bytes of NSKBL (the
+    // class installer 0x51007E88-0x51007EF8 and the stage tail 0x51001042-0x51001054)
+    // execute.
+    static const bool bootcfg_marker = [] {
+        const char* value = std::getenv("ZLB_NSKBL_BOOTCFG");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (bootcfg_marker && pc == 0x51010F20u) {
+        // boot-config VA 0x47C0 lives in NSKBL's low window: PA = VA + 0x40300000.
+        static bool stamped = false;
+        const u32 bootcfg_pa = 0x403047C0u;
+        if (!stamped) {
+            arm_bus_->write8(bootcfg_pa + 0x33u, 0xFFu);
+            stamped = true;
+            ZLB_LOG_INFO("machine",
+                         "boot-config marker written (PA 0x%08X = 0xFF; development "
+                         "substitution)",
+                         bootcfg_pa + 0x33u);
+            add_milestone("NSKBL boot-config marker stamped (development substitution)");
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own
