@@ -63,6 +63,11 @@ constexpr u32 kTreeNodeArenaSize = 0x00100000u;   // 1 MiB
 /// lookups in SceSysmem, mapped (dram-abs) to free DRAM above the other arenas.
 constexpr u32 kLookupArenaVa = 0x01300000u;
 constexpr u32 kLookupArenaSize = 0x00100000u;     // 1 MiB
+/// Heap arena (round 180): blocks handed to NSKBL's general allocator while the map
+/// object's heap pointer (`[[0x5113B5AC] + 0x8C]`) is zero, so the code that creates
+/// the heap (absent from the model's flow) does not abort the class installer.
+constexpr u32 kHeapArenaVa = 0x01400000u;
+constexpr u32 kHeapArenaSize = 0x00100000u;       // 1 MiB
 
 /// Install an L1 section descriptor for `va` (1 MiB-aligned) once, so direct
 /// translations (which do not consult the fault hook) see it as writable.  Uses
@@ -1179,6 +1184,71 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                                      "development substitution)",
                                      block, core);
                         add_milestone("NSKBL object pool supplied (development substitution)");
+                    }
+                }
+            }
+        }
+    }
+
+    // Substitution (round 180): NSKBL's general allocator 0x5100D400 asks the heap
+    // resolver 0x5100567C for a block, which reads the heap object from the map
+    // (`[[0x5113B5AC] + 0x8C]`) and searches a free block in it (0x510049F4 → 0x5100B82C).
+    // In the model that field is zero - and a write trap over the whole run shows it is
+    // only ever written with zero (the page wipe at 0x5101354C and the map init at
+    // 0x510064D6), so nothing creates the heap.  The failure then aborts NSKBL's class
+    // installer 0x51007E70 on its first allocations (12/32/64/44 bytes), which is what
+    // leaves one core away from the barrier (counter stuck at 3 of 4) and livelocks the
+    // machine (docs/NSKBL.md 8.21-8.23).  On hardware the heap exists, so hand out a
+    // zeroed block from the model's heap arena instead of calling the resolver.
+    // ZLB_NSKBL_HEAP=1 enables it (opt-in: round 180 measured that handing out blocks
+    // changes the installer's control flow without unblocking the boot - the failure is
+    // handled further down, so the real fix is the missing heap-creation step, not a
+    // stand-in block).  ZLB_NO_SUBSTITUTION=1 still disables everything.
+    static const bool nskbl_heap = [] {
+        const char* value = std::getenv("ZLB_NSKBL_HEAP");
+        if (value == nullptr || value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (nskbl_heap && pc == 0x5100D418u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                const u32 map_global_va = 0x5113B5ACu;
+                const u32 map_va = arm_bus_->read32(map_global_va);
+                // NSKBL's low window maps VA 0x0-0x3FFFF to PA 0x40300000+.
+                const u32 map_pa = (map_va < 0x40000u) ? (map_va + 0x40300000u) : map_va;
+                const u32 heap = arm_bus_->read32(map_pa + 0x8Cu);
+                const u32 size = static_cast<u32>(arm->r[1]);
+                // Only stand in for the class installer 0x51007E70 (its allocations are
+                // the ones whose failure aborts the class setup); other callers must keep
+                // seeing the real (empty) heap so their control flow is unchanged.  The
+                // installer is recognised from the caller chain on the stack.
+                bool from_installer = false;
+                const u32 sp = static_cast<u32>(arm->r[13]);
+                for (u32 i = 0; i < 24u && !from_installer; ++i) {
+                    const u32 word = arm_bus_->read32(sp + i * 4u);
+                    from_installer = word >= 0x51007E70u && word < 0x51008400u;
+                }
+                if (heap == 0u && from_installer && size != 0u && size < 0x100000u &&
+                    nskbl_heap_next_ + size + 8u <= kHeapArenaSize) {
+                    ensure_arena_section(arm, arm_bus_.get(), kHeapArenaVa);
+                    const u32 block = kHeapArenaVa + nskbl_heap_next_;
+                    const u32 step = (size + 15u) & ~15u;
+                    for (u32 offset = 0; offset < step; offset += 4u) {
+                        arm_bus_->write32(block + offset, 0u);
+                    }
+                    nskbl_heap_next_ += step;
+                    arm->set_register("r0", block);
+                    arm->set_pc(0x5100D41Cu);              // return from 0x5100567C
+                    arm->set_register("THUMB", 1u);
+                    ++boot_pc_fixes_;
+                    if (nskbl_heap_supplies_ < 16u) {
+                        ++nskbl_heap_supplies_;
+                        ZLB_LOG_INFO("machine",
+                                     "NSKBL heap block 0x%08X (%u bytes) from the model "
+                                     "arena (arm%u, map->[0x8C] was 0; development "
+                                     "substitution)",
+                                     block, size, core);
+                        add_milestone("NSKBL heap block supplied (development substitution)");
                     }
                 }
             }
