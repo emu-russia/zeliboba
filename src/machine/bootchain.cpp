@@ -806,8 +806,10 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return value == nullptr || value[0] != '0';
     }();
     // The knob takes a comma separated list of L2 indices to split off ("12",
-    // "10,14", "all"); the default is the heap window alone, which is the one
-    // combination that carries the loader past the wall (round 156).
+    // "10,14", "all").  Round 201 measured that adding index 3 does *not* back the
+    // VA 0x30000 write NSKBL aborts on once the heap exists (the low window comes
+    // from the KBL's own page-table store at 0x4003AD6C, whose indices differ), so
+    // the default stays the heap window alone.
     static const std::string lowalias_list = [] {
         const char* value = std::getenv("ZLB_KBL_LOWALIAS");
         return std::string(value != nullptr ? value : "12");
