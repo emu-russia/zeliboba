@@ -150,6 +150,31 @@ ZLB_TEST(sgx_mmu_translates_through_the_modelled_page_table) {
     ZLB_EXPECT_EQ(status >> 16, static_cast<u32>(f.sgx.translations()));
 }
 
+ZLB_TEST(sgx_decodes_gxm_command_units) {
+    Fixture f;
+    const u32 queue = kermit::kDramBase + 0xC000u;
+    // Three 16-byte units: STATE, DRAW, DRAW (opcode in the low nibble).
+    const u32 stream[12] = {
+        kermit::kSgxGxmOpState, 0, 0, 0,
+        kermit::kSgxGxmOpDraw, 0, 0, 0,
+        kermit::kSgxGxmOpDraw, 0, 0, 0,
+    };
+    for (u32 i = 0; i < 12u; ++i) {
+        f.bus.write32(queue + i * 4u, stream[i]);
+    }
+
+    f.write(kermit::kSgxQueueBase, queue);
+    f.write(kermit::kSgxQueueSize, 0x1000u);
+    f.write(kermit::kSgxQueueWrite, 3u * kermit::kSgxGxmUnitSize);
+    f.write(kermit::kSgxQueueControl, 1u);
+
+    ZLB_EXPECT_EQ(f.sgx.gxm_units(), 3u);
+    ZLB_EXPECT_EQ(f.sgx.gxm_opcode(kermit::kSgxGxmOpState), 1u);
+    ZLB_EXPECT_EQ(f.sgx.gxm_opcode(kermit::kSgxGxmOpDraw), 2u);
+    ZLB_EXPECT_EQ(f.sgx.gxm_draws(), 2u);
+    ZLB_EXPECT_EQ(f.sgx.commands(), 3u);
+}
+
 ZLB_TEST(sgx_reset_returns_the_window_to_power_on) {
     Fixture f;
     f.write(kermit::kSgxQueueBase, 0x40000000u);

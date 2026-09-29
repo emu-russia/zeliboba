@@ -56,6 +56,9 @@ void Sgx::reset() {
     kicks_ = 0;
     commands_ = 0;
     queue_bytes_ = 0;
+    gxm_units_ = 0;
+    gxm_draws_ = 0;
+    for (u32 i = 0; i < kSgxGxmOpcodeCount; ++i) gxm_opcodes_[i] = 0;
     last_words_.clear();
     mmu_dir_base_ = 0;
     mmu_control_ = 0;
@@ -106,18 +109,40 @@ void Sgx::complete_kick() {
         const u32 consumed = (published >= queue_read_) ? (published - queue_read_) : 0u;
         const u32 usable = (consumed > queue_size_) ? queue_size_ : consumed;
         queue_bytes_ += usable;
-        commands_ += usable / 16u;   // the model counts 16-byte command units
+        commands_ += usable / kSgxGxmUnitSize;   // 16-byte command units
         for (u32 offset = 0; offset + 4u <= usable && last_words_.size() < 8u; offset += 4u) {
             last_words_.push_back(bus_.read32(queue_base_ + queue_read_ + offset));
+        }
+        // Walk the units and classify them (the GXM step of docs/GPU.md). The
+        // decode itself is deliberately the only format-aware code in the model.
+        const u32 units = usable / kSgxGxmUnitSize;
+        const u32 limit = (units > kSgxGxmMaxUnitsPerKick) ? kSgxGxmMaxUnitsPerKick : units;
+        for (u32 unit = 0; unit < limit; ++unit) {
+            u32 words[kSgxGxmUnitSize / 4u] = {0, 0, 0, 0};
+            for (u32 i = 0; i < kSgxGxmUnitSize / 4u; ++i) {
+                words[i] = bus_.read32(queue_base_ + queue_read_ + unit * kSgxGxmUnitSize + i * 4u);
+            }
+            decode_unit(words, kSgxGxmUnitSize / 4u);
         }
     }
     queue_read_ = published;
     poke(kSgxQueueRead, queue_read_);
     events_ = kSgxEventTa | kSgxEvent3d;
-    irq_status_ |= kSgxEventTa | kSgxEvent3d;
-    poke(kSgxEventStatus, events_);
+    irq_status_ |= kSgxEventTa | kSgxEvent3d;    poke(kSgxEventStatus, events_);
     poke(kSgxIrqStatus, irq_status_);
     refresh_irq();
+}
+
+void Sgx::decode_unit(const u32* words, u32 count) {
+    if (words == nullptr || count == 0u) return;
+    ++gxm_units_;
+    const u32 opcode = words[0] & kSgxGxmOpcodeMask;
+    if (opcode < kSgxGxmOpcodeCount) {
+        ++gxm_opcodes_[opcode];
+    }
+    if (opcode == kSgxGxmOpDraw) {
+        ++gxm_draws_;
+    }
 }
 
 u64 Sgx::read_word(u32 offset, u64 stored) {

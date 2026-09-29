@@ -1021,6 +1021,26 @@ constexpr u32 kSgxEventErr = 1u << 2;     ///< a malformed command was seen
 constexpr u32 kSgxCoreIdValue = 0x54354305;
 constexpr u32 kSgxCoreRevisionValue = 0x00000100;
 
+/// The modelled command-unit header (docs/GPU.md step 3). The real GXM binary
+/// encoding is not in the SDK headers - gxm/shader_patcher.h is API level only -
+/// and recovering it from libgxm_es4.elf is still open, so the model parses the
+/// queue with this documented placeholder until then:
+///   * the queue is a sequence of 16 byte units, `[u32 header][12 bytes]`,
+///   * the low nibble of the header is the opcode,
+///   * the upper 24 bits are the opcode's argument/handle.
+/// Everything outside decode_unit() is independent of that convention, so when
+/// the firmware format is recovered only that helper changes.
+constexpr u32 kSgxGxmUnitSize = 16;
+constexpr u32 kSgxGxmOpcodeMask = 0xFu;
+constexpr u32 kSgxGxmOpcodeCount = 8;
+constexpr u32 kSgxGxmOpNop = 0;      ///< padding
+constexpr u32 kSgxGxmOpState = 1;    ///< render state block
+constexpr u32 kSgxGxmOpDraw = 2;     ///< draw call
+constexpr u32 kSgxGxmOpShader = 3;   ///< shader / program reference
+constexpr u32 kSgxGxmOpTexture = 4;  ///< texture / sampler binding
+constexpr u32 kSgxGxmOpSync = 5;     ///< flush / event
+constexpr u32 kSgxGxmMaxUnitsPerKick = 512;
+
 /// The modelled SGX block: a register window plus the command-queue handshake.
 /// A kick (write 1 into QUEUE_CONTROL) is completed synchronously - the model
 /// has no shader pipeline yet - and sets EVENT_TA | EVENT_3D, which the enable
@@ -1050,6 +1070,12 @@ public:
     u64 faults() const { return faults_; }
     u64 invalidations() const { return invalidations_; }
     u64 commands() const { return commands_; }
+    /// Command units the GXM parser walked, and how they were classified.
+    u64 gxm_units() const { return gxm_units_; }
+    u64 gxm_draws() const { return gxm_draws_; }
+    u64 gxm_opcode(u32 opcode) const {
+        return opcode < kSgxGxmOpcodeCount ? gxm_opcodes_[opcode] : 0u;
+    }
     u32 queue_base() const { return queue_base_; }
     u32 queue_size() const { return queue_size_; }
     u32 queue_write_offset() const { return queue_write_; }
@@ -1066,11 +1092,17 @@ private:
     void refresh_irq();
     /// Complete one kick: raise the completion events and advance the consumer.
     void complete_kick();
+    /// Classify one 16 byte command unit. The header convention is documented
+    /// above (kSgxGxmUnitSize); this is the only place that knows it.
+    void decode_unit(const u32* words, u32 count);
 
     Bus& bus_;
     std::function<void(u32, bool)> irq_;
     std::vector<u32> last_words_;   ///< first words of the last consumed kick
     u64 queue_bytes_ = 0;
+    u64 gxm_units_ = 0;
+    u64 gxm_draws_ = 0;
+    u64 gxm_opcodes_[kSgxGxmOpcodeCount] = {0, 0, 0, 0, 0, 0, 0, 0};
     u32 mmu_dir_base_ = 0;
     u32 mmu_control_ = 0;
     u64 translations_ = 0;
