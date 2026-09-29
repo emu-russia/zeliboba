@@ -1209,7 +1209,11 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if (value == nullptr || value[0] == '0') return false;
         return substitutions_enabled_static();
     }();
-    if (nskbl_heap && pc == 0x5100D418u) {
+    // Round 194: the heap has to exist before the first *use* of it.  The block
+    // search is entered from the resolver 0x51004AD0 (measured: trace of
+    // 0x5100B82C shows r0 = 0 coming from 0x51004A0A), which happens before the
+    // allocator entry 0x5100D418, so install the object at the resolver too.
+    if (nskbl_heap && (pc == 0x51004AD0u || pc == 0x5100D418u)) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 const u32 map_global_va = 0x5113B5ACu;
@@ -1228,8 +1232,46 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                     const u32 word = arm_bus_->read32(sp + i * 4u);
                     from_installer = word >= 0x51007E70u && word < 0x51008400u;
                 }
-                if (heap == 0u && from_installer && size != 0u && size < 0x100000u &&
-                    nskbl_heap_next_ + size + 8u <= kHeapArenaSize) {
+                if (heap == 0u && (pc == 0x51004AD0u || from_installer)) {
+                    ensure_arena_section(arm, arm_bus_.get(), kHeapArenaVa);
+                    // Round 193: build a heap that the *firmware's own* search accepts,
+                    // so no call has to be skipped.  With granule = 1 (heap+0x20) and
+                    // base = 1 (heap+0x1C) the helpers collapse:
+                    //   r8    = round_up(base, granule)   = 1
+                    //   index = round_up(size, r8)        = size
+                    //   helper 0x51025AD4(size, 1)        = size - 1*size = 0
+                    //   block = granule * 0 + table[index] = table[index]
+                    // so the block address *is* the class-table entry, and pre-filling
+                    // the table with distinct arena pages hands out real memory through
+                    // the allocator's normal path (docs/NSKBL.md 8.29).
+                    const u32 heap_obj = kHeapArenaVa + 0x1000u;
+                    const u32 class_table = kHeapArenaVa + 0x2000u;
+                    const u32 classes = 4096u;
+                    const u32 block_stride = 0x1000u;
+                    const u32 block_count = 240u;
+                    for (u32 i = 0; i < 0x100u; ++i) {
+                        arm_bus_->write32(heap_obj + i * 4u, 0u);
+                    }
+                    for (u32 i = 0; i < classes; ++i) {
+                        const u32 block =
+                            kHeapArenaVa + 0x10000u + (i % block_count) * block_stride;
+                        arm_bus_->write32(class_table + i * 4u, block);
+                    }
+                    arm_bus_->write32(heap_obj + 0x1Cu, 1u);
+                    arm_bus_->write16(heap_obj + 0x20u, 1u);
+                    arm_bus_->write16(heap_obj + 0x32u, static_cast<u16>(classes));
+                    arm_bus_->write32(heap_obj + 0x34u, class_table);
+                    arm_bus_->write32(map_pa + 0x8Cu, heap_obj);
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL heap object 0x%08X installed at map+0x8C "
+                                 "(granule 1, base 1, %u classes, %u arena blocks; "
+                                 "development substitution)",
+                                 heap_obj, classes, block_count);
+                    add_milestone("NSKBL heap object installed (development substitution)");
+                    ++boot_pc_fixes_;
+                    if (nskbl_heap_supplies_ < 8u) ++nskbl_heap_supplies_;
+                }
+                if (false) {
                     ensure_arena_section(arm, arm_bus_.get(), kHeapArenaVa);
                     const u32 block = kHeapArenaVa + nskbl_heap_next_;
                     const u32 step = (size + 15u) & ~15u;
