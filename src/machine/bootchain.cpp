@@ -1101,6 +1101,11 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if (value != nullptr && value[0] == '0') return false;
         return substitutions_enabled_static();
     }();
+    static const bool nskbl_class = [] {
+        const char* value = std::getenv("ZLB_NSKBL_CLASS");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
     if (pool_fix && pc == 0x5100B57Cu && core < static_cast<u32>(kArmCoreCount)) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             const u32 obj = static_cast<u32>(arm->r[4]);
@@ -1113,6 +1118,23 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 arm_bus_->write16(pa + 2u, 0u);                 // used slots
                 arm_bus_->write32(pa + 4u, obj + 0x100u);       // pointer array
                 arm_bus_->write32(pa + 0x1Cu, obj + 0x200u);    // second pointer array
+                // Substitution (round 170): the object also needs a class pointer at +4.
+                // Without it the virtual dispatch `ldr r2,[r4,#4]; ldr r3,[r2,#0x38];
+                // blx r3` at 0x5100B59E goes through VA 0x38 (the fault hook answers with
+                // the low page) to 0xFFFFFFFE and panics with 0xAC.  Build a minimal class
+                // page in the arena whose method slots are all `bx lr` (0x51014B94, ARM),
+                // so any virtual call through it returns harmlessly.
+                if (nskbl_class) {
+                    const u32 class_va = kInstanceArenaVa + kInstanceArenaSize - 0x1000u;
+                    std::string cfault;
+                    u32 class_pa = 0;
+                    if (arm->translate(class_va, true, false, class_pa, cfault)) {
+                        for (u32 off = 0; off < 0x40u; off += 4u) {
+                            arm_bus_->write32(class_pa + off, 0x51014B94u);
+                        }
+                        arm_bus_->write32(pa - 0x30u + 4u, class_va);
+                    }
+                }
                 ++boot_pc_fixes_;
                 if (nskbl_pool_fixes_ < 8u) {
                     ++nskbl_pool_fixes_;
