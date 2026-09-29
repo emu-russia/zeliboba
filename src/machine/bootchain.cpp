@@ -1073,6 +1073,67 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 164, default on): the KBL hands every *secondary* core the
+    // same stage stack (0x4000 - measured with a write trap on its per-core
+    // structures at 0x40020Bxx/0x400207B0), so the three secondaries run the whole
+    // boot-setup stage on one stack, their frames overlap and the barrier's
+    // `pop {r4-r6,pc}` at 0x4003B3D0 reads a zero (ZLB_KBL_TRACE_ZERO=1:
+    // `arm1 from pc=0x4003B3D0 sp=0x3F10`).  On hardware the stage before the KBL
+    // gives each core its own stack through the ARM boot context, which the model
+    // does not have (docs/STATUS.md 3.1).  The trampoline 0x4003A140 is
+    // `mov sp,r2; bx r1`, so biasing r2 per core gives each secondary its own 4 KiB
+    // page inside the same low window.  Measured effect: NSKBL goes 0xA4 -> 0xA7
+    // (all four cores pass "other cores start" and the MMU/VBAR step and run at
+    // 0x80000000), where without it the secondaries die in the barrier.
+    // ZLB_KBL_CORE_STACK=<hex> overrides the step, 0 disables it,
+    // ZLB_NO_SUBSTITUTION=1 disables every substitution.
+    static const u32 core_stack_step = [] {
+        const char* value = std::getenv("ZLB_KBL_CORE_STACK");
+        if (value != nullptr) return static_cast<u32>(std::strtoul(value, nullptr, 16));
+        return substitutions_enabled_static() ? 0x1000u : 0u;
+    }();
+    if (core_stack_step != 0u && pc == 0x4003A140u && core > 0u) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 biased = static_cast<u32>(arm->r[2]) + core * core_stack_step;
+            arm->set_register("r2", biased);
+            if (core_stack_biases_ < 4u) {
+                ++core_stack_biases_;
+                ZLB_LOG_INFO("machine",
+                             "per-core stage stack: arm%u 0x%08X -> 0x%08X (development "
+                             "substitution; ZLB_KBL_CORE_STACK=%X)",
+                             core, static_cast<u32>(arm->r[2]), biased, core_stack_step);
+                add_milestone("per-core ARM stage stack for arm" + std::to_string(core) +
+                              " (development substitution)");
+            }
+        }
+    }
+
+    // Diagnostic (round 164): the KBL's *secondary* cores die by jumping to the zero
+    // page (pc == 0) and then walking the low window until they fetch open bus.  The
+    // instruction that sends them there is what has to be named, and
+    // ZLB_KBL_TRACE_PC cannot express pc = 0 (its guard is `trace_pc != 0`).
+    // ZLB_KBL_TRACE_ZERO=1 logs the first few arrivals at pc == 0 with the pc that
+    // led there and the register file.
+    static const bool trace_zero = [] {
+        return std::getenv("ZLB_KBL_TRACE_ZERO") != nullptr;
+    }();
+    if (trace_zero && pc == 0u && trace_zero_hits_ < 8u) {
+        if (core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++trace_zero_hits_;
+                u64 lr = 0, sp = 0;
+                arm->get_register("r14", lr);
+                arm->get_register("r13", sp);
+                ZLB_LOG_INFO("machine",
+                             "trace zero-page: arm%u from pc=0x%08X lr=0x%08X sp=0x%08X cpsr=0x%08X "
+                             "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X",
+                             core, previous_pc, static_cast<u32>(lr), static_cast<u32>(sp),
+                             arm->cpsr, arm->r[0], arm->r[1], arm->r[2], arm->r[3], arm->r[4],
+                             arm->r[5]);
+            }
+        }
+    }
+
     // Diagnostic (round 114): the class constructor 0x4002A964 (`movs r1,#0` ...
     // `str.w r2,[r3,#0x14]`) is reached through `blx [r6+0x34]` with r0 = r8 = the
     // block the caller 0x40031654 is about to hand out.  Round 113 showed the fatal
