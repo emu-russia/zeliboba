@@ -1359,6 +1359,73 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Substitution (round 197): NSKBL's kernel physical-memory partition
+    // (`ScePhyMemPartKD`, VA 0x5300) keeps a per-core range table at `[+0x9C]`
+    // (32-byte records: u16 type, u16 count, then seven u32 range values).  In the
+    // model that table is empty - only the page wipe ever writes it - so the range
+    // request 0x5100C04C fails, 0x51005700 returns early and SceKernelSysrootClass
+    // is never registered, which is why no heap exists and the class installer
+    // aborts (docs/NSKBL.md 8.33).  On hardware the boot configuration provides the
+    // physical memory ranges; here the model hands out free DRAM pages, refilling
+    // the record whenever the firmware has consumed all of them.
+    // ZLB_NSKBL_PHYSPOOL=0 and ZLB_NO_SUBSTITUTION=1 disable it.
+    static const bool physpool = [] {
+        const char* value = std::getenv("ZLB_NSKBL_PHYSPOOL");
+        // Opt-in: supplying range values does advance the flow past the gate
+        // (checkpoint 0xA7 -> 0xAD), but the guest then dereferences the value
+        // as a *virtual* address it has not mapped and aborts, so the default
+        // run keeps the previous, documented state.  ZLB_NSKBL_PHYSPOOL=1
+        // enables the experiment.
+        if (value == nullptr || value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (physpool && pc == 0x5100C04Cu && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            // VA 0x01500000 <-> PA 0x41500000: the dram-abs rule the other
+            // arenas use, so the section can be mapped for the guest (below).
+            constexpr u32 kPhysPoolBase = 0x41500000u;
+            constexpr u32 kPhysPoolPages = 7u;           // the record holds seven ranges
+            const u32 partition_va = static_cast<u32>(arm->r[0]);
+            const u32 partition_pa =
+                partition_va < 0x40000u ? partition_va + 0x40300000u : partition_va;
+            const u32 table_va = arm_bus_->read32(partition_pa + 0x9Cu);
+            const u32 table_pa = table_va < 0x40000u ? table_va + 0x40300000u : table_va;
+            if (table_va != 0u) {
+                ensure_arena_section(arm, arm_bus_.get(), kPhysPoolBase - 0x40000000u);
+                bool filled = false;
+                for (u32 index = 0; index < kArmCoreCount; ++index) {
+                    const u32 record = table_pa + index * 32u;
+                    if (arm_bus_->read16(record + 2u) != 0u) continue;
+                    arm_bus_->write16(record + 2u, static_cast<u16>(kPhysPoolPages));
+                    for (u32 slot = 0; slot < kPhysPoolPages; ++slot) {
+                        const u32 page = kPhysPoolBase +
+                                         (nskbl_physpool_next_ + slot) * 0x1000u;
+                        for (u32 offset = 0; offset < 0x1000u; offset += 4u) {
+                            arm_bus_->write32(page + offset, 0u);
+                        }
+                        arm_bus_->write32(record + 4u + slot * 4u, page);
+                    }
+                    nskbl_physpool_next_ += kPhysPoolPages;
+                    filled = true;
+                }
+                if (filled) {
+                    ++boot_pc_fixes_;
+                    if (nskbl_physpool_fills_ < 8u) {
+                        ++nskbl_physpool_fills_;
+                        ZLB_LOG_INFO("machine",
+                                     "NSKBL physical-memory range table seeded with %u pages "
+                                     "(record 0x%08X, next page 0x%08X; development "
+                                     "substitution)",
+                                     kPhysPoolPages, table_pa,
+                                     kPhysPoolBase + nskbl_physpool_next_ * 0x1000u);
+                        add_milestone("NSKBL physical-memory ranges supplied (development "
+                                      "substitution)");
+                    }
+                }
+            }
+        }
+    }
+
     // Substitution (round 165): NSKBL's spinlock acquire 0x51014970 livelocks when
     // the object pointer is NULL.  Measured chain: the dispatch at 0x5100B726 reads
     // the list head `[[0x5113B5AC] + 0x64]` (the global holds VA 0x4900 - NSKBL's own
