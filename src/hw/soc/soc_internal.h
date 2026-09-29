@@ -1052,6 +1052,12 @@ constexpr u32 kSgxGxmOpShader = 3;   ///< shader / program reference
 constexpr u32 kSgxGxmOpTexture = 4;  ///< texture / sampler binding
 constexpr u32 kSgxGxmOpSync = 5;     ///< flush / event
 constexpr u32 kSgxGxmMaxUnitsPerKick = 512;
+/// Draw calls kept as a translation record (round 192). Each entry is the STATE
+/// payload that was in force plus the DRAW header's argument: that is the
+/// intermediate representation the OpenGL translation consumes, so the shader
+/// step only has to walk it once the real GXM encodings are recovered.
+constexpr u32 kSgxGxmMaxDraws = 64;
+constexpr u32 kSgxGxmStateWords = 3;   // the 12 payload bytes of a unit
 
 /// The modelled SGX block: a register window plus the command-queue handshake.
 /// A kick (write 1 into QUEUE_CONTROL) is completed synchronously - the model
@@ -1088,6 +1094,16 @@ public:
     u64 gxm_opcode(u32 opcode) const {
         return opcode < kSgxGxmOpcodeCount ? gxm_opcodes_[opcode] : 0u;
     }
+
+    /// One draw call as the translation layer sees it: the render state that was
+    /// in force (the last STATE unit's payload) and the DRAW header's argument.
+    struct TranslatedDraw {
+        u32 state[kSgxGxmStateWords] = {0, 0, 0};
+        u32 argument = 0;
+    };
+    const std::vector<TranslatedDraw>& draws() const { return draws_; }
+    /// Render state currently in force, as last published by a STATE unit.
+    const u32* state() const { return gxm_state_; }
     u32 queue_base() const { return queue_base_; }
     u32 queue_size() const { return queue_size_; }
     u32 queue_write_offset() const { return queue_write_; }
@@ -1115,6 +1131,8 @@ private:
     u64 gxm_units_ = 0;
     u64 gxm_draws_ = 0;
     u64 gxm_opcodes_[kSgxGxmOpcodeCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    u32 gxm_state_[kSgxGxmStateWords] = {0, 0, 0};
+    std::vector<TranslatedDraw> draws_;
     u32 mmu_dir_base_ = 0;
     u32 mmu_control_ = 0;
     u64 translations_ = 0;

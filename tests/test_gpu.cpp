@@ -175,6 +175,33 @@ ZLB_TEST(sgx_decodes_gxm_command_units) {
     ZLB_EXPECT_EQ(f.sgx.commands(), 3u);
 }
 
+ZLB_TEST(sgx_records_draws_with_the_state_in_force) {
+    Fixture f;
+    const u32 queue = kermit::kDramBase + 0xD000u;
+    // STATE (payload 0xA1..0xA4), DRAW with argument 0x11, then another DRAW.
+    const u32 stream[12] = {
+        kermit::kSgxGxmOpState, 0xA1u, 0xA2u, 0xA3u,
+        (0x11u << 8) | kermit::kSgxGxmOpDraw, 0, 0, 0,
+        (0x22u << 8) | kermit::kSgxGxmOpDraw, 0, 0, 0,
+    };
+    for (u32 i = 0; i < 12u; ++i) {
+        f.bus.write32(queue + i * 4u, stream[i]);
+    }
+
+    f.write(kermit::kSgxQueueBase, queue);
+    f.write(kermit::kSgxQueueSize, 0x1000u);
+    f.write(kermit::kSgxQueueWrite, 3u * kermit::kSgxGxmUnitSize);
+    f.write(kermit::kSgxQueueControl, 1u);
+
+    ZLB_EXPECT_EQ(f.sgx.draws().size(), 2u);
+    ZLB_EXPECT_EQ(f.sgx.draws()[0].argument, 0x11u);
+    ZLB_EXPECT_EQ(f.sgx.draws()[1].argument, 0x22u);
+    // Both draws carry the state that was published before them.
+    ZLB_EXPECT_EQ(f.sgx.draws()[0].state[0], 0xA1u);
+    ZLB_EXPECT_EQ(f.sgx.draws()[1].state[2], 0xA3u);
+    ZLB_EXPECT_EQ(f.sgx.state()[0], 0xA1u);
+}
+
 ZLB_TEST(sgx_reset_returns_the_window_to_power_on) {
     Fixture f;
     f.write(kermit::kSgxQueueBase, 0x40000000u);

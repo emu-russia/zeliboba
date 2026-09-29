@@ -58,6 +58,8 @@ void Sgx::reset() {
     queue_bytes_ = 0;
     gxm_units_ = 0;
     gxm_draws_ = 0;
+    draws_.clear();
+    for (u32 i = 0; i < kSgxGxmStateWords; ++i) gxm_state_[i] = 0;
     for (u32 i = 0; i < kSgxGxmOpcodeCount; ++i) gxm_opcodes_[i] = 0;
     last_words_.clear();
     mmu_dir_base_ = 0;
@@ -140,8 +142,22 @@ void Sgx::decode_unit(const u32* words, u32 count) {
     if (opcode < kSgxGxmOpcodeCount) {
         ++gxm_opcodes_[opcode];
     }
+    if (opcode == kSgxGxmOpState) {
+        // Publish the state block: its payload is what the translation layer (and
+        // later the OpenGL step) consumes (round 192).
+        for (u32 i = 0; i < kSgxGxmStateWords; ++i) {
+            gxm_state_[i] = (i + 1u < count) ? words[i + 1u] : 0u;
+        }
+        return;
+    }
     if (opcode == kSgxGxmOpDraw) {
         ++gxm_draws_;
+        if (draws_.size() < kSgxGxmMaxDraws) {
+            TranslatedDraw draw;
+            for (u32 i = 0; i < kSgxGxmStateWords; ++i) draw.state[i] = gxm_state_[i];
+            draw.argument = words[0] >> 8;
+            draws_.push_back(draw);
+        }
     }
 }
 
