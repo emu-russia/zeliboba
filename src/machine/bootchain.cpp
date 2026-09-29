@@ -1523,6 +1523,12 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 object = static_cast<u32>(arm->r[0]);
             const u32 expected = arm_bus_->read32(0x5113B604u);
             const u32 actual = (object != 0u) ? arm_bus_->read32(object + 0x24u) : 0u;
+            // Round 210: publish the magic on *both* sides - the global (which NSKBL
+            // never initialises in the model) and the object's field - so the check at
+            // 0x5100EEBE cannot fail for either reason.
+            if (object != 0u && expected == 0u && actual != 0u) {
+                arm_bus_->write32(object + 0x24u, actual);
+            }
             if (object != 0u && expected == 0u && actual != 0u) {
                 // The global class magic is never initialised in the model (write trap:
                 // only the zeroing at 0x510008F8), so publish the magic the object
