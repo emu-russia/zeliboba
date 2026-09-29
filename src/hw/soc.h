@@ -32,8 +32,23 @@ constexpr u32 kScratchpadSramSize = 0x00200000;  ///< 2 MiB
 constexpr u32 kNullDeviceBase = 0x1D000000;      ///< hardware /dev/null: reads return 0,
                                                   ///< writes are dropped (SceMsif drain window)
 constexpr u32 kNullDeviceSize = 0x00001000;      ///< 4 KiB
-constexpr u32 kScuBase = 0x40000000;   ///< private/secure window; the kernel boot loader
-                                        ///< ELF is linked at 0x40020000 and runs with the MMU off
+constexpr u32 kDramWindowBase = 0x40000000;  ///< physical DRAM window ("arm_priv"/"cmep_dram"):
+                                              ///< the KBL ELF is linked at 0x40020000 and runs
+                                              ///< with the MMU off, and its whole first page
+                                              ///< (0x40000000-0x40000FFF) is DRAM - that page is
+                                              ///< the SKBL exception/monitor vector page, which
+                                              ///< the wiki pins at PA 0x40000000 ("SKBL Reset
+                                              ///< Vector (ARM entry!)")
+constexpr u32 kScuBase = 0x1E000000;   ///< MPCore peripheral block (SCU/GIC/timers).  Round 162:
+                                        ///< this used to sit at 0x40000000, but that window is
+                                        ///< DRAM: kernel_boot_loader maps its vector page to
+                                        ///< VA 0x16100 -> PA 0x40000100 and writes the TrustZone
+                                        ///< monitor table to PA 0x40000140 (measured with
+                                        ///< ZLB_WTRAP), and with the GIC there those writes were
+                                        ///< swallowed by the device, leaving the `smc` entry
+                                        ///< empty.  No firmware access to this block has been
+                                        ///< observed yet, so its placement is a model decision
+                                        ///< until the kernel shows where the Vita puts it.
 constexpr u32 kPeripheralWindowSize = 0x00010000;  ///< MPCore peripheral block (SCU/GIC/timers)
 constexpr u32 kScuSize = 0x20000000;    ///< 512 MiB DRAM window (wiki Physical_Memory:
                                         ///< "0x40000000 0x20000000 512MiB DRAM"); covers the

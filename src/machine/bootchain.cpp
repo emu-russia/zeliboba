@@ -903,16 +903,26 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the load still has to run
     }
 
-    // Substitution (round 94): restore the ARM exception vectors at the mapping the
-    // KBL installed.  The KBL points VBAR at VA 0x16100 and maps that VA onto its
-    // own DRAM page (`vpa 0x16100` = PA 0x40000100), where its copy is incomplete
-    // (two `ldr pc,[pc,#0x18]` words followed by data), so every exception entry
-    // falls into zeros and the core ends up hopping through the whole vector page.
-    // The model stages the real 0xC0-byte table from the KBL's ELF segment (vaddr 0)
-    // the first time the core enters the vector window, at the physical address the
-    // core's own tables resolve.  ZLB_NO_SUBSTITUTION=1 disables it.
-    if (supply_blocks && !kbl_vectors_restored_ && !kbl_vectors_.empty() && pc >= 0x16100u &&
-        pc < 0x16200u) {
+    // Substitution (round 94, extended round 163): restore the ARM exception vectors
+    // at the mapping the KBL installed.  The KBL points VBAR at VA 0x16100 and maps
+    // that VA onto its own DRAM page (`vpa 0x16100` = PA 0x40000100), where its copy
+    // is incomplete (two `ldr pc,[pc,#0x18]` words followed by data), so every
+    // exception entry falls into zeros and the core ends up hopping through the whole
+    // vector page.  The model stages the real 0xC0-byte table from the KBL's ELF
+    // segment (vaddr 0) the first time the core enters the vector window, at the
+    // physical address the core's own tables resolve.
+    //
+    // Round 163: staging the ELF table is not enough for the TrustZone monitor.  SKBL
+    // *builds* the two tables at runtime, with the MMU off, straight into the physical
+    // page PA 0x40000100: the exception stubs at +0x00 and their handlers at +0x20
+    // (measured: {0x4002826C, 0x400288C4, ...}) and the monitor stubs at +0x40..+0x5F
+    // with the SMC handler pointer (MVBAR+0x28 -> 0x4002831C) at +0x68.  NSKBL, however,
+    // clears SCTLR at 0x51000138 and therefore runs with the MMU *off*: its first
+    // `smc` (0x510002E4, r12 = 0x103) fetches the monitor vector physically from
+    // MVBAR = 0x16140, which in the model is the low boot page - the staged ELF table
+    // has zeros there, so the core executed the zero page and derailed.  Mirror the
+    // page SKBL built into the page the MMU-off fetch actually reads.
+    if (supply_blocks && pc >= 0x16100u && pc < 0x16200u) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 // The KBL's mapping of the vector page is a device page, so a *write*
@@ -923,17 +933,39 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 std::string fault;
                 const bool mapped = arm->translate(0x00016100u, false, false, pa, fault);
                 if (!mapped) pa = 0x40000100u;
-                for (size_t i = 0; i < kbl_vectors_.size(); ++i) {
-                    arm_bus_->write8(pa + static_cast<u32>(i), kbl_vectors_[i]);
+                if (!kbl_vectors_restored_ && !kbl_vectors_.empty()) {
+                    for (size_t i = 0; i < kbl_vectors_.size(); ++i) {
+                        arm_bus_->write8(pa + static_cast<u32>(i), kbl_vectors_[i]);
+                    }
+                    kbl_vectors_restored_ = true;
+                    ZLB_LOG_INFO("machine",
+                                 "ARM exception vectors restored at PA 0x%08X (VA 0x16100 mapping%s, "
+                                 "%zu bytes) (development substitution)",
+                                 pa, mapped ? "" : " not readable - using the measured fallback",
+                                 kbl_vectors_.size());
+                    add_milestone("ARM exception vectors restored at PA 0x" + hex(pa, 8) +
+                                  " (development substitution)");
                 }
-                kbl_vectors_restored_ = true;
-                ZLB_LOG_INFO("machine",
-                             "ARM exception vectors restored at PA 0x%08X (VA 0x16100 mapping%s, "
-                             "%zu bytes) (development substitution)",
-                             pa, mapped ? "" : " not readable - using the measured fallback",
-                             kbl_vectors_.size());
-                add_milestone("ARM exception vectors restored at PA 0x" + hex(pa, 8) +
-                              " (development substitution)");
+                // SKBL's runtime page, when it exists and lives somewhere else.
+                const u32 runtime_page = 0x40000100u;
+                if (pa != runtime_page && arm_bus_->read32(runtime_page) != 0u &&
+                    kbl_vector_mirrors_ < 8u) {
+                    bool copied = false;
+                    for (u32 i = 0; i < 0x100u; ++i) {
+                        const u8 byte = arm_bus_->read8(runtime_page + i);
+                        if (byte != 0u) copied = true;
+                        arm_bus_->write8(pa + i, byte);
+                    }
+                    if (copied) {
+                        ++kbl_vector_mirrors_;
+                        ZLB_LOG_INFO("machine",
+                                     "SKBL vector page mirrored to PA 0x%08X (MMU-off monitor "
+                                     "fetch at MVBAR 0x16140) (development substitution)",
+                                     pa);
+                        add_milestone("SKBL vector page mirrored to PA 0x" + hex(pa, 8) +
+                                      " (development substitution)");
+                    }
+                }
             }
         }
         return false;    // the instruction still has to run

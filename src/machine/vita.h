@@ -448,6 +448,9 @@ private:
     /// (round 94).
     std::vector<u8> kbl_vectors_;
     bool kbl_vectors_restored_ = false;
+    /// Round 163: how often SKBL's runtime vector page was mirrored into the low
+    /// boot page, which is where the MMU-off monitor fetch (MVBAR 0x16140) reads.
+    u32 kbl_vector_mirrors_ = 0;
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
     /// loader's service entry point (0x5FF00) that the second loader calls at the

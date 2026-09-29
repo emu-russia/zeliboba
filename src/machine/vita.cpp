@@ -122,7 +122,7 @@ void Vita::build_buses() {
     cmep_bus_->add_ram("cmep_ram", 0x20000, cmep::kRamBase, "CMeP RAM / first loader window (128 KiB)");
     cmep_bus_->add_ram_alias("cmep_priv", cmep::kPrivateBase, cmep::kPrivateSize, cmep_priv_.data(),
                              "CMeP private RAM (128 KiB SRAM + secure kernel)");
-    cmep_bus_->add_ram_alias("cmep_dram", kermit::kScuBase, kermit::kScuSize, dram_.data(),
+    cmep_bus_->add_ram_alias("cmep_dram", kermit::kDramWindowBase, kermit::kScuSize, dram_.data(),
                              "main DRAM seen by the CMeP (ADMA2 table, kernel staging)");
     build_shared_windows();
 
@@ -138,8 +138,11 @@ void Vita::build_buses() {
                             "MeP boot window (mirror of CMeP SRAM 0x00800000)");
     // The kernel boot loader runs with the MMU off and is linked at 0x40020000,
     // so 0x40000000 is the physical DRAM window; it is also where the kernel
-    // modules are mapped through 0x80000000 later on.
-    arm_bus_->add_ram_alias("arm_priv", kermit::kScuBase, kermit::kScuSize, dram_.data(),
+    // modules are mapped through 0x80000000 later on.  Round 162: the MPCore
+    // peripheral block no longer shadows this window (see kermit::kScuBase) - the
+    // KBL keeps its exception/monitor vector page at PA 0x40000100 and the monitor
+    // table at PA 0x40000140.
+    arm_bus_->add_ram_alias("arm_priv", kermit::kDramWindowBase, kermit::kScuSize, dram_.data(),
                             "physical DRAM window (kernel boot loader and kernel image)");
     arm_bus_->add_ram("arm_dram", 0x04000000, kermit::kDramBase, "main DRAM (64 MiB module window)");
     // Round 142: the KBL maps VA 0x1C000000 identity onto the 2 MiB Scratchpad SRAM
