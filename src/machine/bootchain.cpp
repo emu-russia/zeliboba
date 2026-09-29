@@ -1267,17 +1267,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         const char* value = std::getenv("ZLB_NSKBL_LOG_CALLS");
         return value != nullptr && value[0] != '0';
     }();
-    if (log_calls && pc == 0x51011B5Cu && core < static_cast<u32>(kArmCoreCount)) {
+    // Diagnostic (round 177/178): the printf core is 0x51011078.  Hooking its entry and
+    // dumping the caller's stack names the chain that reports the allocation failures
+    // (`format = 0x5102889C`), which is where the NULL heap comes from.
+    if (log_calls && pc == 0x51011078u && core < static_cast<u32>(kArmCoreCount)) {
         static u32 logged = 0;
-        if (logged < 120u) {
-            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 fmt = static_cast<u32>(arm->r[1]);
+            // Round 177: log every logger call (no format filter) and remember the last
+            // few, so the late, repeated calls - the allocation-failure reports - can be
+            // told apart from the boot banner.
+            if (logged < 40u || (fmt >= 0x51028800u && fmt < 0x51028A00u && logged < 200u)) {
                 ++logged;
+                const u32 sp = static_cast<u32>(arm->r[13]);
+                u32 words[6] = {0, 0, 0, 0, 0, 0};
+                for (u32 i = 0; i < 6u; ++i) {
+                    words[i] = arm_bus().read32(sp + i * 4u);
+                }
                 ZLB_LOG_INFO("machine",
-                             "logger call arm%u from 0x%08X: r0=0x%08X r1=0x%08X (format) "
-                             "r2=0x%08X r3=0x%08X",
-                             core, previous_pc, static_cast<u32>(arm->r[0]),
-                             static_cast<u32>(arm->r[1]), static_cast<u32>(arm->r[2]),
-                             static_cast<u32>(arm->r[3]));
+                             "alloc-report arm%u from 0x%08X: r0=0x%08X format=0x%08X "
+                             "r2=0x%08X r3=0x%08X lr=0x%08X sp=0x%08X stack=[%08X %08X "
+                             "%08X %08X %08X %08X]",
+                             core, previous_pc, static_cast<u32>(arm->r[0]), fmt,
+                             static_cast<u32>(arm->r[2]), static_cast<u32>(arm->r[3]),
+                             static_cast<u32>(arm->r[14]), sp, words[0], words[1], words[2],
+                             words[3], words[4], words[5]);
             }
         }
     }
