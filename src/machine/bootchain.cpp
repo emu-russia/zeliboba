@@ -1340,6 +1340,39 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // Diagnostic (round 177/178): the printf core is 0x51011078.  Hooking its entry and
     // dumping the caller's stack names the chain that reports the allocation failures
     // (`format = 0x5102889C`), which is where the NULL heap comes from.
+    // Diagnostic (round 182): NSKBL reports its progress through the printf core
+    // 0x51011078 (format in r1).  Logging every *distinct* format once gives the
+    // complete list of messages the model's run produces - and, by omission, shows
+    // which part of the firmware's output never happens.  ZLB_NSKBL_MSG=1 enables it.
+    static const bool log_messages = [] {
+        const char* value = std::getenv("ZLB_NSKBL_MSG");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (log_messages && pc == 0x51011078u && core < static_cast<u32>(kArmCoreCount)) {
+        static u32 seen[96];
+        static u32 seen_count = 0;
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 fmt = static_cast<u32>(arm->r[1]);
+            bool known = false;
+            for (u32 i = 0; i < seen_count && !known; ++i) {
+                known = seen[i] == fmt;
+            }
+            if (!known && seen_count < 96u) {
+                seen[seen_count++] = fmt;
+                const u32 sp = static_cast<u32>(arm->r[13]);
+                u32 words[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (u32 i = 0; i < 8u; ++i) {
+                    words[i] = arm_bus().read32(sp + i * 4u);
+                }
+                ZLB_LOG_INFO("machine",
+                             "NSKBL message #%u arm%u from 0x%08X format=0x%08X sp=0x%08X "
+                             "stack=[%08X %08X %08X %08X %08X %08X %08X %08X]",
+                             seen_count, core, previous_pc, fmt, sp, words[0], words[1],
+                             words[2], words[3], words[4], words[5], words[6], words[7]);
+            }
+        }
+    }
+
     if (log_calls && pc == 0x51011078u && core < static_cast<u32>(kArmCoreCount)) {
         static u32 logged = 0;
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
