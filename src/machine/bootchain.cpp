@@ -1082,6 +1082,49 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // builders (the never-executed pages 0x51007000-0x51009000) do not run at all, so the
     // faithful state is the unsubstituted one.
 
+    // Substitution (round 169): the flow leaves the normal list/allocator path for the
+    // device-open block at 0x5100B58A because the pool object the model supplies is
+    // empty.  Measured (ZLB_KBL_TRACE_PC=0x5100B638): the block is entered from
+    // 0x5100B58A, which is `bls 0x5100B638` after
+    //
+    //   5100B57C  ldrh r1,[r4,#0x30]      ; free slots
+    //   5100B57E  ldrh r3,[r4,#0x32]      ; used slots
+    //   5100B586  cmp  r1,r3
+    //   5100B58A  bls  0x5100B638         ; "no room" -> device-open -> fatal()
+    //
+    // with r4 = 0x01100000, the arena page handed out by ZLB_NSKBL_POOL, whose counters
+    // are both zero (0 <= 0).  NSKBL's own pool builder (the never-executed pages
+    // 0x51007000-0x51009000) would have filled them.  Give the empty pool one free slot
+    // so the normal path runs; ZLB_NSKBL_POOLFIX=0 and ZLB_NO_SUBSTITUTION=1 disable it.
+    static const bool pool_fix = [] {
+        const char* value = std::getenv("ZLB_NSKBL_POOLFIX");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (pool_fix && pc == 0x5100B57Cu && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 obj = static_cast<u32>(arm->r[4]);
+            std::string fault;
+            u32 pa = 0;
+            if (obj >= kInstanceArenaVa && obj < kInstanceArenaVa + kInstanceArenaSize &&
+                arm->translate(obj + 0x30u, true, false, pa, fault) &&
+                arm_bus_->read16(pa) == 0u && arm_bus_->read16(pa + 2u) == 0u) {
+                arm_bus_->write16(pa, 4u);                      // free slots
+                arm_bus_->write16(pa + 2u, 0u);                 // used slots
+                arm_bus_->write32(pa + 4u, obj + 0x100u);       // pointer array
+                arm_bus_->write32(pa + 0x1Cu, obj + 0x200u);    // second pointer array
+                ++boot_pc_fixes_;
+                if (nskbl_pool_fixes_ < 8u) {
+                    ++nskbl_pool_fixes_;
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL pool 0x%08X given one free slot before the 0x5100B58A "
+                                 "check (development substitution)", obj);
+                    add_milestone("NSKBL pool seeded (development substitution)");
+                }
+            }
+        }
+    }
+
     // Substitution (round 166): NSKBL's object constructor 0x5100B41C is handed the
     // pool/container for the requested size class, which the getter 0x5100B6E4 reads
     // from the map object (`[[0x5113B5AC] + 0x5C/0x64/0x6C]` for types 20/40/80).  The

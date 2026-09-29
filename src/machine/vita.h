@@ -483,6 +483,8 @@ private:
     /// NULL (the map object's container fields are empty in the model).
     u32 nskbl_pool_next_ = 0;
     u32 nskbl_pool_supplies_ = 0;
+    /// Round 169: pool headers seeded with one free slot (ZLB_NSKBL_POOLFIX).
+    u32 nskbl_pool_fixes_ = 0;
     /// Round 167: map-object container slots handed out by the model.
 
     /// CMeP pre-instruction hook, installed on the MeP core: intercepts the first
