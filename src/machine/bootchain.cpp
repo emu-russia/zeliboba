@@ -1258,6 +1258,30 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
+    // Diagnostic (round 176): NSKBL's printf-style logger at 0x51011B5C is called from
+    // fourteen places, and the caller that passes the allocation-failure format is the
+    // wrapper around sceKernelAllocHeapMemory - which is where the NULL heap comes from
+    // (docs/NSKBL.md 8.16-8.20).  ZLB_NSKBL_LOG_CALLS=1 logs each call with its caller
+    // and the format pointer so that wrapper can be named without a breakpoint session.
+    static const bool log_calls = [] {
+        const char* value = std::getenv("ZLB_NSKBL_LOG_CALLS");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (log_calls && pc == 0x51011B5Cu && core < static_cast<u32>(kArmCoreCount)) {
+        static u32 logged = 0;
+        if (logged < 120u) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ++logged;
+                ZLB_LOG_INFO("machine",
+                             "logger call arm%u from 0x%08X: r0=0x%08X r1=0x%08X (format) "
+                             "r2=0x%08X r3=0x%08X",
+                             core, previous_pc, static_cast<u32>(arm->r[0]),
+                             static_cast<u32>(arm->r[1]), static_cast<u32>(arm->r[2]),
+                             static_cast<u32>(arm->r[3]));
+            }
+        }
+    }
+
     // Diagnostic (round 164): the KBL's *secondary* cores die by jumping to the zero
     // page (pc == 0) and then walking the low window until they fetch open bus.  The
     // instruction that sends them there is what has to be named, and
