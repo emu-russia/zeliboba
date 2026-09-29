@@ -61,3 +61,48 @@ GPU имеет смысл начинать только после того, к�
 загружается и запускает модули: иначе нечего отрисовывать. Поэтому текущий
 порядок — сначала `docs/BOOT.md` до стадии `kernel-running`, затем Venezia,
 затем GPU.
+
+## Состояние дисплейной части (раунд 167)
+
+Проверено фактическим прогоном:
+
+```
+zeliboba_ui --screenshot C:\Work\PSVita\_scratch\panel.bmp --screenshot-tab panel --run 600000 -q
+=>  screenshot written: ...panel.bmp (1280x720)
+```
+
+Вкладка **Panel** рисуется (скриншот 1280×720, проверен визуально) и честно
+сообщает состояние:
+
+> «no framebuffer yet — the kernel has not reached the display driver, so the
+> Kermit display controller (0xE2100000, 960x544 panel) has not been programmed.
+> The panel appears here as soon as the kernel publishes a buffer; RGB565 and
+> RGBA8888 are both supported.»
+
+То есть путь «контроллер дисплея → кадр → Panel» в модели **уже работает** и
+ждёт только программирования регистров со стороны ядра; подпись внизу панели —
+`panel: emulated display output; RGB565/RGBA8888 detected from stride`. Скриншот
+этого состояния: `_scratch/panel.png`.
+
+Карта регистров в `src/hw/soc/display.cpp` помечена как **ASSUMPTION**
+(`display.elf`/`oled.elf` её не дали). Что дал разбор прошивки в этом раунде:
+
+* `display.elf` (`fs_dec/os0/kd/display.elf`) **не обращается к MMIO вообще** —
+  ни одного литерала в `0xE2000000-0xE3000000` и ни одной `movw/movt`-пары с
+  таким адресом. Модули `os0` вообще работают с железом через сервисы ядра:
+  сканер, который считает базу «использованной» только если константу в
+  ближайших инструкциях реально берут как базу для `ldr/str`, по всему
+  `fs_dec/os0` нашёл лишь `wlanbt_robin_img_ax.elf` (`0xE0252000`,
+  `0xE0580000`) и `safemode.elf` (`0xE2010000`, `0xE36D0000`);
+* зато литерал **`0xE2100000` действительно есть в `safemode.elf`** (VA
+  `0x8120E5F8`) — то есть «безопасный режим» программирует дисплей напрямую, и
+  это лучший источник настоящей карты регистров. Прямой `ldr [pc,…]` на этот
+  литерал сканер не нашёл, значит ссылка идёт через ARM-код или через таблицу
+  дескрипторов — следующий шаг по дисплею: разобрать `safemode.elf` вокруг
+  `0x8120E5F8` (в `tools/` уже есть `zdis`, а `_scratch/dump_base_users.py`
+  печатает загрузчики литералов) и уточнить `display.cpp`.
+
+Инструменты этого раунда: `ZLB_ARM_COV=1` + `cov`/`cov save` (карта покрытия ARM
+по 2 байта на бит) и `_scratch/scan_missed.py` (пропущенные рёбра потока
+управления) — ими проверено, что внутри Thumb-кода NSKBL **нет** пропущенных
+вызовов и прогон детерминирован.
