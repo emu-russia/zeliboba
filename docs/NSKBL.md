@@ -5704,3 +5704,22 @@ Finally, a caution for the next round: several breakpoints inside that block (`0
 (`0x803FF007` / `0x8009000A`), which cannot be the constructor's first pass.  Either the block
 is re-entered late in the run or those breakpoints land on a different execution; that has to
 be resolved before any further conclusion is drawn from breakpoints inside `0x51023C40..0x51023F00`.
+
+The order of the key points, measured with four breakpoints and consecutive continues, is
+unambiguous and says the write *is* part of the constructor's own pass:
+
+```
+[stop] arm0 breakpoint at 0x51023C40   ; the volume constructor entry
+[stop] arm0 breakpoint at 0x51023E86   ; the write of [vol+0x30] (the 0x0A720290 value)
+[stop] arm0 breakpoint at 0x51023938   ; the lookup reads [vol+0x30] and uses it as the buffer
+```
+
+so `[vol+0x30]` is produced by the constructor itself (through the `cmp r0, #2` branch at
+`0x51023DE0` that reads `[sb+0x24]`/`[sb+0x2c]` from the raw structure) and consumed by the
+lookup afterwards.  Combined with the volume dump above, the mismatch is now stated precisely:
+the driver's parse produces the FAT size at `[vol+0x24] = 19`, the geometry wants the FAT size
+and the root-directory base at `[sb+0x24]`/`[sb+0x2c]` of the *sector buffer* (which still holds
+the raw BPB bytes there), and `r0 = 95/32 = 2` at `0x51023DE0` selects exactly that branch - so
+the classification the branch depends on (the value the constructor computes from the boot
+sector before the division) is the thing to measure next, together with what writes
+`[sb+0x24]`/`[sb+0x2c]` on hardware if the branch is meant to read derived values.
