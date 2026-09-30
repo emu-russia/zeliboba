@@ -6971,3 +6971,38 @@ Next: find why the KBL stops at checkpoint `0x8E` (what the guest asked the secu
 before `0x400219E0`, and what `0x40036998` is told), and decide how much of the GIC bring-up
 (`ICDDCR`/`ISENABLER`/`ICCICR`/`ICCPMR`) the model should default to "as the secure world left it"
 instead of requiring guest writes that never come.
+
+### 10.48 The "secure world left it enabled" policy measured *worse* than strict - and 10.47's "3 reads" was an artifact
+
+The policy of 10.47 was made the default, then measured against the strict behaviour.  It lost:
+
+| mode | eMMC reads | GPO checkpoints | end state |
+|---|---|---|---|
+| **strict** (only guest-written enables count) | **22** | **113**, including NSKBL's `0xA2` and `0xA9` | arm0 `51000D0C` (the old terminal loop) |
+| secure-world-enables assumed | 19 | 51, **no A-series** | arm0 `400219E8` (KBL checkpoint `0x8E` halt), arm1-3 in the KBL's ARM-mode `wfe` helper (`0x4003A01C`, the `bx lr` after `wfe`) |
+
+So assuming the enables does not unblock the boot - it *loses* NSKBL's own checkpoints and ends with
+the secure side halted.  The policy is therefore **off by default**; it stays available as
+`ZLB_GIC_CPUIF=1` (and `ZLB_GIC_STRICT=1` forces the strict behaviour).
+
+**Correction to 10.47.**  Its "3 -> 19 reads" is wrong: the earlier "3 reads" figures came from runs
+that had breakpoints set, which stop the run at the first hit and therefore end it early.  A clean
+default run has always performed about 22 reads.  The storage reads are not interrupt-driven at all -
+they happen with the controller left completely unprogrammed - so the interrupt work of 10.45-10.47
+did *not* unblock storage.
+
+What stays from this stretch are the two genuine fixes, both correct and both currently inert (nothing
+enables the controller, so no line is ever asserted):
+
+* `Gic::refresh_line()` is now called when a device asserts its level (`kermit.cpp`), which is what
+  makes the CPU line mean anything at all;
+* the GIC is finally given a CPU (`kermit_set_cpu(*arm_bus_, arm_)`, which had no callers), without
+  which `refresh_line()` computed the line and dropped it.
+
+The policy is now machine-scoped rather than global (`Vita` -> `kermit_set_secure_world_left_enabled`
+-> `Gic::set_secure_world_left_enabled` -> the distributor), so a bare GIC in a unit test keeps strict
+hardware semantics - `test_soc.cpp:179` (which asserts `!kermit_irq_line`) passes again.
+
+Next: map the 22 reads (`lba=512` many times, `704`, `612`, `614`, `615`, `0`, `24576`, `25071` twice,
+`25072 count=7`) onto the eMMC image's files, to see how far the `os0` lookup actually got and whether
+`psp2bootconfig.skprx` is among the sectors read - the direct progress measure for the objective.

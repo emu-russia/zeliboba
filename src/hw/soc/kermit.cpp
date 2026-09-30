@@ -576,6 +576,10 @@ void kermit_set_cpu(Bus& bus, Cpu* cpu) {
     if (kermit::Gic* gic = find_gic(bus)) gic->set_cpu(cpu);
 }
 
+void kermit_set_secure_world_left_enabled(Bus& bus, bool value) {
+    if (kermit::Gic* gic = find_gic(bus)) gic->set_secure_world_left_enabled(value);
+}
+
 bool kermit_irq_line(const Bus& bus) {
     const kermit::Gic* gic = find_gic(bus);
     if (gic == nullptr) return false;

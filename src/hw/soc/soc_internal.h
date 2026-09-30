@@ -167,6 +167,11 @@ class Cpu;
 /// this looks the interrupt controller up by name, so it works without touching
 /// a private member of KermitBlock (hw/soc.h cannot be modified).
 void kermit_set_cpu(Bus& bus, Cpu* cpu);
+/// Round 343: tell the controller that the stages before the ARM are staged by the
+/// machine as substitutions which reproduce their checkpoints but not their register
+/// programming, so the enables they would have left in place are assumed present.
+/// The machine (Vita) turns this on; a bare GIC keeps the strict behaviour.
+void kermit_set_secure_world_left_enabled(Bus& bus, bool value);
 /// Current state of the CPU's IRQ input line (IrqLine::Irq, i.e. line 0), or
 /// false when the block is not installed.
 bool kermit_irq_line(const Bus& bus);
@@ -322,6 +327,12 @@ public:
     void end_of_interrupt(u32 core, u32 id);
     u32 pending_count() const;
     void set_default_priority(u32 id, u8 value);
+    /// Round 343: when true, an interrupt a device actually raised counts as enabled
+    /// even though no guest ever wrote the enable.  The Vita's secure stages are
+    /// staged by substitutions that reproduce their checkpoints ("secure world
+    /// interrupts registered", GPO 0x82) without running their register programming,
+    /// so the machine turns this on; a bare GIC keeps the strict hardware behaviour.
+    void set_secure_world_left_enabled(bool value) { secure_world_left_enabled_ = value; }
     /// Consume `ticks` from every pending pulse counter. Returns true when any
     /// line was deasserted as a result.
     bool tick_pulses(u64 ticks);
@@ -338,6 +349,7 @@ private:
     std::vector<bool> sampled_;    ///< last sampled level for edge detection
     std::vector<bool> pending_after_eoi_;  ///< an edge arrived while active
     std::vector<u8> priority_;
+    bool secure_world_left_enabled_ = false;
     std::vector<u8> targets_;
     std::vector<u32> pulse_left_;
 };
@@ -372,6 +384,13 @@ public:
     /// Connect a core: the IRQ line is asserted/deasserted through
     /// Cpu::set_irq(IrqLine::Irq) and the current state is applied immediately.
     void set_cpu(Cpu* cpu);
+
+    /// Round 343: forward the machine's "the secure world left the controller
+    /// enabled" policy to the distributor and use it for the CPU interface too.
+    void set_secure_world_left_enabled(bool value) {
+        secure_world_left_enabled_ = value;
+        distributor_->set_secure_world_left_enabled(value);
+    }
     bool line() const { return line_; }
     /// Re-evaluate the IRQ line and notify the CPU when it changed.
     void refresh_line();
@@ -384,6 +403,7 @@ private:
     std::function<void(bool)> line_callback_;
     Cpu* cpu_ = nullptr;
     bool line_ = false;
+    bool secure_world_left_enabled_ = false;
 };
 
 // ---------------------------------------------------------------------------

@@ -40,20 +40,25 @@ constexpr u32 kIcdIPpidr = 0xD00;     // PPI status: bit set == level high
 
 constexpr u32 kSpurious = 1023;
 
-// Round 340 diagnostic: nothing in the guest ever writes the GIC, so both the
-// distributor's ICDDCR enable and the CPU interface's ICCICR/ICCPMR stay zero and
-// the CPU line can never be asserted (highest_pending() needs ICDDCR bit 0, and
-// Gic::refresh_line() needs ICCICR bit 0 plus a priority passing ICCPMR).  NSKBL
-// still reaches its "interrupts registered" checkpoint (GPO A2), which suggests the
-// secure world this model only partly stages leaves the controller enabled before
-// handing over.  ZLB_GIC_CPUIF=1 models that: the distributor and the CPU interface
-// count as enabled.  The default keeps the measured behaviour.
-bool gic_left_enabled_by_secure_world() {
-    static const bool forced = [] {
+// Round 343: the policy itself is set by the machine (`Gic::set_secure_world_left_enabled`,
+// which the Vita turns on because its secure stages are staged by substitutions that
+// reproduce their checkpoints - "secure world interrupts registered", GPO 0x82 -
+// without running their register programming).  These two environment variables
+// remain for experiments: ZLB_GIC_STRICT=1 (or ZLB_GIC_CPUIF=0) forces the strict
+// hardware behaviour, ZLB_GIC_CPUIF=1 forces the substitution.  Measured effect of
+// the policy on the Vita: NSKBL's storage stack goes from 3 to 19 eMMC reads
+// including real file data (docs/NSKBL.md 10.47/10.48).
+bool gic_effective_left_enabled(bool configured) {
+    static const int override = [] {
+        const char* strict = std::getenv("ZLB_GIC_STRICT");
+        if (strict != nullptr && strict[0] != '0') return 0;
         const char* value = std::getenv("ZLB_GIC_CPUIF");
-        return value != nullptr && value[0] == '1';
+        if (value != nullptr && value[0] == '0') return 0;
+        if (value != nullptr && value[0] == '1') return 1;
+        return -1;
     }();
-    return forced;
+    if (override >= 0) return override == 1;
+    return configured;
 }
 
 constexpr u32 kIccIcr = 0x000;
@@ -287,7 +292,7 @@ bool GicDistributor::line_asserted(u32 core, u8 priority_mask) const {
 }
 
 u32 GicDistributor::highest_pending(u32 core, u8 priority_mask) const {
-    if ((peek(kIcdDcr) & 1) == 0 && !gic_left_enabled_by_secure_world()) return kSpurious;
+    if ((peek(kIcdDcr) & 1) == 0 && !gic_effective_left_enabled(secure_world_left_enabled_)) return kSpurious;
 
     u32 best = kSpurious;
     u8 best_priority = 0xFF;
@@ -295,7 +300,7 @@ u32 GicDistributor::highest_pending(u32 core, u8 priority_mask) const {
     for (u32 id = 0; id < max_irq_; ++id) {
         if (!pending_[id]) continue;
         if (active_[id]) continue;  // already being serviced
-        if (!enabled_[id] && !gic_left_enabled_by_secure_world()) continue;
+        if (!enabled_[id] && !(gic_effective_left_enabled(secure_world_left_enabled_) && pending_[id])) continue;
         if (id >= 32) {
             const u8 target = targets_[id];
             if ((target & (1u << core)) == 0) continue;
@@ -615,7 +620,7 @@ void Gic::refresh_line() {
     // presumably left enabled by the secure world this model only partly stages.
     // This knob treats it as enabled so the effect can be measured; the default
     // behaviour is unchanged.
-    static const bool cpuif_forced = gic_left_enabled_by_secure_world();
+    const bool cpuif_forced = gic_effective_left_enabled(secure_world_left_enabled_);
     const bool cpuif_enabled = (cpu_interface_->peek(kIccIcr) & 1u) != 0u || cpuif_forced;
     // ICCPMR is likewise never written (it reads back 0, which masks every
     // priority), so the forced path also has to open the priority mask.

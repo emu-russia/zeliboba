@@ -274,6 +274,16 @@ void Vita::build_cores() {
     // (see gic.cpp), so core 0 is the one to attach; a run that never enables the
     // controller is unaffected.
     if (arm_ != nullptr) kermit_set_cpu(*arm_bus_, arm_);
+    // Round 344: the "the secure world left the controller enabled" policy is NOT
+    // turned on by default.  It was measured against the strict behaviour and lost:
+    // strict completes 22 eMMC reads and keeps NSKBL's own checkpoints through A9,
+    // while assuming the enables (which is what the substitution of round 343 did)
+    // drops to 19 reads, skips the whole NSKBL A-series and ends with the secure side
+    // halting at KBL checkpoint 0x8E.  The two fixes that made interrupts possible at
+    // all stay - Gic::refresh_line() on a device assertion (kermit.cpp) and the GIC
+    // actually being given a CPU (above) - but nothing enables the controller, so a
+    // default run is unchanged.  ZLB_GIC_CPUIF=1 still forces the policy on and
+    // ZLB_GIC_STRICT=1 forces it off, for experiments.
 
     syscon_ = ernie_->cpu();
     if (syscon_) syscon_->name = "Ernie";
