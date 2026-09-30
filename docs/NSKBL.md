@@ -7666,3 +7666,33 @@ callback the driver *does* store in its requests) gets registered, and who is me
 `[device + 0x24A0]` - or decide that, like the partition page cache and the class table at VA 0x400B0000
 ("development substitution" in the boot log), this low-window device structure is another one the model
 should supply.
+
+### 10.67 The device at VA 0x240 is a *second*, service-like storage interface - and nothing ever fills it
+
+Two more measurements narrow what that structure is.
+
+**The driver only ever reads it.**  Scanning the image for the offsets it uses, `#0x2440` appears once
+(`0x5101D668 add.w r6,r0,#0x2440`) and `#0x2480` twenty-six times, all in the driver's own code
+(`0x5101DAB6`, `0x5101DB8A`, `0x5101DFC2`, `0x5101DFCE`, `0x51022502`, `0x5102311A`, ...) and all as
+`add.w rX,rY,#0x2480` - bases for reads.  Combined with the traps of 10.66 (zero writes to the device's
+first page in a whole run; only zero-clears from the lock initialiser on the callback page), the
+structure is **never populated by anyone**, so any submission through it must execute `blx 0`.
+
+**That makes it a different device from the working path.**  The cache fills that *do* work go through
+the ADMA path, whose commands are written straight into the SDIF (`0x51022664`/`0x5102267A`, 10.42) with
+the card doing the DMA into guest memory.  The file-read path instead hands its request to the low-window
+device at VA 0x240 and expects a dispatch entry there to start the transfer.  Two different interfaces
+for two different operations, and only the direct one is modelled.
+
+This also fits the earlier observation that the CMeP never reads any of the ARM's structures (10.40):
+if VA 0x240 is a *service* interface - the ARM asking something else to perform the I/O - then in this
+model there is nothing on the other side of it, which is exactly what "0 writes, empty dispatch, `blx 0`"
+looks like.
+
+Next: decide the shape of the missing service.  The two candidates are a model-side low-window
+substitution (the pattern already used for the partition page cache and the class table at
+VA 0x400B0000, which would have to point the dispatch entry at a routine that performs the transfer) and
+a genuinely missing guest/FW stage that installs that table.  Distinguishing them needs the *intended*
+dispatch target, so the next measurement is to find what a working transfer does differently - in
+particular whether the ADMA path's command writer (`0x51022664`) is reachable from the walk's request
+record, which would tell whether the same routine was meant to sit in the table.
