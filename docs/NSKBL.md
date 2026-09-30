@@ -5752,3 +5752,42 @@ So the next measurements are: the full body of `0x51000D54` (what it does with
 `(ctx, window offset, length, out)` - it may read *through* the driver's cache rather than into
 the address it is given) and who is supposed to install the `0x0A72xxxx` window mapping before
 the lookup uses it.
+
+### 10.20 The method is a cache lookup, and the cache already holds both sectors
+
+The full body of `0x51000D54` settles it - it is not a device read at all, it is the driver's
+**cache lookup**:
+
+```
+51000D58  r6 = r1 & 0x1F                 ; offset inside the unit
+51000D5E  r7 = r2                        ; length (in units)
+51000D66  r4 = r1 & ~0x1F                ; the address, 32-byte aligned: the cache KEY
+51000D6A  bhi 0x51000E60                 ; (r2 + (r1 & 0x1F)) > 0x20 -> error
+51000D6C  r5 = 0x5102B020 ; ++[r5]       ; a global counter (LRU clock)
+51000D98  ; loop over the cache table at 0x51033100, comparing the entry tags
+51000D9E  sl = [entry + 4]  /  sb = [entry2 + 0xC]   with r4
+51000DB8  ; hit: build the cache address, then
+51000DD0  r1 = cache_line + (offset << 9)
+51000DD2  blx 0x51011C80                 ; copy from the cache to (r0 = the caller's out)
+51000DDC  ; 32 entries without a match -> the miss path
+```
+
+and the cache itself is visible in memory.  Its table starts at `0x51033100` with
+0x4008-byte entries `{+0 = state, +4 = tag, +8.. = 0x4000 bytes of data}`:
+
+| address | contents |
+|---|---|
+| `0x51033100` | entry 0: `+0 = 2`, `+4 = 0` (tag), `+8..` = the eMMC **master block** (`Sony Computer Entertainment Inc.`, version 3, 0x71A000 blocks) |
+| `0x51037108` | entry 1: data at `+8` = `0x51037110` = the **os0 boot sector** (`EB FE 90 SCEI`, 512/8/2/512, FAT size 19) |
+| `0x5103B120` | entry 2: zero (empty) |
+
+So the driver's cache *works*: measured at the lookup's own read call
+(`bp arm 0x51023962`) both lines are already filled - the master block and the boot sector were
+read *before* the lookup runs.  The lookup then asks the cache for the address
+`[sp+0x48] = 0x0A720290` (a value computed from the volume's geometry), the tag comparison
+fails (the address is derived from the raw BPB bytes), the miss path runs and the lookup
+returns 0 - which the path helper turns into "not found" and the caller into `0x803FF007`.
+
+That narrows the whole os0 blocker to one number: **the address the lookup passes to the cache**
+must be one the driver has cached (or will cache) - for a FAT16 root directory it should be the
+root directory's sector - and in the model it is the raw-label-derived `0x0A720290`.
