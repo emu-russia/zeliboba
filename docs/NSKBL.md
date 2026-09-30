@@ -7831,3 +7831,45 @@ with the mapping the CPU is actually using at that moment (the same discrepancy 
 per-page `vmem` surprises of 10.61/10.65 - `VA 0x2670 -> PA 0x40301670` while `VA 0x2640 -> PA
 0x40301640`).  Until the hook writes memory the CPU will read, no substitution for this structure can
 take effect, so that translation path is what to fix next.
+
+### 10.71 Correction: the substitution *does* take effect - and the driver polls with *two* waits
+
+**The translation is fine; the first conclusion was wrong.**  A control run settles it.  Breaking on the
+request-error path (`0x510205D4`) *without* the substitution gives `R0 = 0`, `R4 = 0x5117CB00`,
+`R5 = 0x240`, `R6 = 0`; *with* it gives `R6 = 0x300` - the node the substitution put on the device's list
+(VA 0x2640).  So the hook's writes do reach the memory the CPU reads, and the pop really does return the
+substituted node.
+
+**There are two waits per request, with different lists:**
+
+| wait | object (`r4`) | device (`r5 = [r4]`) | list popped | outcome |
+|---|---|---|---|---|
+| 1 | `0x51183948` (the handle) | `0x5117CB00` (the request) | `0x5117EF00` (the driver's pool) | succeeds - returns e.g. `0x5117D400` |
+| 2 | `0x5117CB00` (the request) | **`0x240`** (the hard-wired device) | **`0x2640`** (the device's list) | empty -> `0x510205D4` -> `0x80320011` |
+
+The request object's first field *is* the device address (`[0x5117CB00] = 0x00000240`), which is what
+makes wait 2 address `0x2640`; the handle's first field is the request, which is why wait 1 addresses the
+driver's own pool.  Both come from the same `bl 0x5101F9BC` - one instruction, two lists.
+
+**And a bare node is not enough.**  With the substitution the first poll of wait 2 succeeds (`r6 =
+0x300`), but the driver keeps polling - `0x5101F9BC` is called again - and the second poll finds the list
+empty and takes `beq.w 0x510205D4`.  `0x510205D4` has exactly one branch into it in the whole image
+(`0x5101FE98`, verified by scan), so the error is that empty poll.  Supplying one node per entry into the
+wait therefore does not unblock the boot: the driver wants a *completed transfer*, not a placeholder.
+
+Next: produce a real completion.  That needs the transfer's parameters, so the immediate measurement is
+to dump the request (`0x5117CB00`) and the handle (`0x51183948`) at the moment wait 2 polls, and compare
+them with what the *working* volume path passes to the SDIF command writer - the fields that differ name
+the LBA/buffer/size the model must use to perform the read and then hand the driver a finished request.
+
+Field dump taken at wait 1's poll (`0x5101FE90`), for reference:
+
+```
+5117CB00  40 02 00 00 | 42 00 00 80 | 01 00 00 00 | 80 00 00 40     <- [0]=0x240 (the device)
+5117CB10  00 80 FF C0 | 00 ...                                      <- flags/range fields
+5117CB60  40 CD 17 51 | ...        | 5D D6 01 51                    <- +0x60 pool link, +0x6C callback
+5117CB78  00 CB 17 51                                               <- +0x78 = self
+51183948  00 CB 17 51 | 01 00 00 00 | 00 02 00 00 | 00 00 00 00     <- the handle points at the request
+51183958  00 54 00 01 | 11 4D 42 47 | 48 1B 5A 03 | 33 71 30 00
+51183968  00 32 00 0E | D0 19 03 59 | 0F E3 FF FF | FF 1B 00 40
+```
