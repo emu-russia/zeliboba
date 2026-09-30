@@ -7486,3 +7486,34 @@ to implement, and the completion producer of 10.55/10.58 is still missing alongs
 Next: measure the window side properly - `vmem 0x20` for its mapping and value at the walk, and the
 object field it pairs with - then decide the mirror's exact shape with the corrected addresses
 (`[0x20]` on the window side, `object + 0x290 + slot*0x28` on the driver side).
+
+### 10.62 Correction: the low window is *live guest data*, and both compared bytes are aligned-pointer low bytes
+
+**The window byte at VA 0x20 is not hardware state.**  Breaking just after its load (`0x5101FD94`)
+gives `R0 = 0` with `R3 = 0`, and `vmem 0x20` resolves it to **PA 0x40300020** (ttbr0, the low-window
+rule `VA + 0x40300000`).  Dumping that memory shows a **pointer table**:
+
+```
+40300020  00 01 00 51 | 50 02 00 51 | 80 46 00 00 | 88 02 00 51
+          = 0x51000100, 0x51000250, 0x00004680, 0x51000288
+```
+
+so the guest writes it during the run - my 10.59/10.61 reading ("the window's bytes are hardware state
+the model lacks") is **withdrawn**.  The "the guest never writes the window" traps of 10.47/10.51 were
+simply aimed at the wrong addresses (`0x290`+, one slot past `0x20`).
+
+**And poking it is not a usable lever.**  `poke 0x40300020 255 8` reads back FF immediately, but by the
+time the walk runs the same memory holds the pointer table again - the guest rewrites it - and the walk
+still loads `R0 = 0`.
+
+**Both sides are aligned-pointer low bytes.**  The window side is the first byte of `0x51000100` (0x00)
+and the object side is the first byte of `0x5117CB00` (0x00).  Two aligned pointers always agree on
+their low byte, so as read the comparison can *never* differ and the submission branch would be
+unreachable - which cannot be the intent, so the operand derivation is still incomplete somewhere
+(either the loads are not the ones that decide, or a different field is compared in the cases that
+matter).
+
+Next: settle it over *many* comparisons rather than the first one - break at both loads
+(`0x5101FD90` and `0x5101FDA0`) across a full run and record the pairs of bytes, to find whether any pair
+ever differs - and trap writes on the window's real address (`PA 0x40300020-0x40300040`) to see who
+programs that table and when.
