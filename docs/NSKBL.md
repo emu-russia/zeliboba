@@ -5175,3 +5175,48 @@ Two candidate directions for the next round, in order of promise:
    start at mode 0/1/2; if the block context `0x5102B010` is supposed to open the mode-1
    (SD) device, then `[0x5102B010] = 0` in the ARZL-decoded image is the thing to explain -
    a write trap over `0x5102B000..0x5102B040` shows no writer for it after the decode.
+
+### 10.7 CMD5 is an SDIO-only command, and R1b needs its second event
+
+Answering CMD5 (the earlier `0xC0FF8000` guess) was wrong.  The driver's op-cond wrapper
+`0x51022DE4` retries while the answer is negative and `0x51023012` takes the `cbnz r0` error
+branch; only that branch reaches `0x51022ED8` (the relative-address/CID stage) and finally
+sets `[dev+0x2410] = 1`, the "identified" flag the open checks at `0x5102074A`.  With the
+answer the run took `0x51023034` (`tst r3,#0x8000000`), left `[dev+0x2410] = 3` and the open
+failed with **`0x80320017`** - which is what the measurement of `0x51000E94` showed.
+The card behind this controller is an eMMC, i.e. not SDIO, so `case 5` now reports a command
+timeout like the VHS-less CMD8.
+
+With that, NSKBL's driver runs a complete card identification.  The ARM's SD command trace
+(26 commands, `ZLB_SDIF_TRACE=1`):
+
+```
+CMD0, CMD8(0xAA) x5(timeout), CMD5(0) x4(timeout), CMD55 x5, CMD1(0x40000080),
+CMD2, CMD3(0x00010000), CMD9(0x00010000), CMD7(0x00010000), CMD6(0x03AF0100),
+CMD8(arg=0, data=1 - SEND_EXT_CSD), CMD16(0x200), CMD23(0x20 = 32 blocks)
+```
+
+and `[dev+0x2410]` (0x5117EF10) becomes **1**, so the open's "identified" check passes.
+
+The next command, CMD18 (READ_MULTIPLE_BLOCK), exposed the second gap: the request the
+engine waits on sits at `[dev+0x2428] = 0x5117D400` with `+0x08 = 0x12` (CMD18),
+`+0x0C = 0` (argument not yet written) and `+0x04 = 0` (no state), i.e. **queued but never
+issued**, while the engine polls the interrupt status at `0x5101EDE4` forever.  The last
+register writes before the park come from the transfer-start path and show what it had
+programmed: `0x2C = 0x8003`, `0x2C = 0x8007` (clock control) and `0x38 = 0xFB`
+(NORMAL_INT_SIGNAL_ENABLE).
+
+One model gap found on the way and fixed: an **R1b** command (response type "48 bit with
+busy", command-register bits 0..1 == 3 - CMD6 was `0x61B`) needs a *second* normal-interrupt
+event.  The driver's request engine completes a request only when another interrupt arrives
+after Command Complete (its status mapper `0x5101EBE4` returns early while bit 3 of the
+request's status word is set, which is exactly the R1b case), so CMD6 alone parked the open.
+With `transfer_complete_in_ = 8` for that response type the request's status word goes from
+`0x0000002B` to `0x8000002B` (bit 31 = done) and the driver moves on to the EXT_CSD read and
+the block-count/read setup.
+
+State after this round: the default run no longer stops cleanly at `0x51000D0C` - it parks
+inside the driver at `0x5101EDE4` waiting for the CMD18 data phase, which is *further* than
+the old `0x803FF007`, but it is a park.  Diagnostics: `ZLB_SDIF_TRACE`, `ZLB_EMMC_LOG`,
+`ZLB_WTRAP`/`ZLB_RTRAP` over `0xE0B00000..0xE0B00100`, `ZLB_ARM_TRACE_RANGE`, `bp`,
+`vmem` over the device state at `0x5117EF00` and the request slots at `0x5117Cxxx`.

@@ -243,12 +243,6 @@ u64 Sdif::read(u32 address, unsigned size) {
         return out;
     }
     const u64 value = RegisterBlock::read(address, size);
-    if (sdif_trace() && address >= base_ + kErrorIntStatus &&
-        address < base_ + kErrorIntStatus + 2) {
-        const u32 pc = dma_primary_ != nullptr ? dma_primary_->context.pc : 0;
-        std::fprintf(stderr, "[sdif] read ERROR_INT_STATUS -> 0x%04X arm_pc=%08X\n",
-                     static_cast<unsigned>(value & 0xFFFF), pc);
-    }
     return value;
 }
 
@@ -523,19 +517,20 @@ void Sdif::execute_command() {
                 respond_short(0x40FF8000u);  // ready, high capacity
             }
             break;
-        case 5:  // IO_SEND_OP_COND (the SDIO flavour of "op cond").
-            // Round 302 (measured): NSKBL's storage driver sends CMD0, CMD8(0x1AA)
-            // and then this command as its op-cond poll - the wrapper 0x51022DE4
-            // retries while the R4 answer is negative (`ldr r3,[sp,#0x18]` /
-            // `cmp r3,#0` / `blt` -> retry at 0x51022E28), i.e. while bit 31
-            // ("ready") is clear.  Falling through to `default` answered 0x00000900
-            // forever, so the driver polled CMD5 with argument 0x900 without end and
-            // the device open never returned.  The card behind this controller is not
-            // an SDIO device, so the answer advertises "ready" with *zero* I/O
-            // functions (bits 27:24), which is how a non-SDIO slot ends the SDIO
-            // probe.
-            respond_short(0xC0FF8000u);
+        case 5: {  // IO_SEND_OP_COND - CMD5 only exists on an SDIO card.
+            // Round 303 (measured): NSKBL's storage driver probes with CMD5 after
+            // CMD8 and only *falls back* to the MMC/SD identification when the probe
+            // fails: its wrapper 0x51022DE4 loops while the answer is negative and
+            // 0x51023012 takes the `cbnz r0` error branch, which leads to
+            // 0x51022ED8 (the CID/relative-address stage) and finally sets the
+            // "identified" flag [dev+0x2410] = 1 that the open checks at 0x5102074A.
+            // Answering instead (an earlier guess, 0xC0FF8000) made 0x51023034 see
+            // bit 27 clear, take 0x51023040 and leave [dev+0x2410] = 3, so the open
+            // failed with 0x80320017.  The card behind this controller is an eMMC,
+            // i.e. not SDIO, so it must not answer.
+            command_ok_ = false;
             break;
+        }
         case 2: {  // ALL_SEND_CID
             if (card_) {
                 const auto& cid = card_->cid();
@@ -731,6 +726,19 @@ void Sdif::execute_command() {
     // a loop at 0x47914).
     if (has_data && data_pending_) {
         data_ready_in_ = 8;
+    }
+    // An R1b command (the response type is "48 bit with busy", command-register
+    // bits 0..1 == 3) leaves the card driving DAT0 low after the response.  There is
+    // no real busy time in the model, but the driver still waits for the *second*
+    // event that ends it: NSKBL's request engine completes a request only when the
+    // SDHCI reports another interrupt after Command Complete (its status mapper
+    // 0x5101EBE4 returns early while bit 3 of the request status word is set, which
+    // is exactly the R1b case), so CMD6 (SWITCH, `0x61B`) parked the whole storage
+    // open at the status poll 0x5101EDE4.  Report Transfer Complete once the busy
+    // would have ended.
+    const bool r1b_busy = (command & kCmdResponseMask) == kCmdResponseMask;
+    if (command_ok_ && r1b_busy && !has_data && transfer_complete_in_ == 0) {
+        transfer_complete_in_ = 8;
     }
     if (sdif_trace()) {
         std::fprintf(stderr, "[sdif] raise CmdComplete ok=%d data_pending=%d tc_in=%u\n", command_ok_ ? 1 : 0,
