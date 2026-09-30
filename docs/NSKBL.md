@@ -7620,3 +7620,49 @@ device submission itself is now the thing that fails.
 
 Next: measure `0x5101F6BC` - break on it with the node poked in place, dump its arguments, and follow its
 error return - to see what the submission needs from the (still unmodelled) device at VA 0x240.
+
+### 10.66 The submission dies on a null function pointer taken from the uninitialised device structure
+
+**The submission's arguments** (break on `0x5101F6BC` with the node in place):
+
+```
+R0 = 0x00000240      the device (the low-window structure)
+R1 = 0x5117E180      the request/node
+R2 = 0, R3 = 3, LR = 0x5101FDE3   (called from the walk's submit)
+```
+
+**It is a thin wrapper**: `0x5101F6BC` pushes `1` as a fifth argument and calls `0x5101EE98`, which calls
+`0x5101D660` passing the device, the node and **`0x5101D65D`** - the same callback address the driver
+stores in its request records (`+0x6C`, 10.47/10.51).  So the driver hands its own function to the
+device, and the device-side routine at `0x5101D660` does:
+
+```
+5101D668  r6 = r0 + 0x2440          ; device + 0x2440
+5101D670  r0 = [r6]
+...
+5101D69A  r2 = r4 + 0x2480          ; device + 0x2480
+5101D6A0  r1 = [r2, #0x20]          ; [device + 0x24A0]
+5101D6A2  r3 = [r1]                 ; a FUNCTION POINTER out of that structure
+5101D6A4  blx r3                    ; ... and call it
+5101D6A8  cbnz r0, 0x5101D6FA        ; non-zero -> the error exit
+```
+
+**And that structure is empty.**  At the call, `vmem` shows the whole device region as zeros:
+`VA 0x26E0 -> PA 0x403016E0` (the `[device + 0x24A0]` field), `VA 0x26C0 -> PA 0x403016C0` and
+`VA 0x240 -> PA 0x40300240` all read zero - so `r1 = 0`, `r3 = [0] = 0`, and the code executes
+**`blx 0`**, which is what makes the submission return negative and forces `blt 0x5101FE26`.
+
+**Nobody initialises it, either.**  A write trap over the device's first page
+(`PA 0x40300240-0x40300300`) records **zero** writes in a whole run; over the callback page
+(`PA 0x40301600-0x40301700`) it records 65 writes that are all *zero* and all from the lock-initialisation
+code (`0x51015036`/`0x5101503A`) - the guest only *clears* part of that memory, never fills it.
+
+So the chain now ends at a precise, verifiable place: the walk's submit pops a completed request, hands
+it to the device routine, and that routine calls a function pointer out of a device structure which the
+guest never initialises and the model never provides - which is the last link before `0x80320011`.
+
+Next: find the guest code that is supposed to install that dispatch table - where `0x5101D65D` (the
+callback the driver *does* store in its requests) gets registered, and who is meant to consume
+`[device + 0x24A0]` - or decide that, like the partition page cache and the class table at VA 0x400B0000
+("development substitution" in the boot log), this low-window device structure is another one the model
+should supply.
