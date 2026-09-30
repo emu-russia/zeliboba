@@ -7006,3 +7006,41 @@ hardware semantics - `test_soc.cpp:179` (which asserts `!kermit_irq_line`) passe
 Next: map the 22 reads (`lba=512` many times, `704`, `612`, `614`, `615`, `0`, `24576`, `25071` twice,
 `25072 count=7`) onto the eMMC image's files, to see how far the `os0` lookup actually got and whether
 `psp2bootconfig.skprx` is among the sectors read - the direct progress measure for the objective.
+
+### 10.49 The `os0` volume *is* read - the three cache fills are just later than 400 000 slices
+
+Mapping the reads needed the image's layout first (`emmc_rebuild.exe --inspect build/emmc.img`):
+
+```
+slot03/OS0  user 0x0001000000 size 0x01000000 FAT16   (inactive)
+slot04/OS0  user 0x0002000000 size 0x01000000 FAT16   (active)
+slot05/SA0  0x0003000000, slot07/VS0 0x000B000000, ...
+os0_0: FAT16, 4096 B/cluster, 63 files, 4 dirs, 6.11 MiB data
+vs0_0: FAT16, 929 files, 230 dirs, 80.47 MiB data
+```
+
+so the *active* `os0` slot starts at LBA `0x10000` = 65536 - exactly the LBA the driver reads.
+
+The read list of a *short* run (400 000 slices) ends at the CMeP's boot reads plus `24576`, `25071`
+(twice) and `25072 count=7`, which live inside the *inactive* SLB2 slot (`0x400000-0x800000`, LBA
+16384-32768) - that is what made me think the `os0` reads had disappeared.  They had not: with a long
+enough run (`runm 2000000`) the list ends with the three cache fills of round 23:
+
+```
+lba=0     count=32
+lba=65536 count=32      <- the os0 volume's own boot sector
+lba=65568 count=32      <- the 32-sector cache line holding its root directory
+```
+
+**So the original symptom of the objective is gone: the `os0` volume *is* read.**  What remains is that
+the reads stop after the root-directory cache line - the file lookup's next transfer never happens -
+the loader (`0x510014D4`) then returns `0x80320011` and arm0 spins at `0x51000D0C`.
+
+Note for future measurements: a 400 000-slice run stops *before* the cache fills, so any comparison of
+read counts has to use the same (long) run length.  The round-40 comparison of 19 vs 22 reads used
+equally short runs and is unaffected in its conclusion (the checkpoint stream and end state differ),
+but the absolute numbers belong to the short run.
+
+Next: with the volume read proven, return to the transfer that never completes - the fourth cache fill -
+and use the now-working instrumentation to see whether the driver's completion comes from a polling
+path or needs the interrupt that the strict default never delivers.
