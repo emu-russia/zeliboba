@@ -6886,3 +6886,42 @@ signal-enable offsets versus what the guest writes (measured writes land at `0x3
 Next: check the model's SDIF interrupt-signal-enable offsets against the guest's writes (0x38/0x3A)
 and trace `Sdif::update_irq`'s inputs (`want`, the status words) around the CMD18 completion, to see
 whether the line is ever asserted with an enable bit set in the same instant.
+
+### 10.46 The SDIF *does* assert its line, but it never reaches the ARM core
+
+The offsets are fine: the model's `kNormalIntSignalEnable = 0x38` / `kErrorIntSignalEnable = 0x3A`
+(`sdif.cpp:78-79`) match the SDHCI layout and match the guest's writes.
+
+**The controller asserts.**  A new opt-in log in `Sdif::update_irq` (`ZLB_SDIF_IRQ_LOG=1`) records
+**188 transitions** in a full run, each pair of the form
+
+```
+[sdif] irq assert: normal=0x0001 n_enable=0x00FB error=0x0000 e_enable=0x0000
+[sdif] irq drop:   normal=0x0000 n_enable=0x00FB ...
+```
+
+i.e. `want` really becomes true (Command Complete with its signal enable set) and the callback runs.
+
+**It never reaches the CPU.**  A new opt-in log in `ArmCore::set_irq` (`ZLB_ARM_IRQ_LOG=1`) reports
+**zero** events - the core's `irq_line_` is never asserted - even with the `refresh_line()` fix of
+10.45, the `ZLB_GIC_CPUIF=1` knob (now forcing `ICDDCR` as well as `ICCICR`/`ICCPMR`), and manual
+`poke`s of all three.  So `Gic::refresh_line()` keeps computing `asserted = false`, which leaves
+three candidates: `pending_[4]` false, `enabled_[4]` false, or `active_[4]` stuck (an edge arriving
+while an interrupt is active is parked in `pending_after_eoi_` instead - `gic.cpp:229-237`).
+
+**The vector base is also not what I assumed.**  `VBAR` is never written by the guest (the debug log
+shows only the model's SKBL vector-page mirroring at MVBAR `0x16140`), so the non-secure vector base
+is `ArmMmu::vector_base()` = 0 or `0xFFFF0000`, not the `0x40100` mentioned in `bootchain.cpp:528`.
+Breakpoints at `0x40118`, `0x18` and `0xFFFF0018` all stay silent, so earlier "the ARM never takes an
+interrupt" conclusions are still valid but were measured at a questionable address.
+
+Code changes this round (all probes opt-in; the default run is unchanged - verified: 0 IRQ-vector
+stops and the same terminal pc):
+
+* `kermit.cpp`: `raise()` now refreshes the CPU line (the real fix of 10.45);
+* `gic.cpp`: `gic_left_enabled_by_secure_world()`; `ZLB_GIC_CPUIF=1` also forces `ICDDCR`;
+* `sdif.cpp`: `ZLB_SDIF_IRQ_LOG=1`; `arm_core.cpp`: `ZLB_ARM_IRQ_LOG=1`.
+
+Next: read the distributor's state for id 4 - `ISPENDR0` (base+0x200), `ISACTIVER0` (base+0x300) and
+`ISENABLER0` (base+0x100) - rather than the priority block, and check whether the guest ever *reads*
+`ICCIAR`/`ICCEOIR` (which would set and clear `active_` without any write the traps could see).

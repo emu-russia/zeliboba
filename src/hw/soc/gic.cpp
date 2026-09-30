@@ -40,6 +40,22 @@ constexpr u32 kIcdIPpidr = 0xD00;     // PPI status: bit set == level high
 
 constexpr u32 kSpurious = 1023;
 
+// Round 340 diagnostic: nothing in the guest ever writes the GIC, so both the
+// distributor's ICDDCR enable and the CPU interface's ICCICR/ICCPMR stay zero and
+// the CPU line can never be asserted (highest_pending() needs ICDDCR bit 0, and
+// Gic::refresh_line() needs ICCICR bit 0 plus a priority passing ICCPMR).  NSKBL
+// still reaches its "interrupts registered" checkpoint (GPO A2), which suggests the
+// secure world this model only partly stages leaves the controller enabled before
+// handing over.  ZLB_GIC_CPUIF=1 models that: the distributor and the CPU interface
+// count as enabled.  The default keeps the measured behaviour.
+bool gic_left_enabled_by_secure_world() {
+    static const bool forced = [] {
+        const char* value = std::getenv("ZLB_GIC_CPUIF");
+        return value != nullptr && value[0] == '1';
+    }();
+    return forced;
+}
+
 constexpr u32 kIccIcr = 0x000;
 constexpr u32 kIccPmr = 0x004;
 constexpr u32 kIccBpr = 0x008;
@@ -219,8 +235,7 @@ void GicDistributor::set_default_priority(u32 id, u8 value) {
     poke(byte, (peek(byte) & ~(0xFFull << shift)) | (static_cast<u64>(value) << shift));
 }
 
-void GicDistributor::set_level(u32 id, bool assertion) {
-    if (id >= max_irq_) return;
+void GicDistributor::set_level(u32 id, bool assertion) {    if (id >= max_irq_) return;
     const bool rising = assertion && !sampled_[id];
     sampled_[id] = assertion;
 
@@ -272,7 +287,7 @@ bool GicDistributor::line_asserted(u32 core, u8 priority_mask) const {
 }
 
 u32 GicDistributor::highest_pending(u32 core, u8 priority_mask) const {
-    if ((peek(kIcdDcr) & 1) == 0) return kSpurious;
+    if ((peek(kIcdDcr) & 1) == 0 && !gic_left_enabled_by_secure_world()) return kSpurious;
 
     u32 best = kSpurious;
     u8 best_priority = 0xFF;
@@ -600,10 +615,7 @@ void Gic::refresh_line() {
     // presumably left enabled by the secure world this model only partly stages.
     // This knob treats it as enabled so the effect can be measured; the default
     // behaviour is unchanged.
-    static const bool cpuif_forced = [] {
-        const char* value = std::getenv("ZLB_GIC_CPUIF");
-        return value != nullptr && value[0] == '1';
-    }();
+    static const bool cpuif_forced = gic_left_enabled_by_secure_world();
     const bool cpuif_enabled = (cpu_interface_->peek(kIccIcr) & 1u) != 0u || cpuif_forced;
     // ICCPMR is likewise never written (it reads back 0, which masks every
     // priority), so the forced path also has to open the priority mask.

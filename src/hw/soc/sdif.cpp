@@ -973,6 +973,18 @@ void Sdif::update_irq() {
     const u16 error = error_status_;
     const u16 error_signal = static_cast<u16>(peek(kErrorIntSignalEnable));
     const bool want = ((normal & normal_signal) != 0) || ((error & error_signal) != 0);
+    // Round 340 diagnostic: nothing in the guest enables the GIC, so the ARM never
+    // takes an interrupt; this log shows whether the controller asserts its own line
+    // at all (and with which status/enable words).  ZLB_SDIF_IRQ_LOG=1.
+    static const bool log_irq = [] {
+        const char* value = std::getenv("ZLB_SDIF_IRQ_LOG");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (log_irq && want != irq_line_) {
+        std::fprintf(stderr,
+                     "[sdif] irq %s: normal=0x%04X n_enable=0x%04X error=0x%04X e_enable=0x%04X\n",
+                     want ? "assert" : "drop", normal, normal_signal, error, error_signal);
+    }
     if (want == irq_line_) return;
     irq_line_ = want;
     if (irq_callback_) irq_callback_(static_cast<u32>(Irq::Emmc), irq_line_);

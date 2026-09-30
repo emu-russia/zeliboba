@@ -674,8 +674,24 @@ void ArmCore::branch_to(u32 target) {
 // ===========================================================================
 
 void ArmCore::set_irq(int line, bool asserted) {
-    if (line == static_cast<int>(IrqLine::Irq)) irq_line_ = asserted;
-    else if (line == static_cast<int>(IrqLine::FiQ)) fiq_line_ = asserted;
+    if (line == static_cast<int>(IrqLine::Irq)) {
+        // Round 340 diagnostic: shows whether the interrupt controller actually
+        // asserts this core's line and whether CPSR.I is blocking it - the last
+        // link between the SDIF (which does assert, see docs/NSKBL.md 10.45) and
+        // the guest's handler.  ZLB_ARM_IRQ_LOG=1.
+        static const bool log_irq = [] {
+            const char* value = std::getenv("ZLB_ARM_IRQ_LOG");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (log_irq && asserted != irq_line_) {
+            ZLB_LOG_INFO("cpu", "%s irq line %s (CPSR=0x%08X, IRQ %s) at 0x%08X", name.c_str(),
+                         asserted ? "asserted" : "cleared", cpsr,
+                         (cpsr & arm::kFlagI) != 0 ? "masked" : "open", cur_instr_addr_);
+        }
+        irq_line_ = asserted;
+    } else if (line == static_cast<int>(IrqLine::FiQ)) {
+        fiq_line_ = asserted;
+    }
 }
 
 bool ArmCore::interrupt_pending() const {
