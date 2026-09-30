@@ -7554,3 +7554,42 @@ Next: find why the free list is never refilled.  The release `0x5101F9D0` is cal
 success path and from the request-error path (`0x510205D0`, which *is* reached), yet the pool trap sees
 no push - so measure the release directly: break on `0x5101F9D0` and record whether it runs at all, when
 and with which arguments (its `r0` is the device/+0x2400 list and `r1` the node).
+
+### 10.64 The submit pops from a *different* list - the device's completion queue at VA 0x2640
+
+**The release does run, and early.**  Breaking on `0x5101F9D0` stops repeatedly, all around
+`insns = 53.56M`-`53.66M` - i.e. *before* the walk's programming loop, which runs at `~53.76M`.  Its
+arguments are `R0 = 0x5117CB00` (the object; `+0x2400` is the list) and `R1 = 0x5117CB00` (the node - the
+object *is* the first pool node), called from `0x5102080A`-ish (`LR = 0x5102080F`).
+
+**And at the walk's loop entry the list is not empty.**  Breaking on `0x5101FD8C` and dumping the head
+and tail:
+
+```
+5117EF00  80 E1 17 51 | 00 DD 17 51 ...     head = 0x5117E180   tail = 0x5117DD00
+```
+
+So when the walk's submit popped in the 10.63 experiment, nodes *were* available on *that* list - which
+means it was popping from a **different** one.
+
+**It is: the submit uses `[[object]] + 0x2400`.**  The submit path is
+`0x5101FDAC ldr r7,[r6] ; mov r0,r7 ; bl 0x5101F9BC`, and the first field of the object is
+**`0x00000240`** - so the query's `r0 += 0x2400` lands on **VA 0x2640**, not on `0x5117EF00`.  The release,
+called with the object itself, pushes to `object + 0x2400`.  Two different lists:
+
+| list | base | used by |
+|---|---|---|
+| `0x5117EF00` (= object + 0x2400) | the object | the **release** (push) and the waits (pop) |
+| **`0x2640`** (= `[object]` + 0x2400) | **the device at VA 0x240** | the walk's **submit** (pop) |
+
+**`0x2640` is in the low window** (`PA 0x40302640`) and it is empty - `vmem 0x2640` has read zeros since
+round 27.  So the structure the driver treats as *the device* lives at VA 0x240 in the substituted low
+window, its completion list is at `+0x2400`, and the walk's submit pops finished requests from it.
+
+That closes the chain with the right address at last: **the model has no device at VA 0x240**, so its
+completion list at `0x2640` never receives anything, the submit's pop returns 0, and the code takes
+`cbz r0, 0x5101FDFE` -> `movs r4,#0x11` -> `0x80320011`.
+
+Next: implement that device's completion queue - a low-window structure based at VA 0x240 whose `+0x2400`
+list receives a completed node when a transfer finishes (the SDIF's ADMA is the natural producer) - and
+measure whether the walk's submit then succeeds and the boot advances past the file-data read.
