@@ -3045,6 +3045,12 @@ bool Vita::serve_nskbl_device_call(u32 core) {
         arm_bus_->write32(mm.phys_addr, value);
         return true;
     };
+    auto write_half = [&](u32 va, u16 value) {
+        const arm::MmResult mm = arm->translate_or_fix(va, true, false);
+        if (!mm.ok) return false;
+        arm_bus_->write16(mm.phys_addr, value);
+        return true;
+    };
     u64 request64 = 0;
     if (!arm->get_register("r0", request64) || request64 == 0u) return false;
     const u32 request = static_cast<u32>(request64);
@@ -3054,7 +3060,24 @@ bool Vita::serve_nskbl_device_call(u32 core) {
     // 0x51022681) - those must keep running through the driver's own method, which
     // works; the fourth carries a pool node from the low window (VA 0x300..), and that
     // is the path the real device would answer.
-    if (request >= 0x00100000u) return false;
+    u64 method64 = 0;
+    arm->get_register("r1", method64);
+    const u32 method = static_cast<u32>(method64);
+    if (request >= 0x00100000u) {
+        // Round 379 diagnostic: log what the dispatch is actually asked to do, once per
+        // distinct (request, method) pair, so the gate can be drawn from measurement
+        // instead of guesswork.
+        const u64 key = (static_cast<u64>(request) << 32) | method;
+        if (nskbl_service_seen_.find(key) == nskbl_service_seen_.end() &&
+            nskbl_service_seen_.size() < 16u) {
+            nskbl_service_seen_.insert(key);
+            ZLB_LOG_INFO("machine",
+                         "NSKBL device dispatch: request 0x%08X method 0x%08X r7=0x%08X (not served: "
+                         "outside the substituted object) (ZLB_NSKBL_SERVICE=1)",
+                         request, method, static_cast<u32>(arm->r[7]));
+        }
+        return false;
+    }
     bool ok = false;
     // Diagnostic (round 378): the first few attempts log where they stop, because a
     // failed translation here is indistinguishable from "the method was never called".
@@ -3083,7 +3106,14 @@ bool Vita::serve_nskbl_device_call(u32 core) {
 
     u32 transferred = 0;
     std::string what = "control";
-    if ((index == 17u || index == 18u || index == 24u || index == 25u) && count != 0u) {
+    // Round 379: the driver polls the device through a *state* word.  Its control helper
+    // 0x5101F8F4 reads `ldrh r6,[device+0x241C]`, puts `r6 << 16` into the request's +0x14
+    // and stores the answer from +0x18 into the caller's output, so the device is expected
+    // to keep a sequence there.  The model keeps that sequence for the completions it
+    // produces and answers control requests with it.
+    constexpr u32 kStateOffset = 0x241Cu;
+    const bool data_request = (index == 17u || index == 18u || index == 24u || index == 25u) && count != 0u;
+    if (data_request) {
         const u64 lba = static_cast<u64>(argument) / 512ull;
         // The card's block is 512 bytes.  The request's "size" field is 512 on the driver's
         // own data requests, but the wait's template fills it from the request's command
@@ -3123,6 +3153,15 @@ bool Vita::serve_nskbl_device_call(u32 core) {
         }
         what = format("read lba=%llu blocks=%u (%u bytes moved)", static_cast<unsigned long long>(lba),
                       blocks, transferred);
+        if (transferred != 0u) {
+            ++nskbl_service_state_;                       // one more completion on the device
+            write_half(0x00000240u + kStateOffset, static_cast<u16>(nskbl_service_state_));
+        }
+    } else {
+        // A control request: answer with the device's current sequence, the way the state
+        // word the driver reads at +0x241C leads it to expect.
+        write_va(request + 0x18u, nskbl_service_state_);
+        what = format("control code %u -> state %u", index, nskbl_service_state_);
     }
     // The driver reads these two as the transfer's progress (`0x5101FF12 ldrd r2,r3,
     // [r6,#0x1B8]; ... sub` then stores the delta at `[device+0x9B0+0x12]`).

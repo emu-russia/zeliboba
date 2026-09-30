@@ -13,6 +13,7 @@
 
 #include <array>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -438,6 +439,9 @@ private:
     bool serve_nskbl_device_call(u32 core);
     u32 nskbl_service_calls_ = 0;
     u32 nskbl_service_fail_logs_ = 0;
+    /// Device completion sequence (round 379) - see serve_nskbl_device_call().
+    u32 nskbl_service_state_ = 0;
+    std::set<u64> nskbl_service_seen_;
     /// Nodes handed back to the device's pool, so the driver's wait keeps popping.
     u32 nskbl_service_completions_ = 0;
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
