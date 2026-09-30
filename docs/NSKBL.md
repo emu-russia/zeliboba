@@ -5409,3 +5409,70 @@ stack's partition/volume handling: what the code after the first read does with 
 block (the lookup entry `0x510232EC` is called with the volume object `0x51184FF8`, whose
 `+0x30` is `0xFFFFFFFF` and `+0x38` is 0 at that point) and why it decides the volume is
 unusable instead of reading the OS0 slot at LBA 32768.
+
+### 10.12 The partition scan: the master block's records were never written
+
+Chasing the above found a second defect in the same translation, and it was worth the whole
+master-block detour.  The volume constructor `0x51023C40`:
+
+1. builds the master block *header* in its own buffer from compile-time constants
+   (`0x51011D00..0x51011DB4` writes `"Sony Computer Entertainment Inc."`, version 3, the total
+   block count and the 0x30 constants - the same layout `build_master_block()` produces);
+2. checks `[buffer + 0x1FE] == 0xAA55` (`0x51023F1C`);
+3. scans **16 partition records of 17 bytes** starting at `buffer + 0x50`, looking for a
+   record whose **code byte** (`record + 8`) is 3 (OS0, `VitaPartCode::Os0`) and whose
+   **active** byte (`record + 0x0A`) has bit 0 set (`0x51023F38..0x51023F48`);
+4. and returns `0x803FF007` (`0x51023CF4`) when the 16 records yield no match.
+
+So the model's own layout constants are right (`kPartitionTableOffset = 0x50`,
+`kPartitionRecordSize = 17`, `kPartitionTableSlots = 16`, `Os0 = 0x03`, and the records carry
+code at +8, type at +9, active at +10) - but the scan still found nothing, because the
+records are read out of the driver's *cache line*, and that cache line was still zero.
+
+The reason was the *order* inside the new translation:
+
+```cpp
+if (dma_bus_for(address, 8) != nullptr) return address;   // <- wrong question
+if (address < 0x01000000u) { ...translate... }
+```
+
+`0x00033140` - the second ADMA record's target, i.e. the driver's cache buffer at
+VA 0x51033140 - lies inside the model's own low boot window (the `arm_bootrom` alias at
+PA 0..0x3FFFF), so the bus *did* serve it and the address was used untranslated: the 16320
+bytes went to PA 0x33140 instead of the driver's buffer, the records stayed zero and the scan
+failed.  The first record (`0x0017D5C0`, above the boot window) was translated and worked,
+which is exactly why the master block's first 56 bytes were present in the right place.  The
+fix is to decide by the *address*, not by whether a bus happens to serve it: everything below
+`0x01000000` is window relative (`0x00033140 -> 0x51033140`), everything at or above is used
+as it is (the CMeP's tables live at 0x40000400).
+
+Measured effect (`ZLB_EMMC_LOG=1`):
+
+```
+read lba=0     count=32 ok=1   (the master block)
+read lba=65536 count=32 ok=1   (the ACTIVE OS0 partition: os0_1 at offset 0x02000000)
+```
+
+and the ARM command trace gains a second multi-block read:
+
+```
+CMD13(arg=0x00010000) CMD23(0x20) CMD18(arg=0x00010000, count=32, adma) -> adma table=0x5117D900 moved=16384/16384 ok=1
+```
+
+So the storage stack now parses the partition table, picks the active `OS0` slot (offset
+0x02000000) and reads the volume's first 16 KiB.
+
+The wall moves with it: the error is no longer the partition scan (`0x51023CF4`) but the
+*next* stage's error site `0x51024160`, reached when the helper `0x51023970` - called with
+`r0` = the volume `0x51184FF8`, `r2`/`r3` = stack outputs, `[sp]` = `sp+0x10` and `r6 = 0xE` -
+returns **0**:
+
+```
+5102415A  bl 0x51023970
+5102415E  cbnz r0, 0x510241A2
+51024160  movw r0, #0xf007 / movt r0, #0x803f   ; 0x803FF007
+```
+
+`0x803FF005` (built at `0x51024140`) is the sibling failure for a volume whose `[+0x1C0]` is
+zero, so the helper is the volume's mount/read stage.  That call is the next measurement - and
+note the driver still never reads the FAT or the directory after the volume's first 16 KiB.

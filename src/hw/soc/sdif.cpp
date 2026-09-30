@@ -858,15 +858,21 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
 }
 
 u32 Sdif::dma_translate(u32 address) const {
-    // Round 305 (measured): NSKBL's non-secure window is mapped identity in the guest's
+    // Round 305-307 (measured): NSKBL's non-secure window is mapped identity in the guest's
     // own page tables (`L1[0x510] = 0x5111158E`, VA 0x51000000 -> PA 0x51000000), but its
-    // SD driver hands the DMA engine the *bus* address of that window, which is the
-    // address with the window byte dropped: the request object at VA 0x5117D400 carries
+    // SD driver hands the DMA engine the *bus* address of that window, which is the address
+    // with the window byte dropped: the request object at VA 0x5117D400 carries
     // `[request+0x7C] = 0x0017D480` for its ADMA table at VA 0x5117D480 and builds its
     // records with targets 0x0017D5C0 and 0x00033140 for the buffers at VA 0x5117D5C0 and
-    // VA 0x51033140 - i.e. `address & 0x00FFFFFF`.  The model keeps that memory at the
-    // identity address, so a DMA address the bus cannot serve is tried inside the window.
-    if (dma_bus_for(address, 8) != nullptr) return address;
+    // VA 0x51033140 - i.e. `address & 0x00FFFFFF`.
+    //
+    // Everything below 0x01000000 is window relative, and that has to be decided by the
+    // *address*, not by whether a bus happens to serve it: 0x00033140 lies inside the model's
+    // own low boot window (the ARM boot ROM alias at PA 0..0x3FFFF), so asking the bus first
+    // left that record untranslated and the driver's cache line stayed zero while its
+    // partition scan read no records at all (the open then failed with 0x803FF007 again).
+    // Both the table base and every record target go through here; addresses at or above
+    // 0x01000000 are used as they are (the CMeP's tables live at 0x40000400).
     if (address < 0x01000000u) {
         const u32 windowed = address + 0x51000000u;
         if (dma_bus_for(windowed, 8) != nullptr) return windowed;
