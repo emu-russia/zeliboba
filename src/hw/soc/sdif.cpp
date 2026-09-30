@@ -552,6 +552,31 @@ void Sdif::execute_command() {
             // With the ext-CSD path chosen for both, the SD caller never received the
             // R7 echo, so `os0:psp2bootconfig.skprx` was never opened.
             if (!has_data) {
+                // SD SEND_IF_COND.  A card only answers when it accepts the voltage
+                // range the host asks for (VHS = argument bits 11:8); NSKBL sends
+                // 0xAA (VHS = 0) for a device whose identify left the flags at 0x80
+                // and 0x1AA (VHS = 1) for an SD one.
+                //
+                // Opt-in experiment (ZLB_SDIF_CMD8_NORESP=1, off by default): answer
+                // the VHS-less form with a *command timeout* instead of the echo, which
+                // is what a card that does not support the requested voltage does.  The
+                // driver does map that timeout to the code its caller wants - its error
+                // mapper 0x5101EBE4 turns error-status bit 0 (Command Timeout) into
+                // 0x80320002, the value 0x51022FF6 accepts as "not an SD card, go to
+                // op-cond" - but only while a request is registered at [dev+0x2428];
+                // when the error is raised synchronously inside the command-register
+                // write that slot is still empty, the mapper returns immediately and the
+                // request engine polls 0x5101EDE4 forever (measured: 345 204 223
+                // instructions, arm0 parked at 0x5101EDE4).  Kept as an opt-in probe
+                // until the error is delivered with the request in place.
+                static const bool cmd8_no_response = [] {
+                    const char* value = std::getenv("ZLB_SDIF_CMD8_NORESP");
+                    return value != nullptr && value[0] != '0';
+                }();
+                if (cmd8_no_response && (argument & 0xF00u) == 0u) {
+                    command_ok_ = false;
+                    break;
+                }
                 respond_short(argument);   // R7: echo the check pattern
                 break;
             }

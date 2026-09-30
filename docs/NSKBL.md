@@ -5098,3 +5098,56 @@ still fails and the sequence (CMD0/CMD8/CMD5) repeats three times - the next wal
 inside `0x51022FBC`/`0x51023006` after the op-cond stage.  Note that `case 5` only matters
 once the mode field is 1: in the default (mode 0) run the guest never reaches CMD5, so the
 default checkpoint stays `0xA9`.
+
+### 10.6 Why mode 0 cannot pass the CMD8 probe, and what the driver needs instead
+
+The CMD8 wrapper `0x51022D84` can only return success when *both* of its checks pass:
+
+```
+51022DBE  and.w r2, r3, #0xff      ; R7 low byte
+51022DC2  cmp   r2, #0xaa          ; must be the check pattern
+51022DD4  ands.w r4, r4, r3, lsr #8 ; and (arg & (R7 >> 8)) must be non-zero
+```
+
+With `arg = 0` - which is what the identify produces for mode 0, because
+`0x51022FCC` masks `[dev+0x2418] = 0x80` with `0x00FF8000` - the second check is
+arithmetically always zero, so the wrapper returns `0x80320161`.  Its caller
+`0x51022FF6` accepts only `0` or `0x80320002`, so mode 0 can only work if the *request
+engine* fails the command instead of answering it.
+
+That path exists and was found: the driver's error mapper `0x5101EBE4` turns the SDHCI
+error interrupt status into the guest's error codes, and **bit 0 (Command Timeout) maps to
+`0x80320002`** - exactly the value the CMD8 caller wants:
+
+```
+5101EBFE  tst r2, #1   / bne 0x5101ED44 -> 0x80320002   (command timeout)
+5101EC06  tst r2, #2   -> 0x80320007
+5101EC0C  tst r2, #4   -> 0x80320008
+5101EC14  tst r2, #8   -> 0x80320009
+5101EC1C  tst r2, #0x10-> 0x80320003   (and 0x18 for 0x20/0x40, 0x0c for 0x200)
+```
+
+`0x5101EBE4` then stores the code into the pending request (`[dev+0x2428]+0x28`) and sets
+its completion flag (`| 0x40000000`), which is what lets `0x5101EE62` leave the status
+poll.
+
+Measured with the timeout enabled (`ZLB_SDIF_CMD8_NORESP=1`, off by default): the machine
+parks at `0x5101EDE4` with **both** status registers reading zero and the mapper's bit-0
+branch (`0x5101EC02`) **never** taken - so the timeout bit is consumed before the request
+engine maps it.  The request slot is the suspect: `0x5101EBF2` returns immediately when
+`[dev+0x2428] == 0`, and the model raises the error synchronously inside the
+command-register write, i.e. possibly before the driver has posted the request that the
+mapper needs.  The data phase of the model already defers its events
+(`data_ready_in_`/`transfer_complete_in_`), so deferring the command error the same way is
+the next thing to try.
+
+Two candidate directions for the next round, in order of promise:
+
+1. Deliver a command timeout (error status bit 0, no Command Complete) *after* the driver
+   has posted its request, so `0x5101EBE4` completes it with `0x80320002` and mode 0 (the
+   eMMC) takes the MMC route through `0x51023006`.
+2. Find what sets `[dev+0x2420]` to 1 on hardware.  The guest writes the storage init's
+   loop counter there (`0x5101DF88`), so the three devices of the table at `0x5102A150`
+   start at mode 0/1/2; if the block context `0x5102B010` is supposed to open the mode-1
+   (SD) device, then `[0x5102B010] = 0` in the ARZL-decoded image is the thing to explain -
+   a write trap over `0x5102B000..0x5102B040` shows no writer for it after the decode.
