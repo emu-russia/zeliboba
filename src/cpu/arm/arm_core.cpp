@@ -361,6 +361,24 @@ u32 ArmCore::mem_read_word(u32 va, bool fetch) {
 }
 
 u32 ArmCore::mem_read_half(u32 va) {
+    // Unaligned halfword access (SCTLR.A == 0, which is how this guest runs) is a
+    // plain read of the two bytes *at* the address - no rounding down and no
+    // rotation (rotation is an LDR/LDM rule, not an LDRH one).
+    //
+    // Measured (round 320): NSKBL reads the BPB's bytes-per-sector with
+    // `ldrh.w r7,[r6,#0xb]` (0x51023D9A) from a boot-sector copy whose bytes at
+    // +0x0A are 0x20,0x00 and at +0x0C 0x02,0x08.  Rounding the address down read
+    // 0x0020 where the hardware reads 0x0200, so the driver parsed a 32-byte block
+    // size, computed a zero-length cache read, and the whole os0 file lookup failed
+    // with 0x803FF007.  Callers used to mask with `& ~1u`; they now pass the real
+    // address so this case can be handled here.
+    if ((va & 1u) != 0u) {
+        const u32 lo = mem_read_byte(va);
+        if (pending_fault_ != arm::FaultKind::None) return 0xFFFFu;
+        const u32 hi = mem_read_byte(va + 1u);
+        if (pending_fault_ != arm::FaultKind::None) return 0xFFFFu;
+        return ((hi << 8) | (lo & 0xFFu)) & 0xFFFFu;
+    }
     set_access_pc();
     if (mmu.enabled()) {
         const arm::MmResult result = translate_or_fix(va, false, false);
@@ -407,6 +425,14 @@ void ArmCore::mem_write_word(u32 va, u32 value) {
 }
 
 void ArmCore::mem_write_half(u32 va, u32 value) {
+    // Unaligned halfword stores write the two bytes at the address (see the note in
+    // mem_read_half; the same SCTLR.A == 0 rule applies).
+    if ((va & 1u) != 0u) {
+        mem_write_byte(va, value & 0xFFu);
+        if (pending_fault_ != arm::FaultKind::None) return;
+        mem_write_byte(va + 1u, (value >> 8) & 0xFFu);
+        return;
+    }
     set_access_pc();
     if (mmu.enabled()) {
         const arm::MmResult result = translate_or_fix(va, true, false);
@@ -3049,7 +3075,7 @@ void ArmCore::thumb_load_store_reg(u32 i) {
     const u32 addr = r[rn] + r[rm];
     switch (op) {
         case 0u: mem_write_word(addr & ~3u, r[rd]); break;
-        case 1u: mem_write_half(addr & ~1u, r[rd] & 0xFFFFu); break;
+        case 1u: mem_write_half(addr, r[rd] & 0xFFFFu); break;
         case 2u: mem_write_byte(addr, r[rd] & 0xFFu); break;
         case 3u: {
             const u32 value = mem_read_byte(addr);
@@ -3064,7 +3090,7 @@ void ArmCore::thumb_load_store_reg(u32 i) {
             break;
         }
         case 5u: {
-            const u32 value = mem_read_half(addr & ~1u);
+            const u32 value = mem_read_half(addr);
             if (pending_fault_ == arm::FaultKind::None) r[rd] = value & 0xFFFFu;
             break;
         }
@@ -3074,7 +3100,7 @@ void ArmCore::thumb_load_store_reg(u32 i) {
             break;
         }
         default: {
-            const u32 value = mem_read_half(addr & ~1u);
+            const u32 value = mem_read_half(addr);
             if (pending_fault_ == arm::FaultKind::None) {
                 r[rd] = static_cast<u32>(static_cast<s32>(static_cast<s16>(value & 0xFFFFu)));
             }
@@ -3112,10 +3138,10 @@ void ArmCore::thumb_load_store_half_imm(u32 i) {
     const int rd = static_cast<int>(i & 7u);
     const u32 addr = r[rn] + imm5 * 2u;
     if (load) {
-        const u32 value = mem_read_half(addr & ~1u);
+        const u32 value = mem_read_half(addr);
         if (pending_fault_ == arm::FaultKind::None) r[rd] = value & 0xFFFFu;
     } else {
-        mem_write_half(addr & ~1u, r[rd] & 0xFFFFu);
+        mem_write_half(addr, r[rd] & 0xFFFFu);
     }
     if (pending_fault_ != arm::FaultKind::None) return;
     write_r15(cur_instr_addr_ + 2u);
@@ -4428,13 +4454,13 @@ void ArmCore::thumb32_load_store_single() {
         if (l) {
             u32 value;
             if (size == 0) value = mem_read_byte(addr) & 0xFFu;
-            else if (size == 1) value = mem_read_half(addr & ~1u) & 0xFFFFu;
+            else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
             else value = mem_read_word(addr & ~3u, false);
             if (pending_fault_ != arm::FaultKind::None) return;
             r[rt] = value;
         } else {
             if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
-            else if (size == 1) mem_write_half(addr & ~1u, r[rt] & 0xFFFFu);
+            else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
             else mem_write_word(addr & ~3u, r[rt]);
             if (pending_fault_ != arm::FaultKind::None) return;
         }
@@ -4448,13 +4474,13 @@ void ArmCore::thumb32_load_store_single() {
         if (l) {
             u32 value;
             if (size == 0) value = mem_read_byte(addr) & 0xFFu;
-            else if (size == 1) value = mem_read_half(addr & ~1u) & 0xFFFFu;
+            else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
             else value = mem_read_word(addr & ~3u, false);
             if (pending_fault_ != arm::FaultKind::None) return;
             r[rt] = value;
         } else {
             if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
-            else if (size == 1) mem_write_half(addr & ~1u, r[rt] & 0xFFFFu);
+            else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
             else mem_write_word(addr & ~3u, r[rt]);
             if (pending_fault_ != arm::FaultKind::None) return;
         }
@@ -4472,13 +4498,13 @@ void ArmCore::thumb32_load_store_single() {
     if (l) {
         u32 value;
         if (size == 0) value = mem_read_byte(addr) & 0xFFu;
-        else if (size == 1) value = mem_read_half(addr & ~1u) & 0xFFFFu;
+        else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
         else value = mem_read_word(addr & ~3u, false);
         if (pending_fault_ != arm::FaultKind::None) return;
         r[rt] = value;
     } else {
         if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
-        else if (size == 1) mem_write_half(addr & ~1u, r[rt] & 0xFFFFu);
+        else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
         else mem_write_word(addr & ~3u, r[rt]);
         if (pending_fault_ != arm::FaultKind::None) return;
     }
