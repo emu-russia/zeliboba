@@ -5131,25 +5131,45 @@ error interrupt status into the guest's error codes, and **bit 0 (Command Timeou
 its completion flag (`| 0x40000000`), which is what lets `0x5101EE62` leave the status
 poll.
 
-Measured with the timeout enabled (`ZLB_SDIF_CMD8_NORESP=1`, off by default): the machine
-parks at `0x5101EDE4` with **both** status registers reading zero and the mapper's bit-0
-branch (`0x5101EC02`) **never** taken - so the timeout bit is consumed before the request
-engine maps it.  Deferring the error the way the data phase defers its events is now
-implemented (`Sdif::command_error_in_`, `ZLB_SDIF_ERR_DELAY=<periphclk ticks>`, default 8)
-and the error still reaches the same dead end for delays of 8, 64, 256 and 1024 ticks: the
-mapper is always entered with `r2 == 0` (its "no error" path, which acknowledges and clears
-the error bits at `0x5101ED2A`), which means the request slot is the problem, not the
-timing of the status bit.  The slot is `[dev+0x2428]`: the command path writes the request
-pointer there (`0x5101D88E`) and `0x5101EBF2` returns immediately while it is zero.  The
-next measurement is to break at `0x5101EBE4` and dump `[r0+0x2428]` on the call that
-*should* carry the timeout (the model can log the pc of the poke through the SDIF's own
-trace), i.e. to find who clears the slot between the command write and the status poll.
+Measured before the fixes below: the machine parked at `0x5101EDE4` with **both** status
+registers reading zero and the mapper's bit-0 branch (`0x5101EC02`) never taken.  Chasing
+that down exposed **two more model bugs**, both of the same family as the ones already
+fixed in this file (a sub-word register that does not travel with its 32 bit word):
+
+1. **`ERROR_INT_STATUS` (0x32) was invisible to every read.**  `RegisterBlock::read()`
+   decodes an access that fits in one word through `read_word(offset & ~3, store(offset &
+   ~3))`, i.e. a read of `0x32` is answered from the word at `0x30`.  The SDIF kept the
+   error status in its own byte-image entry, so
+   `poke(kErrorIntStatus, peek(kErrorIntStatus) | 0x0001)` stored 1 while the guest read 0
+   at the same address (measured with a trace inside the SDIF: `stored=0x0001`, and the
+   driver's poll at `0x5101EDE8` still returned `0x0000`).  `write_word()` has the mirror
+   problem: it is always called with the *word* offset, so its `case kErrorIntStatus` could
+   never match - the same trap the software-reset byte had fallen into earlier.  The error
+   status now lives in `Sdif::error_status_` and is merged into the word at `0x30` by
+   `read_word()`/`write_word()` (write-one-to-clear for each half).
+2. **Only SDHCI software-reset bit 0 self-cleared.**  The model handled bit 0 (reset the
+   whole host) but not bit 1 (reset the command circuit) or bit 2 (reset the data circuit),
+   and the driver's error path resets the command circuit and polls the bit
+   (`0x5101ED04`: `movs r1,#2` / `strb r1,[r3,#0x2f]`, poll at `0x5101ED0A..0x5101ED12`);
+   with the error status finally readable the run parked exactly there.  All three bits now
+   self-clear (the model executes commands synchronously).
+
+With both fixed, the CMD8 command timeout reaches the driver's mapper: a breakpoint at
+`0x5101EC02` fires with `r2 = 0x00000001` (Command Timeout) and `r3 = 0x5102BD3C` (the
+request slot is **not** empty), so the mapper produces the `0x80320002` the CMD8 caller
+wants.  The VHS-less CMD8 timeout is therefore now the default behaviour
+(`ZLB_SDIF_CMD8_NORESP=0` restores the old "always echo" answer) and the ARM's SD command
+trace grows from 6 commands (CMD0/CMD8 x3, then the open gives up) to 24 (CMD0, five CMD8
+retries, then the CMD5 op-cond poll).  The default run's terminal state is unchanged
+(`0x51000D0C`, checkpoint `0xA9`), because the open still fails during the op-cond phase
+(`0x51023006`) and the storage init repeats it three times.
 
 Two candidate directions for the next round, in order of promise:
 
-1. Deliver a command timeout (error status bit 0, no Command Complete) *after* the driver
-   has posted its request, so `0x5101EBE4` completes it with `0x80320002` and mode 0 (the
-   eMMC) takes the MMC route through `0x51023006`.
+1. Follow the op-cond phase (`0x51023006` -> `0x51022DE4` CMD5 wrapper -> `0x51022ED8`) and
+   find which check fails after the op-cond answer.  Note that `insns` is a *scheduler*
+   count (the slice loop executes exactly `budget_.arm` steps per core per slice), so it is
+   NOT a measure of how far the guest got - the ARM command trace and the final pc are.
 2. Find what sets `[dev+0x2420]` to 1 on hardware.  The guest writes the storage init's
    loop counter there (`0x5101DF88`), so the three devices of the table at `0x5102A150`
    start at mode 0/1/2; if the block context `0x5102B010` is supposed to open the mode-1

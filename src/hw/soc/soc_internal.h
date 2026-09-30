@@ -621,6 +621,13 @@ private:
     /// the command-register write made Sdif::execute_command() hand it to a driver
     /// whose request slot was still empty (see the CMD8 note in execute_command()).
     u32 command_error_in_ = 0;
+    /// The ERROR_INT_STATUS half (0x32) of the interrupt status word at 0x30.
+    /// RegisterBlock decodes a sub-word read through the *word* it lives in, so the
+    /// error half has to travel with read_word()/write_word() instead of living in
+    /// the byte image: a poke(0x32) was invisible to every read (measured round 303:
+    /// `poke(kErrorIntStatus, 1)` stored 1 and the guest still read 0 at the same
+    /// address, which left NSKBL's whole SD error path blind).
+    u16 error_status_ = 0;
     /// Set while the pending deferred Transfer Complete belongs to an ADMA2
     /// transfer, so the interrupt is reported together with the DMA bit.
     bool dma_complete_ = false;
