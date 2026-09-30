@@ -7517,3 +7517,40 @@ Next: settle it over *many* comparisons rather than the first one - break at bot
 (`0x5101FD90` and `0x5101FDA0`) across a full run and record the pairs of bytes, to find whether any pair
 ever differs - and trap writes on the window's real address (`PA 0x40300020-0x40300040`) to see who
 programs that table and when.
+
+### 10.63 Demonstrated: the walk *does* submit when the bytes differ, and the submit then dies on an empty free list
+
+Two measurements settle what the comparison decides and where `0x80320011` really comes from.
+
+**The loop runs exactly once per run.**  Breaking on its `cmp` (`0x5101FDA8`) stops a single time in a
+whole run, and the range trace of round 53 shows the same: entry, thirteen instructions, skip, return.
+
+**Make the bytes differ and the submission branch is taken.**  Stopping at the loop's entry
+(`0x5101FD8C`), poking the window byte (`poke 0x40300020 255 8`), clearing that breakpoint and letting
+the run continue:
+
+```
+[stop] arm0 breakpoint at 0x5101FD8C      <- the loop entry
+poke 40300020 <- 0xFF ... reads back 0x510001FF
+[stop] arm0 breakpoint at 0x5101FDB0      <- THE POP: the walk is now submitting
+```
+
+So the comparison is exactly the gate: equal bytes -> skip (the normal, structural case, 10.62);
+different bytes -> the walk pops a free node and submits.
+
+**And the submission dies on an empty free list.**  With the same setup plus breakpoints on the fill's
+submit call (`0x5101FDDE`) and the release (`0x5101FDEA`), neither fires - the pop returned 0 and the
+code took `cbz r0, 0x5101FDFE`, i.e. the `movs r4,#0x11` that *builds* the error value.  **That is where
+`0x80320011` comes from**, demonstrated rather than inferred.
+
+**So the operative failure is pool exhaustion**: the walk's submit needs a free node, the list holds
+none (the ten nodes of 10.50 were drained by the waits and nothing ever pushes one back), and the error
+travels up to the loader, which returns it and lets arm0 spin.
+
+The whole mechanism is now mapped end to end: structural skip -> when a submit is needed, pop a free
+node -> empty -> `0x80320011`.
+
+Next: find why the free list is never refilled.  The release `0x5101F9D0` is called from the walk's
+success path and from the request-error path (`0x510205D0`, which *is* reached), yet the pool trap sees
+no push - so measure the release directly: break on `0x5101F9D0` and record whether it runs at all, when
+and with which arguments (its `r0` is the device/+0x2400 list and `r1` the node).
