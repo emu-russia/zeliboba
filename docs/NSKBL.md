@@ -5647,3 +5647,28 @@ registers hold - so `0x51023D4A..0x51023D62` is not the path that reaches it (th
 probably a loop body entered with a different `r6`, e.g. once per FAT), and the geometry inputs
 must be traced from the loop head rather than read linearly.  `ZLB_ARM_TRACE_RANGE` around
 `0x51023D00..0x51023E00` is the tool for that.
+
+### 10.17 Traced: the geometry block is entered from the constructor's read path
+
+`ZLB_ARM_TRACE_RANGE=0x51023D40-0x51023DA0` (8 entries) shows how the block is reached:
+
+```
+trace-range arm0 ENTER 0x51023D4A from 0x51023C96   ; the `bge` after the read at 0x51023C90
+trace-range arm0 LEAVE to 0x51025AF4                ; the ARM division helper
+trace-range arm0 ENTER 0x51023D66 from 0x51025D00
+trace-range arm0 LEAVE to 0x510258D0
+trace-range arm0 ENTER 0x51023D8E from 0x51025AAC
+trace-range arm0 LEAVE to 0x51023E52
+trace-range arm0 ENTER 0x51023D98 from 0x51023E5E
+trace-range arm0 LEAVE to 0x51023DA2
+```
+
+So the sequence really is "read, then parse" (`0x51023C90` -> `bge` -> `0x51023D4A`), the parse
+sees the freshly read sector, and the geometry code is part of that same path - there is no
+loop with a stale `r6` to blame.  The remaining contradiction is the read itself: its callee is
+the global method `[0x51184760]`, which reads as zero when that entry is inspected, yet the
+trace proves the call returned and the `bge` was taken.  A breakpoint at `0x51023C90` stops
+with the run's *final* error values in `r0`/`r1`, so it is probably reached a second time, late
+- resolving which of the two observations belongs to the constructor's pass is the first task
+of the next round, and the second is the geometry path itself, since the volume's parsed
+`+0x24` (19, the FAT size) is not what the geometry code consumes.
