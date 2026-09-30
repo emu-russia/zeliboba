@@ -675,6 +675,20 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         previous_pc = last_arm_pc_[core];
         last_arm_pc_[core] = pc;
     }
+    // Substitution (round 378): the storage device's method.  The driver calls it
+    // through `[device+0x24A0]` at 0x5101D6E8 with the request in r0; no image in the
+    // workspace contains it (round 377), so it is modelled in C++ - see
+    // serve_nskbl_device_call().  ZLB_NSKBL_SERVICE=1 opts in; ZLB_NO_SUBSTITUTION=1
+    // disables every substitution including this one.
+    static const bool nskbl_service = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_NSKBL_SERVICE");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (nskbl_service && pc == 0x5101D6E8u) {
+        if (serve_nskbl_device_call(core)) return true;
+    }
     // Substitution (round 117): make the object manager lock (0x601C = 0x5F80+0x9c)
     // a no-op.  Round 116 measured that only arm0 ever acquires it (20000 balanced
     // acquire/release, zero non-arm0 entries), and the four-core deadlock is arm0
@@ -897,7 +911,11 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // ZLB_NSKBL_DEV=1 opts in.
     static const bool supply_nskbl_device = [] {
         const char* value = std::getenv("ZLB_NSKBL_DEV");
-        return value != nullptr && value[0] != '0';
+        if (value != nullptr && value[0] != '0') return true;
+        // The device service (round 378) needs the object too: without it the driver's
+        // dispatch dereferences NULL and the service is never reached.
+        const char* service = std::getenv("ZLB_NSKBL_SERVICE");
+        return service != nullptr && service[0] != '0';
     }();
     // The object is read inside the wait, and the driver re-initialises its lists per
     // request (and the guest clears that page during its own table setup - measured:
@@ -2995,6 +3013,134 @@ bool Vita::supply_kbl_class_table(u32 core) {
 // object its code reads.  See the declaration in vita.h for the measurements; the
 // write helper follows supply_kbl_class_table above (translate the VA, write through
 // the bus, so the model's own low-window substitution stays in charge of mapping).
+// Development substitution (round 378): the device method.  The driver dispatches
+// through `[device+0x24A0]` (`0x5101D6E4 ldr r2,[device+0x24A0]; 0x5101D6E6 ldr r1,[r2];
+// 0x5101D6E8 blx r1`, with the request in r0); round 377 measured that no image in the
+// workspace contains that method (NSKBL never materialises the SDIF base, the table at
+// 0x51029FC0 is data read only by the secure KBL), so it is modelled here: perform the
+// storage operation the request describes and return success.  Field layout measured in
+// rounds 371-373 from the SDIF command writer 0x51022640 and the dispatch entry
+// 0x51022604.
+bool Vita::serve_nskbl_device_call(u32 core) {
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (arm == nullptr || !emmc_) return false;
+    // NOTE: `ArmCore::translate()` is the raw walk - it fails for the low window and for
+    // mappings the model installs through its fault hook, which is exactly where the
+    // driver's requests live (measured: reading request+8 of 0x5117D400 failed with the
+    // raw call while the CPU accesses the same address fine).  `translate_or_fix()`
+    // applies the same fault fixups the CPU uses, so the service sees what the guest sees.
+    auto read_va = [&](u32 va, bool& ok) {
+        const arm::MmResult mm = arm->translate_or_fix(va, false, false);
+        if (!mm.ok) {
+            ok = false;
+            return 0u;
+        }
+        ok = true;
+        return arm_bus_->read32(mm.phys_addr);
+    };
+    auto write_va = [&](u32 va, u32 value) {
+        const arm::MmResult mm = arm->translate_or_fix(va, true, false);
+        if (!mm.ok) return false;
+        arm_bus_->write32(mm.phys_addr, value);
+        return true;
+    };
+    u64 request64 = 0;
+    if (!arm->get_register("r0", request64) || request64 == 0u) return false;
+    const u32 request = static_cast<u32>(request64);
+    // Only the requests that come from the *substituted* device object use this service.
+    // Measured (round 378): the same dispatch is entered four times, three of them with
+    // the driver's own DRAM requests (0x5117D400/0x5117D880/0x5117DD00, method
+    // 0x51022681) - those must keep running through the driver's own method, which
+    // works; the fourth carries a pool node from the low window (VA 0x300..), and that
+    // is the path the real device would answer.
+    if (request >= 0x00100000u) return false;
+    bool ok = false;
+    // Diagnostic (round 378): the first few attempts log where they stop, because a
+    // failed translation here is indistinguishable from "the method was never called".
+    const auto note_failure = [&](const char* what, u32 offset, u32 va) {
+        if (nskbl_service_fail_logs_ < 8u) {
+            ++nskbl_service_fail_logs_;
+            ZLB_LOG_INFO("machine",
+                         "NSKBL device service: cannot %s request 0x%08X + 0x%X (VA 0x%08X) "
+                         "(ZLB_NSKBL_SERVICE=1)",
+                         what, request, offset, va);
+        }
+    };
+    const u32 command = read_va(request + 0x08u, ok);
+    if (!ok) { note_failure("read", 0x08u, request + 0x08u); return false; }
+    const u32 argument = read_va(request + 0x0Cu, ok);
+    if (!ok) { note_failure("read", 0x0Cu, request + 0x0Cu); return false; }
+    const u32 size_count = read_va(request + 0x24u, ok);
+    if (!ok) { note_failure("read", 0x24u, request + 0x24u); return false; }
+    const u32 buffer = read_va(request + 0x20u, ok);
+    if (!ok) { note_failure("read", 0x20u, request + 0x20u); return false; }
+    const u32 table = read_va(request + 0x7Cu, ok);
+    if (!ok) { note_failure("read", 0x7Cu, request + 0x7Cu); return false; }
+    const u8 index = static_cast<u8>(command & 0xFFu);          // CMD18 = 0x12
+    const u16 block_size = static_cast<u16>(size_count & 0xFFFFu);
+    const u16 count = static_cast<u16>((size_count >> 16) & 0xFFFFu);
+
+    u32 transferred = 0;
+    std::string what = "control";
+    if ((index == 17u || index == 18u || index == 24u || index == 25u) && count != 0u) {
+        const u64 lba = static_cast<u64>(argument) / 512ull;
+        // The card's block is 512 bytes.  The request's "size" field is 512 on the driver's
+        // own data requests, but the wait's template fills it from the request's command
+        // index for the device path (measured: `size 1 count 32` for a CMD18), so clamp it
+        // to the card block - otherwise the transfer would be count bytes, not blocks.
+        const u32 block_bytes = block_size >= 512u ? block_size : 512u;
+        const u32 bytes = block_bytes * count;
+        const u32 blocks = bytes / 512u;
+        std::vector<u8> data(static_cast<size_t>(blocks) * 512u, 0u);
+        if (emmc_->read_blocks(EmmcPartition::User, lba, blocks, data.data())) {
+            u32 done = 0;
+            if (table != 0u) {
+                for (u32 i = 0; i < 64u && done < bytes; ++i) {   // ADMA2 descriptors
+                    bool ok2 = false;
+                    const u32 word0 = read_va(table + i * 8u, ok2);
+                    if (!ok2) break;
+                    const u32 target = read_va(table + i * 8u + 4u, ok2);
+                    if (!ok2) break;
+                    const u16 attr = static_cast<u16>(word0 & 0xFFFFu);
+                    u32 length = (word0 >> 16) & 0xFFFFu;
+                    if (length == 0u) length = 0x10000u;           // ADMA2: 0 means 64 KiB
+                    if ((attr & 1u) == 0u) break;                  // VALID
+                    const u32 chunk = std::min(length, bytes - done);
+                    const arm::MmResult mm = arm->translate_or_fix(target, true, false);
+                    if (mm.ok) arm_bus_->write_bytes(mm.phys_addr, data.data() + done, chunk);
+                    done += length;
+                    if (attr & 2u) break;                          // END
+                }
+            } else if (buffer != 0u) {
+                const arm::MmResult mm = arm->translate_or_fix(buffer, true, false);
+                if (mm.ok) {
+                    arm_bus_->write_bytes(mm.phys_addr, data.data(), bytes);
+                    done = bytes;
+                }
+            }
+            transferred = done;
+        }
+        what = format("read lba=%llu blocks=%u (%u bytes moved)", static_cast<unsigned long long>(lba),
+                      blocks, transferred);
+    }
+    // The driver reads these two as the transfer's progress (`0x5101FF12 ldrd r2,r3,
+    // [r6,#0x1B8]; ... sub` then stores the delta at `[device+0x9B0+0x12]`).
+    write_va(request + 0x1B0u, 0u);
+    write_va(request + 0x1B8u, transferred);
+    if (nskbl_service_calls_ < 32u) {
+        ZLB_LOG_INFO("machine",
+                     "NSKBL device service #%u: request 0x%08X cmd 0x%02X arg 0x%08X size %u count %u "
+                     "table 0x%08X buffer 0x%08X -> %s (ZLB_NSKBL_SERVICE=1, development substitution)",
+                     nskbl_service_calls_, request, index, argument, block_size, count, table, buffer,
+                     what.c_str());
+    }
+    ++nskbl_service_calls_;
+    arm->set_register("r0", 0u);          // success
+    arm->set_pc(0x5101D6EAu);             // past the blx
+    return true;
+}
+
 bool Vita::supply_nskbl_device_object(u32 core) {
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
     ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
@@ -3020,24 +3166,27 @@ bool Vita::supply_nskbl_device_object(u32 core) {
     // the device routine calls with the request in r0 (5101D69A-5101D6A4).
     write_va(kDeviceVa + 0x2480u + 0x20u, kTableVa);
     write_va(kTableVa, kSubmitRoutine);
-    // The completion list at +0x2400 (VA 0x2640): a single free node, so the driver's
-    // wait has something to pop instead of taking the 0x80320011 error path.  The node
-    // must also carry the flag word a *working* request has: the device routine tests
-    // `tst.w r1,#0x400` on `[request+4]` (5101D674/5101D6B6) and skips both indirect
-    // calls - i.e. never submits anything - when the bit is clear.  Measured: the
-    // request the SDIF command writer is actually called with (0x5117D400) has
-    // `[+4] = 0x00000514`, while the driver's own control object (0x5117CB00) has
-    // 0x80000042 and my zeroed node had neither.
-    write_va(kNodeVa + 0x00u, kDeviceVa);
-    write_va(kNodeVa + 0x04u, 0x00000514u);
-    write_va(kNodeVa + 0x08u, 0x12u);
-    write_va(kNodeVa + 0x60u, 0u);
-    write_va(kDeviceVa + 0x2400u, kNodeVa);
-    write_va(kDeviceVa + 0x2404u, kNodeVa);
+    // The pool of free nodes at +0x2400 (VA 0x2640).  Round 371: the wait pops a node,
+    // fills it with its own template (`vstr d16,[r0]` = device + flags 0x514), sets +8,
+    // +0x0C and +0x24/+0x26, then hands it to the device submission 0x5101F6BC.  One
+    // node satisfies the first pop but not the second one on the `r12 == 12` branch
+    // (0x5102057A), which is why a single node is bit-identical to no substitution at
+    // all - measured twice (rounds 368/376).  Eight nodes let the driver reach the
+    // device dispatch at 0x5101D6E8, which the round-378 service intercepts.
+    constexpr u32 kNodeCount = 8u;
+    for (u32 i = 0; i < kNodeCount; ++i) {
+        const u32 node = kNodeVa + i * 0x200u;
+        write_va(node + 0x00u, kDeviceVa);
+        write_va(node + 0x04u, 0x80000514u);   // dispatchable: bit 0x400 gates the indirect calls
+        write_va(node + 0x08u, 0x12u);
+        write_va(node + 0x60u, (i + 1u < kNodeCount) ? (node + 0x200u) : 0u);
+    }
+    write_va(kDeviceVa + 0x2400u, kNodeVa);                              // head
+    write_va(kDeviceVa + 0x2404u, kNodeVa + (kNodeCount - 1u) * 0x200u); // tail
     ZLB_LOG_INFO("machine",
-                 "NSKBL device object supplied at VA 0x%03X (SDIF base 0x%08X, submit 0x%08X, node 0x%03X) "
-                 "(ZLB_NSKBL_DEV=1, development substitution)",
-                 kDeviceVa, kSdifBase, kSubmitRoutine, kNodeVa);
+                 "NSKBL device object supplied at VA 0x%03X (SDIF base 0x%08X, submit 0x%08X, %u nodes "
+                 "from 0x%03X) (ZLB_NSKBL_DEV=1, development substitution)",
+                 kDeviceVa, kSdifBase, kSubmitRoutine, kNodeCount, kNodeVa);
     add_milestone("NSKBL device object supplied (development substitution)");
     return true;
 }

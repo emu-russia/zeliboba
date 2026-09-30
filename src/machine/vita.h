@@ -422,6 +422,24 @@ private:
     bool supply_nskbl_device_object(u32 core);
     /// One-shot latch for the substitution above (round 366).
     bool nskbl_device_supplied_ = false;
+
+    /// Development substitution (round 378): the device method itself.  Round 377
+    /// measured that *no* image in the workspace contains a constructor for the
+    /// device object (NSKBL has no instruction that materialises the SDIF base, and
+    /// the table at 0x51029FC0 is read only by the secure KBL), so the method the
+    /// driver dispatches to at 0x5101D6E8 cannot be guest code.  When
+    /// ZLB_NSKBL_SERVICE=1 this intercepts the `blx r1` and performs the storage
+    /// operation the request describes in C++: the command index is `[request+8]`
+    /// (`0x12` = CMD18), the SDIF argument `[request+0x0C]` (a byte offset), the
+    /// buffer `[request+0x20]`, block size and count `[request+0x24]`/`[request+0x26]`
+    /// and the ADMA2 table `[request+0x7C]`; the transfer is read from the eMMC card
+    /// into the descriptor targets, the progress fields `[request+0x1B0]`/
+    /// `[request+0x1B8]` are filled in and r0 = 0 (success) is returned.
+    bool serve_nskbl_device_call(u32 core);
+    u32 nskbl_service_calls_ = 0;
+    u32 nskbl_service_fail_logs_ = 0;
+    /// Nodes handed back to the device's pool, so the driver's wait keeps popping.
+    u32 nskbl_service_completions_ = 0;
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
     /// class, so the loader own carve path hands the block out.
     bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);
