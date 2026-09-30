@@ -7696,3 +7696,55 @@ a genuinely missing guest/FW stage that installs that table.  Distinguishing the
 dispatch target, so the next measurement is to find what a working transfer does differently - in
 particular whether the ADMA path's command writer (`0x51022664`) is reachable from the walk's request
 record, which would tell whether the same routine was meant to sit in the table.
+
+### 10.68 The device structure's missing contents are known field by field - including the SDIF base
+
+**Where the constant `0x240` comes from.**  The walk's submit stores it into every request:
+
+```
+5101FDB0  bl 0x5101F9BC          the pop
+5101FDB6  cbz r0, 0x5101FDFE     empty -> the error
+5101FDBC  mov.w r2, #0x240
+5101FDC2  str r2, [r0]           request[0] = the device address
+```
+
+so `0x240` is a *hard-wired device address* in the driver, matching `[object] = 0x240` from 10.64.  The
+other two sites that build the constant (`0x51006B80`, `0x5100A240`) turn it into `0x0B100240` /
+`0x0B100260` - a Kermit device window, unrelated.
+
+**The working path shows what the structure must contain.**  Breaking on the ADMA command writer
+(`0x51022664`):
+
+```
+R4 = 0xE0B00000     the SDIF register base
+R5 = 0x5117D400     the request
+```
+
+and the routine gets there through the device: `51022608 ldr r4,[r0,#0x78]` (the request's `+0x78` = the
+device, which the device routine itself stored at `0x5101D67A`), `5102260C add.w r3,r4,#0x2400` (= VA
+0x2640), `51022610 ldr r4,[r3,#0x30]` (the device's `+0x2430` = **VA 0x2670**), which yields
+`0xE0B00000`.
+
+So the device object at VA 0x240 is expected to be pre-filled with at least:
+
+| field | VA | expected value |
+|---|---|---|
+| `+0x2430` | `0x2670` | the SDIF register base, **`0xE0B00000`** |
+| `+0x2440` | `0x2680` | a value the driver copies into its requests (`+0x70`) |
+| `+0x2480` + `0x20` | `0x26E0` | a pointer to a dispatch table |
+| that table's first entry | - | a "submit" routine taking the request in r0 and returning 0 on success |
+| `+0x2400` | `0x2640` | the completion list the walk's submit pops from (10.64) |
+
+**And the driver's own submit routine fits the dispatch entry.**  `0x51022604` takes the request in
+`r0`, writes the SDIF command/argument registers (`str r1,[r4,#0x58]`, `str r3,[r4,#8]`,
+`strh r0,[r4,#0xc]`), and returns 0 (`51022670 movs r0,#0`) - which is exactly what `0x5101D6A8
+cbnz r0` requires for success.
+
+**That makes the fix concrete**: like the partition page cache and the class table at VA 0x400B0000, the
+model should supply this low-window device object - the SDIF base `0xE0B00000` at VA 0x2670 and a
+one-entry dispatch table at VA 0x26E0 pointing at the driver's submit routine (`0x51022605`, Thumb) - and
+then the walk's submission has something to call instead of `blx 0`.
+
+Next: implement that substitution in the model (opt-in first, following the existing "development
+substitution" pattern) and measure whether the walk's submit then completes and the boot advances past
+the file-data read.
