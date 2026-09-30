@@ -5476,3 +5476,74 @@ returns **0**:
 `0x803FF005` (built at `0x51024140`) is the sibling failure for a volume whose `[+0x1C0]` is
 zero, so the helper is the volume's mount/read stage.  That call is the next measurement - and
 note the driver still never reads the FAT or the directory after the volume's first 16 KiB.
+
+### 10.13 The last blocker: the global block-read method at 0x51184760 is never installed
+
+The chain is now understood all the way to the file lookup, and it stops on one field.
+
+The lookup helper `0x51023970(volume, path, out1, out2, ...)` splits the path
+(`0x51024854`/`0x510247A4`) and walks its components, calling the volume lookup `0x510232EC`
+for each of them; a zero return sets its "not found" marker (`r5 = -0x63`) and the caller
+stores `0x803FF007` at `0x51024160`.  The path it is given is the full
+`"os0/psp2bootconfig.skprx"` (`0x5102BDE7`), and the first component it asks the volume for is
+therefore `"os0"` - inside the volume, not as a device.
+
+Inside `0x510232EC` the read of the directory is issued through a **global** method pointer:
+
+```
+5102338C  r8 = [vol, #0x50]        ; the volume's first data block (the driver parsed the BPB)
+51023392  ip = 0x51184760          ; the global block-read method slot
+5102339A  r6 = [ip]
+510233A2  cmp r6, #0
+510233A4  beq 0x51023946           ; <- taken in the model: no method, so the lookup gives up
+510233BA  blx r6                   ; read( [0x51184B84], buffer, r8 >> 9, 0x51184780 )
+```
+
+Measured: `[0x51184760]` is **zero** and **nothing in the guest ever writes it**.  A write trap
+over the whole slot area (`ZLB_WTRAP=0x51184700-0x51184800`) shows only the BSS zeroing
+(`pc 0x510008F8`) and the sentinel initialisation done by the path helper itself
+(`pc 0x51023BA4..0x51023BF8`, values 0/0xFFFFFFFF); a scan of the image for the
+`movw/movt 0x4760/0x5118` pair finds four *readers* - the dispatcher `0x51023128`, the volume
+constructor twice (`0x51023CA6`, `0x51023CFE`) and the lookup - and no writer at all.
+
+The driver's own dispatcher shows what the design intends: `0x51023128` prefers the global
+method when it is non-zero and otherwise falls back to the *object's* method at `[r0]`:
+
+```
+5102312A  r4 = [0x51184760]
+51023136  cbz r4, 0x5102314C     ; no global method -> use the object's
+5102314C  r4 = [r0]              ; the volume's method slot (0x51000D55, installed)
+5102314E  cbz r4, 0x5102315C     ; neither -> 0x803FF007 (0x5102315C)
+51023158  blx r4
+```
+
+and the volume's own slot *is* installed by the constructor (`[vol+0x54] = 0x51000D55`,
+`[vol+0x58] = 0x5102B010`, written at `0x51023FDC`).  The lookup does not use that fallback, so
+the remaining work is to find what installs the global method on hardware - it is a
+per-console/driver registration stage our flow does not reach - or to supply it (a
+substitution, with the signature the call at `0x510233BA` uses: context, buffer, LBA,
+`0x51184780`).  A debugger experiment (`bp arm 0x510233A2`, `poke 0x51184760 <candidate> 32`,
+continue) is the cheapest way to find out which of the two fills the gap.
+
+Everything else on this path now measures correct: the master block is read and parsed, the
+active `OS0` partition (os0_1 at 0x02000000) is chosen, the volume's first 16 KiB is read, and
+its boot sector is in the driver's buffers byte for byte (`SCEI`, 512 bytes/sector, 8
+sectors/cluster, 2 FATs, 512 root entries, FAT size 19 - parsed into the volume at `+0x48`,
+where the lookup checks it).
+
+Measured with the debugger experiment itself (`bp arm 0x510233A2`, `poke 0x51184760 <value> 32`,
+then continue):
+
+| poke | instructions at the end | new eMMC reads | first external load |
+|---|---|---|---|
+| none | 153 205 277 | - | `0x803FF007` |
+| `0x51000D55` (the volume's own method) | 207 312 669 | none | `0x803FF007` |
+| `0x51000D15` (the block-read entry `0x51000D14`) | 207 312 669 | none | `0x803FF007` |
+
+So the zero really is what stops the lookup - setting *any* function there lets the flow past
+`0x510233A4` and the run does 54M instructions more - but the value is not the missing piece by
+itself: neither candidate makes the driver issue the directory read, and the load still fails
+with the same code.  Either the correct method is a *different* interface (the call at
+`0x510233BA` passes a fourth argument, `0x51184780`, which the volume's simple callback ignores)
+or a *second* piece of the driver's registration is missing as well.  That is where the next
+round starts.
