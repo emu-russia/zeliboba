@@ -5723,3 +5723,32 @@ the raw BPB bytes there), and `r0 = 95/32 = 2` at `0x51023DE0` selects exactly t
 the classification the branch depends on (the value the constructor computes from the boot
 sector before the division) is the thing to measure next, together with what writes
 `[sb+0x24]`/`[sb+0x2c]` on hardware if the branch is meant to read derived values.
+
+### 10.19 The storage init creates *two* volume objects, and the window the second one uses is faulted out
+
+The storage init (`0x51000E7C`) creates two objects through the same wrapper (`0x51023FD8`),
+and the measurements of both calls show they are not the same kind of volume:
+
+| call site | object | size (`r1`) | method (`r2` -> `[obj+0x54]`) | context (`r3` -> `[obj+0x58]`) |
+|---|---|---|---|---|
+| `0x51000F5A` | `0x51184FF8` | `0x00110000` | **`0x51000D55`** (= `0x51000D54`) | `0x5102B010` |
+| `0x51000F78` | `0x51184F9C` | `0x00100000` | **`0x51000D15`** (= `0x51000D14`) | a literal |
+
+`0x51000D14` is the plain block read (it dispatches on `[obj]`: 0 -> `0x510205E8`,
+1 -> `0x51022480`, and returns `0x80010013` when the handle is null), but `0x51000D54` - the
+method of the object the file lookup actually uses - is a different routine that works in
+32-byte units: `r6 = r1 & 0x1F`, `r4 = r1 & ~0x1F`, `r5 = r2 + r6`, and it bails to
+`0x51000E60` when `r5 > 0x20`.  So the value the lookup passes as "the buffer"
+(`r1 = 0x0A720290`, measured at `bp arm 0x51023962`) is a *32-byte-aligned window offset*, not
+an ordinary buffer address.
+
+That window is not mapped, and the guest did that itself: a write trap on the L1 slot
+(`0x4030829C`, i.e. `L1[0x0A7]` for VA 0x0A700000) shows the guest writing the empty/fault
+descriptor `0x1E0` there at `pc = 0x51014D72`/`0x51014D76` - the NSKBL low-window page-table
+setup.  `vpa 0x0A720290` then reports `section translation fault`, and the model has no memory
+there either.
+
+So the next measurements are: the full body of `0x51000D54` (what it does with
+`(ctx, window offset, length, out)` - it may read *through* the driver's cache rather than into
+the address it is given) and who is supposed to install the `0x0A72xxxx` window mapping before
+the lookup uses it.
