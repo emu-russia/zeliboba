@@ -5134,12 +5134,16 @@ poll.
 Measured with the timeout enabled (`ZLB_SDIF_CMD8_NORESP=1`, off by default): the machine
 parks at `0x5101EDE4` with **both** status registers reading zero and the mapper's bit-0
 branch (`0x5101EC02`) **never** taken - so the timeout bit is consumed before the request
-engine maps it.  The request slot is the suspect: `0x5101EBF2` returns immediately when
-`[dev+0x2428] == 0`, and the model raises the error synchronously inside the
-command-register write, i.e. possibly before the driver has posted the request that the
-mapper needs.  The data phase of the model already defers its events
-(`data_ready_in_`/`transfer_complete_in_`), so deferring the command error the same way is
-the next thing to try.
+engine maps it.  Deferring the error the way the data phase defers its events is now
+implemented (`Sdif::command_error_in_`, `ZLB_SDIF_ERR_DELAY=<periphclk ticks>`, default 8)
+and the error still reaches the same dead end for delays of 8, 64, 256 and 1024 ticks: the
+mapper is always entered with `r2 == 0` (its "no error" path, which acknowledges and clears
+the error bits at `0x5101ED2A`), which means the request slot is the problem, not the
+timing of the status bit.  The slot is `[dev+0x2428]`: the command path writes the request
+pointer there (`0x5101D88E`) and `0x5101EBF2` returns immediately while it is zero.  The
+next measurement is to break at `0x5101EBE4` and dump `[r0+0x2428]` on the call that
+*should* carry the timeout (the model can log the pc of the poke through the SDIF's own
+trace), i.e. to find who clears the slot between the command write and the status poll.
 
 Two candidate directions for the next round, in order of promise:
 

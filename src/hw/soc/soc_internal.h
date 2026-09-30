@@ -615,6 +615,12 @@ private:
     /// PERIPHCLK ticks left before Transfer Complete is reported after the last
     /// data byte was consumed.
     u32 transfer_complete_in_ = 0;
+    /// PERIPHCLK ticks left before a *failed* command reports its error interrupt
+    /// status.  On hardware the error (e.g. a command timeout) arrives after the
+    /// driver has posted the request it belongs to; raising it synchronously inside
+    /// the command-register write made Sdif::execute_command() hand it to a driver
+    /// whose request slot was still empty (see the CMD8 note in execute_command()).
+    u32 command_error_in_ = 0;
     /// Set while the pending deferred Transfer Complete belongs to an ADMA2
     /// transfer, so the interrupt is reported together with the DMA bit.
     bool dma_complete_ = false;

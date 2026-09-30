@@ -217,6 +217,7 @@ void Sdif::reset() {
     app_cmd_ = false;
     rca_ = 0;
     busy_left_ = 0;
+    command_error_in_ = 0;
     last_command_register_ = 0;
     last_lba_ = 0;
     last_count_ = 0;
@@ -714,7 +715,14 @@ void Sdif::execute_command() {
     if (command_ok_) {
         poke(kNormalIntStatus, peek(kNormalIntStatus) | status);
     } else {
-        poke(kErrorIntStatus, peek(kErrorIntStatus) | 0x0001);
+        // Defer the error the way the data phase is deferred: on hardware the
+        // interrupt arrives after the driver has posted the request it belongs to,
+        // and the driver's completion path (0x5101EBE4) only maps the error status
+        // into its own code while [dev+0x2428] still names that request.
+        command_error_in_ = [] {
+            const char* value = std::getenv("ZLB_SDIF_ERR_DELAY");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8u;
+        }();
     }
     // The model executes a command synchronously, so the command inhibit bits
     // have to clear immediately: the CMeP second loader polls Present State bit 0
@@ -845,6 +853,21 @@ void Sdif::finish_transfer(bool ok) {
 }
 
 void Sdif::tick(u64 cycles) {
+    if (command_error_in_ != 0) {
+        // A failed command reports its error interrupt status a few ticks after the
+        // command register write, so the driver has its request in place when the
+        // error is mapped (see execute_command()).
+        if (cycles >= command_error_in_) {
+            command_error_in_ = 0;
+            if (sdif_trace()) {
+                std::fprintf(stderr, "[sdif] raise CommandError\n");
+            }
+            poke(kErrorIntStatus, peek(kErrorIntStatus) | 0x0001);
+            update_irq();
+        } else {
+            command_error_in_ -= static_cast<u32>(cycles);
+        }
+    }
     if (transfer_complete_in_ != 0) {
         // The data phase finished; report it a few ticks later (see
         // read_data_port()).
