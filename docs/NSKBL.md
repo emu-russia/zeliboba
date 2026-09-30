@@ -5837,3 +5837,39 @@ loops report a state that does not match their instruction (e.g. `0x51023372` st
 `r0 = 0x803FF007`), so the key's inputs have to be read from `ZLB_ARM_TRACE_RANGE` output or
 from a stop that is verified against the instruction's own effect rather than from the first
 `regs` after `runm`.
+
+### 10.22 NSKBL mixes ARM and Thumb code, and two probes have limits worth knowing
+
+**The image is not all Thumb.**  `blx` with an immediate operand *switches to ARM state*, so the
+routines reached that way must be disassembled as ARM - and two of them matter on this path:
+
+| address | what it is | evidence |
+|---|---|---|
+| `0x51011C80` | the **ARM `memcpy`** the cache uses (`blx 0x51011C80` at `0x51000E56`) | `pld [r1]`, `cmp r2, #0xc`, `ble`, byte-wise head alignment, then word copies |
+| `0x51025AF4` | the **ARM division** helper the volume constructor calls | `cmp r1, #0; eor ip, r0, r1; clz ...` |
+
+Disassembled as Thumb both look like garbage (NEON instructions, branches outside the image),
+which is why they were misread earlier; a `bp arm 0x51011C80` stops there and the caller's `lr`
+is `0x51000E5B` (the return address of the `blx` at `0x51000E56`).  For future work: before
+disassembling an NSKBL address, decide the instruction set from the caller's `bl`/`blx`.
+
+**Probe limits measured this round.**
+
+* `ZLB_ARM_BRANCH_LOG=<lo>-<hi>` works (its default range logs 200 hits, its cap is 200
+  entries), but it reports **no branch target anywhere in `0x51020000..0x51030000`** even though
+  the code there provably executes (write traps at `0x51023E86`, breakpoints at `0x51023C40`,
+  `0x51023D4A`, `0x51023962`, the read dispatcher `0x51023128`).  So either that whole region is
+  reached by fall-through from below `0x51020000` or the probe does not cover every branch path
+  (the model's `arm_call` at `bootchain.cpp:3515` drives only the ARLZ decoder, not the storage
+  code).  Until that is resolved, absence of a branch-log entry is *not* evidence that code did
+  not run.
+* Breakpoints themselves match the PC **exactly** (`debugger.cpp:262` compares
+  `cpu->get_pc()`), so a stop at `0x51023D4A` really means the PC was there.  A `step` while a
+  breakpoint is still set does not advance (the step stops on the same breakpoint); clear it
+  first with `bpc <addr>`.
+* A cross-check of the division's inputs (`r0 = 95, r1 = 32, r2 = 31, r7 = 64`) shows they are
+  consistent with *byte* reads at the boot sector's `+0x0A` (`0x20` = 32) and `+0x0C` (`0x02` =
+  2), not with the `ldrh` at `+0xb`/`+0x11` (`0x0200` = 512) that the linear disassembly at
+  `0x51023D52..0x51023D5C` shows - so the instruction stream that actually runs in that block is
+  not the one the linear walk from `0x51023C40` produces, and the geometry analysis has to be
+  re-anchored on the real boundaries before any further conclusion is drawn from it.
