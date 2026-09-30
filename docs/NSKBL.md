@@ -7044,3 +7044,39 @@ but the absolute numbers belong to the short run.
 Next: with the volume read proven, return to the transfer that never completes - the fourth cache fill -
 and use the now-working instrumentation to see whether the driver's completion comes from a polling
 path or needs the interrupt that the strict default never delivers.
+
+### 10.50 The list is at VA 0x5117EF00 (not ...08): one build push, ten pops, and no push-back
+
+My earlier address was wrong: the query adds `0x2400` to the device (`0x5117CB00`) and lands on
+**0x5117EF00**, so every trap I aimed at `0x5117EF08` watched the wrong word - which is why 10.36
+concluded "the head is only ever written with zero".  Trapping the right word over a full run
+(`runm 2000000`) gives the whole story:
+
+```
+head writes (14):
+  0          pc=510008F8      a clear
+  0          pc=51013548      the driver's clear
+  0          pc=5101FA0A      the list init
+  0x5117CB00 pc=5101FA1E      the build (the head; the nodes link through their +0x60)
+  0x5117CD40 pc=5101FA2A  \  ten pops, advancing the head:
+  0x5117CF80 pc=5101FA2A   |  0x5117CB00, 0x5117CD40, 0x5117CF80, 0x5117D1C0, 0x5117D400,
+  0x5117D1C0 pc=5101FA2A   |  0x5117D640, 0x5117D880, 0x5117DAC0, 0x5117DD00, 0x5117DF40
+  ... 0x5117E180 pc=5101FA2A /
+
+head reads (10): the same ten nodes, all from pc=5101FA24 (the pop helper)
+```
+
+So the list is a **free-node pool with about eleven nodes**; **ten of them are popped and none is ever
+pushed back**.  All ten pops come from the *wait* path (`0x5101FE60` -> the query `0x5101F9BC`), while
+the walk's own pop (`0x5101FDB0`) never fires at all - the walk skips every slot because both compared
+bytes are zero (10.37) and so neither submits a transfer nor calls the recycle helper `0x5101F9D0`.
+
+The consequence is exactly the failure chain: every wait pops a *free* node and takes it for a
+completion, until the list is empty; the next wait gets 0 and the request layer fails with
+`0x80320011` - the error the loader returns.  **Round 27's "pool exhaustion" was right in substance
+and only wrong in address.**
+
+Next: make the walk take its non-equal branch.  Dump `[VA 0x290]` and `[device+0x290]` *at the walk*
+(`bp arm 0x5101FD90`) over a long run, and watch (write trap on `device+0x290`) whether the device's
+descriptor slots are ever filled - one of those two tables has to become non-zero for a transfer to be
+submitted and the nodes to circulate.
