@@ -6176,3 +6176,43 @@ inside NSKBL, not a parse failure.
 Next: disassemble the wait/wake pair (`0x510147D8`, `0x5101477C`) to name the condition that
 releases a waiter and what should satisfy it - a scheduler block/wake primitive is the prime
 suspect, together with the MMU state of both stuck cores.
+
+### 10.29 The lock primitives, the lock global, and why the "deadlock" snapshot read zero
+
+The wait/wake addresses are **ARM-mode** routines (the same interworking rule as 10.22), and in ARM
+they are the textbook primitives:
+
+| address | what it is |
+|---|---|
+| `0x51014528` | get CPU id: `mrc p15, 0, r0, c0, c0, 5` (MPIDR) `and r0, #0xF` |
+| `0x5101474C` | atomic halfword store: `ldrexh` / `strexh` retry loop |
+| `0x5101477C` | atomic halfword subtract: `ldrexh` / `sub` / `strexh` |
+| `0x510147D0` | **`sev`** |
+| `0x510147D8` | **`wfe`** (also `dsb sy; wfi` at `0x510147E0`, `dsb sy`, `dmb sy`) |
+| `0x51014958` | clear + `dmb sy` + store + `dsb sy` + **`sev`** |
+
+The release (`0x510158AC`) therefore rotates the owner to the next CPU id (wrapping at 4),
+atomically decrements a counter at `[lock+4]`, clears a word and issues two `sev`s, then **waits
+with `wfe` until `[lock+4] == 4`** - a four-core barrier-style rendezvous, not a plain mutex.  The
+model implements `wfe`/`sev` faithfully and without a lost-wakeup race (`sev_hook` sets a sticky
+`event_pending_` on every core and wakes the waiting ones, `vita.cpp:253-264`), so the waits
+themselves are not the problem.
+
+**Correction to 10.28**: the "deadlock" snapshot was misleading on two counts.
+
+* The global the lock wrapper dereferences, `[0x5113B61C]`, *is* written - exactly one site does
+  it, the function at `0x51010A5C`, in `ldr.w r7,[r6,#0x220] ; movw r5,#0xb61c ; movt r5,#0x5113
+  ; str r7,[r5]` (`0x51010A8E`).  A breakpoint there stops on **arm0** with `r5 = 0x5113B61C`,
+  `r7 = 0x00004000` (a low-window pointer), `r6 = 0x51184C00`, and **`SCTLR = 0x20005805`, MMU
+  on** - so the flow *does* install the scheduler object, about 69 000 instructions *after* the
+  stop 10.28 examined.
+* That earlier stop read the global as zero because of the MMU state, not because it was never
+  written: in that snapshot `core` reported `mmu=off` for both non-secure cores, so `vmem` and the
+  core alike were using the identity mapping, while at the writer arm0 has the MMU on.  In other
+  words the cores disagreed about address translation at that instant.
+
+So the current picture: the loader runs on arm3, walks NSKBL's lock/barrier code, and the state
+that decides whether it proceeds depends on each core's MMU being configured the same way.  The
+next measurement is per-core `SCTLR`/TTBR over time - start with the four ARM cores right before
+and right after `0x51010A5C` runs (`bp arm 0x51010A8E`, `core`, per core `regs`), to find which
+core loses (or never gets) the NSKBL mapping.
