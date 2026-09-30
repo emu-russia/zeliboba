@@ -5477,73 +5477,69 @@ returns **0**:
 zero, so the helper is the volume's mount/read stage.  That call is the next measurement - and
 note the driver still never reads the FAT or the directory after the volume's first 16 KiB.
 
-### 10.13 The last blocker: the global block-read method at 0x51184760 is never installed
+### 10.13 Correction: the zero global method is *not* the blocker, the read buffer is
 
-The chain is now understood all the way to the file lookup, and it stops on one field.
-
-The lookup helper `0x51023970(volume, path, out1, out2, ...)` splits the path
-(`0x51024854`/`0x510247A4`) and walks its components, calling the volume lookup `0x510232EC`
-for each of them; a zero return sets its "not found" marker (`r5 = -0x63`) and the caller
-stores `0x803FF007` at `0x51024160`.  The path it is given is the full
-`"os0/psp2bootconfig.skprx"` (`0x5102BDE7`), and the first component it asks the volume for is
-therefore `"os0"` - inside the volume, not as a device.
-
-Inside `0x510232EC` the read of the directory is issued through a **global** method pointer:
+Round 308 concluded that the lookup `0x510232EC` gives up because the global method at
+`[0x51184760]` is zero.  That was wrong, and the code says so plainly: the branch taken at
+`0x510233A4` is a **fallback**, not an error path.
 
 ```
-5102338C  r8 = [vol, #0x50]        ; the volume's first data block (the driver parsed the BPB)
-51023392  ip = 0x51184760          ; the global block-read method slot
-5102339A  r6 = [ip]
+5102339A  r6 = [0x51184760]        ; prefer the global method
 510233A2  cmp r6, #0
-510233A4  beq 0x51023946           ; <- taken in the model: no method, so the lookup gives up
-510233BA  blx r6                   ; read( [0x51184B84], buffer, r8 >> 9, 0x51184780 )
+510233A4  beq 0x51023946           ; taken (it is zero) - and this is the fallback:
+51023946  r7 = [vol, #0x54]        ;   the volume's own read method (0x51000D55, installed)
+5102394A  cbz r7, 0x5102396A       ;   only *this* is the error
+5102394C  lr = [sp,#0x30]
+51023950  r3 = 0x51184780
+51023954  r1 = [sp,#0x48]          ;   the buffer
+51023956  r2 = r8 >> 9             ;   the LBA
+5102395E  r0 = [lr, #0x58]         ;   the context ([vol+0x58] = 0x5102B010)
+51023962  blx r7
+51023964  b 0x510233BC             ;   and the result is checked at 0x510233BC
 ```
 
-Measured: `[0x51184760]` is **zero** and **nothing in the guest ever writes it**.  A write trap
-over the whole slot area (`ZLB_WTRAP=0x51184700-0x51184800`) shows only the BSS zeroing
-(`pc 0x510008F8`) and the sentinel initialisation done by the path helper itself
-(`pc 0x51023BA4..0x51023BF8`, values 0/0xFFFFFFFF); a scan of the image for the
-`movw/movt 0x4760/0x5118` pair finds four *readers* - the dispatcher `0x51023128`, the volume
-constructor twice (`0x51023CA6`, `0x51023CFE`) and the lookup - and no writer at all.
+so the same interface as the global one (`context, buffer, LBA, 0x51184780`) is served by the
+volume itself - which is exactly what the dispatcher `0x51023128` does too, and it is why the
+pokes in round 308 changed the instruction count without changing the outcome: with the global
+set, the call gets `[0x51184B84]` (= 0, the other unset global) as its context instead of the
+valid `0x5102B010`.
 
-The driver's own dispatcher shows what the design intends: `0x51023128` prefers the global
-method when it is non-zero and otherwise falls back to the *object's* method at `[r0]`:
+Measured what the fallback actually passes (`bp arm 0x51023962`):
+
+| argument | value | what it is |
+|---|---|---|
+| `r0` | `0x5102B010` | the storage context, `[vol+0x58]` - valid |
+| `r1` | `0x0A720290` | the buffer, `[sp+0x48]` = `[vol+0x30]` - **unmapped** |
+| `r7` | `0x51000D55` | the volume's read method - installed |
+
+and `vpa 0x0A720290` reports `section translation fault (fsr 0x5)` while `map 0x0A720290`
+reports no device and no region - the guest's own page tables do not map it and the model has
+nothing there.  The read therefore cannot land, the lookup returns 0, the path helper marks
+"not found" and the caller stores `0x803FF007`.
+
+Where that address comes from is measured too: the constructor writes it at `0x51023E86`
+(into `[vol+0x30]`), computed from the parsed boot sector structure:
 
 ```
-5102312A  r4 = [0x51184760]
-51023136  cbz r4, 0x5102314C     ; no global method -> use the object's
-5102314C  r4 = [r0]              ; the volume's method slot (0x51000D55, installed)
-5102314E  cbz r4, 0x5102315C     ; neither -> 0x803FF007 (0x5102315C)
-51023158  blx r4
+51023E6C  ip = [sb, #0x24]         ; a BPB-derived field
+51023E70  [vol, #0x24] = ip
+51023E74  r0 = r1 * ip + r2
+51023E78  [vol, #0x38] = r0
+51023E7A  r2 = [sb, #0x2c]
+51023E7E  r1 = r2 - 2
+51023E80  [vol, #0x2c] = r2
+51023E82  r3 = r8 * (r2 - 2) + r0
+51023E86  [vol, #0x30] = r3        ; <- 0x0A720290
 ```
 
-and the volume's own slot *is* installed by the constructor (`[vol+0x54] = 0x51000D55`,
-`[vol+0x58] = 0x5102B010`, written at `0x51023FDC`).  The lookup does not use that fallback, so
-the remaining work is to find what installs the global method on hardware - it is a
-per-console/driver registration stage our flow does not reach - or to supply it (a
-substitution, with the signature the call at `0x510233BA` uses: context, buffer, LBA,
-`0x51184780`).  A debugger experiment (`bp arm 0x510233A2`, `poke 0x51184760 <candidate> 32`,
-continue) is the cheapest way to find out which of the two fills the gap.
-
-Everything else on this path now measures correct: the master block is read and parsed, the
-active `OS0` partition (os0_1 at 0x02000000) is chosen, the volume's first 16 KiB is read, and
-its boot sector is in the driver's buffers byte for byte (`SCEI`, 512 bytes/sector, 8
-sectors/cluster, 2 FATs, 512 root entries, FAT size 19 - parsed into the volume at `+0x48`,
-where the lookup checks it).
-
-Measured with the debugger experiment itself (`bp arm 0x510233A2`, `poke 0x51184760 <value> 32`,
-then continue):
-
-| poke | instructions at the end | new eMMC reads | first external load |
-|---|---|---|---|
-| none | 153 205 277 | - | `0x803FF007` |
-| `0x51000D55` (the volume's own method) | 207 312 669 | none | `0x803FF007` |
-| `0x51000D15` (the block-read entry `0x51000D14`) | 207 312 669 | none | `0x803FF007` |
-
-So the zero really is what stops the lookup - setting *any* function there lets the flow past
-`0x510233A4` and the run does 54M instructions more - but the value is not the missing piece by
-itself: neither candidate makes the driver issue the directory read, and the load still fails
-with the same code.  Either the correct method is a *different* interface (the call at
-`0x510233BA` passes a fourth argument, `0x51184780`, which the volume's simple callback ignores)
-or a *second* piece of the driver's registration is missing as well.  That is where the next
-round starts.
+so the field is a *computed offset* built from the structure at `[sb]` - either the boot
+sector parse filled `[sb]` with values that do not fit an os0 volume (the volume object's own
+size field is `0x00110000`, i.e. 1.06 MiB, not the 16 MiB of the os0 slot) or the lookup is
+reading a field that is not a pointer at all.  Note also that the volume object the lookup uses
+(`0x51184FF8`) is created by the storage init through the wrapper `0x51023FD8`
+(`0x51000F78`: `r0 = 0x51184F9C`, `r2 = 0x51000D15` - the read method - `r1 = 0x100000`,
+`r3 = a literal`), and that the boot sector data itself is correct in the driver's buffers
+(`SCEI`, 512/8/2/512/19 measured in round 307).  The next measurement is the boot-sector parse
+(`0x5100B092..0x5100B0E6`, which writes the volume's `+0x1B8..+0x1BC`) and the two computed
+offsets above: which BPB fields they end up with and whether the size field `0x00110000`
+should have been the os0 volume's.
