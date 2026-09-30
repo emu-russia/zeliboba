@@ -6080,3 +6080,31 @@ an external load: the run ends after 400 000 slices at the terminal loop `0x5100
 
 Next: name `0x80320011` (no `movw/movt` pair builds it, so it is computed or comes from a table)
 and trace the flow that now runs between the successful lookup and the terminal loop.
+
+### 10.27 After the fix: the lookup works, the device init runs, and the loader is never reached
+
+Probing the post-fix flow with breakpoint sets (they fire only when the code really runs) gives a
+clear frontier:
+
+* The load path around the old failure - `0x51001486`, `0x5100149C`, `0x510014A2`,
+  `0x510014BA`, `0x510014C2`, `0x510014CC`, and the two continuations `0x51001350` (success) and
+  `0x51001340` / `0x510013F4` / `0x51001338` (the error labels) - **never fires**.  The loader
+  that used to reach `0x510014CC` and fail with `0x803FF007` is not entered at all any more.
+* The device/interface initialisation at `0x51024A4C` **does** run: it is the table-driven copy
+  that installs the Ernie SC register pointers (`0xE3100300/0304/0308`, `0xE3102xxx`,
+  `0xE3103xxx`) and the globals at `0x51184B88`, reading its table from `0x5102A43C`.  Its
+  helpers (`0x51024B70` read-modify-write with `tst`, `0x51024C64`) are re-entered a few times.
+* The regions that still never execute are `0x51024D9A-0x510258D0` (2870 bytes, the rest of that
+  interface setup) and `0x51025E36-0x510262A8` (1138 bytes).
+
+At the end of the 400 000-slice budget the machine is idle rather than failed: the ARM sits in
+NSKBL's idle loop `0x51000D0C`, the CMeP sits at `0x40002`, there is no further eMMC traffic
+(the last read is the root-directory line at LBA 65568), the GPO checkpoint stays `0xA9`
+("kernel pre-init done, before first external load") and the guest console still prints
+`Safe Mode : [ YES ]`.  So the fix removed the `0x803FF007` failure and moved the wall: the file
+lookup succeeds, the interface setup runs, and the flow stops *before* the loader stage - both
+cores end up waiting instead of one reporting an error.
+
+Next: find what should hand control from the interface setup to the loader (the CMeP/ARM handshake
+and its model substitutions are the suspects), and re-check what `0x80320011` is - the terminal
+registers hold it as a leftover, and no `movw/movt` pair builds it.
