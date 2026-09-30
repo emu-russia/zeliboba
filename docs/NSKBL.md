@@ -7123,3 +7123,32 @@ Next: trace the name comparison inside `0x510232EC` - step to its entry-matching
 directory entries it walks (they come from the cached root-directory line, the driver's cache table at
 `0x51033100` with `0x4000` byte lines) and the comparison it makes for long-name and short entries.
 The objective is now a name-matching problem, not a storage one.
+
+### 10.52 The lookup walks an *empty* directory: its entry buffer is filled later, and only once
+
+Two corrections and one decisive measurement.
+
+**The parser is complete, so the long name is not the obstacle.**  Disassembling `0x510232EC` shows a
+full FAT/VFAT walker: the cluster argument `-2` selects the root-directory path at `0x5102390E`, the
+loop at `0x51023378` reads the entry's first byte and handles end-of-directory (`0x00` -> `0x510238F0`),
+deleted (`0xE5` -> `0x510237F6`), the dot entries (`0x2E` -> `0x5102386C`) and **LFN entries**
+(attribute `0x0F` at `+0x0B` -> `0x5102358E`), where it reads the sequence number with its `0x40` last
+flag, the short-name checksum at `+0x0D` and the UTF-16 name fragments.  It also takes the block size
+from `[volume + 0x50] = 0x200` and derives 16 entries per 512-byte block.
+
+**The buffer it walks is empty.**  Breaking at the lookup's entry and dumping the entry pointer it
+starts from (`0x51184780`, loaded at `0x51023334`) gives 128 bytes of **zeros** - so the walk sees
+end-of-directory on its very first byte and reports "not found".
+
+**The buffer is filled after the lookup, and the lookup only runs once.**  A write trap on
+`0x51184780..0x51184800` records 32 zero writes (a clear from `0x510008F8`) and then 32 *data* writes
+from `0x51011D00`..`0x51011DB4` with name-like values (`2020444B` = "KD  ", `20202020` = "    ",
+`64006B41`, `3D450000`).  Ordering them against the lookup settles it: the first fill happens at
+`insns = 50 682 979`, and a breakpoint on the lookup stops exactly once in a whole run - *before* that
+fill.  So the driver asks its parser to find `psp2bootconfig.skprx` in a directory buffer that is still
+empty, gets "not found", and only afterwards fills that buffer from the card data.
+
+Next: find which stage is supposed to fill `0x51184780` before the lookup - the driver's directory
+cache (`0x51033100`, `0x4000`-byte lines, which *does* hold data at the lookup's time) is the natural
+candidate - and what the lookup's caller passes as its cluster so that the parser and the filler agree
+on the same buffer.
