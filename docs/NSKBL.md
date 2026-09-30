@@ -5943,3 +5943,48 @@ root-cluster slot `[structure+0x2C]`, and there is nothing in the flow that does
 Next steps: find what should write that slot (the driver's FAT16 normalisation, or the read path
 that fills the structure), then chase the remaining failure in the directory parse with the same
 ring/range probes.
+
+### 10.24 The parse consumes the structure before it holds the boot sector (timing dependency)
+
+Chasing the second defect found the first one's real shape.  The file lookup bails out at
+`0x510233D8`:
+
+```
+[13] 510233D2 ldrb.w r3, [r10, #0]    ; r10 = 0x51184780 (the read's OUT buffer)
+[14] 510233D6 cmp r3, #0
+[15] 510233D8 beq 0x510238F0          ; taken: the OUT buffer is empty -> give up
+```
+
+and it is empty because the cache read was called with length **zero**: the lookup computes
+`r2 = [vol+0x50] >> 9`, and `[vol+0x50]` is `0x20` instead of `0x200`.
+
+That field is written twice, and a **non-intrusive write trap** (`ZLB_WTRAP=0x51185048-0x5118504C`,
+no breakpoints, default run) catches both writes with their sites:
+
+```
+[wtrap] arm_priv +0x11185048 w4 = 0x200 pc=51023C62   ; the constructor: the block size (correct)
+[wtrap] arm_priv +0x11185048 w4 = 0x20  pc=51023DA2   ; the parse: 32 (wrong)
+```
+
+`0x51023DA2` is `str r7, [r4, #0x50]` and `r7` came from `ldrh.w r7, [r6, #0x0b]` - the
+bytes-per-sector field of the structure.  So in the *default* run that field reads **32**, while
+the same structure, dumped at a breakpoint on that very instruction (`bp arm 0x51023D9A`), holds
+the **correct os0 boot sector** (`EB FE 90 SCEI ... 00 02 08 02 ...`, i.e. 512 at `+0xb`).  The
+value the parse sees therefore depends on whether the ARM was stalled - a **timing/ordering
+dependency** between the read that fills the structure and the parse that consumes it.
+
+The model's SDIF explains how that can happen: for an ADMA read (`sdif.cpp` case 18) the card
+bytes are written to guest memory by the table walk at command time, but the TransferComplete
+status/interrupt is only raised `transfer_complete_in_ = 32` ticks later (`sdif.cpp:660-667`,
+`928-944`).  Anything that reads the cache line - or the buffer the read method copies it into -
+between the command and that tick sees a line that is not valid yet, and the driver's flow (which
+does not appear to wait on that status here) then parses stale contents.
+
+This also re-reads section 10.23 correctly: the `[sb+0x2C]`/`[vol+0x30]` garbage is what the same
+stale structure yields, and the rounded-`regs` values from `ZLB_ARM_TRACE_RANGE` *are* reliable
+(the trap-free `[vol+0x50] = 0x20` matches the trace's `r7 = 0x20`); it was the breakpoint-based
+structure dump that sat on the other side of the timing window.
+
+Next: pin the ordering (SDIF ADMA write, the cache copy, the parse) with `ZLB_SDIF_TRACE` plus
+the same write trap, and then fix the model's read-completion timing so that a completed command
+implies the data is in memory - that is a model-side fix on this path, not a substitution.
