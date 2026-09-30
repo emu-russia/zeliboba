@@ -5867,9 +5867,79 @@ disassembling an NSKBL address, decide the instruction set from the caller's `bl
   `cpu->get_pc()`), so a stop at `0x51023D4A` really means the PC was there.  A `step` while a
   breakpoint is still set does not advance (the step stops on the same breakpoint); clear it
   first with `bpc <addr>`.
-* A cross-check of the division's inputs (`r0 = 95, r1 = 32, r2 = 31, r7 = 64`) shows they are
-  consistent with *byte* reads at the boot sector's `+0x0A` (`0x20` = 32) and `+0x0C` (`0x02` =
-  2), not with the `ldrh` at `+0xb`/`+0x11` (`0x0200` = 512) that the linear disassembly at
-  `0x51023D52..0x51023D5C` shows - so the instruction stream that actually runs in that block is
-  not the one the linear walk from `0x51023C40` produces, and the geometry analysis has to be
-  re-anchored on the real boundaries before any further conclusion is drawn from it.
+* A cross-check of the division's inputs (`r0 = 95, r1 = 32, r2 = 31, r7 = 64`) was first read as
+  evidence that the linear disassembly of the block was wrong.  **Corrected in 10.23**: the ring
+  trace shows the linear disassembly *is* correct (the same instruction addresses in the same
+  order); the inputs simply come from different fields than assumed - `r1 = 32` is `[sb+0x0b]`
+  after the parse rewrote the structure's copy, and `r7 = 64` comes from the `lsls` of the
+  root-entries field, so no byte-level misalignment exists.
+
+### 10.23 The real path and the real values: the FAT16 branch is taken, and one field is raw
+
+`ZLB_ARM_TRACE_RING=0x51023E86` dumps the last 16384 pcs when that store is reached, and
+`ZLB_ARM_TRACE_RANGE=0x51023E6A-0x51023E8A` with `ZLB_ARM_TRACE_TRIGGER=0x51023DE0` prints the
+same instructions *with the register file*.  Together they replace every earlier guess about
+this block:
+
+```
+trace-ring: ... 51023D4A 51023D4E 51023D52 51023D56 51023D58 51023D5C 51023D5E 51023D60
+            51023D62  (ARM divider 51025AF4)  51023D66 51023D68 51023D6A 51023D6C 51023D70
+            51023D72 51023D78 51023D7C ... 51023D8A (ARM divider) 51023D8E ...
+            51023DB2 ... 51023DCE 51023DD2 51023DD6 51023DD8 51023DDA 51023DDE 51023DE0
+            51023E6A 51023E74 51023E78 51023E7A 51023E7E 51023E80 51023E82 51023E86
+```
+
+so the path *does* run through the division, and the linear disassembly of this block is
+correct - the arithmetic simply differs from what I assumed.  The classification is:
+
+```
+51023D84  mls r0, r2, r3, r7     ; r0 = -(reserved) - (division result) - nfats*FATsize
+51023D88  add r0, lr             ; lr = the total-sectors-16 field
+51023D8A  blx 0x510258D0         ; ARM unsigned divide: r0 / r1  ->  the CLUSTER COUNT
+51023D8E  movw r2, #0xFF4
+51023D92  cmp r0, r2
+51023D94  bhi 0x51023E52
+51023E52  movw r3, #0xFFF4 ; cmp r0, r3 ; ite hi ; movhi r0, #2 ; movls r0, #1
+51023DDE  cmp r0, #2
+51023DE0  beq 0x51023E6A         ; taken  =>  r0 = 2  =>  FAT16 (not FAT32!)
+```
+
+`0x0FF4 = 4084`, so `X > 4084 -> r0 = 2 (FAT16)`, otherwise `1 (FAT12)` - the branch at
+`0x51023DE0` is the **FAT16** path, which is what this volume really is (4087 clusters).  The
+label "FAT32 path" used in sections 10.13-10.22 is therefore wrong; the taken branch is the
+*flexible* FAT16 path.  Its register trace is:
+
+| instruction | values | meaning |
+|---|---|---|
+| `51023E6A cbnz r3, 0x51023E74` | `r3 = 0x13` | the FAT size (nonzero), so the `[sb+0x24]` fallback is skipped and `r12` keeps the parsed FAT size |
+| `51023E74 mla r0, r1, r12, r2` | `r0 = 2*19 + 0x10002 = 0x10028` | `nfats * FATsize + partition offset + reserved` = **the root directory's sector** |
+| `51023E78 str r0, [r4, #56]` | `[vol+0x38] = 0x10028` | correct |
+| `51023E7A ldr.w r2, [r9, #44]` | `r2 = 0x414E204F` | `[sb+0x2C]` = the **raw boot-sector label bytes** (`"O NA"` from `NO NAME`) |
+| `51023E80 str r2, [r4, #44]` | `[vol+0x2C] = 0x414E204F` | copied into the volume |
+| `51023E82 mla r3, r8, r1, r0` | `r3 = 8*(raw-2) + 0x10028 = 0x0A720290` | `r8 = 8` (sectors per cluster) - the garbage cache key |
+| `51023E86 str r3, [r4, #48]` | `[vol+0x30] = 0x0A720290` | the key the lookup later hands to the cache |
+
+**The whole os0 blocker is that single field**: for FAT16 the driver expects its normalised BPB
+to carry the *root cluster* at `+0x2C` (the code computes `spc * (root_cluster - 2) +
+root_dir_sector`, which for `root_cluster = 2` degenerates to exactly the root directory's
+sector), but the structure at `0x51184980` still holds the raw sector there, so the root cluster
+becomes `0x414E204F` and the key becomes `0x0A720290`.
+
+Measured with a poke that supplies the value (`bp arm 0x51023D4A`, `poke 0x511849AC 2 32`,
+continue, `ZLB_EMMC_LOG=1`):
+
+```
+read lba=65536 count=32 ok=1      ; the volume's first sector (as before)
+read lba=65568 count=32 ok=1      ; NEW: the 32-sector-aligned cache line holding the ROOT DIRECTORY
+```
+
+`0x10028 = 65576`, and the cache masks its key to 32 sectors (`r4 = r1 & ~0x1F`), so the fill at
+LBA 65568 is exactly the request for the root directory - the driver reads its directory for the
+first time.  Instance count and outcome: the run gains ~48 000 instructions but still ends at the
+path helper's `0x51024160`, so a *second* defect remains in the directory parse / name matching.
+The first one is now proven and precise: **the boot-sector parse never fills the normalised
+root-cluster slot `[structure+0x2C]`, and there is nothing in the flow that does.**
+
+Next steps: find what should write that slot (the driver's FAT16 normalisation, or the read path
+that fills the structure), then chase the remaining failure in the directory parse with the same
+ring/range probes.
