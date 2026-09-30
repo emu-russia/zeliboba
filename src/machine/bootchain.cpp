@@ -885,6 +885,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
 
     // Substitution (on by default, off with ZLB_NO_SUBSTITUTION=1): the allocator is
     // about to run for the class whose page cache is empty.
+    // Round 366: NSKBL's *first external load* - the file read of psp2bootconfig.skprx
+    // - never reaches the SDIF.  Measured: the boot reads the os0 boot sector and root
+    // directory (LBA 0/65536/65568) and then stops, NSKBL's own checkpoint sits at 0xA9
+    // ("kernel pre-init done, before first external load"), and the driver's wait
+    // (0x5101FE60) pops an empty device completion list at VA 0x2640 and builds
+    // 0x80320011.  The device object that list belongs to is the hard-wired VA 0x240,
+    // which nothing in the chain writes.  Fill it as soon as the driver first enters
+    // that wait: early enough that the object is read (it is read inside the call) and
+    // late enough that the low window is mapped and no longer being cleared.
+    // ZLB_NSKBL_DEV=1 opts in.
+    static const bool supply_nskbl_device = [] {
+        const char* value = std::getenv("ZLB_NSKBL_DEV");
+        return value != nullptr && value[0] != '0';
+    }();
+    // The object is read inside the wait, and the driver re-initialises its lists per
+    // request (and the guest clears that page during its own table setup - measured:
+    // 65 zero writes from the lock init), so re-apply it at every entry into the wait
+    // rather than once.  The first attempt latched at the wait's entry and the second
+    // hooked the pop call itself; both left the instruction count bit-identical
+    // (767606285), so neither had taken effect where the driver reads.
+    constexpr u32 kNskblWaitPc = 0x5101FE60u;
+    if (supply_nskbl_device && pc == kNskblWaitPc && core < static_cast<u32>(kArmCoreCount)) {
+        supply_nskbl_device_object(core);
+    }
+
     static const bool supply_blocks = [] {
         const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
         return value == nullptr || value[0] == '0';
@@ -2964,6 +2989,48 @@ bool Vita::supply_kbl_class_table(u32 core) {
         cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
     }
     return false;
+}
+
+// Development substitution (round 366): give NSKBL's storage driver the device
+// object its code reads.  See the declaration in vita.h for the measurements; the
+// write helper follows supply_kbl_class_table above (translate the VA, write through
+// the bus, so the model's own low-window substitution stays in charge of mapping).
+bool Vita::supply_nskbl_device_object(u32 core) {
+    if (core >= static_cast<u32>(kArmCoreCount)) return false;
+    ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+    if (arm == nullptr) return false;
+    constexpr u32 kDeviceVa = 0x00000240u;    // hard-wired by the driver (0x5101FDBC)
+    constexpr u32 kSdifBase = 0xE0B00000u;    // measured at the working command writer
+    constexpr u32 kSubmitRoutine = 0x51022605u;  // 0x51022604 | Thumb
+    constexpr u32 kTableVa = 0x00000280u;
+    constexpr u32 kNodeVa = 0x00000300u;
+    auto write_va = [&](u32 va, u32 value) {
+        u32 pa = 0;
+        std::string fault;
+        if (!arm->translate(va, true, false, pa, fault)) return false;
+        arm_bus_->write32(pa, value);
+        return true;
+    };
+    // +0x2430 is the field the command writer reads as its register base
+    // (5102260C add r3,r4,#0x2400 ; 51022610 ldr r4,[r3,#0x30]).
+    if (!write_va(kDeviceVa + 0x2430u, kSdifBase)) return false;
+    // +0x2440 is copied into every request at +0x70 (5101D670/5101D67C).
+    write_va(kDeviceVa + 0x2440u, 1u);
+    // +0x2480 + 0x20 -> the dispatch table; its first entry is the "submit" method
+    // the device routine calls with the request in r0 (5101D69A-5101D6A4).
+    write_va(kDeviceVa + 0x2480u + 0x20u, kTableVa);
+    write_va(kTableVa, kSubmitRoutine);
+    // The completion list at +0x2400 (VA 0x2640): a single free node, so the driver's
+    // wait has something to pop instead of taking the 0x80320011 error path.
+    write_va(kNodeVa + 0x60u, 0u);
+    write_va(kDeviceVa + 0x2400u, kNodeVa);
+    write_va(kDeviceVa + 0x2404u, kNodeVa);
+    ZLB_LOG_INFO("machine",
+                 "NSKBL device object supplied at VA 0x%03X (SDIF base 0x%08X, submit 0x%08X, node 0x%03X) "
+                 "(ZLB_NSKBL_DEV=1, development substitution)",
+                 kDeviceVa, kSdifBase, kSubmitRoutine, kNodeVa);
+    add_milestone("NSKBL device object supplied (development substitution)");
+    return true;
 }
 
 // Experiment body (round 101): give one size class the free-chunk marker and the

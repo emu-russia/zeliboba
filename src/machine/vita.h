@@ -391,6 +391,22 @@ private:
     /// Create the per-class table the SceUID registration walks through the global
     /// 0x400B291C; the loader never writes that global itself (round 93).
     bool supply_kbl_class_table(u32 core);
+    /// Development substitution (round 366): NSKBL's storage driver addresses its
+    /// device through a hard-wired object at VA 0x240 (`str r2,[r0]` with r2 = 0x240
+    /// in the request builder at 0x5101FDBC).  That object lives in the low window
+    /// and nothing in the boot chain ever writes it - measured: zero writes over its
+    /// first page in a whole run - so the driver's first data access dereferences a
+    /// NULL function pointer (`blx [0]` out of `[device+0x24A0]`, docs/NSKBL.md
+    /// 10.66).  This fills the fields the driver is measured to read: the SDIF
+    /// register base at +0x2430 (0xE0B00000, the value the working ADMA command
+    /// writer uses), a pointer at +0x24A0 to a one-entry dispatch table holding the
+    /// driver's own submit routine (0x51022604, which takes the request in r0, writes
+    /// the SDIF command registers and returns 0), and a free node on the device's
+    /// completion list at +0x2400 (VA 0x2640) - the list the driver's wait pops and
+    /// which is empty in every measured run (docs/NSKBL.md 10.69).
+    bool supply_nskbl_device_object(u32 core);
+    /// One-shot latch for the substitution above (round 366).
+    bool nskbl_device_supplied_ = false;
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
     /// class, so the loader own carve path hands the block out.
     bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);

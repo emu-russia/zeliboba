@@ -7784,3 +7784,50 @@ successful device setup (the stub at `0x5101E78C` suggests a table of method slo
 fill), or the same structure being written through a VA that the low window maps elsewhere.  Trapping
 writes over the device's whole low-window range (resolved with `vmem`, not assumed) and breaking on the
 first post-open access to `[device + 0x24A0]` should name it.
+
+### 10.70 The failure in NSKBL's own terms: checkpoint 0xA9, and the file's data is never read
+
+**The boot checkpoint (debugger `gpo`) settles where the boot stands:**
+
+```
+GPO raw=0x00A90000  checkpoint=0xA9 - NSKBL: kernel pre-init done, before first external load
+```
+
+So NSKBL completes pre-init (0xA1), interrupt registration (0xA2), the serial console (0xA3), the device
+buffer (0xA4), co-processor init (0xA5) and MMU/VBAR (0xA6) - and stops at its **first external load**.
+
+**The eMMC read list says the same thing exactly.**  With `ZLB_EMMC_LOG=1` the whole run performs 22
+reads: the boot chain's own (LBA 512/704/612/614/615/0/24576/25071-25072), then the os0 volume's
+
+```
+lba=0 count=32   lba=65536 count=32   lba=65568 count=32
+```
+
+(boot sector and the two root-directory cache fills) **and nothing else** - the file's first cluster is
+never read.  So the diagnosis is confirmed at the level that matters: the volume and the directory work,
+the lookup finds `psp2bootconfig.skprx`, and the *data* transfer is never issued.
+
+**The NSKBL image names the storage ports.**  A scan for the SDIF base constant finds a device table at
+`0x51029FC0`:
+
+```
+51029FC0  00 00 B0 E0 | 00 00 C0 E0 | 00 00 C1 E0 | 00 00 00 00    0xE0B00000, 0xE0C00000, 0xE0C10000, 0
+51029FD0  "SceSdif0"  | "SceSdif1"  | "SceSdif2"  | "SceSdif3"     (with a table of name pointers at 0x5102A000)
+```
+
+All three ports are implemented in the model (`map 0xE0B00000/0xE0C00000/0xE0C10000` -> `Kermit.Sdif0/1/2`),
+so the transport is not the missing piece.
+
+**First implementation attempt (`ZLB_NSKBL_DEV=1`, off by default).**  `supply_nskbl_device_object` fills
+the device object the driver reads - the SDIF base `0xE0B00000` at `+0x2430`, a pointer at `+0x24A0` to a
+one-entry dispatch table holding the driver's own submit routine `0x51022605`, and a free node on the
+device's completion list at `+0x2400` (VA 0x2640) - re-applied at every entry into the wait
+(`0x5101FE60`).  The object is verifiably present in memory (`vmem 0x2670` = `0xE0B00000`,
+`vmem 0x2640` = `0x00000300`/`0x00000300`), **yet the run is bit-identical** (767606285 instructions, 22
+reads, checkpoint 0xA9), so the driver never sees those writes where it reads.
+
+**That is the concrete next problem:** the model's `ArmCore::translate()` inside the pc hook disagrees
+with the mapping the CPU is actually using at that moment (the same discrepancy that produced the
+per-page `vmem` surprises of 10.61/10.65 - `VA 0x2670 -> PA 0x40301670` while `VA 0x2640 -> PA
+0x40301640`).  Until the hook writes memory the CPU will read, no substitution for this structure can
+take effect, so that translation path is what to fix next.
