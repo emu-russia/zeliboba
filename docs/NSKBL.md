@@ -6268,3 +6268,43 @@ end-of-run state, which is what earlier rounds did.
 Next: read the loader's return value at `0x51001540`, decide whether the terminal `0x51000D0C` is
 an idle or a panic loop (its only instruction is `b` to itself, so only an interrupt can leave it),
 and identify the event the three parked cores are waiting for.
+
+### 10.31 The loader really returns 0x80320011, and nothing in NSKBL or the KBL builds that value
+
+Read at the loader's `pop` (`bp arm 0x51001540`, arm0, `insns = 53 767 801`, before any further
+run):
+
+```
+R0 = 0x80320011   R4 = 0x510B3204   R5 = R6 = 0x51184C00
+R7 = R8 = 0x00004000               R14 = 0x51001677
+```
+
+so the value is a *real* return, not a leftover (which corrects 10.30's caution).  Where it comes
+from is now well constrained:
+
+* `0x80320011` does **not** occur anywhere in the NSKBL image (no `11 00 32 80` byte sequence) and
+  **not** in the KBL image either (dumped with `save 0x40020000 0x60000` after a full run) - and no
+  `movs/movw #0x11` + `movt #0x8032` pair builds it in *either* image (a 14-instruction window
+  scan, both Thumb and ARM).
+* Inside NSKBL exactly four sites build it, and **none of them executes**:
+
+| site | context | fired? |
+|---|---|---|
+| `0x5101FDFE` / `0x5101FE00` | request-completion error path (logs via the printf at `0x5102A180`) | no |
+| `0x510205D6` / `0x510205DC` | request completion: `bl 0x5101F9D0`, `movs r7,#0x11`, `bl 0x5101E790`, `movt r7,#0x8032`, `b 0x5101FF6A` | no |
+| `0x5102252E` / `0x51022530` | request phase update (`str r7,[r0,#8]`, phase `0x514`) | no |
+| `0x51022544` / `0x51022546` | the neighbouring error exit | no |
+
+while the device-read entry `0x510205E8` fires four times (the four eMMC reads: LBA 0, 65536, 65568
+and one more).  So the storage stack *is* entered and the reads *do* run, yet the value the mount
+returns is composed somewhere the two images do not contain.
+
+Two candidates follow from that: the value is assembled at run time from a callee's `0x11` plus a
+`movt rX,#0x8032` (the scan above only looks for the *pair*, so a `movt` over an already-`0x11`
+register would be missed), or it is produced by one of the *other* SLB2 modules - `kprx_auth_sm`
+(the module-authentication service) and the secure kernel are the natural sources for a
+`0x8032xxxx` code.
+
+Next: break on the `movs r7,#0x11` instructions themselves (`0x510205D6`, `0x5102252E`,
+`0x51022544`) rather than on the `movt`, and check the four `0x510205E8` call sites' callers for an
+out-call to the secure side (SMC or an Ernie request) that could return the code.
