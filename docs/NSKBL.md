@@ -7302,3 +7302,44 @@ Next: follow call 2 through the descriptor loop with a raised `ZLB_ARM_TRACE_LIM
 after the first call) to see the exact skipping branch and what the caller reads back, and settle *which*
 object should hold the descriptor slots - `0x51183948` (the handle installed at `[0x5102B014]`) or
 `0x5117CB00` (the object the walk loops over) - and why both are zero for the whole run.
+
+### 10.57 The walk's real shape: a slot search that jumps into the programming loop, which returns on the first *unchanged* slot
+
+Disassembling around `0x5101FE30` finishes the picture.
+
+**`0x5101FAD8` is not a bail - it is the slot search.**  It loads each slot's base/size pair with
+`ldrd r8, sb, [r6, #0x298]` and `ldrd r0, r1, [r6, #0x2a0]` (stride `0x28`: `+0x2c0`/`+0x2c8`,
+`+0x2e8`/`+0x2f0`, ...), computes `end = base + size` and tests whether the transfer `[r5:r4]` lies
+inside.  At the search's entry the registers are `R4 = 0x11C60` (the offset), `R5 = 0`, `R6 =
+0x5117CB00`; the first slot reads base `0` and size `0x5117CF80`, so the transfer is accepted.
+
+**The match arms are the missing entry point:**
+
+```
+5101FE30  mov.w sb, #1 ; b 0x5101FD8C
+5101FE36  mov.w sb, #2 ; b 0x5101FD8C
+5101FE3C  mov.w sb, #8 ; b 0x5101FD8C
+5101FE42  mov.w sb, #3 ; b 0x5101FD8C      (and 4..7 likewise)
+```
+
+so the **programming loop is entered at `0x5101FD8C`**, not at `0x5101FD88` - which is exactly why a
+breakpoint on `0x5101FD88` never fired and several earlier readings of this loop were partial.  The
+loop derives the slot offset from `sb` itself (`lsl sl,sb,#2`; `add r4,sl,sb`; `lsls r7,r4,#3` = slot *
+0x28).
+
+**And the loop returns on the first *unchanged* slot.**  Its skip path is
+`0x5101FDF6 str.w r8,[r6,#0x3d8] ; b 0x5101FD62`, and `0x5101FD62` is `mov r0, r4 ; pop` - a *return*.
+So the semantics are: find the slot covering the transfer; if that slot's byte in the low window equals
+the device's own slot byte, the descriptor is "already programmed", so return 0 and let the caller wait
+for the transfer's completion; only when the bytes differ does the walk pop a free node, fill it,
+submit it and release it.
+
+Both bytes are zero here, so the walk returns 0 and the caller (`0x5101FE60`) waits - for a completion
+that is supposed to come from the hardware.  Nothing in this model pushes onto the list at
+`[device + 0x2400]` (head/tail pair at VA `0x5117EF00`), which is why the wait drains the free nodes and
+fails with `0x80320011`.
+
+Next: identify which modelled device is supposed to push the completed request onto that list - it is
+the driver's hardware interface, and the candidates are the SDIF's ADMA engine and the Kermit DMA
+channels.  The list's head and tail (`0x5117EF00`/`0x5117EF04`) and the node chain through `+0x60` are
+the exact structure to look for in a device model.
