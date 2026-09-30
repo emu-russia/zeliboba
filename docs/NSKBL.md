@@ -7748,3 +7748,39 @@ then the walk's submission has something to call instead of `blx 0`.
 Next: implement that substitution in the model (opt-in first, following the existing "development
 substitution" pattern) and measure whether the walk's submit then completes and the boot advances past
 the file-data read.
+
+### 10.69 Correction: the walk's submit is never taken naturally - the wait polls the *device's* completion list and finds it empty
+
+**Which error path fires on its own.**  In a default run, breakpoints show the caller's wait
+(`0x5101FE60`) being reached while the walk's submit error (`0x5101FDFE`) and the request-error path
+(`0x510205D4`) stay silent in the sampled window.  The walk's submit path - the one 10.63 could only
+reach by poking the compared bytes apart - is therefore **not** what fails naturally, and 10.68's plan
+(building the dispatch table for that submit) was aimed at a path the driver never takes.
+
+**The wait's full anatomy** (`0x5101FE60`):
+
+```
+5101FE66  r5 = [r0]                     the object's first field = the device (0x240)
+5101FE74  mov r0,r5 ; bl 0x5101E78C     (a) the device "start" call
+5101FE7E  ... bl 0x5101FA5C             (b) THE WALK - returns 0, "nothing to do"
+5101FE8E  mov r0,r5 ; bl 0x5101F9BC     (c) POP the device's completion list (VA 0x2640)
+5101FE96  cmp r0,#0 ; beq 0x510205D4    (d) empty -> the request-error path, which builds 0x80320011
+```
+
+Call (a) is a **stub**: `0x5101E78C` is `movs r0,#0 ; bx lr` - it returns success and does nothing.  So
+the natural flow is: no-op, walk says nothing to do, **the driver pops the device's completion list
+looking for the finished transfer, finds it empty, and takes the error path** - which is exactly where
+`0x80320011` is produced.
+
+**That relocates the gap.**  The walk is a secondary mechanism (a reaper that submits a slot only when
+its state differs from the device's mirror), not the file-read path.  What the driver is waiting for is a
+*completion* on the device's list at VA 0x2640, and nothing in the model ever produces one.  The device
+object at VA 0x240 (10.68) is still the structure that must exist, but what it needs first is the
+*request handover* - somewhere the driver must have handed the transfer to that device - because its
+"start" call is only a stub.
+
+Next: find where the transfer is actually handed to the device.  Candidates: a call reached only after a
+successful device setup (the stub at `0x5101E78C` suggests a table of method slots the model does not
+fill), or the same structure being written through a VA that the low window maps elsewhere.  Trapping
+writes over the device's whole low-window range (resolved with `vmem`, not assumed) and breaking on the
+first post-open access to `[device + 0x24A0]` should name it.
