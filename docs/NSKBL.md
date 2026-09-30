@@ -7080,3 +7080,46 @@ Next: make the walk take its non-equal branch.  Dump `[VA 0x290]` and `[device+0
 (`bp arm 0x5101FD90`) over a long run, and watch (write trap on `device+0x290`) whether the device's
 descriptor slots are ever filled - one of those two tables has to become non-zero for a transfer to be
 submitted and the nodes to circulate.
+
+### 10.51 The lookup does reach the root directory with the exact target name
+
+Three measurements in a long run (`runm 2000000`) pin the objective down.
+
+**The walk's comparison runs exactly once.**  `bp arm 0x5101FDAA` (the `cmp` inside the descriptor
+loop) stops **once** in a whole run, while `0x5101FD88` (the loop's nominal `movs sb,#0` entry) never
+stops - the flow enters the loop mid-way.  At that one stop both operands are zero, so the only
+descriptor comparison of the run skips.
+
+**The device object at that moment:** its descriptor area (`device + 0x270`, `0x5117CD70`..`0x5117CDAF`)
+is **all zero**, while `device + 0x2A0` holds a *different* structure - a pool list (`0x5117CF80`,
+count 1, and the code pointer `0x5101D65D`).  So the descriptor slots the walk compares are genuinely
+empty; the pool list lives elsewhere (the `+0x2400` window of 10.50).
+
+**The file lookup is finally visible.**  `bp arm 0x510232EC` (the lookup of round 277's note) stops
+with
+
+```
+R0 = 0x51184FF8      the os0 volume object (the same one the mount table holds)
+R1 = 0xFFFFFFFE      -2, the conventional "root directory" pseudo-cluster
+R2 = 0x5102BB74   R3 = 0x5102BDB4   R4 = 0x5102BDBC
+```
+
+and dumping those stack addresses shows the strings outright:
+
+```
+5102BDE0  6F 73 30 2F 70 73 70 32 62 6F 6F 74           "os0/psp2boot"
+5102BB74  70 73 70 32 62 6F 6F 74 63 6F 6E 66 69 67     "psp2bootconfig.s"
+5102BB84  6B 70 72 78 00                                "kprx\0"
+```
+
+So the path has been parsed down to the *root directory* and the name being searched is exactly
+**`psp2bootconfig.skprx`** - the file of the objective.  Reading the volume (10.49) and parsing the
+path both work; what is left is the **name match against the directory entries**, which the model's own
+comment in `sdif.cpp:641` ("NSKBL's file lookup reports 'not found' for os0:psp2bootconfig.skprx
+although the entry is in the image") already flagged.  The name is 18 characters, so the match has to
+go through a VFAT long-name entry.
+
+Next: trace the name comparison inside `0x510232EC` - step to its entry-matching loop, dump the
+directory entries it walks (they come from the cached root-directory line, the driver's cache table at
+`0x51033100` with `0x4000` byte lines) and the comparison it makes for long-name and short entries.
+The objective is now a name-matching problem, not a storage one.
