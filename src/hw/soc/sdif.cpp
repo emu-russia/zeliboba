@@ -774,7 +774,7 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
     // through the path at 0x48158, which also sets transfer mode bit 0 (DMA
     // enable). A driver that uses ADMA never touches the 0x20 data port, so the
     // host has to move the bytes itself.
-    const u32 table = static_cast<u32>(peek(kAdmaSystemAddress));
+    const u32 table = dma_translate(static_cast<u32>(peek(kAdmaSystemAddress)));
     adma_address_ = table;
     adma_bytes_ = 0;
     adma_ok_ = false;
@@ -826,8 +826,9 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
         // 48640 bytes, the short transfer made the driver retry forever (round
         // 153-10 in docs/SYSCON.md).
         const u32 transfer_length = length == 0 ? 0x10000u : length;
+        const u32 physical_target = dma_translate(target);
         if (((attribute >> 4) & 0x3u) == 0x2u && transfer_length != 0) {
-            if (bus->first_unmapped(target, transfer_length) != 0) {
+            if (bus->first_unmapped(physical_target, transfer_length) != 0) {
                 if (sdif_trace()) {
                     std::fprintf(stderr, "[sdif] adma: target 0x%08X len %u unmapped\n", target,
                                  transfer_length);
@@ -836,11 +837,11 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
             }
             if (read) {
                 if (static_cast<size_t>(consumed) + transfer_length > payload.size()) return false;
-                bus->write_bytes(target, payload.data() + consumed, transfer_length);
+                bus->write_bytes(physical_target, payload.data() + consumed, transfer_length);
             } else {
                 const size_t base = sink->size();
                 sink->resize(base + transfer_length);
-                bus->read_bytes(target, sink->data() + base, transfer_length);
+                bus->read_bytes(physical_target, sink->data() + base, transfer_length);
             }
             consumed += transfer_length;
             adma_bytes_ += transfer_length;
@@ -854,6 +855,23 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
                      static_cast<unsigned>(payload.size()), adma_ok_ ? 1 : 0);
     }
     return adma_ok_;
+}
+
+u32 Sdif::dma_translate(u32 address) const {
+    // Round 305 (measured): NSKBL's non-secure window is mapped identity in the guest's
+    // own page tables (`L1[0x510] = 0x5111158E`, VA 0x51000000 -> PA 0x51000000), but its
+    // SD driver hands the DMA engine the *bus* address of that window, which is the
+    // address with the window byte dropped: the request object at VA 0x5117D400 carries
+    // `[request+0x7C] = 0x0017D480` for its ADMA table at VA 0x5117D480 and builds its
+    // records with targets 0x0017D5C0 and 0x00033140 for the buffers at VA 0x5117D5C0 and
+    // VA 0x51033140 - i.e. `address & 0x00FFFFFF`.  The model keeps that memory at the
+    // identity address, so a DMA address the bus cannot serve is tried inside the window.
+    if (dma_bus_for(address, 8) != nullptr) return address;
+    if (address < 0x01000000u) {
+        const u32 windowed = address + 0x51000000u;
+        if (dma_bus_for(windowed, 8) != nullptr) return windowed;
+    }
+    return address;
 }
 
 Bus* Sdif::dma_bus_for(u32 address, u32 length) const {

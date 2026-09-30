@@ -5375,3 +5375,37 @@ Follow-up measurements (same round, after the two points above were started):
   entry) or the hardware really does keep NSKBL's data at low physical addresses and the
   model has no memory there.  Deciding this is the next step, and it is what stands between
   the model and an ADMA walk that succeeds.
+
+### 10.11 The ADMA walk succeeds, and the driver now reads the volume
+
+The translation the last measurement implies is now implemented: `Sdif::dma_translate()` tries
+the address as given and, when no bus serves it, the same offset inside NSKBL's window
+(`address + 0x51000000`, only for addresses below 0x01000000).  Both the table base and every
+record target go through it.
+
+Measured effect (`ZLB_SDIF_TRACE=1`):
+
+```
+CMD idx=18 arg=0 tm=0x0033 block=0x00200200 size=512 count=32 data=1 read=1 multi=1 dma=1
+adma rec @0x5117D480 attr=0x0021 len=56    target=0x0017D5C0
+adma rec @0x5117D488 attr=0x0021 len=16320 target=0x00033140
+adma rec @0x5117D490 attr=0x0023 len=8     target=0x0017D600   (END)
+adma table=0x5117D480 moved=16384/16384 ok=1
+raise TransferComplete dma=1
+```
+
+so all 32 blocks (16 KiB) reach the driver's own buffers, and the guest memory at
+VA 0x5117D5C0 holds the first 56 bytes of the transfer - `Sony Computer En`, i.e. the eMMC's
+master block.  The park at `0x5101EE06` is gone and the run ends in the familiar terminal loop
+`0x51000D0C`.
+
+What is still missing is one level up: the storage open returns **0** at `0x51000E94` (the
+original `0x803FF007` is gone) and the volume is read once, but the first external load still
+returns `0x803FF007` at `0x510014D5` and **no further sector is ever read**.  The driver reads
+LBA 0 - which in the reconstructed image is the console's *master block* (partition table:
+`slot03/OS0` at 0x0001000000 and `slot04/OS0` at 0x0002000000, both FAT16, per
+`emmc_rebuild --inspect`) - and then stops, so the next measurement is inside the storage
+stack's partition/volume handling: what the code after the first read does with the master
+block (the lookup entry `0x510232EC` is called with the volume object `0x51184FF8`, whose
+`+0x30` is `0xFFFFFFFF` and `+0x38` is 0 at that point) and why it decides the volume is
+unusable instead of reading the OS0 slot at LBA 32768.

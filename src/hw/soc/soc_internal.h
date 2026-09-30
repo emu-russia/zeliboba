@@ -585,6 +585,10 @@ private:
     bool adma_transfer(bool read, const std::vector<u8>& payload, std::vector<u8>* sink);
     /// Whichever bus maps `address`, or nullptr when neither does.
     Bus* dma_bus_for(u32 address, u32 length) const;
+    /// The address to move DMA bytes through: the identity address when a bus serves
+    /// it, otherwise the same offset inside NSKBL's non-secure window (see the
+    /// measurement in sdif.cpp).
+    u32 dma_translate(u32 address) const;
     void update_irq();
 
     EmmcCard* card_ = nullptr;
