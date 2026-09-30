@@ -6489,3 +6489,45 @@ free-node pool empties
 Next: decide whether the pool is meant to start with more than three nodes (a guest capacity the
 model gets wrong) or whether the recycle on completion never runs - a write watch on the pool head
 (VA 0x2640) plus a breakpoint on `0x5101F9D0` will show which of the two it is.
+
+### 10.36 The failing request is *skipped* by a byte comparison, and the pool is never filled
+
+Correcting 10.35: reading the pool address at the pop itself (`bp arm 0x5101FA24`, `R0`) gives
+**VA 0x5117EF08**, not `0x2640` - the query is called with a controller pointer, and the request's
+`+8` field (`= 1`) is not it.  A write trap on the real head
+(`ZLB_WTRAP=0x5117EF08-0x5117EF10`) shows only writes of **zero**:
+
+```
++0x1117EF08 w4 = 0x0 pc=5101354C     ; a clear routine
++0x1117EF0C w4 = 0x0 pc=5101354C
++0x1117EF08 w4 = 0x0 pc=5101FA0A     ; another list operation
++0x1117EF0C w4 = 0x0 pc=5101FA0C
+```
+
+so **no node is ever pushed into the pool** during the whole run.
+
+More importantly, the failing submit is not stopped by an empty pool at all - it is **skipped
+before the pop**:
+
+```
+5101FD90  ldrb.w r0, [r3, #0x20]   ; r3 = 0x270 (descriptor 0) + 0x20 = VA 0x290
+5101FDA0  ldrb.w r4, [r1, #0x290]  ; r1 = the request
+5101FDA8  cmp r0, r4
+5101FDAA  beq 0x5101FDF6           ; EQUAL -> skip the pop *and* the submission
+5101FDAC  ldr r7, [r6]
+5101FDB0  bl 0x5101F9BC            ; the pop (only reached when the bytes differ)
+```
+
+Measured: `[VA 0x290] = 0` and `[request+0x290] = 0`, so the comparison matches and the request is
+dropped; the caller (`0x5101FE60`) then polls the completion list once, finds nothing and fails with
+`0x80320011`.
+
+The byte at **VA 0x290 is never written anywhere in the run** (`ZLB_WTRAP=0x40300290-0x40300298`
+finds zero writes even though the read is real) - a global the driver *reads* and nothing
+*initialises*.  VA 0x290 is inside NSKBL's **low window**, the very region the model fills with
+development substitutions ("NSKBL low window: ... granted privileged access (development
+substitution)"), which makes this a prime model-side suspect.
+
+Next: find what VA 0x290 (and the low-window structure it belongs to) is supposed to hold - the
+guest code that would initialise it, or the substitution expected to - because that single byte
+currently decides whether the request is submitted at all.
