@@ -6035,3 +6035,48 @@ Next: decide between the two candidate causes - the model's Thumb-2 `LDRH (immed
 (offset `imm12` read one too low) and its effective-address computation for that load - by
 disassembling the address with the model's own disassembler after boot (`dis 0x51023D9A 3`) and
 by adding a one-line self-test for `ldrh.w rd, [rn, #imm12]` to `zlb_tests`, then fix the decoder.
+
+### 10.26 FIXED: the Thumb-2 halfword load rounded an unaligned address down
+
+Neither candidate in 10.25 was the cause; the third one was.  `thumb32_load_store_single()`
+decoded the instruction correctly (`imm12_form` set by `hw1 & 0x80`, `size == 1` from
+`hw1 & 0x20`, `imm12 = hw2 & 0xFFF` = 0x00B) and then threw the odd bit away:
+
+```cpp
+else if (size == 1) value = mem_read_half(addr & ~1u) & 0xFFFFu;
+```
+
+`mem_read_half()` reads `bus->read16(phys_addr)` - an *aligned* bus access - so an unaligned
+`LDRH` returned the byte pair at `addr & ~1`, i.e. the halfword at `+0x0A`.  The guest runs with
+SCTLR.A == 0, where an unaligned halfword access is simply the two bytes *at* the address (no
+rounding down, and no rotation - rotation is an `LDR`/`LDM` rule).  The same masking existed at
+eleven call sites (six loads, five stores) across the Thumb-2 and A32 paths.
+
+The fix (commit `1777447`): `mem_read_half`/`mem_write_half` handle an odd address byte-wise -
+each byte going through its own translation, so a page-crossing unaligned access works too - and
+the call sites pass the real address instead of `addr & ~1u`.
+
+Measured after the fix, in a plain default run with no pokes or breakpoints:
+
+```
+[wtrap] +0x11185048 w4 = 0x200 pc=51023C62   ; constructor
+[wtrap] +0x11185048 w4 = 0x200 pc=51023DA2   ; the parse now reads 512, not 32
+read lba=65536 count=32 ok=1                 ; the volume's first sector
+read lba=65568 count=32 ok=1                 ; NEW: the cache line holding the ROOT DIRECTORY
+```
+
+and the coverage map shows two regions running for the very first time
+(`ZLB_ARM_COV=1` + the debugger's `cov`):
+
+* `0x510233C0-0x510238F2` - the lookup's directory parsing (previously 1330 unexecuted bytes),
+* `0x5102416A-0x51024854` - the path helper's continuation after the component walk
+  (previously 1770 unexecuted bytes).
+
+So the file lookup now succeeds and the driver proceeds past it.  The chain still does not reach
+an external load: the run ends after 400 000 slices at the terminal loop `0x51000D0C` with
+`r0 = 0x80320011` - a *new* error, and none of the four old failure sites
+(`0x5102315C`, `0x51023CF4`, `0x51024160`, `0x5102470A`) is reached any more.  `zlb_tests`
+436/436, `verify.ps1` 9/9 and the eMMC image still checks out (992 files, 0 mismatches).
+
+Next: name `0x80320011` (no `movw/movt` pair builds it, so it is computed or comes from a table)
+and trace the flow that now runs between the successful lookup and the terminal loop.
