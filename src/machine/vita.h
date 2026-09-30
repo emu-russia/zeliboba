@@ -276,6 +276,21 @@ public:
     /// Raw bitmap (for `cov save`), one bit per arm_cov_granularity() bytes.
     const std::vector<u8>& arm_cov_bytes() const { return arm_cov_bits_; }
 
+    // ------------------------------------------------------------------
+    // CMeP (MeP) PC coverage
+    // ------------------------------------------------------------------
+
+    /// Same map for the security core: ZLB_MEP_COV=1 arms it, and the debugger's
+    /// `cov mep` prints it.  The MeP side has no `c`-command of its own, so this is
+    /// the only way to answer "which part of first_loader / second_loader /
+    /// secure_kernel actually ran".
+    bool mep_cov_executed(u32 addr) const;
+    u32 mep_cov_base() const { return mep_cov_base_; }
+    u32 mep_cov_size() const { return mep_cov_size_; }
+    u32 mep_cov_granularity() const { return mep_cov_gran_; }
+    bool mep_cov_armed() const { return !mep_cov_bits_.empty(); }
+    const std::vector<u8>& mep_cov_bytes() const { return mep_cov_bits_; }
+
 private:
     void build_buses();
     /// Round 191: optional GPU/display self-test (ZLB_GPU_SELFTEST=1) that puts a
@@ -500,6 +515,15 @@ private:
     u32 arm_cov_gran_ = 2u;            ///< bytes per bit (2 = one Thumb instruction)
     std::vector<u8> arm_cov_bits_;
     void arm_cov_mark(u32 pc);
+    /// CMeP PC coverage: the window covers the 128 KiB CMeP RAM (first loader and
+    /// the staged second loader at 0x40000) *and* the private window at 0x800000
+    /// where the secure kernel is linked, because one window has to hold both.
+    /// Narrow it with ZLB_MEP_COV_BASE / ZLB_MEP_COV_SIZE.
+    u32 mep_cov_base_ = 0x00040000u;
+    u32 mep_cov_size_ = 0x00800000u;   ///< 0x40000..0x840000
+    u32 mep_cov_gran_ = 2u;            ///< bytes per bit (2 = one MeP instruction)
+    std::vector<u8> mep_cov_bits_;
+    void mep_cov_mark(u32 pc);
     /// Round 166: pages handed to NSKBL's object constructor when the pool pointer is
     /// NULL (the map object's container fields are empty in the model).
     u32 nskbl_pool_next_ = 0;

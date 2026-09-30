@@ -163,9 +163,10 @@ private:
     std::string cmd_emmc(const std::vector<std::string>& args);
     std::string cmd_boot(const std::vector<std::string>& args);
     std::string cmd_faults(const std::vector<std::string>& args);
-    /// Round 167: ARM PC coverage map (ZLB_ARM_COV=1): per-page hit counts plus the
-    /// longest unexecuted runs, so "which function never ran" is one command away.
-    std::string cmd_cov(const std::vector<std::string>& args);
+    /// Round 167: PC coverage map (ZLB_ARM_COV=1 / ZLB_MEP_COV=1): per-page hit
+    /// counts plus the longest unexecuted runs, so "which function never ran" is one
+    /// command away.  `mep` selects the CMeP map instead of the ARM one.
+    std::string cmd_cov(const std::vector<std::string>& args, bool mep);
     std::string cmd_keyring(const std::vector<std::string>& args);
     std::string cmd_image(const std::vector<std::string>& args);
     std::string cmd_log(const std::vector<std::string>& args);

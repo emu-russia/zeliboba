@@ -398,10 +398,16 @@ Qaf/WLAN/Safe-Mode/Update-Mode флаги; содержимое блока DIP-s
    `kSecondLoaderPatches` (`src/hw/cmep/bigmac.cpp`). Переменная
    `ZLB_CMEP_COLD_PATH` больше не нужна.
 2. **`build_kbl_param()` больше не вызывается** в обычном прогоне
-   (`src/machine/bootchain.cpp`): запись строит вторая стадия, а C++-сборщик
-   остался только фолбэком для прогона с `ZLB_NO_SUBSTITUTION=1`, где
-   загрузчик до этого места не доходит. Зеркало scratch на PA 0 сохранено —
-   ARM читает запись именно через него.
+   (`src/machine/bootchain.cpp`: `if (!substitutions_enabled_static()) build_kbl_param();`).
+   **Поправка по замерам (покрытие + трап):** вторая стадия при этом запись не
+   строит — она исполняет только обнуление (`0x41B38` → 256 байт), а до сборщика
+   (`0x41B4A`, `0x41B9E`) не доходит: модель останавливает CMeP на «done»-прыжке
+   secure kernel. Поэтому в дефолтной конфигурации `SceKblParam` остаётся
+   **нулевой**, и KBL доходит до Non-Secure именно с ней (проверено: `ZLB_RTRAP`
+   даёт нули по PA `0x100..0x1C4`; `bootctx` печатает `context at +0x100: 0 0`).
+   Значения, перечисленные ниже, — то, что пишет C++-сборщик, когда он вызван
+   (`ZLB_NO_SUBSTITUTION=1` + `--stage kbl`, либо `--stage nskbl` при отсутствующей
+   записи). Зеркало scratch на PA 0 сохранено — ARM читает запись именно через него.
 3. **База исправлена: `kKblParamBase = 0x1F000040` → `0x1F000100`**
    (`src/machine/vita.h`). Прежнее значение было выведено из викиной фразы про
    «fallback DIP switch buffer по физическому 0x80» и оказалось на 0xC0 ниже:
@@ -438,7 +444,8 @@ Qaf/WLAN/Safe-Mode/Update-Mode флаги; содержимое блока DIP-s
   следующая отдельная задача — «ждать окончания второй стадии», а не «ждать
   бюджет».
 
-**Проверки.** Самотесты **416/0**; `verify.ps1` — все девять пунктов `ok`
+**Проверки.** Самотесты на тот момент **416/0** (актуальное число — `docs/STATUS.md` §7);
+`verify.ps1` — все девять пунктов `ok`
 (build, self tests, machine layout, boot plan, first loader, second loader,
 arm kernel boot loader, kernel stage, eMMC image; 992 файла, 0 расхождений).
 

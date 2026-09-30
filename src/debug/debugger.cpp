@@ -1080,27 +1080,44 @@ bool Debugger::execute(const std::string& line) {
         return true;
     }
     if (command == "cov" || command == "coverage") {
-        // `cov save <file>` writes the raw bitmap so external tools can join it with the
-        // disassembly (see _scratch/scan_missed.py).
-        if (!args.empty() && args[0] == "save") {
-            if (args.size() < 2) {
-                emit("usage: cov save <file>");
+        // `cov [mep] [start] [bytes]` prints the map, `cov save <file> [mep]` writes the
+        // raw bitmap so external tools can join it with the disassembly.
+        std::vector<std::string> rest = args;
+        bool mep = false;
+        if (!rest.empty() && (rest[0] == "mep" || rest[0] == "cmep")) {
+            mep = true;
+            rest.erase(rest.begin());
+        } else if (!rest.empty() && rest[0] == "arm") {
+            rest.erase(rest.begin());
+        }
+        if (!rest.empty() && rest[0] == "save") {
+            if (rest.size() < 2) {
+                emit("usage: cov save <file> [mep]");
                 return true;
             }
-            std::ofstream out(args[1], std::ios::binary);
+            // `cov save <file> mep` and `cov mep save <file>` are both accepted.
+            if (rest.size() > 2 && (rest[2] == "mep" || rest[2] == "cmep")) mep = true;
+            std::ofstream out(rest[1], std::ios::binary);
             if (!out) {
-                emit("cannot write " + args[1]);
+                emit("cannot write " + rest[1]);
                 return true;
             }
-            const std::vector<u8>& bits = vita_.arm_cov_bytes();
+            const std::vector<u8>& bits = mep ? vita_.mep_cov_bytes() : vita_.arm_cov_bytes();
+            if (bits.empty()) {
+                emit(format("coverage bitmap is empty (%s map armed, but no instruction of that core ran)",
+                            mep ? "CMeP" : "ARM"));
+                return true;
+            }
             out.write(reinterpret_cast<const char*>(bits.data()),
                       static_cast<std::streamsize>(bits.size()));
-            emit(format("coverage bitmap written: %s (%zu bytes, base 0x%08X, %u bytes/bit)",
-                        args[1].c_str(), bits.size(), vita_.arm_cov_base(),
-                        vita_.arm_cov_granularity()));
+            emit(format("coverage bitmap written: %s (%zu bytes, base 0x%08X, %u bytes/bit, %s)",
+                        rest[1].c_str(), bits.size(),
+                        mep ? vita_.mep_cov_base() : vita_.arm_cov_base(),
+                        mep ? vita_.mep_cov_granularity() : vita_.arm_cov_granularity(),
+                        mep ? "CMeP" : "ARM"));
             return true;
         }
-        emit(cmd_cov(args));
+        emit(cmd_cov(rest, mep));
         return true;
     }
     if (command == "info") {
@@ -1163,6 +1180,8 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  bootctx                ARM boot context: CMeP DRAM source and the PA 0 mirror\n"
         "  faults [all]           MMU fault ring: faulting pc, VA and page-table entry\n"
         "  keyring                captured CMeP keyring state\n"
+        "  cov [mep] [start] [n]  PC coverage map (ZLB_ARM_COV / ZLB_MEP_COV);\n"
+        "                         cov save <file> [mep] writes the raw bitmap\n"
         "  boot                   boot chain report and plan\n"
         "  info                   image / core / access statistics\n"
         "breakpoints / watchpoints\n"
@@ -1172,31 +1191,37 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  watchc [id] | wpl\n"
         "misc\n"
         "  log <level>            trace|debug|info|warn|error|off\n"
-        "  stage <name>           jump the boot chain to first|second|kbl|kernel\n"
+        "  stage <name>           jump the boot chain to first|second|secure|kbl|nskbl|kernel\n"
         "  load <file> [addr]     load an image into the active core's bus\n"
         "  quit";
 }
 
-std::string Debugger::cmd_cov(const std::vector<std::string>& args) {
-    if (!vita_.arm_cov_armed()) {
-        return "coverage not armed (start the model with ZLB_ARM_COV=1)";
+std::string Debugger::cmd_cov(const std::vector<std::string>& args, bool mep) {
+    const bool armed = mep ? vita_.mep_cov_armed() : vita_.arm_cov_armed();
+    if (!armed) {
+        return mep ? "CMeP coverage not armed (start the model with ZLB_MEP_COV=1)"
+                   : "ARM coverage not armed (start the model with ZLB_ARM_COV=1)";
     }
-    const u32 gran = vita_.arm_cov_granularity();
-    const u32 base = vita_.arm_cov_base();
-    const u32 size = vita_.arm_cov_size();
+    const u32 gran = mep ? vita_.mep_cov_granularity() : vita_.arm_cov_granularity();
+    const u32 base = mep ? vita_.mep_cov_base() : vita_.arm_cov_base();
+    const u32 size = mep ? vita_.mep_cov_size() : vita_.arm_cov_size();
+    const auto executed = [&](u32 addr) {
+        return mep ? vita_.mep_cov_executed(addr) : vita_.arm_cov_executed(addr);
+    };
     u32 start = args.empty() ? base : static_cast<u32>(std::strtoul(args[0].c_str(), nullptr, 0));
     u32 bytes = args.size() > 1 ? static_cast<u32>(std::strtoul(args[1].c_str(), nullptr, 0)) : size;
     if (start < base) start = base;
     if (start + bytes > base + size) bytes = (base + size > start) ? (base + size - start) : 0u;
 
-    std::string out = format("coverage 0x%08X-0x%08X (%u bytes per bit)\n", start, start + bytes, gran);
+    std::string out = format("coverage %s 0x%08X-0x%08X (%u bytes per bit)\n",
+                             mep ? "CMeP" : "ARM", start, start + bytes, gran);
     // Per-page hit counts, so a page that was only brushed through stands out.
     for (u32 page = start; page < start + bytes; page += 0x1000u) {
         const u32 end = (page + 0x1000u < start + bytes) ? page + 0x1000u : start + bytes;
         u32 hit = 0, total = 0;
         for (u32 a = page; a < end; a += gran) {
             ++total;
-            if (vita_.arm_cov_executed(a)) ++hit;
+            if (executed(a)) ++hit;
         }
         out += format("  0x%08X  %3u/%3u %s\n", page, hit, total,
                       hit == 0u ? "  <- never executed" : (hit == total ? "  (fully covered)" : ""));
@@ -1207,7 +1232,7 @@ std::string Debugger::cmd_cov(const std::vector<std::string>& args) {
     u32 run_start = 0;
     bool in_run = false;
     for (u32 a = start; a < start + bytes; a += gran) {
-        if (!vita_.arm_cov_executed(a)) {
+        if (!executed(a)) {
             if (!in_run) { run_start = a; in_run = true; }
         } else if (in_run) {
             holes.push_back({run_start, a});

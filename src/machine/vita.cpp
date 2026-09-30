@@ -77,7 +77,7 @@ Vita::Vita() = default;
 Vita::~Vita() = default;
 
 // ---------------------------------------------------------------------------
-// Tooling: ARM PC coverage (ZLB_ARM_COV=1, printed by the debugger's `cov`)
+// Tooling: PC coverage (ZLB_ARM_COV=1 / ZLB_MEP_COV=1, printed by `cov`)
 // ---------------------------------------------------------------------------
 
 void Vita::arm_cov_mark(u32 pc) {
@@ -87,6 +87,15 @@ void Vita::arm_cov_mark(u32 pc) {
     }();
     if (!enabled) return;
     if (arm_cov_bits_.empty()) {
+        // The default window is the NSKBL image (0x51000000+256 KiB); the KBL runs
+        // at 0x40020000, so its runs pass ZLB_ARM_COV_BASE/SIZE.
+        if (const char* base = std::getenv("ZLB_ARM_COV_BASE")) {
+            arm_cov_base_ = static_cast<u32>(std::strtoul(base, nullptr, 0));
+        }
+        if (const char* size = std::getenv("ZLB_ARM_COV_SIZE")) {
+            const u32 value = static_cast<u32>(std::strtoul(size, nullptr, 0));
+            if (value >= 0x1000u) arm_cov_size_ = value;
+        }
         // 2 bytes per bit = one Thumb instruction: at 16 bytes the "did this site execute"
         // question answered yes whenever *any* address in the block ran, which made the
         // missed-edge scan report calls that never happened (round 167).
@@ -109,6 +118,41 @@ bool Vita::arm_cov_executed(u32 addr) const {
     if (addr < arm_cov_base_ || addr >= arm_cov_base_ + arm_cov_size_) return false;
     const u32 index = (addr - arm_cov_base_) / arm_cov_gran_;
     return (arm_cov_bits_[index >> 3] & static_cast<u8>(1u << (index & 7u))) != 0;
+}
+
+void Vita::mep_cov_mark(u32 pc) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ZLB_MEP_COV");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (!enabled) return;
+    if (mep_cov_bits_.empty()) {
+        if (const char* base = std::getenv("ZLB_MEP_COV_BASE")) {
+            mep_cov_base_ = static_cast<u32>(std::strtoul(base, nullptr, 0));
+        }
+        if (const char* size = std::getenv("ZLB_MEP_COV_SIZE")) {
+            const u32 value = static_cast<u32>(std::strtoul(size, nullptr, 0));
+            if (value >= 0x1000u) mep_cov_size_ = value;
+        }
+        if (const char* gran = std::getenv("ZLB_MEP_COV_GRAN")) {
+            const u32 value = static_cast<u32>(std::strtoul(gran, nullptr, 0));
+            if (value >= 2u && value <= 64u) mep_cov_gran_ = value;
+        }
+        const size_t bits = mep_cov_size_ / mep_cov_gran_;
+        mep_cov_bits_.assign((bits + 7u) / 8u, 0u);
+        ZLB_LOG_INFO("machine", "CMeP coverage armed: 0x%08X-0x%08X, %u bytes per bit",
+                     mep_cov_base_, mep_cov_base_ + mep_cov_size_, mep_cov_gran_);
+    }
+    if (pc < mep_cov_base_ || pc >= mep_cov_base_ + mep_cov_size_) return;
+    const u32 index = (pc - mep_cov_base_) / mep_cov_gran_;
+    mep_cov_bits_[index >> 3] |= static_cast<u8>(1u << (index & 7u));
+}
+
+bool Vita::mep_cov_executed(u32 addr) const {
+    if (mep_cov_bits_.empty()) return false;
+    if (addr < mep_cov_base_ || addr >= mep_cov_base_ + mep_cov_size_) return false;
+    const u32 index = (addr - mep_cov_base_) / mep_cov_gran_;
+    return (mep_cov_bits_[index >> 3] & static_cast<u8>(1u << (index & 7u))) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +269,14 @@ void Vita::build_cores() {
     cmep_ = make_cpu(Arch::MeP, *cmep_bus_);
     if (cmep_) cmep_->name = "CMeP";
     // Intercept the first loader service call the second loader makes at the end
-    // of its work (see Vita::cmep_pc_hook).
+    // of its work (see Vita::cmep_pc_hook).  The same per-instruction hook marks
+    // the CMeP coverage map (ZLB_MEP_COV=1), so the security core needs no second
+    // callback.
     if (MePCore* mep = dynamic_cast<MePCore*>(cmep_.get())) {
-        mep->pc_hook = [this](u32 pc) { return cmep_pc_hook(pc); };
+        mep->pc_hook = [this](u32 pc) {
+            mep_cov_mark(pc);
+            return cmep_pc_hook(pc);
+        };
     }
 
     // Kermit is a quad core Cortex-A9 MPCore. Each core gets its own CP15/MMU

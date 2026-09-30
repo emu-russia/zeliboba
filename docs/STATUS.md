@@ -76,6 +76,12 @@ Stage 1 **не достигнут**. Цепочка до NSKBL проходит�
    командой `0x0010` (`get_version`), и в измеренных прогонах он равен нулю, а
    источник в DRAM остаётся нулевым. То, что kernel_boot_loader читает по PA 0,
    модель получает зеркалом scratch CMeP (подстановка, §4).
+   **Измерено покрытием и трапом:** запись `SceKblParam` (PA `0x1F000100`) в
+   обычном прогоне **нулевая** — вторая стадия исполняет только её обнуление
+   (`0x41B38`), до сборщика (`0x41B4A`) не доходит, а C++-сборщик при включённых
+   подстановках не вызывается. KBL читает нули (`0x400376E4`, `0x4002028C`) и
+   всё равно доходит до Non-Secure, то есть запись не является условием
+   перехода в NSKBL.
 2. **Раздел памяти KBL приходит наполненным от предыдущей ступени.** В самом KBL
    все 15 обращений к аллокатору идут с флагом `0x10` («только кэш»), поэтому
    нарезка новых блоков запрещена, кэш блоков `0x1000` за 230 млн инструкций так
@@ -154,8 +160,15 @@ $env:ZLB_NO_SUBSTITUTION=1
 Диагностические переменные: `ZLB_SDIF_TRACE`, `ZLB_BIGMAC_TRACE`, `ZLB_EMMC_LOG`,
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
-`ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_COV=1` (+ `cov` в
-отладчике), `ZLB_ARM_TRACE_RANGE=lo-hi`, `ZLB_NO_SUBSTITUTION=1`.
+`ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
+`ZLB_NO_SUBSTITUTION=1`.
+
+**Покрытие кода.** `ZLB_ARM_COV=1` (окно по умолчанию — образ NSKBL
+`0x51000000+256 КиБ`; `ZLB_ARM_COV_BASE`/`ZLB_ARM_COV_SIZE`/`ZLB_ARM_COV_GRAN`
+меняют окно и шаг) и `ZLB_MEP_COV=1` для CMeP. Печатает карту команда
+`cov [mep] [start] [bytes]`, сохраняет сырой битмап — `cov save <file> [mep]`;
+`python tools/cov_report.py --preset arm|nskbl|mep --bitmap <file>` считает
+доли по образам и проверяет список точек входа (`--query имя=адрес`).
 
 ## 6. Дальнейшие шаги
 
@@ -179,4 +192,6 @@ $env:ZLB_NO_SUBSTITUTION=1
 | Цепочка | Syscon → first_loader → second_loader → secure_kernel → ARM KBL → NSKBL одним прогоном, без команд `stage` |
 | CMeP | вторая стадия ~4121 чтение eMMC; secure kernel ~117 тыс. инструкций, рукопожатия `0x9/0x101/0x102/0x106` |
 | NSKBL | чекпойнт **`0xA9`**; 22 чтения eMMC за прогон; первый кластер данных файла не читается |
+| Покрытие (прогон `runm 700000`, детерминированный: 268 406 285 инструкций) | CMeP: first_loader 935 исполненных сайтов, second_loader 9559, secure_kernel 603; ARM: KBL 11 828 (исполнены все точки входа, кроме `panic`/`abort`), NSKBL 20 552 (все чекпойнты `0xA1`–`0xA9`) |
+| Насыщенность покрытия | прогон `runm 1400000` даёт **побитово тот же** битмап NSKBL (20552 сайта, 0 отличающихся байт): в текущей конфигурации новых исполняемых участков не появляется |
 | Ядро | не загружено (стадия `kernel` грузит `bootimage.elf` напрямую — это отладочный путь, а не загрузка ядра) |
