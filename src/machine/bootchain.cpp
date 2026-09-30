@@ -3213,6 +3213,16 @@ bool Vita::supply_nskbl_device_object(u32 core) {
     if (!write_va(kDeviceVa + 0x2430u, kSdifBase)) return false;
     // +0x2440 is copied into every request at +0x70 (5101D670/5101D67C).
     write_va(kDeviceVa + 0x2440u, 1u);
+    // Round 385: +0x2410 is the field the submission chain insists on before it hands a
+    // request to the device methods.  Measured with a PCTRAP over 0x5101EE98 (the chain
+    // both the wait and the driver's own reads go through): at 0x5101EF20 it reads
+    // `ldr r0,[r6,#16]` with r6 = device + 0x2400 and, when r0 is zero, takes the cold
+    // block at 0x5101F0CC that presets r3 = 0x8032001A (0x5101F0D0) and returns it.  For
+    // the driver's own requests r6 = its own object 0x5117EF00 and that word is 1, so the
+    // check passes; with the object supplied here it was zero and every submission from
+    // the substituted pool node came back 0x8032001A - the error NSKBL prints on the UART
+    // ("0x8032001a 1169 0 0x11c60(72800) 32", docs/NSKBL.md round 383).
+    write_va(kDeviceVa + 0x2410u, 1u);
     // +0x2480 + 0x20 -> the dispatch table; its first entry is the "submit" method the
     // device routine calls with the request in r0 (5101D69A-5101D6A4).
     write_va(kDeviceVa + 0x2480u + 0x20u, kDriverMethodTable);
