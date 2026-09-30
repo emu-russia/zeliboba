@@ -7414,3 +7414,36 @@ Next: implement that mirror in the model - a device (or a write hook) covering V
 PA 0x40300270-0x403003B0 that reflects the driver's programmed slot bytes (8 slots of 0x28 starting at
 the object's `+0x290`) - and measure whether the walk then submits and the boot advances.  The window's
 low addresses and its `device` mapping are already known (`vmem 0x290` -> PA 0x40300290 device).
+
+### 10.60 The low window is writable and persistent, but a uniform seed does not make the walk submit
+
+Rather than guessing an implementation, the hypothesis was tested with the debugger.
+
+**The window can be poked and the value sticks.**  `poke 0x40300290 255 8` writes 0xFF and reading it
+back confirms it, and it survives a `runm 1000` (`mem 0x40300290` still shows FF) - so `poke` is a
+usable lever for this experiment, no rebuild needed.
+
+**But seeding all eight slot bytes with 0xFF does not produce a submission.**  With the seed in place
+and breakpoints on the walk's entry (`0x5101FA5C`), its programming-loop comparison (`0x5101FDAA`) and
+its pop (`0x5101FDB0`), a full run stops **three times, all at the entry** - each with
+`R0 = 0x51183948`, the *handle* object - and the comparison and the pop never fire.  Without the seed
+the comparison fired once (10.48).  So the window's contents do change the path, but not in the way a
+uniform seed predicts.
+
+**Why the prediction fails:** the comparison's operands are read with a one-slot rotation - the byte
+load at `0x5101FD90` happens *before* `r3` is advanced to this slot's window offset at `0x5101FD9C` -
+so at the stop measured in 10.48 `r3 = 0x298` meant the *previous* slot's window byte had been read,
+and a uniform 0xFF seed cannot be reasoned about slot by slot.
+
+**Conclusion:** the "mirror the object's bytes into the window" fix is *not yet justified*.  First the
+operand derivation of the programming loop has to be pinned down exactly - with the window seeded and a
+range trace over `0x5101FA5C-0x5101FE60` for a call that actually reaches the loop - and only then can a
+mirror be designed and implemented.
+
+Useful side facts recorded: the low-window page is writable and persistent (so a device or hook there is
+feasible), and the lookup's caller is `0x51023A10`-`0x51023A20` (arguments volume=`r7`, cluster=`r5`,
+name=`sp+8`, out=`sl`, plus `[sp+0x240]`), continuing at `0x510239C4`, with the mount table at
+`0x51184560` initialised right after at `0x51023A24`.
+
+Next: range-trace the programming loop with the window seeded and the trace trigger on `0x5101FD8C`
+(the loop's real entry), so the operand derivation is measured rather than inferred.
