@@ -5672,3 +5672,35 @@ with the run's *final* error values in `r0`/`r1`, so it is probably reached a se
 - resolving which of the two observations belongs to the constructor's pass is the first task
 of the next round, and the second is the geometry path itself, since the volume's parsed
 `+0x24` (19, the FAT size) is not what the geometry code consumes.
+
+### 10.18 Measured: the sector does reach the structure, but the geometry reads the raw copy
+
+Two clean measurements settle the data path and leave one precise mismatch.
+
+* **The structure is filled by the constructor's own read.**  At the constructor's entry
+  (`bp arm 0x51023C40`) VA 0x51184980 is all zeros; at the parse entry (`bp arm 0x51023D4A`)
+  it holds the os0 boot sector (`EB FE 90 SCEI ...`) with `r3 = 0x51184980` (the destination)
+  and `r1 = 0x51037310` (the source inside the driver's cache, which the ADMA filled).  So the
+  volume's sector 0 is read and copied into the structure *before* the parse - the data path
+  is correct.
+* **The parse writes the derived fields into the volume, the geometry reads them from the
+  structure.**  Dumping the volume at the end of the run shows `+0x24 = 0x13` (the FAT size
+  19), `+0x20 = 0x00010002`, `+0x1C = 2`, `+0x28 = 2`, `+0x18 = 0x00010000` - exactly what the
+  parse block writes at `0x51023DB2..0x51023DCE`.  The structure at 0x51184980 still holds the
+  *raw* bytes there (`0x511849A0`: `00 00 00 00 80 00 29 45 3D 5A 3F 4E 4F 20 4E 41` /
+  `4D 45 20 20 20 20 46 41 54 31 36 20 20 20` - the FAT16 serial and the `NO NAME`/`FAT16`
+  label), and the geometry code consumes *those* (`0x51023E6C`), so the arithmetic
+  `r0 = r1 * [sb+0x24] + r2` and `r3 = r8 * ([sb+0x2c] - 2) + r0` produces
+  `[vol+0x30] = 0x0A720290` - an address neither the guest's page tables nor the model map.
+
+A debugger check of that mismatch (`bp arm 0x51023938`, `poke 0x51185028 0x51184980 32`,
+continue) shows the meaning of the field: with the *sector buffer* in `[vol+0x30]` the run
+does 207 312 647 instructions instead of 153 205 277 - i.e. the flow gets much further - but
+the helper still ends at `0x51024160`, so `[vol+0x30]` is part of the problem and not all of
+it.  No new sector read appears in the eMMC log either way.
+
+Finally, a caution for the next round: several breakpoints inside that block (`0x51023C76`,
+`0x51023C90`, `0x51023E6C`) stop with the *run's final* error values in `r0`/`r1`
+(`0x803FF007` / `0x8009000A`), which cannot be the constructor's first pass.  Either the block
+is re-entered late in the run or those breakpoints land on a different execution; that has to
+be resolved before any further conclusion is drawn from breakpoints inside `0x51023C40..0x51023F00`.
