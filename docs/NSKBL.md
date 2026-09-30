@@ -6392,3 +6392,49 @@ submit is what silently gives up.
 Next: break on that submit (`0x5101FA5C`) for the failing request and step it to the branch that
 gives up, checking the device state it reads (`[device+0x2400]`, the capabilities/clock registers)
 against one of the three requests that did reach the card.
+
+### 10.34 The failing submit returns fine; the hang is a chain rooted in the loader's failure
+
+The submit `0x5101FA5C` is called exactly **four** times (one per read): breakpoints on it stop four
+times and the failure site `0x5101FE98` fires immediately after the fourth, with `R4 = 0x5117CB00`
+(the request object of 10.33) and `R0 = 0` (the empty-queue result).
+
+Stepping that fourth call (10 instructions per chunk, from `0x5101FA5C` after clearing the
+breakpoint) gives its whole visible path:
+
+```
+5101FA5C -> 5101FA80 -> 5101FA9C -> 5101FABE -> 5101FAD8 -> 5101FAF6 -> 5101FB10
+         -> 5101FD90 -> 5101FDFA -> (return) -> 5101F9C2 (inside the completion query)
+         -> 5101FE98 (the failure) -> 5101FF6E -> 51000E78
+```
+
+`0x5101FDFA` is `movs r4, #0` followed by `b 0x5101FD62`, i.e. the submit's **success** path (which
+is why the `0x5101FDFE movs r4,#0x11` site never fires - the branch skips it).  So the submit
+*queues* the request successfully and returns; the caller then polls the completion queue once,
+finds it empty and fails the request.
+
+**Why nothing completes** is now visible in the cores' final state, with the lock object read
+through its real translation (`[0x5113B61C] = 0x4000`, `vpa 0x4000` -> PA `0x40304000`):
+
+```
+arm1/arm2/arm3 : pc=510147DC (the `bx lr` after the `wfe`), lr=51015893  <- the LOCK ACQUIRE spin
+arm0           : pc=51000D0C (the terminal self-branch),      lr=51001677
+
+lock (VA 0x4034): [lock+4] = 4   (the counter: all released)
+                  [lock+6] = 0   (the owner: cpu 0 = arm0)
+```
+
+The acquire (`0x51015884-0x51015898`) spins until the owner field equals the caller's own MPIDR
+value, and the release rotates the owner to the next id.  The owner is `0` (arm0) while arm0 sits in
+the terminal self-branch and never calls the acquire again, so arm1/arm2/arm3 wait forever and the
+storage worker that would complete the request never runs.
+
+That makes the whole hang a **chain whose root is the loader's failure**: mount error `0x80320011`
+-> arm0 spins in the fatal loop `0x51000D0C` -> the lock token stays parked on arm0 -> the other
+three cores block in the acquire -> no worker completes the next request.  The "deadlock" of
+10.28-10.29 is therefore a *consequence*, not the cause.
+
+Next: confirm that `0x51000D0C` is the intended fatal path for a failed loader, then attack the
+loader failure itself: find who is supposed to fill the completion queue at `[device+0x2400]` (a
+worker on which core, in which code) and whether the MPIDR-based token makes that worker unable to
+run in the model.
