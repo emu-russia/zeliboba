@@ -7152,3 +7152,43 @@ Next: find which stage is supposed to fill `0x51184780` before the lookup - the 
 cache (`0x51033100`, `0x4000`-byte lines, which *does* hold data at the lookup's time) is the natural
 candidate - and what the lookup's caller passes as its cluster so that the parser and the filler agree
 on the same buffer.
+
+### 10.53 Correction: the lookup fills its own buffer through a read callback, and the image is correct
+
+**The image is not the problem.**  Parsing the active `os0` volume's root directory straight out of
+`build/emmc.img` (boot sector at LBA 65536: 512 B/sector, 8 sectors/cluster, 2 reserved, 2 FATs of 19
+sectors, 512 root entries -> root directory at LBA 65576):
+
+```
++0x0000 LFN  seq=0x41 chk=0x13  'kd'          +0x0020 SHORT 'KD'          chk=0x13
++0x0040 LFN  seq=0x42 chk=0xAD  'g.skp'       +0x0060 LFN  seq=0x01 chk=0xAD 'psp2b'
++0x0080 SHORT 'PSP2BO~1SKP'     chk=0xAD      +0x00A0 LFN seq=0x42 'prx' ...
++0x00E0 SHORT 'PSP2CO~1SKP' ... +0x0120 SHORT 'SM' ... +0x0160 'UE' ... +0x01A0 'US'
+```
+
+The LFN fragments are in VFAT's reverse order with the `0x40` last flag, and **every checksum matches**
+(0xAD for `g.skp`, `psp2b` and `PSP2BO~1SKP`).  So `psp2bootconfig.skprx` is present and well formed.
+
+**The lookup reads the directory itself.**  Its loop calls the volume's read callback
+(`[0x51184760]`, installed as a `0x51011xxx` routine) as `blx r6` with `r3 = 0x51184780` - the buffer -
+and `r2 = block_size >> 9` = 1 sector.  So **the buffer is empty when the lookup is entered because the
+lookup has not read yet**, and the "clear + fill" pair of 10.52 *is* that read callback.  That invalidates
+10.52's conclusion ("the buffer is filled too late"): the fill is the lookup's own action.
+
+**And it does parse the real data.**  Breaking on the LFN handler (`0x5102358E`) stops with
+`R0 = 0x51184780` (the buffer), `R2 = 0x0F` (the LFN attribute) and **`R3 = 0x41`** - the sequence
+number of the *first* long entry in the image, which is the `kd` directory's.  The loop around it
+(`0x510237F6`-`0x5102384C`) is a correct full walk: 16 entries per 512 byte block, block iteration,
+end-of-directory check, and the `-2` root case returning 0 (not found).
+
+Note: "the handler runs once" was a single-`runm` artifact - a breakpoint stops at the *first* hit, and
+only repeated `runm` calls count hits (the same lesson as 10.49).
+
+So everything up to the name comparison works: the image is right, the callback fills the buffer, the
+walk parses entries and processes LFN fragments.  What is left is the comparison of the assembled long
+name against the target.
+
+Next: instrument that comparison.  The walk assembles the long name from the LFN fragments and compares
+it with the target pointer at `[sp+0x50]` (0x5102BB74, `psp2bootconfig.skprx`); break at the compare
+chain between the LFN assembly and the `bne` that rejects an entry (0x510236xx-0x510237F6) and dump the
+assembled name next to the target, to find the first byte where they disagree.
