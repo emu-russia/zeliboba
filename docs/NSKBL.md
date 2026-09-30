@@ -7373,3 +7373,44 @@ Next: find the *producer* of the completion the driver polls.  Since the guest p
 masked, that producer is either guest code that never runs, or a device behaviour the model lacks - and
 in the guest the only code that ever touches the list is the release `0x5101F9D0`, called from the
 walk's submit path (never taken) and from `0x510205D0` on the request-error path.
+
+### 10.59 The device's slot table *is* programmed - the missing half is the low-window mirror
+
+Trapping the *other* device object - `0x51183948`, the handle the walk was first called with, whose slot
+pointer the trace showed as `0x51183BB8` - tells a very different story from `0x5117CB00`:
+
+```
+slot-relative (base 0x51183BB8, stride 0x28)      value        pc
+  +0x03C, +0x064, +0x08C, +0x0B4, +0x0DC, ...    1,2,3,4,5,6,7   0x51020EDC
+  +0x028, +0x050, +0x078, +0x0A0                 0xE3400000      0x510210AE/...
+  +0x038, +0x060, +0x088, +0x0B0                 0x71A000        0x51020FF2/...
+  +0x0C8, +0x0F0, +0x118, +0x140                 0xE3400000/0xE3800000
+  +0x0A8, +0x100, +0x128                         0x400000 / 0x71C000
+```
+
+The walk reads a slot's base at object `+0x298` and its size at `+0x2a0` (stride 0x28), and with the
+object at `0x51183948` those land exactly on the `0xE3400000`-family and `0x71A000` writes above.  Note
+**`0x71A000` = 7446528 = the eMMC's own `SEC_COUNT`** (`emmc info`), and `0x71C000` its neighbour - so
+this table describes the card's partition ranges exactly as the hardware's `SEC_COUNT`/`BOOT_SIZE`
+fields do, and the guest fills it in at `0x51020EDC`-`0x510210EA`.  So the object the walk loops over
+*is* properly initialised - just not the object (`0x5117CB00`) I had been checking.
+
+**What is never written is the low-window half of the comparison.**  The walk compares a per-slot byte
+in the low window (`0x290 + slot*0x28`) with the object's own byte (`object + 0x290 + slot*0x28`), and
+neither side is ever written by the guest: both traps show zeros, and a full-run dump of the window
+(`vmem 0x290`) stays zero.  This is not a trap blind spot - the same low window *does* carry live data
+where the guest writes it (the NSKBL lock at VA 0x4034 holds counter 4 and owner 0, 10.34), so the guest
+genuinely never writes VA 0x270-0x3AF.
+
+That leaves one conclusion: **the low-window slot bytes are hardware state**.  They have the same layout
+as the driver's own table (a byte, a 64-bit base, a 64-bit size per 0x28-byte slot), which is exactly a
+*device-side mirror* of the programmed descriptors - the controller is supposed to copy what the driver
+programs into that window, and the driver reads it back to decide whether a slot still needs
+submitting.  With the window永远 zero the comparison can never differ, so the walk always answers
+"already programmed", never submits, never releases, and the waits drain the free list into
+`0x80320011`.
+
+Next: implement that mirror in the model - a device (or a write hook) covering VA 0x270-0x3AF /
+PA 0x40300270-0x403003B0 that reflects the driver's programmed slot bytes (8 slots of 0x28 starting at
+the object's `+0x290`) - and measure whether the walk then submits and the boot advances.  The window's
+low addresses and its `device` mapping are already known (`vmem 0x290` -> PA 0x40300290 device).
