@@ -6438,3 +6438,54 @@ Next: confirm that `0x51000D0C` is the intended fatal path for a failed loader, 
 loader failure itself: find who is supposed to fill the completion queue at `[device+0x2400]` (a
 worker on which core, in which code) and whether the MPIDR-based token makes that worker unable to
 run in the model.
+
+### 10.35 `[controller+0x2400]` is a free-node pool, and it runs out
+
+Disassembling the submit's tail settles what the queue actually is:
+
+```
+5101FDAC  ldr r7, [r6]                 ; r6 = the request, [r6] = the controller
+5101FDB0  bl 0x5101F9BC                ; POP a node from [controller+0x2400]
+5101FDB6  cbz r0, 0x5101FDFE           ; empty -> movs r4,#0x11 ; movt r4,#0x8032 (the ERROR)
+5101FDC2  str r2, [r0]                 ; else FILL the node ...
+5101FDD0  str r4, [r0, #4]
+5101FDD2  str r2, [r0, #8]
+5101FDD6  str r3, [r0, #0xc]
+5101FDDE  bl 0x5101F6BC                ; ... and submit it
+5101FDE4  blt 0x5101FE26
+5101FDEA  bl 0x5101F9D0                ; the completion/recycle helper
+```
+
+so `[controller+0x2400]` is a **free-node pool**, not a queue of device completions: the submit pops
+an empty node, fills it with the request and submits it.  The failure `0x80320011` of 10.32-10.34 is
+therefore **pool exhaustion**, and the nodes come back through `0x5101F9D0` (`movs r2,#0 ;
+str r2,[r1,#0x64] ; bl 0x5101FA10`).
+
+The submit's body is a loop over **eight scatter/gather descriptor slots** - `ldrd r8, sb,
+[r6, #0x2c0]` plus `ldrd r0, r1, [r6, #0x2c8]`, stride `0x28` (0x2c0, 0x2e8, 0x310, 0x338, 0x360,
+0x388, 0x3b0, ...).
+
+At the failing submit (the fourth call of `0x5101FA5C`) the argument is `r0 = 0x5117CB00`, the
+request object itself (`r2 = r3 = 0x20`, 32 sectors), and the request's first field is `0x240`, so
+the pool is `[0x240 + 0x2400] = VA 0x2640`.  Measured at the end of the run:
+
+```
+vmem 0x240  2  ->  00 00 00 00 ...   (the controller: all zero)
+vmem 0x2640 2  ->  00 00 00 00 ...   (the free-node pool: empty)
+```
+
+**The complete chain**, with the loop closed:
+
+```
+free-node pool empties
+  -> the submit cannot allocate a node  -> 0x80320011
+  -> the mount (0x510012F4) fails       -> the loader (0x510014D4) returns the error
+  -> arm0 spins in the fatal loop 0x51000D0C
+  -> NSKBL's lock token parks on arm0 (owner = 0)
+  -> arm1/arm2/arm3 wait forever in the acquire (0x5101588E)
+  -> the SD completions stop being processed -> the pool never refills
+```
+
+Next: decide whether the pool is meant to start with more than three nodes (a guest capacity the
+model gets wrong) or whether the recycle on completion never runs - a write watch on the pool head
+(VA 0x2640) plus a breakpoint on `0x5101F9D0` will show which of the two it is.
