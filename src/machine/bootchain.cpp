@@ -3186,8 +3186,20 @@ bool Vita::supply_nskbl_device_object(u32 core) {
     if (arm == nullptr) return false;
     constexpr u32 kDeviceVa = 0x00000240u;    // hard-wired by the driver (0x5101FDBC)
     constexpr u32 kSdifBase = 0xE0B00000u;    // measured at the working command writer
-    constexpr u32 kSubmitRoutine = 0x51022605u;  // 0x51022604 | Thumb
-    constexpr u32 kTableVa = 0x00000280u;
+    // Round 380: the driver's *own* method table, found in the image data at 0x5102A2C8.
+    // Its first entry is the submit method the driver's own (working) requests are
+    // dispatched with - measured in the round-379 trace as `method 0x51022681`:
+    //   [0x5102A2C8] = 0x51022681  submit
+    //   [0x5102A2CC] = 0x51022605  the SDIF command writer wrapper (what the earlier
+    //                              substitution pointed at, which is *not* what the
+    //                              driver uses for its data requests)
+    //   [0x5102A2D0] = 0x5102254D  the failure handler (0x5101D6F2 `ldr r1,[r2,#8]`)
+    //   followed by the module names ("SceSdif", "SceSfat", ...)
+    // Pointing the device object at this table - instead of a hand-made table that held
+    // 0x51022605 - makes the device path use the very method the driver is measured to
+    // use successfully for its own volume reads.
+    constexpr u32 kDriverMethodTable = 0x5102A2C8u;
+    constexpr u32 kSubmitRoutine = 0x51022681u;  // [0x5102A2C8] - the driver's submit method
     constexpr u32 kNodeVa = 0x00000300u;
     auto write_va = [&](u32 va, u32 value) {
         u32 pa = 0;
@@ -3201,31 +3213,43 @@ bool Vita::supply_nskbl_device_object(u32 core) {
     if (!write_va(kDeviceVa + 0x2430u, kSdifBase)) return false;
     // +0x2440 is copied into every request at +0x70 (5101D670/5101D67C).
     write_va(kDeviceVa + 0x2440u, 1u);
-    // +0x2480 + 0x20 -> the dispatch table; its first entry is the "submit" method
-    // the device routine calls with the request in r0 (5101D69A-5101D6A4).
-    write_va(kDeviceVa + 0x2480u + 0x20u, kTableVa);
-    write_va(kTableVa, kSubmitRoutine);
+    // +0x2480 + 0x20 -> the dispatch table; its first entry is the "submit" method the
+    // device routine calls with the request in r0 (5101D69A-5101D6A4).
+    write_va(kDeviceVa + 0x2480u + 0x20u, kDriverMethodTable);
     // The pool of free nodes at +0x2400 (VA 0x2640).  Round 371: the wait pops a node,
     // fills it with its own template (`vstr d16,[r0]` = device + flags 0x514), sets +8,
     // +0x0C and +0x24/+0x26, then hands it to the device submission 0x5101F6BC.  One
     // node satisfies the first pop but not the second one on the `r12 == 12` branch
     // (0x5102057A), which is why a single node is bit-identical to no substitution at
     // all - measured twice (rounds 368/376).  Eight nodes let the driver reach the
-    // device dispatch at 0x5101D6E8, which the round-378 service intercepts.
+    // device dispatch at 0x5101D6E8.
     constexpr u32 kNodeCount = 8u;
+    // Round 380: the nodes must also carry somewhere for the data to go.  With the driver's
+    // own method table the device path runs the driver's real transfer code, which programs
+    // the SDIF from the node's ADMA2 table at +0x7C and buffer at +0x20.  Measured: adding
+    // the table and the buffer changed nothing yet (same 22 eMMC reads, same instruction
+    // count as with both zero), so this is preparation for the point where the transfer is
+    // actually attempted rather than a fix - one descriptor covers the measured 16 KiB.
+    constexpr u32 kDmaBufferVa = 0x51100000u;
+    constexpr u32 kDmaBufferSize = 0x4000u;
+    constexpr u32 kDmaTableVa = 0x510FF000u;
+    write_va(kDmaTableVa, (kDmaBufferSize << 16) | 0x0023u);      // VALID|END|ACT0, 16 KiB
+    write_va(kDmaTableVa + 4u, kDmaBufferVa);
     for (u32 i = 0; i < kNodeCount; ++i) {
         const u32 node = kNodeVa + i * 0x200u;
         write_va(node + 0x00u, kDeviceVa);
         write_va(node + 0x04u, 0x80000514u);   // dispatchable: bit 0x400 gates the indirect calls
         write_va(node + 0x08u, 0x12u);
+        write_va(node + 0x20u, kDmaBufferVa);
+        write_va(node + 0x7Cu, kDmaTableVa);
         write_va(node + 0x60u, (i + 1u < kNodeCount) ? (node + 0x200u) : 0u);
     }
     write_va(kDeviceVa + 0x2400u, kNodeVa);                              // head
     write_va(kDeviceVa + 0x2404u, kNodeVa + (kNodeCount - 1u) * 0x200u); // tail
     ZLB_LOG_INFO("machine",
-                 "NSKBL device object supplied at VA 0x%03X (SDIF base 0x%08X, submit 0x%08X, %u nodes "
-                 "from 0x%03X) (ZLB_NSKBL_DEV=1, development substitution)",
-                 kDeviceVa, kSdifBase, kSubmitRoutine, kNodeCount, kNodeVa);
+                 "NSKBL device object supplied at VA 0x%03X (SDIF base 0x%08X, method table 0x%08X "
+                 "-> submit 0x%08X, %u nodes from 0x%03X) (ZLB_NSKBL_DEV=1, development substitution)",
+                 kDeviceVa, kSdifBase, kDriverMethodTable, kSubmitRoutine, kNodeCount, kNodeVa);
     add_milestone("NSKBL device object supplied (development substitution)");
     return true;
 }
