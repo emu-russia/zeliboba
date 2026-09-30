@@ -3021,7 +3021,16 @@ bool Vita::supply_nskbl_device_object(u32 core) {
     write_va(kDeviceVa + 0x2480u + 0x20u, kTableVa);
     write_va(kTableVa, kSubmitRoutine);
     // The completion list at +0x2400 (VA 0x2640): a single free node, so the driver's
-    // wait has something to pop instead of taking the 0x80320011 error path.
+    // wait has something to pop instead of taking the 0x80320011 error path.  The node
+    // must also carry the flag word a *working* request has: the device routine tests
+    // `tst.w r1,#0x400` on `[request+4]` (5101D674/5101D6B6) and skips both indirect
+    // calls - i.e. never submits anything - when the bit is clear.  Measured: the
+    // request the SDIF command writer is actually called with (0x5117D400) has
+    // `[+4] = 0x00000514`, while the driver's own control object (0x5117CB00) has
+    // 0x80000042 and my zeroed node had neither.
+    write_va(kNodeVa + 0x00u, kDeviceVa);
+    write_va(kNodeVa + 0x04u, 0x00000514u);
+    write_va(kNodeVa + 0x08u, 0x12u);
     write_va(kNodeVa + 0x60u, 0u);
     write_va(kDeviceVa + 0x2400u, kNodeVa);
     write_va(kDeviceVa + 0x2404u, kNodeVa);

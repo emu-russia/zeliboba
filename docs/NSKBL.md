@@ -7862,6 +7862,44 @@ to dump the request (`0x5117CB00`) and the handle (`0x51183948`) at the moment w
 them with what the *working* volume path passes to the SDIF command writer - the fields that differ name
 the LBA/buffer/size the model must use to perform the read and then hand the driver a finished request.
 
+### 10.72 The dispatch is gated on a request flag, and the two request kinds differ exactly there
+
+**The device routine gates both indirect calls on one flag bit.**  `0x5101D660` tests
+`tst.w r1,#0x400` on `[request+4]` before each dispatch (`0x5101D674` and `0x5101D6B6`) and `beq` jumps
+over the `blx` when the bit is clear - so a request whose flags lack 0x400 is *set up* (the routine
+stores the device, the callback, `[device+0x2440]` and zero into `+0x78`/`+0x6C`/`+0x70`/`+0x74`) but
+never submitted.  That is why the SDIF command writer never ran even in the 10.63/10.71 runs where the
+walk's submit path did.
+
+**And the two kinds of request differ exactly there.**  Measured side by side:
+
+| field | working request `0x5117D400` (a pool node, the one the SDIF writer is called with) | control object `0x5117CB00` (what the driver's wait 2 polls on) |
+|---|---|---|
+| `+0x00` | `0x00000240` (the device) | `0x00000240` |
+| `+0x04` | **`0x00000514`** - bit 0x400 **set** | **`0x80000042`** - bit 0x400 **clear** |
+| `+0x08` | `0x00000012` | `0x00000001` |
+| `+0x0C` | `0` | `0x40000080` |
+| `+0x10` | `0` | `0xC0FF8000` |
+| `+0x20` | `0x51033108` | `0` |
+| `+0x60`/`+0x6C`/`+0x78` | - | pool link `0x5117CD40`, callback `0x5101D65D`, self |
+
+So the driver is not failing to dispatch by accident: its control object deliberately carries flags
+without bit 0x400, i.e. it is a *device-control* request that waits for the device to answer, while the
+*nodes* it dispatches carry `0x514`.
+
+**Attempt and result.**  The `ZLB_NSKBL_DEV=1` substitution now also gives the node on the device's
+completion list the working flag word and `[+8] = 0x12`.  **Measured: still no change** - with the
+substitution plus a poked window byte the SDIF writer still does not run, the checkpoint stays 0xA9 and
+the run still performs 22 eMMC reads.  The flag word alone does not reach the dispatch, because the code
+that evaluates it is the walk's submit path, which is only entered under the poked condition, and the
+request it hands the device routine there is not the node this substitution seeds.
+
+**Where that leaves the task.**  The os0 modules still do not load.  The remaining work is to make the
+*device* answer the control request: either by supplying the device state that makes the driver build a
+`0x514` request of its own (i.e. issue a dispatch), or by implementing the control operation's reply on
+the completion list.  Both need the device's own definition, which is the one thing the boot chain never
+writes and the model does not have.
+
 Field dump taken at wait 1's poll (`0x5101FE90`), for reference:
 
 ```
