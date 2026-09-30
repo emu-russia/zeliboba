@@ -5220,3 +5220,62 @@ inside the driver at `0x5101EDE4` waiting for the CMD18 data phase, which is *fu
 the old `0x803FF007`, but it is a park.  Diagnostics: `ZLB_SDIF_TRACE`, `ZLB_EMMC_LOG`,
 `ZLB_WTRAP`/`ZLB_RTRAP` over `0xE0B00000..0xE0B00100`, `ZLB_ARM_TRACE_RANGE`, `bp`,
 `vmem` over the device state at `0x5117EF00` and the request slots at `0x5117Cxxx`.
+
+### 10.8 Why the queued CMD18 is never issued: the request's class/state word
+
+The park is fully explained by the guest's own request state machine, and the missing piece
+is one field of the request object - not a hardware behaviour.
+
+The command issue routine is `0x5101D860(device, request)`.  It masks the request's status
+word, stores it back, marks the request "issued" (`[request+0x64] = 2`, `0x5101D886`), puts
+the request into the device slot (`[dev+0x2428] = request`, `0x5101D88E`), raises the SD
+clock (`0x5101D87C`) and enables the command-complete signal (`0x5101D8F8`), and then
+dispatches on `([request+4] & 7) - 1` through a `tbh` at `0x5101D902`:
+
+| `[request+4] & 0xF8` (class) | command-register flags produced | where |
+|---|---|---|
+| `0x50` / `0x40` | `2` | `0x5101D9FE` |
+| `0x30` | `9` | `0x5101DACA` |
+| `0x28` | `0x1B` (R1b, used by CMD6) | `0x5101DAD0` |
+| `0x10` / `0x60` / `0x80` / `0x90` | `0x1A` | `0x5101DABC` |
+| anything else | `0` | `0x5101D8EA` |
+
+and on the low three bits, which are a **phase** counter: `1..4` select the `tbh` entries at
+`0x5101DAA8` (`0x5101DA9E`/`0x5101DA76`/`0x5101DA04`), where entry 3 (`0x5101DA04`, phase 4)
+is the *data* path - it programs the block size/count from `[request+0x24]`/`[+0x26]`,
+builds the transfer mode from class bits 8 and 11, and writes the command with the
+data-present bit.  A phase of 0 makes `0x5101D8F2` (`subs r2, #1`) wrap to `0xFFFFFFFF`, the
+`bhi` at `0x5101D8FE` is taken and the routine returns at `0x5101DA74` **without writing the
+command register at all** - while the request stays marked "issued" and in the slot.
+
+That is exactly what the CMD18 request looks like.  Write trap over `0x5117D400..0x5117D440`
+(`ZLB_WTRAP=0x5117D400-0x5117D440`):
+
+```
+5101FEA4  vstr d16 -> +0x00 = 0x240, +0x04 = 0     (the read builder zeroes the class/phase word)
+5101FEB0  +0x08 = 0x12                              (CMD18)
+5101FEE8  +0x0C = 0                                 (LBA 0)
+5101FEF0  +0x24 = 0x200, +0x26 = 0x20               (block size 512, 32 blocks)
+5101FEF6  +0x20 = 0x51033108                        (the data buffer, inside the driver's own
+                                                     cache table at 0x51033100)
+5101D6C6  +0x04 = 0                                 (0x5101D660, the submit preparation)
+5101D88C  +0x04 = 0                                 (0x5101D860, the issue routine)
+```
+
+The submit wrapper `0x5101F6BC` (called by the read builder at `0x5101FF04`) passes the 5th
+argument 1, so the executor `0x5101EE98` takes the `sl != 0` branch at `0x5101F28A`; because
+the slot is empty it ends up at `0x5101F66A`, which calls the issue routine - and that
+returns without issuing, after which `0x5101F2EC` waits in the engine `0x5101EDC8` forever.
+For comparison, a *command* request is built with the word already set: the SWITCH builder
+stores `+0x04 = 0x2B` at `0x51020D40` (phase 3, class `0x28`), which is why CMD6 - and every
+command before it - went out.
+
+So the open question for the next round is narrow and checkable: **who is supposed to set the
+class/phase word of a data request** (the `+0x04` writer other than the two builders).
+Candidates, in order: the cache layer that calls the read builder (it hands the request over
+asynchronously, the executor's `sl != 0` branch exists precisely for "queue it"), the
+completion handler `0x5101DAE4` (it advances `[request+0x64]` from 2 to 3, clears the slot
+and then issues the *next* queued request through the same `0x5101D860`), or the
+data-phase handler `0x5101DBD4` called by the engine at `0x5101EE54`.  A write trap on
+`0x5117D404` plus `ZLB_ARM_TRACE_RANGE` around the read builder's callers should answer it
+directly.
