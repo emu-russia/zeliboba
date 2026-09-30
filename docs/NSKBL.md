@@ -6337,3 +6337,58 @@ word `0x240`, 32 sectors, object `0x5117CB00`), not a device error.
 Next: dump the request object `0x5117CB00` and the stack's state at that stop, and compare with one
 of the three requests that did reach the card - the rejection is a state/busy check in the request
 layer, and that check is what has to be reproduced.
+
+### 10.33 The request layer fails because the completion queue is empty, and the submit issued no command
+
+The request object at `0x5117CB00` (dumped at the error stop) and its surroundings:
+
+```
+5117CB00  40 02 00 00 | 42 00 00 80 | 01 00 00 00 | 80 00 00 40   <- phase 0x240, status 0x80000042
+5117CB10  00 80 FF C0 | 00 ...                                     <- 0xC0FF8000, rest zero
+51184560  F8 4F 18 51 | 87 03 00 00 | FE FF FF FF | 80 00 00 00   <- the mount table
+51184570  28 00 01 00 | ...                                        <- 0x10028, the root-dir sector
+```
+
+so the mount table does hold the volume (`0x51184FF8`), `0x387`, `-2`, `0x80` and the root
+directory's sector `0x10028` - the mount got that far.
+
+The request layer's failure has exactly **one** producer:
+
+```
+5101FE8E  r0 = r5 ; bl 0x5101F9BC      ; the completion query
+5101FE94  r6 = r0
+5101FE96  cmp r0, #0
+5101FE98  beq.w 0x510205D4             ; -> movs r7,#0x11 ; movt r7,#0x8032
+```
+
+and that query is a **linked-list pop from the completion queue at `[device+0x2400]`**:
+
+```
+5101F9BC  push {r3,lr} ; dmb sy ; r0 += 0x2400 ; bl 0x5101FA24 ; dsb sy ; pop
+5101FA24  r3 = [r0] ; cbz r3, 0x5101FA2E      ; empty -> return 0
+5101FA28  r2 = [r3, #0x60] ; [r0] = r2        ; else advance the head and return the node
+```
+
+so the queue was **empty**, the query returned 0 and the request was failed with `0x80320011`.
+
+The SDIF trace (`ZLB_SDIF_TRACE=1`) explains why, and matches 10.32's "the failed request never
+reached the card":
+
+```
+[sdif] CMD idx=18 arg=0x00010020 ... count=32 dma=1 read=1     ; LBA 65568 - the root dir line
+[sdif] adma table=0x5117DD80 moved=16384/16384 ok=1
+[sdif] raise CmdComplete ok=1 / raise TransferComplete dma=1
+[sdif] ... CMD idx=13 ...
+[sdif] w Kermit.Sdif0 +0x2C size=2 value=0x8003                ; CLOCK_CONTROL: enable + stable + bit 15
+                                                    (no SDIF access at all after this line)
+```
+
+The next request's submit (`bl 0x5101FA5C`, which reads `[r6+8]`, `[r6+0x3d8]` and a 64-bit LBA to
+build the transfer) returns without issuing a single SD command, so nothing can complete and the
+queue stays empty.  The `CLOCK_CONTROL` write itself is benign in the model - `0x8003` only sets
+bits 15/1/0, and the reset bits live in the high byte (`sdif.cpp:352-383`), which is 0 here - so the
+submit is what silently gives up.
+
+Next: break on that submit (`0x5101FA5C`) for the failing request and step it to the branch that
+gives up, checking the device state it reads (`[device+0x2400]`, the capabilities/clock registers)
+against one of the three requests that did reach the card.
