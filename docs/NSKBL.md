@@ -5543,3 +5543,37 @@ reading a field that is not a pointer at all.  Note also that the volume object 
 (`0x5100B092..0x5100B0E6`, which writes the volume's `+0x1B8..+0x1BC`) and the two computed
 offsets above: which BPB fields they end up with and whether the size field `0x00110000`
 should have been the os0 volume's.
+
+### 10.14 What `[sb]` really is: the driver's boot-sector structure is never filled
+
+The measurement at `0x51023E86` identifies the structure: the constructor's `sb` register is
+**VA 0x5117DA40**, the buffer the block read put the boot sector's first 48 bytes into, and its
+fields are read as if they had been *parsed*:
+
+```
+51023E6C  ip = [sb, #0x24]         ; meant to be a parsed value
+51023E74  r0 = r1 * ip + r2
+51023E7A  r2 = [sb, #0x2c]         ; meant to be a parsed value
+51023E82  r3 = r8 * (r2 - 2) + r0
+51023E86  [vol, #0x30] = r3
+```
+
+measured values at that instruction: `r8 = 8` (sectors per cluster, correctly parsed),
+`r0 = 0x00010028`, `r2 = 0x414E204F`, `r3 = 0x0A720290`.  `0x414E204F` is the ASCII
+`"O NA"` - i.e. `[sb+0x2c]` is still the *raw* boot sector bytes at offset 0x2B, the volume
+label `NO NAME` - and `[sb+0x24]` is the same raw area.  So the structure the constructor
+expects to be *parsed* has never been filled, the geometry it computes is junk, and the lookup
+then tries to read the directory into `0x0A720290`.
+
+A write trap over the whole structure (`ZLB_WTRAP=0x5117DA40-0x5117DA90`) confirms it: every
+write to it is a *zero* (`pc 0x51013568..0x5101357x`, the driver's clear routine, plus the BSS
+zeroing) - **no parsed fields are ever written**.  The raw boot sector bytes reach the buffer
+through the ADMA transfer (bus-level writes, which no core-store trap sees), and after that
+nothing touches it.
+
+So the missing step is the **boot-sector parse**: the code that reads the raw BPB and stores
+the numeric fields into the driver's structure.  It must run between the volume's first read
+and the constructor's geometry computation - the read completion path is the natural place -
+and it is what the next round has to find.  Note that the constructor *does* have the sectors
+per cluster (r8 = 8) and the block size ([vol+0x50] = 0x200, [vol+0x48] = 8 for the lookup's
+check), so part of the parse runs; the fields at `sb+0x24`/`sb+0x2c` are the ones left raw.
