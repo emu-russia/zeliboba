@@ -533,7 +533,16 @@ struct KermitBlock::Impl {
     u64 periph_ticks(u64 cycles) const { return kermit::periph_ticks_from_cycles(cycles); }
 
     void raise(u32 id, bool level) {
-        if (gic) gic->distributor().set_level(id, level);
+        if (!gic) return;
+        gic->distributor().set_level(id, level);
+        // Round 339: the CPU line is a level derived continuously from the
+        // distributor on hardware, but the model only recomputed it when the guest
+        // wrote to the distributor/CPU interface or when a pulse expired.  A device
+        // that asserts its line (Kermit.Sdif0 does, and the guest had enabled its
+        // signal bits - see docs/NSKBL.md 10.42) therefore never reached the CPU:
+        // a breakpoint on the non-secure IRQ vector (VA 0x40118) never fired in a
+        // whole run, and the storage completion NSKBL waits for never arrived.
+        gic->refresh_line();
     }
 };
 

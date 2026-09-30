@@ -6848,3 +6848,41 @@ be re-measured.
 Next: (a) find the model's real GIC base and re-trap it to see whether NSKBL's A2 step programs it,
 and (b) determine whether the SDIF ever asserts its IRQ line at all - its signal-enable bits *are*
 set (10.42), so the question is whether the missing piece is IRQ *assertion* or IRQ *delivery*.
+
+### 10.45 The GIC is never programmed, and the model only refreshed the CPU line on guest writes
+
+Measured:
+
+* the GIC *is* the ARM's device: `map 0x1E001000` answers `arm device=Kermit.GIC` (and `mep
+  device=-`), so 10.44's "wrong address" note was itself wrong - the address was right, the *block*
+  was simply never touched;
+* a write trap over the whole block (`ZLB_WTRAP=0x1E000000-0x1E004000`) records **zero writes** in a
+  whole run.  Consequently `ICDDCR` (`0x1E001000`) reads **0** - the distributor is *disabled* - and
+  the CPU interface `ICCICR` (`0x1E000100`) and `ICCPMR` read 0 as well;
+* the model gates delivery on exactly those bits: `GicDistributor::highest_pending` returns spurious
+  unless `ICDDCR & 1` (`gic.cpp:275`), and `Gic::refresh_line` needs `ICCICR & 1` plus a priority
+  that passes `ICCPMR` (`gic.cpp:593-596`).
+
+Two findings follow, one fixed here:
+
+1. **Fixed (real bug, default run unchanged):** a device asserting its line never refreshed the CPU
+   line at all - `Kermit::raise` only did `distributor().set_level(...)`, while `refresh_line()` ran
+   just on guest writes to the distributor/CPU interface (`gic.cpp:537/547`) or on a pulse expiry
+   (`gic.cpp:561`).  `Kermit::raise` now calls `gic->refresh_line()` after `set_level`
+   (`kermit.cpp`).  On hardware the CPU line is a level derived continuously from the distributor,
+   so this is a correctness fix; measured effect on the default run: none (the IRQ vector still
+   never fires and the run ends at exactly the same instruction count, `insns=460406285`).
+2. **Opt-in knob `ZLB_GIC_CPUIF=1`** (`gic.cpp`): treats the CPU interface as enabled and opens the
+   priority mask to 0xFF, so the delivery path can be tested while the guest leaves the GIC
+   unprogrammed.  Default behaviour is unchanged.
+
+Even with the fix, the knob, and manual `poke`s of `ICDDCR=1`, `ICCICR=1`, `ICCPMR=0xFF`, the
+non-secure IRQ vector (VA 0x40118) **still never fires**.  That means no source ever becomes
+*pending*: `GicDistributor::set_level` only latches a **rising edge** (`assertion && !sampled_[id]`,
+`gic.cpp:224`), so the next thing to verify is the SDIF's own line bookkeeping - in particular
+whether the status bits and the *signal enable* bits are set simultaneously, and the model's
+signal-enable offsets versus what the guest writes (measured writes land at `0x38` and `0x3A`).
+
+Next: check the model's SDIF interrupt-signal-enable offsets against the guest's writes (0x38/0x3A)
+and trace `Sdif::update_irq`'s inputs (`want`, the status words) around the CMD18 completion, to see
+whether the line is ever asserted with an enable bit set in the same instant.

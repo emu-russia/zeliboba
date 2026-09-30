@@ -591,8 +591,24 @@ void Gic::set_cpu(Cpu* cpu) {
 }
 
 void Gic::refresh_line() {
-    const bool asserted = cpu_interface_->peek(kIccIcr) & 1u ? distributor_->line_asserted(0, cpu_interface_->priority_mask())
-                                                             : false;
+    // Round 339 diagnostic: the CPU interface's ICCICR.Enable bit gates the whole
+    // CPU line, and measurement says nothing in the guest ever writes the GIC at
+    // all - a write trap over the full block (0x1E000000-0x1E004000) records zero
+    // writes, ICCICR reads back 0, and a breakpoint on the non-secure IRQ vector
+    // (VA 0x40118) never fires in a complete run.  NSKBL still reaches its
+    // "interrupts registered" checkpoint (GPO A2), so on hardware the interface is
+    // presumably left enabled by the secure world this model only partly stages.
+    // This knob treats it as enabled so the effect can be measured; the default
+    // behaviour is unchanged.
+    static const bool cpuif_forced = [] {
+        const char* value = std::getenv("ZLB_GIC_CPUIF");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool cpuif_enabled = (cpu_interface_->peek(kIccIcr) & 1u) != 0u || cpuif_forced;
+    // ICCPMR is likewise never written (it reads back 0, which masks every
+    // priority), so the forced path also has to open the priority mask.
+    const u8 mask = cpuif_forced ? 0xFFu : cpu_interface_->priority_mask();
+    const bool asserted = cpuif_enabled ? distributor_->line_asserted(0, mask) : false;
     if (asserted == line_) return;
     line_ = asserted;
     if (line_callback_) line_callback_(line_);
