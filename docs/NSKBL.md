@@ -7447,3 +7447,42 @@ name=`sp+8`, out=`sl`, plus `[sp+0x240]`), continuing at `0x510239C4`, with the 
 
 Next: range-trace the programming loop with the window seeded and the trace trigger on `0x5101FD8C`
 (the loop's real entry), so the operand derivation is measured rather than inferred.
+
+### 10.61 The loop's compared byte comes from VA 0x20, and the object's side is structurally zero
+
+The range trace of the programming loop - trigger on its real entry `0x5101FD8C`, range
+`0x5101FD8C-0x5101FE60` - captures its entire execution (13 instructions) and settles the operands:
+
+```
+ENTER 0x5101FD8C from 0x5101FE34          (the match arm for sb = 1)
+[1] 5101FD8C mov.w r10,r9,lsl#2   r3=00000000 r4=00011C60 r6=5117CB00 r7=00000001
+[2] 5101FD90 ldrb.w r0,[r3,#32]   <- r3 is STILL 0 here: the load is from VA 0x00000020
+[6] 5101FD9C add.w r3,r7,#0x270   r3 becomes 0x298 only now
+[7] 5101FDA0 ldrb.w r4,[r1,#656]  r1=0x5117CB28 -> byte at 0x5117CDB8
+[9] 5101FDA8 cmp r0,r4            r0=00  r4=00
+[10] 5101FDAA beq 0x5101FDF6      -> skip, then 0x5101FDFC b 0x5101FD62 = return
+```
+
+**The window side is read from VA 0x20, not 0x290.**  Because the byte load happens one instruction
+*before* `r3` is advanced to this slot's window offset, the first slot processed uses the pre-loop
+`r3` - which the match arm left at **0** - so the "window byte" is `[0x20]`.  Only later iterations
+would read `[0x270 + (sb-1)*0x28 + 0x20]`.  My earlier traps and pokes at `0x290` were therefore aimed
+one slot past the value this iteration compares.
+
+**The mapping is identity, so physical tools do address the guest's memory.**  `vmem` at the walk shows
+`VA 0x5117CDB8 -> PA 0x5117CDB8`, `VA 0x5117CB00 -> PA 0x5117CB00` and `VA 0x51184780 -> PA
+0x51184780` (all `device`, ttbr1).  So `poke`/`mem`/the write traps *do* reach the same memory the guest
+uses - the failed seed of 10.60 was aimed at the wrong address, not the wrong address space.
+
+**And the object's side is structurally zero.**  The byte at `object + 0x290 + slot*0x28`
+(`0x5117CDB8`) is the low byte of a 32-bit pointer (`0x5117CB00` at the time of the walk), so for an
+aligned pointer it is *always* 0 - the equality the loop tests is not an accident of uninitialised
+data but the normal case, and skipping is the normal answer.
+
+**Conclusion:** the walk's "nothing to do" reply is *correct*; the only quantity that could ever make it
+differ is the **window byte at VA 0x20** - hardware state the model does not provide.  That is the half
+to implement, and the completion producer of 10.55/10.58 is still missing alongside it.
+
+Next: measure the window side properly - `vmem 0x20` for its mapping and value at the walk, and the
+object field it pairs with - then decide the mirror's exact shape with the corrected addresses
+(`[0x20]` on the window side, `object + 0x290 + slot*0x28` on the driver side).
