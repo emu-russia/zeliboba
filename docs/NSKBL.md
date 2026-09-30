@@ -5791,3 +5791,49 @@ returns 0 - which the path helper turns into "not found" and the caller into `0x
 That narrows the whole os0 blocker to one number: **the address the lookup passes to the cache**
 must be one the driver has cached (or will cache) - for a FAT16 root directory it should be the
 root directory's sector - and in the model it is the raw-label-derived `0x0A720290`.
+
+### 10.21 The miss path *is* a cache fill, and it is asked for sector 0x0A720280
+
+The miss path (`0x51000DDC`) is not an error return - it picks the least-recently-used entry and
+**reads the sector through the block device**:
+
+```
+51000DDC  ; scan the 64 entry timestamps at +0 and keep the smallest
+51000E18  fp = entry << 11 ; sl = (fp + entry) << 3      ; the entry's address (stride 0x4008)
+51000E26  r1 = r4                                       ; the KEY becomes the block read's address
+51000E3A  bl 0x51000D14                                 ; the block read (device I/O)
+51000E3E  cmp r0, #0 ; blt 0x51000E68                   ; the fill failed -> error
+51000E4E  str r4, [r5, #4]                              ; store the tag = the key
+```
+
+So a cache miss *does* issue a device read, and tracing the fills
+(`bp arm 0x51000E3A`, three continues) gives exactly three keys:
+
+| fill | key (`r1`) | what it is |
+|---|---|---|
+| 1 | `0x00000000` | the eMMC master block (entry 0's tag) |
+| 2 | `0x00010000` | sector 65536, the active os0 volume's first sector (entry 1's tag) |
+| 3 | **`0x0A720280`** | the lookup's request for the directory - the raw-label-derived garbage |
+
+and the third fill is the failure: the driver asks for a sector number that does not exist (the
+value was derived from the raw BPB label bytes), so the fill cannot succeed, the lookup returns
+0 and the caller stores `0x803FF007`.
+
+Two corrections to earlier notes come with this measurement:
+
+* The context the fills use is valid: `[0x5102B010] = 0` (device type 0) and
+  **`[0x5102B014] = 0x51183948`** - the device handle *is* installed (the round-302 note that it
+  is always zero no longer holds), so `0x51000D14`'s `cbz r0` guard passes and the read is
+  attempted.
+* The cache entry stride is `0x4008` (`fp = entry << 11; sl = (fp + entry) << 3`), i.e. 64
+  entries of `{+0 = timestamp, +4 = tag, +8.. = 0x4000 data}` from `0x51033100`; the tags of
+  entries 0 and 1 are `0` and `0x00010000` - both are *sector numbers*, which is what the
+  lookup's key has to be.
+
+The next measurement must therefore capture the computation of that key at the right stop:
+`mla r3, r0, r2, r1` at `0x51023372` with `r0 = [vol+0x48] = 8` (sectors per cluster),
+`r1 = [vol+0x38]` and `r2 = cluster - 2`.  Note for that work: several breakpoints inside these
+loops report a state that does not match their instruction (e.g. `0x51023372` stopping with
+`r0 = 0x803FF007`), so the key's inputs have to be read from `ZLB_ARM_TRACE_RANGE` output or
+from a stop that is verified against the instruction's own effect rather than from the first
+`regs` after `runm`.
