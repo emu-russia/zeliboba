@@ -5577,3 +5577,43 @@ and the constructor's geometry computation - the read completion path is the nat
 and it is what the next round has to find.  Note that the constructor *does* have the sectors
 per cluster (r8 = 8) and the block size ([vol+0x50] = 0x200, [vol+0x48] = 8 for the lookup's
 check), so part of the parse runs; the fields at `sb+0x24`/`sb+0x2c` are the ones left raw.
+
+### 10.15 Measured: the constructor parses *before* it reads, and the volume's I/O buffer is an unmapped address
+
+Three measurements pin the remaining problem down.
+
+1. **`sb` is the buffer at VA 0x51184980, and it holds the os0 boot sector** - the constructor
+   starts with `r6 = 0x51184980` (`0x51023D4A`), `sb = r6` (`0x51023D56`), and the BPB fields
+   it reads from it (`+0xb`, `+0xe`, `+0x10`, `+0x11`, `+0x13`, `+0x16`, `+0x20`) are the
+   *raw* offsets, i.e. the structure is meant to be the raw boot sector.  A dump at
+   `0x51023DE0` shows it holding exactly the os0 boot sector (`EB FE 90 SCEI ... 00 02 08 02
+   00 02 00 02 00 80 F8 13 00 ...`).
+
+2. **The parse runs before the read.**  With breakpoints on both, `0x51023D62` (the geometry
+   computation) is reached at `insns = 53 702 359` and `0x51023F8C` (the dispatcher read of the
+   volume's first block) never fires before it, so the constructor computes the geometry from
+   whatever the structure held at that moment.  Measured at the division helper
+   (`0x51025AF4` is an **ARM-mode** routine - the Thumb disassembly there is garbage because
+   `blx` switches state - called with `95 / 32` and returning `2`): the registers were
+   `r0 = 95, r1 = 32, r2 = 31, r7 = 64`, i.e. the structure's `+0xb = 32` and `+0x11 = 2` -
+   *not* the boot sector's `512`/`512`.  So at that point `0x51184980` did **not** hold the os0
+   boot sector: it held stale content, the branch at `0x51023DE0` (`cmp r0, #2`) took the
+   FAT32-style path, and `[vol+0x30]` was computed from the raw `NO NAME` label bytes.
+
+3. **The lookup uses `[vol+0x30]` as the I/O buffer** (`0x51023938` -> `[sp+0x58]` ->
+   `[sp+0x48]` -> `r1` at the read call), so whatever the constructor leaves there is the
+   address the directory read targets - measured `0x0A720290`, unmapped in the guest and in
+   the model.
+
+The volume's *other* fields are right: `[vol+0x50] = 0x02000000` (the active os0 partition's
+byte offset, which is why the lookup's read went to LBA 65536), `[vol+0x48] = 8`,
+`[vol+0x54] = 0x51000D55` (the read method) and `[vol+0x58] = 0x5102B010` (the context).
+
+So the open question is now sharp: **which stage is supposed to fill the structure at
+0x51184980 with the volume's boot sector before the constructor parses it** - and, if the
+constructor's `[vol+0x30]` is meant to be a mapped buffer address rather than a sector offset,
+**which stage maps it**.  The next measurements: a write trap on the whole structure
+(`0x51184980..0x51184A00`, which currently shows only the constants written at `0x51011D00`
+and the raw sector arriving by DMA), and the same trace for the *first* volume object
+`0x51184F9C` that the storage init creates at `0x51000F78` - comparing the two objects should
+show whether one of them is parsed correctly and the other is not.
