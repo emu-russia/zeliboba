@@ -6582,3 +6582,40 @@ drives it through the secure/CMeP path.
 Next: watch the fourth entry of `0x510205E8` (break on its entry, continue four times, then step the
 fourth) to find where it gives up without issuing a command, and establish which side owns
 `pc=0003FFFE` in the SDIF trace.
+
+### 10.39 The storage engine is the CMeP, and the ARM's usual channels are excluded
+
+Stepping the fourth entry of the device read (`bp arm 0x510205E8` four times, then clear and step):
+
+```
+510205E8 ... 51020602 -> 51020622 -> 5101FE72 -> 5101FE84 -> 5101FA7C -> 5101FA9A -> 5101FABA -> 5101FAD4
+```
+
+The routine first validates its arguments, then computes a **chunk that stops at the next 4 KiB
+boundary** (`r4 = 0x1000 - (r1 & 0xFFF)`, `0x51020618-0x51020620`), bails when that chunk is larger
+than what is left (`bhs 0x51020668`) and otherwise calls the wait/process routine `0x5101FE60`,
+which runs the completion processor of 10.38 and polls for a completion.
+
+**Who actually talks to the card** is answered by the SDIF trace's `pc=` values - three writers, all
+in the CMeP's second-loader/secure-kernel area (0x40000+):
+
+| pc | commands |
+|---|---|
+| `00047912` | 28 (the eMMC init: CMD0/1/2/3/9/7/8/16/13) |
+| `000481E2` | 19 (CMD17 with ADMA) |
+| `0003FFFE` | 34 (CMD18 with ADMA - the storage reads, and the final CMD13) |
+
+The ARM's possible channels are all excluded by measurement:
+
+* the mailbox `0xE0000000-0xE0000040` receives **only CMeP writes** (8 in the whole run, all boot
+  handshakes `0x9/0x101/0x102/0x106`); the ARM writes none;
+* the Ernie SC window `0xE3100000-0xE3104000` receives **only ARM writes**, all from the
+  device/interface init (`0x51024B8E-0x51024D22`), none during the storage requests;
+* the GIC `0x1E001000-0x1E002000` receives **zero** writes.
+
+So NSKBL and the CMeP coordinate through **shared DRAM state** - the request object
+(`0x5117CB00`) and its controller (the pool at `0x5117EF08`, the template at VA 0x270) - plus
+whatever signals the CMeP, and the fourth request never produced a CMeP command.
+
+Next: find the shared handshake the CMeP polls (its storage code lives at 0x40000-0x49000) and what
+the ARM has to set for it, with the request object and its controller as the candidate shared state.
