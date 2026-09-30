@@ -289,13 +289,25 @@ void Vita::wire_bridges() {
         const bool soc_facing = (base >= 0xE0000000u && base < 0xF0000000u) ||
                                 (base >= 0x30000000u && base < 0x30010000u);
         if (!soc_facing) continue;
-        // Note (measured, round 260): 0xE0B00000 is *SDIF port 0* in the ARM address space
-        // (see kermit.cpp's table), but the mirrored Ernie SC command/reply windows claim
-        // the same address and, being the smaller windows, win Bus::find_device.  An
-        // experiment that kept those two windows off the ARM bus changed nothing at all -
-        // the same 153 205 277 instructions and the same halt - so NSKBL never touches
-        // 0xE0B00000 on the failing path and the shadowing is not the cause.  See
-        // docs/NSKBL.md section 8.93.
+        // Round 302 (measured): the two SC *message* windows are the CMeP/Ernie-side
+        // transfer windows and must NOT be mirrored into the ARM address space.  Their
+        // syscon addresses (0xE0B00000 / 0xE0BF0000, 0x200 bytes each) coincide with
+        // Kermit's SDIF0 and SDIF1 register blocks, and because Bus::find_device prefers
+        // the *smaller* window they won the arbitration: `map 0xE0B00024` showed
+        //     arm  -> Ernie.ScCmd@mirror  read32 = 0x00000000
+        //     mep  -> Kermit.Sdif0@mirror read32 = 0x00030000
+        // for the SDHCI PRESENT_STATE register.  NSKBL's storage driver opens its device
+        // with `0x5101E970` = "PRESENT_STATE bit 16 (card inserted) set" (0x5101E976:
+        // ldr r0,[r3,#0x24] / ubfx r0,r0,#0x10,#1), so reading the SC window's zero made
+        // the open fail with 0x80320013, the block device context 0x5102B014 stayed NULL,
+        // every `read_blocks` call returned 0x80010013 (0x51000D14 -> 0x51000D44) and the
+        // whole os0 volume stayed unread - which is why NSKBL's open of
+        // os0:psp2bootconfig.skprx returned 0x803FF007.  The ARM reaches the syscon's SC
+        // registers through Ernie.SC at 0xE3100000 (mirrored above already), so dropping
+        // these two windows from the ARM bus costs the ARM nothing.
+        // The round-260 experiment that concluded "the shadowing is not the cause" was
+        // measured before NSKBL ever reached its storage driver, so it saw no difference.
+        if (device->name() == "Ernie.ScCmd" || device->name() == "Ernie.ScReply") continue;
         arm_bus_->add_device(std::make_unique<DeviceMirror>(*device, base, device->size()));
     }
 

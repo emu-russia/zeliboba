@@ -4938,3 +4938,132 @@ the exits of that function.
 
 Diagnostics left in the tree, all off by default: `ZLB_EMMC_LOG` (logs `EmmcCard`
 read/write block addresses) and `ZLB_NSKBL_OPEN_EXIT` / `ZLB_NSKBL_OPEN_EXIT_PC`.
+
+## 10. os0: the storage path - root cause found and two model bugs fixed (round 302)
+
+The section-9 conclusion ("no sector of the `os0` volume is ever read, so the volume is
+never mounted") was correct, but the cause was not in the guest's file-system code at all:
+it was two modelling errors in the **SD host controller**, both measured this round.
+
+### 10.1 The failure chain, measured end to end
+
+Everything below was measured on a `runm 400000` run (from power-on, `runm` is what applies
+the boot substitutions - `run` does not, see `docs/STATUS.md` §5).
+
+1. NSKBL reaches checkpoint `0xA9` and calls its first external load
+   (`0x510014D4` -> loader `0x51001104` -> open `0x510191BC`), exactly as section 9
+   describes: the loader builds `os0:kd/psp2bootconfig.skprx`, the object dispatcher
+   (`0x51018F6C`) turns it into object call `#0x10005`, and `0x51001548` converts the
+   `os0:` prefix into `os0/` before calling the volume open `0x510240C0`.
+2. `0x510240C0` -> `0x51023970` -> lookup `0x510232EC` returns 0 from its shared tail
+   `0x510238F0` (`mov r0, r3`, `r3 = 0`).  The trace shows *why*: the request arrives with
+   the second argument `r1 = 0xFFFFFFFE` (`-2`), so `0x51023358` takes the `0x5102390E`
+   branch, which computes `r0 = [volume+0x38] - [volume+0x30]`.  That difference is `-1`
+   (the constructor `0x51023C40` writes `[+0x38] = -1` and nothing ever writes `+0x30`),
+   `ble` at `0x5102337A` leaves the walk loop before its first iteration, and `0x51023966`
+   returns 0.  The "volume" in question is the block-device object `0x51184FF8` that
+   `0x51000E7C` registers (the SD/eMMC storage stack).
+3. `0x51000E7C` is the storage bring-up.  It opens the underlying controller with
+   `0x51021664(dev_id = [0x5102B010], out = &0x5102B014)`, pokes a cache table at
+   `0x51033100`, and only then registers the `os0` (`0x51184FF8`) and `sd0`
+   (`0x51184F9C`) block devices.  A write trap on `0x5102B000..0x5102B040` proves that
+   `0x5102B014` is written **only** with 0 (three times, by the open's own prologue
+   `0x51020686`, plus the give-up path `0x51000EB0`): the controller never opens.
+4. The open (`0x51020678`) fails early.  Every `read_blocks` through the block device then
+   returns `0x80010013` from `0x51000D14` (`[ctx+4] == 0`, `0x51000D44`), the constructor
+   `0x51023C40` never sees sector 0, the FAT fields of the volume stay at their
+   constructor defaults, and `os0:psp2bootconfig.skprx` is reported "not found" ->
+   `0x803FF007`.
+
+### 10.2 Model bug 1: the Ernie SC message windows shadow SDIF0 in the ARM's address space
+
+`Vita::wire_bridges` mirrors every SoC-facing Ernie device into the ARM bus.  Two of them
+are the syscon's SC *message* windows:
+
+```
+ernie::kScCmdWindow  = 0xE0B00000   (0x200 bytes)
+ernie::kScRespWindow = 0xE0BF0000   (0x200 bytes)
+```
+
+`0xE0B00000` is simultaneously **Kermit's SDIF0 register block** (`kSdif0Base`,
+0x10000 bytes).  `Bus::find_device` prefers the smaller window, so the ARM lost the whole
+SDHCI register file.  Measured with the debugger's `map` command:
+
+```
+map 0xE0B00024
+  mep   device=Kermit.Sdif0@mirror   read32=0x00030000   <- the real SDHCI PRESENT_STATE
+  arm   device=Ernie.ScCmd@mirror    read32=0x00000000   <- the SC window, all zeroes
+```
+
+NSKBL's controller open tests exactly that register (`0x5101E970`: `ldr r0,[r3,#0x24]` /
+`ubfx r0,r0,#0x10,#1`, "card inserted"), so it read 0 and gave up with `0x80320013`.
+
+The model even documented the symptom as if it were correct behaviour: round 244
+attributed NSKBL's write of `0xE0B0002F` to "the SC window's start bit" and round 245
+added a self-clearing handler for it.  `0xE0B0002F` is not an SC register at all - it is
+SDHCI `SOFTWARE_RESET`, and `0x5101D784` (`strb.w r3,[r4,#0x2f]` followed by the poll at
+`0x5101D788`) is the controller reset the driver waits on.
+
+Fix: `Vita::wire_bridges` no longer mirrors `Ernie.ScCmd` / `Ernie.ScReply` into the ARM
+bus.  The ARM's SC interface is `Ernie.SC` at `0xE3100000`, which stays mirrored.  After
+the fix the ARM reads `0xE0B00024 = 0x00030000` (`ZLB_RTRAP=0xE0B00020-0xE0B00030`) and
+NSKBL's controller open proceeds past the card-inserted check.
+
+The round-260 note ("keeping those windows off the ARM bus changed nothing") is stale: it
+was measured while NSKBL still stopped before its storage driver, so it could not have seen
+a difference.  It is replaced by the measurement above.
+
+### 10.3 Model bug 2: CMD8 was always decoded as MMC SEND_EXT_CSD
+
+With the register file visible, the ARM started driving SDIF0 (`ZLB_SDIF_TRACE=1`):
+
+```
+CMD idx=0  arg=0x0   tm=0x0000 data=0      <- CMD0
+CMD idx=8  arg=0xAA  tm=0x0000 data=0      <- CMD8, no data phase
+CMD idx=0 ... CMD idx=8 ...                <- repeated three times (the three open attempts)
+```
+
+The model's `case 8` unconditionally implemented **SEND_EXT_CSD** (a 512-byte data phase),
+which is what the CMeP boot chain uses (`CMD idx=8 arg=0x0 tm=0x0010 data=1`).  On SD the
+same index is **SEND_IF_COND** with no data phase and an R7 response that echoes the check
+pattern.  The guest wrapper `0x51022D84` checks exactly that:
+
+```
+51022DBE  and.w r2, r3, #0xff
+51022DC2  cmp   r2, #0xaa          ; R7 low byte must be the check pattern
+51022DC4  it ne / movne.w r0, #0x80320160
+...
+51022DD4  ands.w r4, r4, r3, lsr #8 ; arg & (R7 >> 8) must be non-zero
+51022DDC  it ne / movne r0, r5      ; otherwise 0x80320161
+```
+
+Fix: `case 8` now branches on the data-present flag - `has_data == false` answers
+`respond_short(argument)` (the R7 echo), `has_data == true` keeps the ext-CSD block.  The
+CMeP's command trace is unchanged; the ARM's CMD8 check now passes.
+
+### 10.4 The remaining wall: the controller "mode" field `[dev+0x2420]`
+
+With both fixes in, the device open walks much deeper (three helper calls
+`0x5101F73C` -> `0x51022D84` -> `0x51022D88`) and now fails one stage later with
+**`0x80320016`** from `0x51022FBC`, whose first act is the CMD8 probe.  The reason is a
+guest-side field the model never fills:
+
+* `0x51022FCC` reads `[device+0x2418]`, masks it with `0x00FF8000` and passes
+  `(mask != 0) ? 1 : 0` to the CMD8 wrapper as the check pattern (`0x1AA` vs `0xAA`).
+* `[device+0x2418]` is written by the identify routine `0x5101D720` from
+  `[device+0x2420]` (a controller "mode"): `0` -> `0x00000080`, `1` -> `0x00300000`,
+  `2` -> `0x00000080`, `>2` -> `0`.
+* Only `0x00300000` survives the `0x00FF8000` mask, so the guest needs
+  `[device+0x2420] == 1`; the trace at `0x5101D726` shows `r6 = 0` in the model, and a
+  write trap over `0x5117EF00..0x5117EF40` shows that **nothing writes `[device+0x2420]`
+  for the whole run** - it is BSS (`vmem` right after the ARZL decode reads zeroes there).
+
+That is the next measurement: find who is supposed to set the mode to 1 (the driver's
+"card/controller type" field; `0x5101D860` uses `mode == 2` to skip the clock-control
+programming, so `1` = SD, `2` = MMC), and supply the hardware state it is derived from -
+likely the SDIF capabilities/slot or a card-detect event, not a guest constant.
+
+State after this round: `zlb_tests` 436/436, `verify.ps1` green, the run still reaches
+checkpoint `0xA9` with no panic (the storage still does not mount), and the eMMC image is
+unchanged.  Diagnostics used: `ZLB_SDIF_TRACE`, `ZLB_RTRAP`/`ZLB_WTRAP`, `ZLB_EMMC_LOG`,
+`ZLB_ARM_TRACE_RANGE` + `ZLB_ARM_TRACE_TRIGGER`, the debugger's `map`, `vmem` and `bp`.

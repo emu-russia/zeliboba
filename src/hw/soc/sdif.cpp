@@ -528,7 +528,20 @@ void Sdif::execute_command() {
             rca_ = argument & 0xFFFF0000u;
             respond_short(0x00000900u);  // READY_FOR_DATA | CURRENT_STATE=transfer
             break;
-        case 8: {  // SEND_EXT_CSD: 512 bytes over the data lines
+        case 8: {  // CMD8 is *two different commands* depending on the bus mode.
+            // Round 302 (measured): MMC uses CMD8 = SEND_EXT_CSD (argument 0, a 512
+            // byte data phase), which is what the CMeP boot chain issues
+            // (`CMD idx=8 arg=0x0 tm=0x0010 data=1`).  SD uses CMD8 = SEND_IF_COND
+            // (no data phase, R7 echoes the 0x1AA-style check pattern), which is how
+            // NSKBL starts its card: its trace is `CMD idx=0 arg=0x0` then
+            // `CMD idx=8 arg=0xAA tm=0x0000 data=0`, repeated three times, and then
+            // the storage open fails with 0x80320160 (the SD init gives up).
+            // With the ext-CSD path chosen for both, the SD caller never received the
+            // R7 echo, so `os0:psp2bootconfig.skprx` was never opened.
+            if (!has_data) {
+                respond_short(argument);   // R7: echo the check pattern
+                break;
+            }
             if (card_) {
                 const auto& ext = card_->ext_csd();
                 data_.assign(ext.begin(), ext.end());
