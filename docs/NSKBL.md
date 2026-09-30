@@ -6308,3 +6308,32 @@ register would be missed), or it is produced by one of the *other* SLB2 modules 
 Next: break on the `movs r7,#0x11` instructions themselves (`0x510205D6`, `0x5102252E`,
 `0x51022544`) rather than on the `movt`, and check the four `0x510205E8` call sites' callers for an
 out-call to the secure side (SMC or an Ernie request) that could return the code.
+
+### 10.32 The error is built at 0x510205D6 and the failed request never reached the card
+
+Breaking on the `movs` (instead of the `movt`) changes the picture:
+
+* `bp arm 0x510205D6` **does** fire (arm0), while `0x510205DC` (the `movt`) did not - a breakpoint
+  artifact, because stepping through the sequence proves it runs: `step 6` from `0x510205D6` leaves
+  **`R7 = 0x80320011` with `PC = 0x5101FF6A`**, i.e. the `movt r7,#0x8032` executed and the error
+  exit was taken.  (The intervening `bl 0x5101E790` is `movs r0,#0 ; bx lr` - it returns 0.)
+* Another `step 6` shows the error travelling up: **`R0 = 0x80320011`, `PC = 0x51000E40`** - the
+  `blt` of the cache fill right after its block read (`0x51000E3A` -> `cmp r0,#0` -> `blt`), so the
+  failed block read is what the fill sees, and from there the mount (`0x510012F4`) and the loader
+  (`0x510014D4`) return it.
+
+The request context at the error site:
+
+```
+PC=510205D6  R0=0x240  R4=0x5117CB00 (the request object)  R5=0x240  R8=0x20 (32 sectors)
+R9=0x11C60   R11=0x5103F120  SP=0x5102BBEC  LR=0x5101F9CB (return of `bl 0x5101F9D0`)
+```
+
+and the eMMC log gives the decisive detail: only **three** reads complete (LBA 0, 65536, 65568)
+while the device-read entry `0x510205E8` is entered **four** times.  So the failing request was
+rejected by the SD stack **before any card traffic** - it is a request/state failure (phase/class
+word `0x240`, 32 sectors, object `0x5117CB00`), not a device error.
+
+Next: dump the request object `0x5117CB00` and the stack's state at that stop, and compare with one
+of the three requests that did reach the card - the rejection is a state/busy check in the request
+layer, and that check is what has to be reproduced.
