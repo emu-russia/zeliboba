@@ -5546,6 +5546,9 @@ should have been the os0 volume's.
 
 ### 10.14 What `[sb]` really is: the driver's boot-sector structure is never filled
 
+*(Corrected in 10.15: the register measurement there shows `sb` = VA **0x51184980** - the copy
+the driver keeps, not the raw read buffer at 0x5117DA40 that this section first inferred.)*
+
 The measurement at `0x51023E86` identifies the structure: the constructor's `sb` register is
 **VA 0x5117DA40**, the buffer the block read put the boot sector's first 48 bytes into, and its
 fields are read as if they had been *parsed*:
