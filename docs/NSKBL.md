@@ -5354,3 +5354,24 @@ Next measurements, in order:
 2. Decide what the hardware has at PA `0x0017D480`.  If the driver is right, the low window
    must be bigger than `0x00040000` (the current `arm_bootrom` alias) and the SDIF's ADMA
    needs a bus for it.
+
+Follow-up measurements (same round, after the two points above were started):
+
+* The field is **zero when the request is built** - `bp arm 0x5101FEA4` then
+  `vmem 0x5117D47C` reads 0 - so the `0x0017D480` appears later, yet a write trap over
+  `0x5117D470..0x5117D490` for the whole run catches nothing.  A write made by a *model
+  substitution* (those go straight to the bus) or by a DMA path that does not pass the core's
+  store helper would explain that, and the trap's coverage is worth re-checking.
+* The request object contains the ADMA table itself: at `+0x80` there are two ADMA2 records
+  `{attr 0x21, len 0x38, target 0x0017D5C0}` and `{attr 0x21, len 0x3FC0, target 0x00033140}`,
+  and at `+0x100` the same transfer as `{0x5117D480, 0x00033140, 0x00003FC0}`.
+* Those targets give the rule away: `0x0017D5C0 = 0x5117D5C0 & 0x00FFFFFF` and
+  `0x00033140 = 0x51033140 & 0x00FFFFFF`.  So the driver converts a window VA to the
+  address it hands the DMA engine with a **24 bit mask** (`VA & 0x00FFFFFF`, equivalently
+  `VA - 0x51000000` for this window), while the model's page tables (and all of its own
+  documentation) treat the same window as identity VA = PA.  Either the model's identity
+  mapping for VA `0x51000000+` is the wrong convention (the guest's own L1 entry
+  `L1[0x510] = 0x5111158E` is what both agree on, so this needs a look at who writes that
+  entry) or the hardware really does keep NSKBL's data at low physical addresses and the
+  model has no memory there.  Deciding this is the next step, and it is what stands between
+  the model and an ADMA walk that succeeds.
