@@ -4492,10 +4492,24 @@ void ArmCore::thumb32_coprocessor() {
 
     if (cp == 10u || cp == 11u) {
         if ((cur_instr_ & 0x0E000000u) == 0x0C000000u) {
+            // The size of a VFP load/store is the *coprocessor number*: cp10 is
+            // single precision, cp11 is double.  (`cp` is bits 11:8, i.e. the
+            // trailing bit of the encoding's `101x` field - bit 8 alone is that
+            // same bit, and treating it as "single" inverted the size.)
+            //
+            // Measured (round 305): NSKBL builds its SD request objects with
+            // `vldr d16,[pc,#0x180]` / `vstr d16,[r0]` around the literal
+            // {0x240, 0x514} at 0x51020020 - the class/phase word of the request.
+            // With the inverted size only the low 32 bits were stored, so the
+            // request's phase word stayed 0, the command issue routine 0x5101D860
+            // returned without writing the command register (its `tbh` dispatch
+            // needs phase 1..4) and the storage driver parked at 0x5101EDE4
+            // waiting for a CMD18 that was never sent.
+            const bool single = cp == 10u;
             if ((cur_instr_ & 0x02000000u) != 0u) {
-                execute_vfp_load_store_multiple(cur_instr_, (cur_instr_ & 0x100u) != 0);
+                execute_vfp_load_store_multiple(cur_instr_, single);
             } else {
-                execute_vfp_load_store(cur_instr_, cp, (cur_instr_ & 0x100u) != 0);
+                execute_vfp_load_store(cur_instr_, cp, single);
             }
             return;
         }

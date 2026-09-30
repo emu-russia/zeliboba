@@ -5279,3 +5279,78 @@ and then issues the *next* queued request through the same `0x5101D860`), or the
 data-phase handler `0x5101DBD4` called by the engine at `0x5101EE54`.  A write trap on
 `0x5117D404` plus `ZLB_ARM_TRACE_RANGE` around the read builder's callers should answer it
 directly.
+
+### 10.9 The class/phase word was being lost by the CPU: Thumb-2 VFP load/store size
+
+The answer to 10.8 turned out to be that the guest *does* set the word - and the **CPU model
+was dropping half of it**.  `0x5101FEA4` is a 64 bit VFP store:
+
+```
+5101FE9C  vldr d16, [pc, #0x180]   ; the literal at 0x51020020: {0x00000240, 0x00000514}
+5101FEA4  vstr d16, [r0]           ; writes +0x00 = 0x240 and +0x04 = 0x514
+```
+
+`0x514 & 7 == 4` (the phase of the data path, `0x5101DA04`) and `0x514 & 0xF8 == 0x10` (the
+class that selects the `0x1A` command-register flags), which is exactly what the issue
+routine needs.  The model only ever stored the low 32 bits, so the request's word stayed 0
+and 10.8's early return followed.
+
+The cause was the **size bit of a Thumb-2 VFP load/store**: its size is the *coprocessor
+number* - cp10 is single precision, cp11 is double - and that number's low bit is bit 8 of
+the instruction.  `thumb32_coprocessor` passed `(cur_instr_ & 0x100) != 0` as "single", i.e.
+the exact opposite: every `vldr`/`vstr dN` executed as a 32 bit `s` access (the `vldr d16`
+above loaded into `s1` and the `vstr` stored four bytes).  The ARM and A32-VFP decoders were
+already correct (`single = cpnum == 10`), only the Thumb path was inverted.
+
+Confirmed by a debugger experiment before touching the code: with `bp arm 0x5101FEA4`,
+`bpc 0x5101FEB2` and `poke 0x5117D404 4 32` (putting the phase back by hand) the very next
+run issued CMD18 and read `lba=0 count=32 ok=1`, i.e. the whole theory held.
+
+Measured effect of the fix (`src/cpu/arm/arm_core.cpp`, `thumb32_coprocessor`):
+
+| measurement | before | after |
+|---|---|---|
+| `[request+0x04]` (the class/phase word) | `0` | `0x514` |
+| storage open at `0x51000E94` (`bp`) | `0x803FF007` (the original symptom) | **`0` (success)** |
+| ARM SD command trace | ends at CMD23 | CMD18 issued, 26 commands + the data phase |
+| eMMC reads | 19 (boot chain only) | + one `lba=0 count=32` - the os0 volume's first 16 KiB |
+
+So the os0 volume is finally *read*.
+
+### 10.10 The new wall: the ADMA table address has no memory in the model
+
+The driver still does not finish the read.  For the CMD18 it programs ADMA and the model
+refuses the table:
+
+```
+[sdif] CMD idx=18 arg=0 tm=0x0033 block=0x00200200 size=512 count=32 data=1 read=1 multi=1 dma=1 adma=0x0017D480
+[sdif] adma: no bus for table 0x0017D480
+[sdif] raise CmdComplete ok=1 data_pending=1 tc_in=0
+```
+
+The address comes from the request object: `0x51022658` loads `[r5, #0x7c]` and stores it
+into `ADMA_SYSTEM_ADDRESS` (`0xE0B00058`) at `0x51022660`.  Measured with a write trap over
+the request (`0x5117D470..0x5117D490`, and VA 0x5117D400 is identity mapped to PA
+0x5117D400): **nothing ever writes `+0x7C`**, so the value is not produced by the code the
+model executes.  And PA `0x0017D480` has no memory on the ARM bus (`map 0x0017D480` reports
+no device and `mem 0x0017D480` reads `0xFFFFFFFF`; the only low RAM is
+`arm_bootrom`/`shared_sram_`, `board::kArmBootWindowSize = 0x00040000` at PA 0), while the
+guest's own page tables have no mapping for VA `0x0017D480` either (`vmem` ->
+`page translation fault (fsr 0x7)`), so the guest cannot even *reach* that address itself.
+
+Consequences: `adma_transfer()` fails, `data_pending_` stays true, the model keeps Buffer
+Read Ready asserted (a level flag) and the driver - which uses ADMA and never touches the
+`0x20` data port - waits at `0x5101EE06` (`ZLB_EMMC_LOG=1` shows the 32 block read, no further
+ones).
+
+Next measurements, in order:
+
+1. Find who *should* initialise `[request+0x7C]`.  It is read by the data-transfer issue
+   routine `0x510226xx`, so a write trap over the whole 0x240 byte request (not just the tail)
+   plus `ZLB_ARM_TRACE_RANGE` on the pool-allocating caller of `0x5101F9BC` should show it;
+   if the field is genuinely pre-set in the guest's data, the model's initial memory content
+   for that page is the thing to compare (the page comes from the model's physical pool
+   substitution, which zeroes what it hands out).
+2. Decide what the hardware has at PA `0x0017D480`.  If the driver is right, the low window
+   must be bigger than `0x00040000` (the current `arm_bootrom` alias) and the SDIF's ADMA
+   needs a bus for it.
