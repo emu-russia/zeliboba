@@ -6925,3 +6925,49 @@ stops and the same terminal pc):
 Next: read the distributor's state for id 4 - `ISPENDR0` (base+0x200), `ISACTIVER0` (base+0x300) and
 `ISENABLER0` (base+0x100) - rather than the priority block, and check whether the guest ever *reads*
 `ICCIAR`/`ICCEOIR` (which would set and clear `active_` without any write the traps could see).
+
+### 10.47 Breakthrough: the GIC was never given a CPU, and with interrupts NSKBL's storage works
+
+Two things were wrong, and the second one was the wall.
+
+**The interrupt id.**  The SDIF's callback passes `Irq::Emmc`, and that enum (`soc.h:60-64`) is
+`32 + 26` = **58**, an SPI - not the `4` of `IrqLine` in `cpu.h:51`.  `GicDistributor` requires
+`enabled_[58]`, i.e. `ISENABLER1` at `0x1E001104`, and the guest never writes the GIC at all, so that
+bit stays clear and `highest_pending()` never returns the id.  `ZLB_GIC_CPUIF=1` now also treats every
+id as enabled, which is when the log finally named the winner:
+
+```
+[info] kermit GIC line assert: icddcr=0x00000000 iccicr=0x00000000 pmr=0xFF id=58 (cpu=null)
+```
+
+**`cpu=null` - the real bug.**  `kermit_set_cpu()` (`kermit.cpp:575`) had **no callers anywhere**, so
+`Gic::cpu_` stayed null and `refresh_line()` computed the line and then dropped it:
+`if (cpu_ != nullptr) cpu_->set_irq(...)`.  **Fixed**: `Vita` now calls
+`kermit_set_cpu(*arm_bus_, arm_)` once the cores exist (`vita.cpp`).  The model implements CPU0's
+interface, so core 0 is the one to attach; with the controller left disabled nothing changes (verified:
+the default run still ends at `arm=51000D0C`).
+
+**Effect with `ZLB_GIC_CPUIF=1`:**
+
+* the core's line is asserted at last - `ZLB_ARM_IRQ_LOG=1` prints
+  `ARM Cortex-A9 irq line asserted (CPSR=0x000001D3, IRQ masked)`;
+* **the storage stack starts working**: eMMC reads go from 3 to **19**, and they are real file reads,
+  e.g. `read lba=24576 count=1`, `read lba=25071 count=1` (twice) and `read lba=25072 count=7`;
+* the run no longer dead-ends in the old terminal loop.  It now stops at **`0x400219E8`**, which is
+  the KBL's own
+
+```
+400219E0  push {r3, lr}
+400219E2  movs r0, #0x8e
+400219E4  bl 0x40036998        ; the checkpoint writer
+400219E8  b 0x400219e8         ; an infinite self-loop
+```
+
+i.e. the secure side writes checkpoint `0x8E` and halts - and `0x8E` is exactly the last GPO code
+the run emits.  So the storage problem is solved and the boot has advanced to a *new*, much later
+wall on the secure side.
+
+Next: find why the KBL stops at checkpoint `0x8E` (what the guest asked the secure side for just
+before `0x400219E0`, and what `0x40036998` is told), and decide how much of the GIC bring-up
+(`ICDDCR`/`ISENABLER`/`ICCICR`/`ICCPMR`) the model should default to "as the secure world left it"
+instead of requiring guest writes that never come.

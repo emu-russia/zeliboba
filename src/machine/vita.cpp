@@ -266,6 +266,15 @@ void Vita::build_cores() {
     }
     arm_ = arm_cores_[0].get();
 
+    // Round 342: give the GIC its CPU.  `kermit_set_cpu` had no callers anywhere, so
+    // `Gic::cpu_` stayed null and every interrupt the controller asserted was dropped
+    // on the floor - measured as "GIC line assert: ... id=58 (cpu=null)" in
+    // Gic::refresh_line, with ArmCore::set_irq never firing even when the SDIF
+    // asserted its line 188 times in a run.  The model implements CPU0's interface
+    // (see gic.cpp), so core 0 is the one to attach; a run that never enables the
+    // controller is unaffected.
+    if (arm_ != nullptr) kermit_set_cpu(*arm_bus_, arm_);
+
     syscon_ = ernie_->cpu();
     if (syscon_) syscon_->name = "Ernie";
 }

@@ -295,7 +295,7 @@ u32 GicDistributor::highest_pending(u32 core, u8 priority_mask) const {
     for (u32 id = 0; id < max_irq_; ++id) {
         if (!pending_[id]) continue;
         if (active_[id]) continue;  // already being serviced
-        if (!enabled_[id]) continue;
+        if (!enabled_[id] && !gic_left_enabled_by_secure_world()) continue;
         if (id >= 32) {
             const u8 target = targets_[id];
             if ((target & (1u << core)) == 0) continue;
@@ -620,7 +620,23 @@ void Gic::refresh_line() {
     // ICCPMR is likewise never written (it reads back 0, which masks every
     // priority), so the forced path also has to open the priority mask.
     const u8 mask = cpuif_forced ? 0xFFu : cpu_interface_->priority_mask();
-    const bool asserted = cpuif_enabled ? distributor_->line_asserted(0, mask) : false;
+    const u32 winning = cpuif_enabled ? distributor_->highest_pending(0, mask) : kSpurious;
+    const bool asserted = winning != kSpurious;
+    // Round 341 diagnostic: the SDIF asserts its line (measured with
+    // ZLB_SDIF_IRQ_LOG) but ArmCore::set_irq never fires (ZLB_ARM_IRQ_LOG), so the
+    // question is what this function computes.  ZLB_GIC_LOG=1 prints every change
+    // together with the distributor's gate for the winning id.
+    static const bool log_gic = [] {
+        const char* value = std::getenv("ZLB_GIC_LOG");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (log_gic && asserted != line_) {
+        ZLB_LOG_INFO("kermit",
+                     "GIC line %s: icddcr=0x%08X iccicr=0x%08X pmr=0x%02X id=%u (cpu=%s)",
+                     asserted ? "assert" : "clear", static_cast<unsigned>(distributor_->peek(kIcdDcr)),
+                     static_cast<unsigned>(cpu_interface_->peek(kIccIcr)), mask, winning,
+                     cpu_ != nullptr ? "set" : "null");
+    }
     if (asserted == line_) return;
     line_ = asserted;
     if (line_callback_) line_callback_(line_);
