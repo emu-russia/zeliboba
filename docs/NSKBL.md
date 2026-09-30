@@ -7192,3 +7192,40 @@ Next: instrument that comparison.  The walk assembles the long name from the LFN
 it with the target pointer at `[sp+0x50]` (0x5102BB74, `psp2bootconfig.skprx`); break at the compare
 chain between the LFN assembly and the `bne` that rejects an entry (0x510236xx-0x510237F6) and dump the
 assembled name next to the target, to find the first byte where they disagree.
+
+### 10.54 The lookup *finds* the file - the "not found" exit never runs
+
+Two measurements settle it.
+
+**The image's long names decode correctly.**  Assembling the LFN chains of the active `os0` volume's
+root directory straight from `build/emmc.img` gives `kd`, **`psp2bootconfig.skprx`** (the entry
+`PSP2BO~1SKP`), `psp2config.skprx`, `sm`, `ue`, `us` - so the name the driver searches for is present,
+spelled exactly, with matching checksums (10.53).
+
+**The walk visits exactly our file's three LFN entries and then stops.**  With the LFN handler
+(`0x5102358E`) as a breakpoint and `core arm0` selected, three hits are recorded (offsets relative to
+the directory buffer `0x51184780`):
+
+```
+R0 = 0x51184780   R3 = 0x41     the LFN of 'kd'                       (dir +0x00)
+R0 = 0x511847C0   R3 = 0x42     the LFN tail 'g.skp' of psp2bootconfig (dir +0x40)
+R0 = 0x511847E0   R3 = 0x01     its continuation 'psp2b'              (dir +0x60)
+```
+
+and then nothing more - the entry it matches is the very next one (`PSP2BO~1SKP` at +0x80).  (The first
+of those hits is at `insns = 53 757 065`, *after* the buffer read of 10.52 at ~50.68M, which is
+consistent with the lookup filling its own buffer.)
+
+**And the failure exit is never taken.**  Breaking on the lookup's "not found" return
+(`0x51023966`, the `movs r0,#0` the root case reaches when the block loop is exhausted) **never
+stops**, while the lookup's entry (`0x510232EC`) does.  So the parser matches
+`psp2bootconfig.skprx` and returns a result - the model's old note in `sdif.cpp:641` ("reports
+'not found'") no longer holds, which is the effect of the round-23 unaligned-halfword fix: the block
+size parses correctly now, so the directory reads deliver real data.
+
+**Consequence for the objective:** opening `os0:psp2bootconfig.skprx` works.  What still fails is the
+step after it - reading the file's own data - which is where the request layer returns `0x80320011`
+(10.24-10.33), and where the eMMC trace stops after the root-directory cache line (10.49).
+
+Next: follow the open past the lookup - the driver should now read the file's first cluster - and apply
+the request-layer analysis of 10.24-10.33 to *that* transfer, which is the one that never completes.
