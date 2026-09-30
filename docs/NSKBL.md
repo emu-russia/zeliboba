@@ -6531,3 +6531,33 @@ substitution)"), which makes this a prime model-side suspect.
 Next: find what VA 0x290 (and the low-window structure it belongs to) is supposed to hold - the
 guest code that would initialise it, or the substitution expected to - because that single byte
 currently decides whether the request is submitted at all.
+
+### 10.37 Both descriptor tables are empty, so the submit is a no-op
+
+With the breakpoint on the comparison itself (`bp arm 0x5101FDAA`, one stop), the operands are:
+
+```
+PC=5101FDAA   R0=0  R1=0x5117CB28  R3=0x298  R4=0  R6=0x5117CB00  R8=0x5117CD98
+```
+
+and reading the layout behind them:
+
+* the loop's `r3` is `0x270 + slot*0x28` - a **low-window** address (the low window maps
+  `VA -> PA 0x40300000 + VA`, measured: `VA 0x290 -> PA 0x40300290`, `VA 0x4034 -> PA 0x40304034`),
+  and the compared byte is `[r3 + 0x20]`, i.e. `VA 0x290` for slot 0;
+* `r1 = request + slot*0x28` and the compared byte is `[r1 + 0x290]`, i.e. `0x5117CDB8`;
+* the request's descriptor area `0x5117CD70` (8 slots of 0x28) is **all zero**;
+* a write trap over the **whole** low-window template table
+  (`ZLB_WTRAP=0x40300270-0x403003B0`) records **zero writes in the entire run**.
+
+So both sides of the comparison are zero, every slot matches, and the submit never pops a pool node
+and never issues a command - which is exactly what the SDIF trace of 10.33 shows for it.
+
+Note that the window itself works: the neighbouring NSKBL lock lives in it too
+(`<VA 0x4034> -> PA 0x40304034`, and its fields are live - counter 4, owner 0, see 10.34).  Only the
+**template table at VA 0x270** (8 entries of 0x28, one byte at +0x20 each) is untouched, while the
+driver *reads* it to decide whether a slot needs submitting.
+
+Next: find what fills that table (a guest init stage the flow skips, or a substitution the model is
+missing) and who produces the completion for the three reads that *did* succeed - the parked worker
+of 10.34 and this empty table are the two ends of the same question.
