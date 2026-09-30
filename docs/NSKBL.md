@@ -5620,3 +5620,30 @@ constructor's `[vol+0x30]` is meant to be a mapped buffer address rather than a 
 and the raw sector arriving by DMA), and the same trace for the *first* volume object
 `0x51184F9C` that the storage init creates at `0x51000F78` - comparing the two objects should
 show whether one of them is parsed correctly and the other is not.
+
+### 10.16 The structure *is* filled, the volume *is* parsed, and the geometry still picks the wrong fields
+
+The measurements above needed two corrections, and they change where the problem sits.
+
+* The constructor runs **exactly once** for the volume the lookup uses: breakpoint at
+  `0x51023C40` with `r0 = 0x51184FF8`, `r1 = 0x00110000`, and a second continue ends the run -
+  so there is no "earlier invocation with stale data".
+* At the geometry computation (`bp arm 0x51023D62`) the structure at VA 0x51184980 **already
+  holds the os0 boot sector** (`EB FE 90 SCEI ... 00 02 08 02 00 02 00 02 00 80 F8 13 00 ...`
+  dumped at the same stop).  The problem is therefore not a missing fill of that buffer.
+* The volume object **is parsed correctly**: dumping 0x51184FF8 shows `+0x24 = 0x13` (the FAT
+  size 19), `+0x20 = 0x00010002`, `+0x1C = 2`, `+0x28 = 2`, `+0x18 = 0x00010000`,
+  `+0x48 = 8`, `+0x50 = 0x02000000` (the active os0 partition offset) - exactly what the
+  constructor's parse block (`0x51023DB2..0x51023DCE`) writes.  Only `+0x2c` still holds the
+  raw label bytes `"O NA"`.
+
+The remaining puzzle is a register discrepancy that the next round should resolve, because it
+decides whether the geometry code reads the raw structure or the parsed volume fields: at the
+breakpoint on `0x51023D62` the registers are `r0 = 95, r1 = 32, r2 = 31, r7 = 64, r8 = 0x4000`
+while the structure at `r6 = 0x51184980` holds `+0xb = 0x0200` and `+0x11 = 0x0200`.  A linear
+reading of `0x51023D52..0x51023D60` (`r3 = [r6+0x11]; r1 = [r6+0xb]; r7 = r3 << 5; r2 = r1 - 1;
+r0 = r2 + r7`) would give `r1 = 512, r2 = 511, r7 = 16384, r0 = 16895`, which is *not* what the
+registers hold - so `0x51023D4A..0x51023D62` is not the path that reaches it (the block is
+probably a loop body entered with a different `r6`, e.g. once per FAT), and the geometry inputs
+must be traced from the loop head rather than read linearly.  `ZLB_ARM_TRACE_RANGE` around
+`0x51023D00..0x51023E00` is the tool for that.
