@@ -7593,3 +7593,30 @@ completion list at `0x2640` never receives anything, the submit's pop returns 0,
 Next: implement that device's completion queue - a low-window structure based at VA 0x240 whose `+0x2400`
 list receives a completed node when a transfer finishes (the SDIF's ADMA is the natural producer) - and
 measure whether the walk's submit then succeeds and the boot advances past the file-data read.
+
+### 10.65 The submit path runs end to end once a node is on the device's list - and the next wall is the device submission itself
+
+**Tooling lesson first: the low window is mapped per page.**  `vmem 0x2640` at the pop resolves to
+**PA 0x40301640**, while `vmem 0x290` gave PA 0x40300290 and `vmem 0x20` gave PA 0x40300020.  Assuming
+`PA = VA + 0x40300000` sent two pokes to the wrong memory (10.60, and again on the first try here);
+low-window addresses must be resolved with `vmem` every time.
+
+**With the right address the submit path runs.**  Stopping at the loop's entry, poking the window byte
+(`PA 0x40300020 = 0xFF`) *and* a free node onto the device's completion list (`PA 0x40301640 =
+0x5117E180`, with that node's `+0x60` link cleared), then continuing:
+
+```
+[stop] arm0 breakpoint at 0x5101FD8C      the loop entry
+[stop] arm0 breakpoint at 0x5101FDB0      the pop - it now returns the node
+[stop] arm0 breakpoint at 0x5101FDDE      the device-submission call - the submit path runs
+```
+
+So 10.64 is confirmed by experiment: the walk's submit pops a *completed* request from the device's list
+at VA 0x2640, and with a node there it proceeds to call the device submission `0x5101F6BC`.
+
+**And the next wall is that call.**  The release breakpoint (`0x5101FDEA`) does *not* fire, which means
+`0x5101F6BC` returned negative and the code took `blt 0x5101FE26` - the submission error path.  So the
+device submission itself is now the thing that fails.
+
+Next: measure `0x5101F6BC` - break on it with the node poked in place, dump its arguments, and follow its
+error return - to see what the submission needs from the (still unmodelled) device at VA 0x240.
