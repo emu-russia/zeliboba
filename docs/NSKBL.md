@@ -6216,3 +6216,55 @@ that decides whether it proceeds depends on each core's MMU being configured the
 next measurement is per-core `SCTLR`/TTBR over time - start with the four ARM cores right before
 and right after `0x51010A5C` runs (`bp arm 0x51010A8E`, `core`, per core `regs`), to find which
 core loses (or never gets) the NSKBL mapping.
+
+### 10.30 The loader is the device bring-up, and the flow ends idle, not panicking
+
+**State of all four cores at the end of a default run** (`runm 400000`, no breakpoints):
+
+```
+arm0 ARM Cortex-A9 pc=51000D0C running Thumb SYS NzCv non-secure mmu=on
+arm1 ARM Cortex-A9 pc=510147DC HALTED  ARM SYS Nzcv non-secure mmu=on
+arm2 ARM Cortex-A9 pc=510147DC HALTED  ARM SYS Nzcv non-secure mmu=on
+arm3 ARM Cortex-A9 pc=510147DC HALTED  ARM SYS Nzcv non-secure mmu=on
+[0x5113B61C] = 0x00004000   (then 0x4540, 0x48C0 - a structure of pointers)
+```
+
+All four cores are non-secure with the MMU **on**, the MMU-state divergence of 10.29 is gone, and
+the scheduler object *is* installed.  Three cores are parked at `0x510147DC`, which is the `bx lr`
+immediately **after the `wfe` at `0x510147D8`** - the normal wait state - while arm0 spins in
+`0x51000D0C`.  The "deadlock" of 10.28 was therefore a transient wait that resolved; the model's
+`wfe`/`sev` pair behaves correctly.
+
+**The loader in full** (`0x510014D4`), disassembled:
+
+```
+510014D4  push {r4, r5, lr} ; r5 = r0
+510014DC  bl 0x51010994          ; lock
+510014E0  blx 0x51014528         ; mpidr
+510014E6  beq 0x51001542         ; CPU 0 only:
+51001542  bl 0x51000E7C          ;     the storage/interface init
+510014E8  bl 0x510109AC          ; unlock
+510014EE  bl 0x51010994          ; lock
+510014F6  cbnz r0, 0x5100151C    ; non-CPU-0 skips the init
+5100150E  bl 0x51001104          ;     a one-shot init (r0 = 0x51028214, r1 = 0x510B3204)
+51001518  bl 0x51018018
+5100151C  bl 0x510109AC          ; unlock
+51001536  bl 0x510012F4          ; the mount/registration worker
+5100153A  and.w r0, r0, r0, asr #31   ; return the error, else 0
+51001540  pop {r4, r5, pc}
+```
+
+and the arguments of the worker name it: `r0 = 0x51028214` is the **device table** holding the
+strings `"os0:"` and `"sd0:"`, `r1 = 0x510B3204` is its state, `r2 = 1` the count, `r3 = 4` a flag.
+So "the first external load" checkpoint is the **device/storage bring-up**, not a module read.
+
+**`0x80320011` is not produced where it is built.**  The only site that builds it is the storage
+layer's `movs r4, #0x11 ; movt r4, #0x8032` at `0x5101FDFE`, where it is *logged* through the debug
+printf with the format at `0x5102A180` (`0x%x %d -> %d`) - but breakpoints on `0x5101FDFE` and on
+the error return `0x5101FE26` never fire.  The terminal `r0 = 0x80320011` therefore has to be read
+*at* the loader's return (`bp arm 0x51001540`, then `core`, `regs` before continuing), not from the
+end-of-run state, which is what earlier rounds did.
+
+Next: read the loader's return value at `0x51001540`, decide whether the terminal `0x51000D0C` is
+an idle or a panic loop (its only instruction is `b` to itself, so only an interrupt can leave it),
+and identify the event the three parked cores are waiting for.
