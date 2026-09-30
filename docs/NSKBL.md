@@ -5988,3 +5988,50 @@ structure dump that sat on the other side of the timing window.
 Next: pin the ordering (SDIF ADMA write, the cache copy, the parse) with `ZLB_SDIF_TRACE` plus
 the same write trap, and then fix the model's read-completion timing so that a completed command
 implies the data is in memory - that is a model-side fix on this path, not a substitution.
+
+### 10.25 The memory holds 512, and the model's load of `[r6+0xB]` returns 32
+
+The ordering is pinned with **one wide, non-intrusive write trap**
+(`ZLB_WTRAP=0x51184980-0x51185050`, 951 writes, default run, no breakpoints):
+
+```
+672 : [vol+0x50] = 0x200   pc=51023C62   ; the constructor sets the block size (correct)
+676 : [struct+0x08] = 0x65747570  pc=51011D0C   ; the "Sony Computer..." constant copy
+803 : [struct+0x00] = 0x5390FEEB  pc=51011D00   ; "EB FE 90 53" - the os0 boot sector arrives
+804 : [struct+0x04] = 0x20494543
+805 : [struct+0x08] = 0x00202020        ; bytes 20 20 20 00  -> +0x0B = 0x00
+806 : [struct+0x0C] = 0x00020802        ; bytes 02 08 02 00  -> +0x0C = 0x02
+...        (the whole 512-byte boot sector: 0x00020002, 0x0013F880, 0x00FF003F,
+            0x45290080, 0x4E3F5A3D, 0x414E204F ...)
+932 : [vol+0x50] = 0x20    pc=51023DA2   ; the parse stores 32 (wrong)
+943 : [vol+0x30] = 0x0A720290 pc=51023E86
+```
+
+so the structure **is** filled with the correct boot sector, 130 writes before the parse stores 32.
+The word at `struct+0x08` is written exactly three times in the whole run (BSS zero, the "Sony"
+constant, the boot sector) and never again, so at `0x51023DA2` memory holds `20 20 20 00 02 08 02
+00` and the halfword at `+0x0B` is `0x0200 = 512`.
+
+The parse nevertheless reads **32**, which is the halfword at **`+0x0A`** (`20 00`).  That is
+isolated with `bpc` + `step`:
+
+```
+bp arm 0x51023D9A ; bpc 0x51023D9A ; core arm ; regs ; step 1 ; regs
+  before: R6 = 0x51184980  R7 = 0xFFFFFFFC  PC = 0x51023D9A  CPSR Thumb
+  after : R6 = 0x51184980  R7 = 0x00000020  PC = 0x51023D9E  CPSR Thumb
+```
+
+and `vmem 0x51184988` in the same session prints `20 20 20 00 02 08 02 00 02 00 02 00 80 F8 13 00`,
+i.e. `0x0200` at `+0x0B`.  The instruction's own bytes (verified twice, in the image and in a
+`save` of runtime memory) are `b6 f8 0b 70` = `ldrh.w r7, [r6, #0xb]` - offset 0x0B, not 0x0A.
+
+So the picture is: **the guest code and the guest memory are both right, and the model's
+execution of that load returns the value one byte lower.**  This is a model-side defect on this
+path, and it is the first thing that has to be fixed before any further conclusion about the os0
+driver can be drawn - the `[vol+0x50] = 0x20` (wrong block size), the zero-length cache read, the
+empty lookup output buffer and the `[vol+0x30] = 0x0A720290` geometry all follow from it.
+
+Next: decide between the two candidate causes - the model's Thumb-2 `LDRH (immediate)` decoding
+(offset `imm12` read one too low) and its effective-address computation for that load - by
+disassembling the address with the model's own disassembler after boot (`dis 0x51023D9A 3`) and
+by adding a one-line self-test for `ldrh.w rd, [rn, #imm12]` to `zlb_tests`, then fix the decoder.
