@@ -6809,3 +6809,42 @@ mapping.
 Next: dump the device object's descriptor slots (device + 0x270, device = `0x5117CB00`) and the
 VA 0x270 template **at the walk's own breakpoint**, resolved with the MMU state of that moment, and
 compare a walk call that submits against the failing one.
+
+### 10.44 The completion queue is `[device+0x2400]`, nothing ever posts to it, and the ARM never takes an interrupt
+
+The pop's address is now measured instead of inferred: breaking at its *call site* inside the
+transfer primitive (`bp arm 0x5101FE8E`) gives `R5 = 0x5117CB00` - the device object - and the call
+is `bl 0x5101F9BC` with `r0 = r5`, so the queue is `device + 0x2400 = ` **VA 0x5117EF08**.  The write
+trap from 10.36 on exactly that address recorded **only writes of zero**, so **no completion is ever
+posted into it** and every pop fails.
+
+Also: **the walk's own pop (`0x5101FDB0`) is never reached** - a breakpoint there does not fire in a
+whole run - so the walk skips all eight slots and returns without touching the pool.  Both the walk
+and the queue are inert.
+
+**The ARM never takes an interrupt either.**  A breakpoint on the non-secure IRQ vector (VA
+`0x40118` = VBAR_NS `0x40100` + 0x18, per `bootchain.cpp:528`) never fires in a full run, while the
+model's interrupt path is wired end to end: `kermit.cpp:745` (`sdif0->set_irq_callback` ->
+`Kermit::raise` -> `gic->distributor().set_level`), `gic.cpp:590/599` (`cpu->set_irq`), and
+`arm_core.cpp:676-683` (the line is honoured only while `CPSR.I` is clear).
+
+**The GPO sequence decodes as pairs**, which corrects my reading of the checkpoints: the value the
+CMeP writes carries *two* fields - a phase counting down (`0x5E 0x5D ... 0x56`) and NSKBL's own
+A-series steps counting up (`0xA1 0xA2 ... 0xA9`):
+
+```
+... 0x5E 0xA1  0x5D 0xA2  0x5C 0xA3  0x5B 0xA4 ... 0x5A 0xA5 ... 0x59 0xA6 ...
+    0x58 0xA7 ... 0x57 0xA8 ... 0x56 0xA9  0x56 0x56 0xA9 0xA9  0x56 0xA9
+```
+
+so the run *does* pass **0xA2 = "NSKBL: interrupts registered"** (`debugger.cpp:44`) and stops at
+**{0x56, 0xA9} = "before the first external load"** - the loader stage that then fails.
+
+Finally, the address I probed for the GIC (`0x1E001000`) reads `0xFF` from the ARM bus, i.e. it is
+not where the model puts it (`kermit.cpp:643`: `periph_base + kermit::kGicDistOffset`), so the
+"guest never writes the GIC" conclusion of round 32/33 was drawn from the wrong address and has to
+be re-measured.
+
+Next: (a) find the model's real GIC base and re-trap it to see whether NSKBL's A2 step programs it,
+and (b) determine whether the SDIF ever asserts its IRQ line at all - its signal-enable bits *are*
+set (10.42), so the question is whether the missing piece is IRQ *assertion* or IRQ *delivery*.
