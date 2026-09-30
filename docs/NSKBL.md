@@ -7406,7 +7406,7 @@ That leaves one conclusion: **the low-window slot bytes are hardware state**.  T
 as the driver's own table (a byte, a 64-bit base, a 64-bit size per 0x28-byte slot), which is exactly a
 *device-side mirror* of the programmed descriptors - the controller is supposed to copy what the driver
 programs into that window, and the driver reads it back to decide whether a slot still needs
-submitting.  With the window永远 zero the comparison can never differ, so the walk always answers
+submitting.  With the window always zero the comparison can never differ, so the walk always answers
 "already programmed", never submits, never releases, and the waits drain the free list into
 `0x80320011`.
 
