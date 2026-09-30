@@ -6619,3 +6619,42 @@ whatever signals the CMeP, and the fourth request never produced a CMeP command.
 
 Next: find the shared handshake the CMeP polls (its storage code lives at 0x40000-0x49000) and what
 the ARM has to set for it, with the request object and its controller as the candidate shared state.
+
+### 10.40 The CMeP reads none of the ARM's structures, and its own chain has no storage error
+
+Three more traps settle it:
+
+* **read trap on the request object** (`ZLB_RTRAP=0x5117CB00-0x5117CC00`): 27 reads, **all ARM**
+  (`0x5101FA28`, `0x5101D666`, `0x5101EECC`, `0x5101DBxx`, `0x5101EE62`, `0x51020614`,
+  `0x5101FE66`, `0x5101FA62`).  The CMeP never looks at it.
+* **read trap on the ADMA chain area** (`ZLB_RTRAP=0x5117DD00-0x5117E000`): 133 reads, **all ARM**
+  (mostly `0x5102267A`, `0x51022988`, `0x5101DBxx`).  The CMeP does not read the chains either,
+  even though its CMD18 transfers carry ADMA records whose targets are ARM buffers.
+* **read trap on the low-window template** (`ZLB_RTRAP=0x40300270-0x40300400`): **zero** reads, even
+  though the ARM demonstrably reads VA 0x290 there - accesses through the model's substituted low
+  window never reach the trap, so read traps are blind in that region.
+
+**The CMeP's own boot chain completed cleanly.**  A write trap on the GPO block
+(`ZLB_WTRAP=0xE20A0000-0xE20A0010`) records 268 writes, **all from the CMeP**, and the checkpoint
+codes (the value in the `+8`/`+C` registers, high half) run:
+
+```
+0x41 0x42 0x43 0x44 0x45 0x48 0x54 0x55 0x5F 0x56 0x4D 0x51 0x57 0x58 0x46 0x47 0x49
+then 0x7E 0x81 0x7D 0x82 0x7C 0x83 ...
+```
+
+Decoded with the model's own table (`debugger.cpp:71-88`): GPO init (0x41), keyring (0x43),
+**SD/eMMC initialised (0x48)**, firmware version (0x54/0x55), QA flags (0x46),
+**loading kernel_boot_loader.self (0x49)** - and the storage *error* codes are all **absent**:
+0x4A (SD/eMMC I/O error), 0x4B (ConsoleID read failed), 0x52 (eMMC not available), 0x53 (OpenPSID
+failed) never appear.
+
+So the CMeP's storage engine works, but **every card command in the trace comes from CMeP code and
+none of the ARM's structures is ever read by it** - there is no post-boot ARM->CMeP request
+transport anywhere the traps can see.  That is consistent with the fourth NSKBL read waiting for a
+completion that nothing can produce.
+
+Next: establish how post-boot I/O is *supposed* to reach the CMeP (a mailbox/SPAD handshake the
+model lacks, or results appearing in the driver's cache table `0x51033100` instead of an SDIF
+completion), and whether NSKBL's storage stack reads its results from shared memory rather than
+waiting on the controller.
