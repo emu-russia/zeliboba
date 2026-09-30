@@ -133,7 +133,12 @@ enum class ScCommand : u32 {
     ResetDevice = 0x0900,
     Suspend = 0x0901,
     Resume = 0x0902,
-    StorageRead = 0x1100,
+    /// 0x1100 takes no payload (flags = 0x0000 in the firmware command table) and
+    /// answers with the 4-byte Ernie DL version - it is not a storage read.  The
+    /// remaining members of the 0x1080/0x1101/0x1180..0x1185 group keep labels
+    /// derived from grouping, not from reverse: the syscon is not the eMMC host
+    /// (see ernie_emmc.cpp and docs/SYSCON.md 6).
+    GetErnieDlVersion = 0x1100,
     StorageWrite = 0x1101,
     StorageInfo = 0x1000,
     StorageErase = 0x1180,

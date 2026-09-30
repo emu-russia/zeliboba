@@ -1,9 +1,13 @@
 // zeliboba - Ernie eMMC host.
 //
-// The syscon is the storage host for the early boot path: its RL78 firmware
-// brings the card up and serves block transfers to the CMeP first loader (and to
-// the secure kernel once it is running).  Only the transactor below is modelled
-// here; the SC commands that drive it live in ernie_sc.cpp / ernie.cpp.
+// NOTE (docs/SYSCON.md 6): the syscon is **not** the storage host of the boot
+// path.  eMMC hangs off the SoC's SDIO0 (Kermit SDIF, 0xE0B00000, ADMA2) and the
+// second loader runs the card's own identification sequence
+// (GO_IDLE_STATE..SWITCH); the Ernie command table has no storage_read /
+// emmc_get_csd entry, and 0x1100 - once labelled a storage read - is the Ernie DL
+// version (4 bytes, no payload).  What is modelled here is only the SC-side block
+// transactor that the firmware's 0x1180..0x1185 handlers are grouped around; those
+// labels are grouping, not reverse, and must not be quoted as fact.
 //
 // Evidence for the command layout used by the SC handlers:
 //

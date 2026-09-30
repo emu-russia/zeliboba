@@ -37,12 +37,12 @@ Evidence: `datasheets/thgbm3g5d1fbaie32nm4gbe-mmc_e_rev0.3_100917.pdf`
 | User area (datasheet) | 3,997,171,712 bytes = 0xEE3C0000, SEC_COUNT 0x00772000 | datasheet page 4 |
 | User area (console's own table) | 0x71A000 blocks = 3.55 GiB | reference eMMC dump, master block |
 | Boot partitions | 2 x 2 MiB (BOOT_SIZE_MULTI = 0x10 x 128 KiB) | see note below |
-| RPMB | 512 KiB (RPMB_SIZE_MULT = 0x01) | datasheet page 7 |
+| RPMB | 512 KiB in the model (`kRpmbSize`), i.e. `RPMB_SIZE_MULT = 0x01` x 128 KiB **rounded up** — an assumption, not a datasheet number | `src/hw/emmc/emmc.h` |
 | Block size | 512 bytes | READ_BL_LEN / WRITE_BL_LEN = 0x9 |
 | CID MID | 0x11 (Toshiba) | datasheet page 4 |
 | CID OID | 0x00 | datasheet page 4 |
 | CID CBX | 01b (BGA) | datasheet page 4 |
-| CID PRV / PSN / MDT | 0x03 / 0x5A1B0B00 / 0x0130 | placeholder, the real serial is per console |
+| CID PRV / PSN / MDT | 0x03 / 0x5A1B0B00 / MDT = 0x30 (the model's u16 field is 0x0130; the CID field itself is 8 bits) | placeholder, the real serial is per console |
 | CSD_STRUCTURE / SPEC_VERS | 3 / 4 (CSD version 1.0, high capacity) | datasheet page 5 |
 | CSD TAAC / NSAC / TRAN_SPEED | 0x0E / 0x00 / 0x32 (26 MHz) | datasheet page 5 |
 | CSD CCC | 0x0F5 | datasheet page 5 |
@@ -162,7 +162,7 @@ the two SLB2 copies in the eMMC dump. Layout:
 0x08  u32     entry table size = 0x200
 0x0C  u32     entry count
 0x10  u32     data offset hint = 0x2000
-0x14  u32     reserved
+0x14  u32     reserved (12 reserved bytes, 0x14..0x1F)
 0x20  entries, 0x30 bytes each, count of them:
         +0x00 u32 first 512 byte block of the payload
         +0x04 u32 payload size in bytes
@@ -194,8 +194,9 @@ header bytes at 0x14..0x1F).
 The container is written to **four** places: the two eMMC boot partitions
 (`EmmcPartition::Boot0`/`Boot1`, file offsets 0xE3400000/0xE3600000 for the
 default size) and the two user area SLB2 partitions at 8 MiB and 12 MiB. The
-first loader reads the SLB2 partition out of the user area, which is also what
-the machine's boot chain does.
+machine's boot chain looks for the container in the boot partitions first and
+only then in the user area (`read_slb2_container()`, `src/machine/bootchain.cpp`);
+the user area copies are the fallback.
 
 ---
 
@@ -248,11 +249,12 @@ images keeps the choice identical to hardware.
 
 The 512 KiB idstorage partition at 0x00040000 is **reconstructed**: its content
 is personal to each console (it holds the per-unit keys) and is not in the PUP.
-The image contains the leaf index table described by
-`pup_fiction/extract_idstorage.py` - 256 little endian leaf numbers at 0x00,
-followed by 256 leaves of 512 bytes - with leaves 1..255 registered and the
-unused leaves filled with the alternating `0xFFF5`/`0xFFFF` pattern that the
-reference dump shows. This is a placeholder, not a real ID storage.
+What the builder actually writes is described in §5.1, which matches the code
+(`build_idstorage_image()` in `src/hw/emmc/emmc_image.cpp`) and the reference dump;
+the earlier description of "256 leaf numbers at 0x00, leaves 1..255 registered"
+was wrong and is not repeated here. This is a placeholder, not a real ID storage:
+only leaf 0 (the mapping table) and leaf 192 (the SMI list) carry data, everything
+else is `0xFF`.
 
 ---
 
@@ -289,8 +291,8 @@ Independent cross-checks that were run:
   `PUP_dec/os0.bin` / `vs0.bin`, with a zero filled tail.
 * The eMMC boot partitions and the two `bls` copies are byte identical to each
   other (first 0xA000 bytes).
-* End to end: `zeliboba.exe -q -ex "run 300000" -ex "boot" -ex "quit"` reads the
-  container out of the image through the emulated card and stages it -
+* End to end: `zeliboba.exe -q -ex "boot" -ex "runm 300000" -ex "boot" -ex "quit"`
+  reads the container out of the image through the emulated card and stages it -
 
   ```
   [info ] machine    SLB2 from eMMC SLB2: 7 entries
@@ -301,13 +303,12 @@ Independent cross-checks that were run:
   [info ] boot         SLB2 entry kernel_boot_loader.self  offset=0x3DE00 size=355220
   [info ] boot         SLB2 entry kprx_auth_sm.self        offset=0x94A00 size=35064
   [info ] boot         SLB2 entry prog_rvk.srvk            offset=0x9D400 size=1728
-  [info ] boot       ARM boot ROM staged second_loader.enp at 0x1F000000 (93184 bytes)
+  [info ] boot       ARM boot ROM staged second_loader.enc at 0x407C0000 (93184 bytes)
   ```
 
-  The run then stops in the CMeP first loader's keyring/Bigmac validation
-  (`first loader failure path taken (mailbox = 2)`), which is downstream of the
-  eMMC: the container is found, parsed, and its payload staged. That failure is
-  a property of the emulated MeP/hardware chain, not of the image.
+  The CMeP first loader then reports `first loader reported SUCCESS to the ARM
+  mailbox` and hands control to `0x40000`, so the container is found, parsed,
+  validated by the loader's own crypto chain and executed.
 
 ### What could not be verified
 
@@ -349,5 +350,6 @@ Independent cross-checks that were run:
   payload двумя проходами (0x464C0/0x46632/0x4687C).
 
 Сборщик образа (`build_idstorage_image`) пишет таблицу по дампу и синтезирует
-SMI-лист: `"SMI\0"`, version 1, нулевую область 0x0C..0x7F; payload и подпись
-оставлены нулями, так как на железе они зашифрованы ключом консоли.
+SMI-лист: `"SMI\0"`, version 1, `u32 minfw_plaintext = 0` и нули до 0x7F; payload
+(0x80..0xFF) — нули, подпись (0x100..0x1FF) — `0xFF`, потому что на железе они
+зашифрованы ключом консоли, которого в дампах нет.

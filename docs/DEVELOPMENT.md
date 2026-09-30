@@ -37,10 +37,15 @@ tests/          zlb_tests self test binary                   (everyone)
 * Every core must be deterministic: no wall clock, no random, no thread locals.
   The hardware RNG is a device (`BigmacDevice`), not a core feature.
 * Do not add dependencies. SDL3 is the only allowed third party library.
-* Do not look at any emulator that is not part of this workspace. Use the C#
-  `VitaTestSuite` reference in the workspace, the binutils-generated tables
-  (`_scratch/mep/ref`, `rl78ref`, `_rl78docs`), the datasheets in `datasheets/`
-  and the boot ROM analysis in `dumps/bootrom_analysis/`.
+* Use the C# `VitaTestSuite` reference in the workspace, the binutils-generated
+  ISA tables (`rl78ref`, `_rl78docs`), the datasheets in `datasheets/` and the
+  boot ROM analysis in `dumps/bootrom_analysis/`.
+* Do not copy code from another emulator. External *references* are allowed and
+  are used where the workspace has no ground truth: `docs/CPU_ARM_AUDIT.md`
+  compares the ARM core against capstone/GNU as (decoding) and Unicorn 2.1.4 /
+  QEMU (execution semantics). Those tools are not part of the repository, so any
+  measurement that depends on them has to name the version and the artifact, and
+  cannot be reproduced from the workspace alone.
 
 ## Cpu interface cheat sheet
 
@@ -50,8 +55,12 @@ class Cpu {
   bool halted; std::string halt_reason; u32 pc; bool undefined_instruction;
   std::set<u32> breakpoints;
 
+  virtual Arch arch() const;                 // MeP / Arm / Rl78
+  virtual const char* core_name() const;
   virtual void reset();
-  virtual void reset(u32 entry);      // must handle arch specific entry semantics
+  virtual void reset(u32 entry);             // has a default body; a core overrides it
+                                             // when the entry needs arch specific semantics
+  virtual void prepare_reset_context(u64 a0, u64 a1, u64 a2, u64 a3);
   virtual StepResult step();
   virtual std::string disassemble(u32 address, unsigned& length);
   virtual void registers(std::vector<RegValue>& out) const;
@@ -62,6 +71,7 @@ class Cpu {
   virtual void set_irq(int line, bool asserted);
   virtual bool interrupt_pending() const;
   virtual void tick(u64 cycles);
+  u32 get_pc() const; void set_pc(u32);
 };
 ```
 

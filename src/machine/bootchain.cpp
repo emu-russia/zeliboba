@@ -3368,11 +3368,13 @@ bool Vita::mirror_cmep_scratch_to_arm() {    // See the note at the call site: A
 
 bool Vita::build_kbl_param() {
     // SceKblParam - the 0x100-byte record the second loader creates and the secure
-    // and non-secure kernel boot loaders read (wiki: KBL_Param).  Its DIP-switch
-    // field sits at physical 0x1F000080, which fixes the record at 0x1F000040 in
-    // SPAD32K.  The per-console chain that would build it cannot complete in this
-    // model, so the documented fields are written here (a development
-    // substitution; the magic and layout follow the wiki).
+    // and non-secure kernel boot loaders read (wiki: KBL_Param).  It lives at
+    // board::kKblParamBase = 0x1F000100 in SPAD32K; the earlier 0x1F000040 came
+    // from reading the wiki's "fallback DIP switch buffer at physical 0x80" as the
+    // record base, which is 0xC0 too low (the loader's own builder at 0x41B4A
+    // loads 0x1F000100).  The per-console chain that would build it cannot
+    // complete in this model, so the documented fields are written here (a
+    // development substitution; the magic and layout follow the wiki).
     const u32 base = board::kKblParamBase;
     const u32 dram_base = board::kKblParamDram;
     auto put8 = [&](u32 offset, u8 value) { arm_bus_->write8(base + offset, value); };
@@ -3434,7 +3436,7 @@ bool Vita::build_kbl_param() {
                  base, arm_bus_->read32(base + 0xFC), arm_bus_->read32(base + 0x60),
                  arm_bus_->read32(base + 0x64), arm_bus_->read32(base + 0x90), arm_bus_->read32(base + 0x94),
                  arm_bus_->read32(base + 0x98), arm_bus_->read32(base + 0x9C));
-    add_milestone("SceKblParam built at 0x1F000040 (development substitution, wiki layout)");
+    add_milestone(format("SceKblParam built at 0x%08X (development substitution, wiki layout)", base));
     return true;
 }
 
