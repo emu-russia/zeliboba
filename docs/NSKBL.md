@@ -6561,3 +6561,24 @@ driver *reads* it to decide whether a slot needs submitting.
 Next: find what fills that table (a guest init stage the flow skips, or a substitution the model is
 missing) and who produces the completion for the three reads that *did* succeed - the parked worker
 of 10.34 and this empty table are the two ends of the same question.
+
+### 10.38 Correction: `0x5101FA5C` is a completion processor, not the submitter
+
+Stopping at the *first* and the *second* call of `0x5101FA5C` and dumping the request's descriptor
+area (`0x5117CD70` = request + 0x270, 8 slots of 0x28) shows it **already all zero at both stops** -
+the same static request object is used for every call and its slots are empty throughout.  Combined
+with the routine's own shape (walk the eight slots, compare each against the low-window template at
+VA 0x270, skip the equal ones, and call the recycle helper `0x5101F9D0` on the rest) this makes it a
+**completion processor / cleanup**, not the submission path.  The "pool exhaustion" and "no-op
+submit" readings of 10.35-10.37 were therefore about the wrong function.
+
+Where the submission really is: the device read `0x510205E8` is entered **four** times (10.32) and
+the fourth is the one that produces no card command - the SDIF trace ends with a `CLOCK_CONTROL`
+write of `0x8003` and no further access.  Note that `0x8003` appears as an immediate **nowhere** in
+the NSKBL image, and the SDIF trace labels every command with `pc=0003FFFE` (a low address, not an
+NSKBL one), so the storage driver that talks to the card is not NSKBL's own code - the ARM side
+drives it through the secure/CMeP path.
+
+Next: watch the fourth entry of `0x510205E8` (break on its entry, continue four times, then step the
+fourth) to find where it gives up without issuing a command, and establish which side owns
+`pc=0003FFFE` in the SDIF trace.
