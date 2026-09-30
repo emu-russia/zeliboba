@@ -274,6 +274,30 @@ void Vita::build_cores() {
     // (see gic.cpp), so core 0 is the one to attach; a run that never enables the
     // controller is unaffected.
     if (arm_ != nullptr) kermit_set_cpu(*arm_bus_, arm_);
+
+    // Round 354 (opt-in, ZLB_NSKBL_VBAR=1): the non-secure VBAR is never written by
+    // the guest - the debug log shows only the model's SKBL vector-page mirroring for
+    // MVBAR 0x16140 - so `ArmMmu::vector_base()` stays 0 and any interrupt delivered
+    // to NSKBL would vector into unmapped low memory.  The model already stages the
+    // secure world's vector page (mirrored at PA 0x40326100 for the MMU-off monitor
+    // fetch); NSKBL's own vectors live at VA 0x40100, which is what bootchain.cpp:528
+    // and the boot code assume.  Without this, enabling the controller in the GIC
+    // only produces exceptions that go nowhere - which is the most likely reason the
+    // enable substitution of round 343 measured *worse* than strict.
+    static const bool set_nskbl_vbar = [] {
+        const char* value = std::getenv("ZLB_NSKBL_VBAR");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (set_nskbl_vbar) {
+        for (size_t k = 0; k < kArmCoreCount; ++k) {
+            if (ArmCore* core = dynamic_cast<ArmCore*>(arm_cores_[k].get())) {
+                core->vbar_nonsecure = 0x00040100u;
+            }
+        }
+        ZLB_LOG_INFO("machine",
+                     "NSKBL non-secure VBAR set to 0x00040100 on %d cores (development substitution)",
+                     static_cast<int>(kArmCoreCount));
+    }
     // Round 344: the "the secure world left the controller enabled" policy is NOT
     // turned on by default.  It was measured against the strict behaviour and lost:
     // strict completes 22 eMMC reads and keeps NSKBL's own checkpoints through A9,

@@ -7343,3 +7343,33 @@ Next: identify which modelled device is supposed to push the completed request o
 the driver's hardware interface, and the candidates are the SDIF's ADMA engine and the Kermit DMA
 channels.  The list's head and tail (`0x5117EF00`/`0x5117EF04`) and the node chain through `+0x60` are
 the exact structure to look for in a device model.
+
+### 10.58 The model has no completion producer, and the guest waits with interrupts masked
+
+**Nothing in the model can produce that completion.**  Searching the sources for any storage completion
+concept finds only the CMeP's bignum semaphore, its mailbox descriptor channels and the MeP timer's
+completion latch - no queue, no push, nothing that could place a finished request on NSKBL's list at
+`[device + 0x2400]`.  The SDIF model walks ADMA tables and writes guest memory, but it has no idea that
+a driver queue exists.
+
+**And the interrupt route does not apply to this wait.**  With the enable substitution
+(`ZLB_GIC_CPUIF=1`) the ARM's line really is asserted - `ZLB_ARM_IRQ_LOG=1` prints
+`ARM Cortex-A9 irq line asserted (CPSR=0x000001D3, IRQ masked)` - but **CPSR.I is set**, and
+`ArmCore::step` only takes an interrupt when `(cpsr & kFlagI) == 0` (`arm_core.cpp:710`).  The guest
+never clears it, so the asserted line simply stays pending.  That also explains why the enable
+substitution measured *worse* than strict in 10.48: it changed the machine state without ever delivering
+anything usable.
+
+**A substitution was added for the day interrupts do matter.**  Since the guest never writes VBAR, the
+non-secure vector base is `ArmMmu::vector_base()` = 0, so a delivered interrupt would vector into
+unmapped low memory rather than NSKBL's vectors at VA 0x40100 (which `bootchain.cpp:528` and the boot
+code assume).  `ZLB_NSKBL_VBAR=1` now sets `vbar_nonsecure = 0x00040100` on every ARM core (the model
+already stages the secure world's vector page for MVBAR 0x16140, so this is the same kind of
+substitution).  Measured: combined with the GIC enable the IRQ vector still never fires - because the
+guest keeps IRQs masked - and the run ends exactly as before.  The option is off by default; a default
+run still ends at `arm=51000D0C`.
+
+Next: find the *producer* of the completion the driver polls.  Since the guest polls with interrupts
+masked, that producer is either guest code that never runs, or a device behaviour the model lacks - and
+in the guest the only code that ever touches the list is the release `0x5101F9D0`, called from the
+walk's submit path (never taken) and from `0x510205D0` on the request-error path.
