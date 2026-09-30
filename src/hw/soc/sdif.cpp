@@ -497,6 +497,19 @@ void Sdif::execute_command() {
                 respond_short(0x40FF8000u);  // ready, high capacity
             }
             break;
+        case 5:  // IO_SEND_OP_COND (the SDIO flavour of "op cond").
+            // Round 302 (measured): NSKBL's storage driver sends CMD0, CMD8(0x1AA)
+            // and then this command as its op-cond poll - the wrapper 0x51022DE4
+            // retries while the R4 answer is negative (`ldr r3,[sp,#0x18]` /
+            // `cmp r3,#0` / `blt` -> retry at 0x51022E28), i.e. while bit 31
+            // ("ready") is clear.  Falling through to `default` answered 0x00000900
+            // forever, so the driver polled CMD5 with argument 0x900 without end and
+            // the device open never returned.  The card behind this controller is not
+            // an SDIO device, so the answer advertises "ready" with *zero* I/O
+            // functions (bits 27:24), which is how a non-SDIO slot ends the SDIO
+            // probe.
+            respond_short(0xC0FF8000u);
+            break;
         case 2: {  // ALL_SEND_CID
             if (card_) {
                 const auto& cid = card_->cid();

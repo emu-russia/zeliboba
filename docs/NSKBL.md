@@ -5067,3 +5067,34 @@ State after this round: `zlb_tests` 436/436, `verify.ps1` green, the run still r
 checkpoint `0xA9` with no panic (the storage still does not mount), and the eMMC image is
 unchanged.  Diagnostics used: `ZLB_SDIF_TRACE`, `ZLB_RTRAP`/`ZLB_WTRAP`, `ZLB_EMMC_LOG`,
 `ZLB_ARM_TRACE_RANGE` + `ZLB_ARM_TRACE_TRIGGER`, the debugger's `map`, `vmem` and `bp`.
+
+### 10.5 What `mode == 1` unlocks, and the CMD5 (op-cond) wall behind it
+
+The mode field is not a guest constant: `0x5101DF88` (`str.w r7,[lr,#0x20]`, `lr = device
++ 0x2400`) writes the storage init's **loop counter** into it, so the three device objects
+of the table at `0x5102A150` get mode 0, 1 and 2.  The block-device context `0x5102B010`
+opens id 0, so the identify runs with mode 0 and the CMD8 check pattern is 0.
+
+Forcing the mode of the device being opened to 1 (a one-off debugger poke at the
+identify's `0x5101D726`, no code change) shows what the field controls:
+
+| measurement | mode 0 (default) | mode 1 (poked) |
+|---|---|---|
+| instructions | 153 205 277 | 207 050 132 (later 283 851 186 with CMD5) |
+| arm0 pc at the end | `0x51000D0C` (terminal loop after `0x803FF007`) | `0x5101F9FA` (inside the storage stack) |
+| ARM SDIF commands | `CMD0`, `CMD8 arg=0xAA` (x3) | `CMD0`, `CMD8 arg=0x1AA`, `CMD5 arg=0`, `CMD5 arg=0x300000`, then the sequence repeats for the next open attempt |
+
+So the SD path is the intended one for the device the storage context opens, and the run
+reaches the op-cond poll.  That poll exposed one more model gap: the driver's op-cond
+command is **CMD5** (`cmd_name(5)` = SEND_OP_COND for the CMeP, IO_SEND_OP_COND in the SD
+world), and its wrapper `0x51022DE4` retries while the R4 answer has bit 31 clear
+(`ldr r3,[sp,#0x18]`, `cmp r3,#0`, `blt` -> retry at `0x51022E28`).  Falling through to the
+`default:` case answered `0x00000900` forever, so the driver polled with argument `0x900`
+without end.  `case 5` now answers `0xC0FF8000` - "ready, zero I/O functions", which is how
+a slot without SDIO ends the SDIO probe.
+
+With that, the poll ends and the run goes on to 283 851 186 instructions, but the open
+still fails and the sequence (CMD0/CMD8/CMD5) repeats three times - the next wall is
+inside `0x51022FBC`/`0x51023006` after the op-cond stage.  Note that `case 5` only matters
+once the mode field is 1: in the default (mode 0) run the guest never reaches CMD5, so the
+default checkpoint stays `0xA9`.
