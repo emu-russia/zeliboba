@@ -6658,3 +6658,47 @@ Next: establish how post-boot I/O is *supposed* to reach the CMeP (a mailbox/SPA
 model lacks, or results appearing in the driver's cache table `0x51033100` instead of an SDIF
 completion), and whether NSKBL's storage stack reads its results from shared memory rather than
 waiting on the controller.
+
+### 10.41 Correction: the SDIF trace's `pc=` is the CMeP DMA context, and the ARM drives the SDIF itself
+
+**10.39 and 10.40 are withdrawn.**  The `pc=` field in the SDIF trace is not the writer's program
+counter at all:
+
+```c
+// sdif.cpp:490
+const u32 cmep_pc = dma_secondary_ != nullptr ? dma_secondary_->context.pc : 0;
+const u32 arm_pc  = dma_primary_   != nullptr ? dma_primary_->context.pc   : 0;
+fprintf(stderr, "[sdif] pc=%08X CMD idx=...", cmep_pc, ...);
+```
+
+it prints the **CMeP DMA context's** pc (and `arm_pc` is not printed at all).  Every conclusion I
+drew from those values about *who* drives the card was therefore unfounded.
+
+A write trap on the SDIF register block (`ZLB_WTRAP=0xE0B00000-0xE0B00200`, 801 writes) shows both
+processors writing, with the ARM side clearly NSKBL's own storage driver:
+
+| writer | pc |
+|---|---|
+| ARM Cortex-A9 | `0x5101EE2E`, `0x5101EE2A`, `0x5101DB02`, `0x5101D8F8`, `0x5101D87E`, `0x5101DA9A` (~200 writes) |
+| CMeP | `0x47960`, `0x4795C`, `0x47912`, `0x47886` (the boot chain's card init) |
+
+and a trap on the command/transfer-mode registers (`ZLB_WTRAP=0xE0B0000C-0xE0B00012`, 163 writes)
+confirms whom each register write belongs to:
+
+```
+0xE0B0000C  transfer mode  <- ARM 0x5101DA88 (16), 0x51022664 (3)
+0xE0B0000E  command        <- ARM 0x5101DA9A (30), 0x5101DAA4 (12)
+                           <- CMeP 0x47912 (28), 0x47886 (27), 0x481E2 (19), 0x481D4 (19)
+```
+
+**So NSKBL issues SD commands directly to the same SDIF the model already handles** - there is no
+missing ARM->CMeP transport, and the "the storage engine is the CMeP" reading of 10.39/10.40 was
+wrong.
+
+The tail of the ARM's command stream is informative: `tm=0x0 cmd=0xD1A` (CMD13 SEND_STATUS),
+`tm=0x33 cmd=0x123A` (CMD18, 32 blocks, data+response), then `tm=0x0 cmd=0xD1A` again - the driver
+reaches the card and then stops issuing commands, while its completion never appears.
+
+Next: with writer attribution now correct, follow the driver's completion path from its next
+command-register write (`bp arm 0x5101DA9A`) - the failure lies inside the ARM<->SDIF interaction
+(the interrupt/completion path), not in any missing inter-processor channel.
