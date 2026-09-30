@@ -7229,3 +7229,43 @@ step after it - reading the file's own data - which is where the request layer r
 
 Next: follow the open past the lookup - the driver should now read the file's first cluster - and apply
 the request-layer analysis of 10.24-10.33 to *that* transfer, which is the one that never completes.
+
+### 10.55 The completion list is a FIFO whose release is never called, and the descriptor slots stay zero
+
+**The lookup's caller** is at `0x51023A1C` (its `LR` at the lookup's entry is `0x51023A21`), inside the
+path/open helper that starts at `0x51023970`.
+
+**The list is a FIFO.**  Disassembling the helpers shows the mechanism plainly:
+
+```
+5101FA10  r3 = [r0, #4]        ; the TAIL
+5101FA14  str r2, [r1, #0x60]  ; node->next = 0
+5101FA18  str r1, [r3, #0x60]  ; tail->next = node      (append)
+5101FA1A  str r1, [r0, #4]     ; tail = node
+5101FA1E  str r1, [r0]         ; (empty list) head = tail = node
+5101FA24  r3 = [r0]            ; the HEAD  (pop)
+```
+
+and the release `0x5101F9D0` is `r0 += 0x2400 ; bl 0x5101FA10` - i.e. it *does* put a node back on the
+tail.
+
+**But nothing ever calls it.**  A full-run write trap on the pool (head and tail, 10.50) sees only the
+build push and the ten pops, and a full-run trap over the device's descriptor slots
+(`device + 0x270`..`+0x28F`, i.e. `0x5117CD70`..`0x5117CD8F`) records **only zero writes** - 173 writes
+in the region, of which the 7 non-zero ones all land in the *request object* fields at `+0x2A0`..`+0x2B8`
+(a code pointer `0x5101D65D`, a state counter going 2 -> 3, a pointer back to `0x5117CB00`, and list
+links), never in the slots.
+
+**So the walk cannot submit.**  It skips a slot when the low-window byte equals the device's slot byte,
+and both are always zero, so it takes the skip branch every time, never calls the release, and the waits
+merely drain the free list until it is empty - which is the `0x80320011` the loader returns.
+
+This also explains why the three successful 32-sector reads (LBA 0/65536/65568, 10.49) exist at all:
+they come from the *ADMA* path (commands written at `0x51022664`/`0x5102267A`, 10.42), a different API.
+The transfer that follows the (now working) open uses the walk path and fails there.
+
+Next: establish what is *supposed* to program the device's descriptor slots (`device + 0x270`) - the
+guest never writes them in a whole run - and what writes the low-window mirror the walk compares them
+against.  One of the two must come from a stage the flow skips, or from the device model itself; the
+SDIF's ADMA table (which this model *does* walk, `0x5117DD80` in the trace) is the natural suspect for
+the hardware side of that interface.
