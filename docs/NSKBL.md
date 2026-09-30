@@ -7269,3 +7269,36 @@ guest never writes them in a whole run - and what writes the low-window mirror t
 against.  One of the two must come from a stage the flow skips, or from the device model itself; the
 SDIF's ADMA table (which this model *does* walk, `0x5117DD80` in the trace) is the natural suspect for
 the hardware side of that interface.
+
+### 10.56 The walk is called with two different device objects, and the range tracer shows its whole path
+
+**The comparison's operands, re-measured with the mapping:**  at `0x5101FDAA` the registers are
+`R0 = 0` (the byte loaded from VA 0x290), `R4 = 0` (the device's slot byte at `device + 0x290`),
+`R3 = 0x298` (so the load was indeed VA 0x290), `R7 = 0x28` (slot 1 - slot 0 was already processed),
+`R6 = 0x5117CB00` (the device).  `vmem 0x290` resolves to **PA 0x40300290 device** - the same mapping
+as at the end of the run - and both that byte and `0x5117CD90` are zero.
+
+**The range tracer is the right tool here.**  With `ZLB_ARM_TRACE_RANGE=0x5101FA5C-0x5101FE60`,
+`ZLB_ARM_TRACE_TRIGGER=0x5101FA5C` and a limit, the walk's whole execution is dumped with registers, and
+it shows **two calls with different device objects**:
+
+| call | device | offset / length | path |
+|---|---|---|---|
+| 1 | **`0x51183948`** | 0, 0x20 | ~117 instructions, ends at `0x5101FD60 movs r4,#0 ; mov r0,r4 ; pop` - **returns 0** |
+| 2 | **`0x5117CB00`** | `0x11C60`, 0x20 | this is the call whose descriptor loop appears in 10.37/10.55 |
+
+Call 1's path ends by *falling through* the guard at `0x5101FD40`-`0x5101FD5C` (a pair of 64-bit range
+comparisons against `fp:sl`; the `beq 0x5101FAA8` retry is not taken), so it returns 0 - and that guard
+is a *different* variant from the one at `0x5101FD68`-`0x5101FD84` whose `beq` is the only static branch
+to the bail target `0x5101FAD8`.  The code is shared and entered at several points, which is why
+single-address breakpoints kept giving a partial view.
+
+So the picture is: the walk is invoked per chunk with a device object, and for the object that owns the
+descriptor slots it enters the loop, finds the low-window byte equal to its own slot byte (both zero)
+and skips - returning "nothing to do" to `0x5101FE60`, which then pops a completion and fails because
+nothing ever pushes one back (10.55).
+
+Next: follow call 2 through the descriptor loop with a raised `ZLB_ARM_TRACE_LIMIT` (or a trigger placed
+after the first call) to see the exact skipping branch and what the caller reads back, and settle *which*
+object should hold the descriptor slots - `0x51183948` (the handle installed at `[0x5102B014]`) or
+`0x5117CB00` (the object the walk loops over) - and why both are zero for the whole run.
