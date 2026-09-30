@@ -6754,3 +6754,58 @@ builds the chain from the request object.
 (Caveat for later rounds: `0x5117D400-0x5117E000` is also used as a general data buffer - a write
 trap there records 2035 writes, 768 of them from `0x510008F8` - so it cannot be used to count table
 builds without filtering.)
+
+### 10.43 The device read submits chunk by chunk through `0x5101FE60`, and the walk never pops a node
+
+The whole device read (`0x510205E8-0x51020676`) is now readable:
+
+```
+510205EC..51020602  validate and save the arguments (r5 = device, r7 = offset, r8 = count, r3 = len)
+51020610  cmp r3,#0 ; beq 0x51020670            ; len == 0 -> 0x8032000E
+51020614  r4 = [r0, #0xc] ; cbz r4, 0x51020668  ; no DMA word -> the tail path
+51020618  r4 = 0x1000 - (r1 & 0xFFF)            ; chunk to the next page boundary
+51020620  cmp r4, r3 ; bhs 0x51020668           ; chunk >= remaining -> the tail path
+51020626  bl 0x5101FE60                         ; FIRST chunk
+...
+51020646  r4 = min(r6, 0x1000)
+5102065A  r7 += r4
+5102065C  bl 0x5101FE60                         ; the next chunk (loop)
+51020662  bge 0x5102063C
+51020668  bl 0x5101FE60                         ; the tail chunk
+```
+
+so the primitive `0x5101FE60` is *the* chunk transfer, and the fourth entry of the device read took
+the tail path (`bhs 0x51020668`) - i.e. it is a *small* read, shorter than the distance to the page
+boundary.
+
+Inside `0x5101FE60`:
+
+```
+5101FE66  r5 = [r0]                    ; a sub-object of the device
+5101FE74  bl 0x5101E78C                ; a check of it
+5101FE7E  r0 = r4 ; r1 = sb ; r2 = r8
+5101FE82  bl 0x5101FA5C                ; THE WALK: submit the descriptor chain
+5101FE8E  r0 = r5 ; bl 0x5101F9BC      ; pop a completion
+5101FE96  cmp r0,#0 ; beq 0x510205D4   ; empty -> 0x80320011
+```
+
+and **the walk never pops a free node at all**: the pool head (VA `0x5117EF08`, measured at the pop
+itself) is only ever written with **zero** (`pc=0x5101FA0A`, `0x5101FA0C`), never with a node
+pointer, so no node is ever taken and the equal-descriptor `beq` of 10.37 skips every slot.
+
+That splits NSKBL's reads into two paths:
+
+| path | submit | observed result |
+|---|---|---|
+| ADMA (commands written at `0x51022664`/`0x5102267A`) | builds an ADMA table in ARM memory | **the three successful reads** (`0x5117D480`, `0x5117D900`, `0x5117DD80` + CMD18) |
+| walk (`0x5101FA5C`, via `0x5101FE60`) | pops a free node and submits it | **never submits** - and this is the path the cache fill (`0x51000E3A`) takes for the fourth read |
+
+Note on the blind region: the model's low-window substitution (`bootchain.cpp:490-559`) patches
+*page table entries* only - it does not intercept data accesses - so the read trap seeing nothing in
+VA 0x270-0x3FF is still unexplained.  The likely cause is per-core MMU state: `vmem` was resolved at
+the *end* of the run, while the walk's read happens much earlier, possibly through a different
+mapping.
+
+Next: dump the device object's descriptor slots (device + 0x270, device = `0x5117CB00`) and the
+VA 0x270 template **at the walk's own breakpoint**, resolved with the MMU state of that moment, and
+compare a walk call that submits against the failing one.
