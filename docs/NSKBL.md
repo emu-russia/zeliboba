@@ -6108,3 +6108,71 @@ cores end up waiting instead of one reporting an error.
 Next: find what should hand control from the interface setup to the loader (the CMeP/ARM handshake
 and its model substitutions are the suspects), and re-check what `0x80320011` is - the terminal
 registers hold it as a leftover, and no `movw/movt` pair builds it.
+
+### 10.28 The loader *is* called (on arm3) and deadlocks in NSKBL's own lock
+
+Section 10.27's probes were on the wrong addresses and the wrong core.  Disassembling the
+"idle loop" itself shows what really happens:
+
+```
+51000CF0  movs r0, #0x10
+51000CF2  bl 0x51000CA4
+51000CF6  movs r0, #0xA9          ; the GPO checkpoint value
+51000CF8  bl 0x51010F98           ; checkpoint writer
+51000CFC  movw r3, #0x14D5 ; movt r3, #0x5100
+51000D04  cbz r3, 0x51000D0C
+51000D06  mov r0, r4
+51000D08  bl 0x510014D4           ; <<< THE LOADER IS CALLED HERE
+51000D0C  b 0x51000D0C           ; and this spin is what runs *after* it returns
+```
+
+`0x510014D4` has exactly one caller (`0x51000D08`), so the terminal loop is not "the flow stopped
+before the loader" - the loader runs and the loop is its caller spinning afterwards.  The loader
+runs on **arm3**, not arm0, which is why the breakpoint set in 10.27 never fired (the same
+`bp arm` does catch it: `bp arm 0x510014D4` reports `[stop] arm3 breakpoint at 0x510014D4`).
+
+Tracing the loader with registers (`ZLB_ARM_TRACE_RANGE=0x510014D4-0x51001800`,
+`ZLB_ARM_TRACE_TRIGGER=0x51000D08`, `ZLB_ARM_TRACE_LIMIT=300`) gives its whole visible execution -
+11 instructions, then the trace stops because a call never returns:
+
+```
+[1]  510014D4 push {r4-r5, r14}      r0=51184C00 ... lr=51000D0D
+[5]  510014DC bl 0x51010994          ; ACQUIRE  ([0x5113B61C]+0x34 -> 0x51015874)
+[6]  510014E0 blx 0x51014528         ; get cpu id -> r0 = 3
+[8]  510014E6 beq 0x51001542         ; not taken (r0 = 3)
+[9]  510014E8 bl 0x510109AC          ; RELEASE  (-> 0x510158AC)
+[11] 510014EE bl 0x51010994          ; ACQUIRE again - and it never comes back
+```
+
+`0x51010994` is the lock wrapper (`movw r3,#0xb61c ; movt r3,#0x5113 ; ldr r0,[r3] ; adds r0,#0x34
+; bl 0x51015874`) and `0x510109AC` its release.  The acquire spins on the owner field:
+
+```
+51015884  ldrh r1, [r4, #6]     ; owner (cpu id)
+51015888  sxth r3, r1
+5101588A  cmp r3, r5            ; == this cpu?
+5101588C  beq 0x5101589A
+5101588E  blx 0x510147D8        ; else: yield/wait
+51015892  ldrh r2, [r4, #6]     ; re-read the owner
+51015896  cmp r0, r5
+51015898  bne 0x5101588E        ; spin
+```
+
+and a breakpoint on that spin stops on **arm3** while `core` reports:
+
+```
+arm0 ARM Cortex-A9 pc=510147DC HALTED ARM SYS nzCv non-secure mmu=off
+arm1 ARM Cortex-A9 pc=4003A01C HALTED ARM SYS nzCv secure   mmu=on
+arm2 ARM Cortex-A9 pc=4003A01C HALTED ARM SYS nzCv secure   mmu=on
+arm3 ARM Cortex-A9 pc=5101588E running Thumb SYS Nzcv non-secure mmu=off
+```
+
+so **arm0 is stopped inside the same wait helper (`0x510147DC` is inside `0x510147D8`)** while
+arm3 spins for the lock, and the two secure cores sit at `0x4003A01C`.  Both non-secure cores also
+report **mmu=off**, although NSKBL ran with the MMU on earlier (`non-secure mmu=on` in every
+previous trace).  The current wall is therefore a lock/scheduler deadlock between arm0 and arm3
+inside NSKBL, not a parse failure.
+
+Next: disassemble the wait/wake pair (`0x510147D8`, `0x5101477C`) to name the condition that
+releases a waiter and what should satisfy it - a scheduler block/wake primitive is the prime
+suspect, together with the MMU state of both stuck cores.
