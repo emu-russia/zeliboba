@@ -444,6 +444,8 @@ private:
     std::set<u64> nskbl_service_seen_;
     /// Nodes handed back to the device's pool, so the driver's wait keeps popping.
     u32 nskbl_service_completions_ = 0;
+    /// Log cap for the round-388-391 submission experiments.
+    u32 nskbl_async_bit_logs_ = 0;
     /// Experiment (round 101): free-chunk marker plus page-table entry for one size
     /// class, so the loader own carve path hands the block out.
     bool supply_kbl_carve_state(u32 core, u32 pool_va, u32 size);

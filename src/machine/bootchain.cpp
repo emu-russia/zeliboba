@@ -689,6 +689,68 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (nskbl_service && pc == 0x5101D6E8u) {
         if (serve_nskbl_device_call(core)) return true;
     }
+    // Experiment (round 391): fix the transfer parameters at the last possible moment.
+    // Measured with the command writer's own trace (ZLB_KBL_TRACE_PC=0x51022664): the
+    // failing CMD18 is written for the substitution's node 0x00000300 with `[node+0x7C] = 0`
+    // (no ADMA2 table, so `sdif+0x58 = 0`) and a 1-byte block size, while the driver's own
+    // volume reads carry a table (0x17D480/0x17D900/0x17DD80) and size 512.  The writer is
+    // called from 0x5101DAE2 with the node in r5 (its first instruction reads r5), and it
+    // reads the size from its own r0, so both can be supplied there.
+    static const bool nskbl_dma_fix = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_NSKBL_DMA_FIX");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (nskbl_dma_fix && pc == 0x5101DAE0u && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            // 0x5101DAE0 is `blx r3` with the node in r0 (0x5101DADA `mov r0, r5`); the
+            // call goes to `[[device+0x24A0]+4]` = 0x51022605, whose body (0x51022604)
+            // computes the SDIF registers *from the node*.  The earlier attempt hooked
+            // 0x5101DAE2 - which is the caller's `pop`, i.e. it ran after the method had
+            // already read the node.
+            const u32 node = static_cast<u32>(arm->r[0]);
+            auto read32_at = [&](u32 va, bool& ok32) {
+                const arm::MmResult r = arm->translate_or_fix(va, false, false);
+                if (!r.ok) {
+                    ok32 = false;
+                    return 0u;
+                }
+                ok32 = true;
+                return arm_bus_->read32(r.phys_addr);
+            };
+            auto write32_at = [&](u32 va, u32 value) {
+                const arm::MmResult r = arm->translate_or_fix(va, true, false);
+                if (!r.ok) return false;
+                arm_bus_->write32(r.phys_addr, value);
+                return true;
+            };
+            bool ok32 = false;
+            const u32 command = read32_at(node + 0x08u, ok32);
+            const u32 argument = read32_at(node + 0x0Cu, ok32);
+            const u32 table = read32_at(node + 0x7Cu, ok32);
+            const u32 size = static_cast<u32>(arm->r[0] & 0xFFFFu);
+            if (ok32 && (command & 0xFFu) == 0x12u && node < 0x00100000u) {
+                u32 changes = 0;
+                if (table == 0u && write32_at(node + 0x7Cu, 0x510FF000u)) ++changes;
+                if (size < 512u) {
+                    arm->set_register("r0", 512u);
+                    ++changes;
+                }
+                if (argument > 0x00100000u && (argument % 512u) == 0u) {
+                    if (write32_at(node + 0x0Cu, argument / 512u)) ++changes;
+                }
+                if (changes != 0u && nskbl_async_bit_logs_ < 24u) {
+                    ++nskbl_async_bit_logs_;
+                    ZLB_LOG_INFO("machine",
+                                 "NSKBL storage method call for node 0x%08X cmd 0x%02X: size %u -> 512, "
+                                 "arg 0x%08X -> LBA %u, table 0x%08X -> 0x510FF000 (%u change(s), "
+                                 "ZLB_NSKBL_DMA_FIX=1)",
+                                 node, command & 0xFFu, size, argument, argument / 512u, table, changes);
+                }
+            }
+        }
+    }
     // Substitution (round 117): make the object manager lock (0x601C = 0x5F80+0x9c)
     // a no-op.  Round 116 measured that only arm0 ever acquires it (20000 balanced
     // acquire/release, zero non-arm0 entries), and the four-core deadlock is arm0
