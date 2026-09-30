@@ -6702,3 +6702,55 @@ reaches the card and then stops issuing commands, while its completion never app
 Next: with writer attribution now correct, follow the driver's completion path from its next
 command-register write (`bp arm 0x5101DA9A`) - the failure lies inside the ARM<->SDIF interaction
 (the interrupt/completion path), not in any missing inter-processor channel.
+
+### 10.42 The driver programs the controller fully and enables interrupts; the fourth read stops before issuing anything
+
+Per-offset counts of the ARM's writes to the SDIF block (`ZLB_WTRAP=0xE0B00000-0xE0B00200`, ARM
+entries only) show a complete SDHCI bring-up and use:
+
+| offset | register | writes |
+|---|---|---|
+| `0x08` | argument | 34 |
+| `0x0C` | transfer mode | 34 |
+| `0x0E` | command | 34 |
+| `0x30` | normal int status (acks) | 42 |
+| `0x32` | error int status (acks) | 52 |
+| `0x34` | normal int *status* enable | 2 |
+| `0x36` | error int status enable | 22 |
+| `0x38` | normal int **signal** enable | 40 |
+| `0x3A` | error int signal enable | 2 |
+| `0x2C`/`0x2E`/`0x2F` | clock / timeout / reset | 76 / 6 / 12 |
+| `0x28`/`0x29` | present state 2 / clock byte | 10 / 3 |
+
+so NSKBL enables the interrupt *signalling* (`0x38`) itself and the interrupt path is not what is
+missing.
+
+The driver's final accesses (read trap, 556 reads, all ARM) are a poll loop:
+
+```
++0x29 = 0x0B      pc=5101F2B8
++0x24 = 0x30000   pc=5101D896   PRESENT_STATE: card inserted+stable, NO cmd/dat inhibit = idle
++0x10 = 0x900     pc=5101ECA0   Response0 = READY_FOR_DATA | transfer state (CMD13's answer)
++0x28 = 0x10      pc=5102261C
++0x00 = 0x00      pc=5101DC0C
+```
+
+The controller is **idle** (no transfer in flight) while the driver waits, and it has already read
+the response it polled for.
+
+Counting the real transfers from the SDIF trace: **22 ADMA walks**, of which exactly three belong to
+the ARM (tables at `0x5117D480`, `0x5117D900`, `0x5117DD80`, each `moved=16384/16384 ok=1`) and
+match the three CMD18s (`arg=0x0`, `0x10000`, `0x10020` = LBA 0, 65536, 65568).  **There is no
+fourth CMD18** - the fourth request never reached the card, confirming 10.32, while the ARM issued
+34 commands in total.
+
+So the fourth read stops *before* the driver builds a descriptor chain or writes the command
+register: the controller stays idle, its completion never appears, and the wait of 10.38 gives up.
+
+Next: find where the fourth request diverges from the three that worked - those three got an ADMA
+table in the ARM's memory and a CMD18; the fourth got neither, so the divergence is in whatever
+builds the chain from the request object.
+
+(Caveat for later rounds: `0x5117D400-0x5117E000` is also used as a general data buffer - a write
+trap there records 2035 writes, 768 of them from `0x510008F8` - so it cannot be used to count table
+builds without filtering.)
