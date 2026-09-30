@@ -412,6 +412,13 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     // 0x40075B94 and the partition region at 0x40300000).  The attribute bits are
     // the KBL's own section attributes (0x1158E, the value in its TTBR1 entries).
     // ZLB_NO_SUBSTITUTION=1 disables it.
+    // Round 219 (measured, reverted): the guess that this substitution is what
+    // captures the partition's node array at VA 0x00100000 does not hold.  Skipping it
+    // for the non-secure stage - so NSKBL's own abort handler sees the fault - leaves
+    // the run bit-identical (114 758 543 instructions, checkpoint 0xAD), and the write
+    // trap shows no store at PA 0x40100000 (the page this rule would pick for
+    // VA 0x00100000).  The array's physical page is therefore not the one this branch
+    // installs; see docs/NSKBL.md 8.55 for what is actually known.
     if (va >= 0x00100000u && va < 0x40000000u) {
         const u32 l1_base = arm->mmu.ttbr0 & 0xFFFFC000u;
         const u32 l1_slot = l1_base + ((va >> 20) & 0xFFFu) * 4u;
@@ -481,18 +488,155 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     const u32 l2_base = l1_entry & 0xFFFFFC00u;
     const u32 l2_index = (va >> 12) & 0xFFu;
     const u32 slot = l2_base + l2_index * 4u;
-    if (arm_bus_->read32(slot) != 0u) return false;             // already mapped
+    const u32 existing = arm_bus_->read32(slot);
+
+    // Substitution (round 213): NSKBL's own low window.  The kernel boot loader
+    // hands the non-secure stage a table that describes VA 0x30000-0x3FFFF as a
+    // 64 KiB *large page* whose AP field is 00, i.e. "no access" for every mode
+    // (0x4034941D: large page, base PA 0x40340000, XN, AP = 0).  NSKBL's own
+    // allocator hands out memory from that part of the window and the first store
+    // raises a *permission* fault (DFSR 0x80F, DFAR 0x00030000), which is why the
+    // earlier rounds saw the fault hook never run: the address *is* described, so
+    // there is no translation miss to repair.  The rest of the window (VA
+    // 0x4000-0x2FFFF) consists of small pages following the model's rule
+    // PA = VA + 0x40300000, so replace the large page with sixteen small pages of
+    // that same rule - the "fix the table entry" the round-203 analysis asked for,
+    // triggered by the fault itself instead of by a pc.  Only while the non-secure
+    // NSKBL runs; the secure KBL keeps the page it built.
+    // ZLB_NSKBL_LOWWIN=0 and ZLB_NO_SUBSTITUTION=1 disable it.
+    static const bool nskbl_lowwin = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_NSKBL_LOWWIN");
+        return on == nullptr || on[0] != '0';
+    }();
+    if (existing != 0u) {
+        if (!nskbl_lowwin) return false;
+        if (arm->secure_state()) return false;
+        if ((existing & 3u) != 1u) return false;                 // not a large page
+        // Only the permission fields change: the KBL's physical base (bits [31:16])
+        // is kept exactly as it built it, because it is the only record of where
+        // that part of the window really lives on hardware.  For a level-2 large
+        // page the model decodes AP from bits [5:4] with the ARMv5 subpage table
+        // (`check_large_ap`), where AP = 01 denies subpage 0 - exactly the 16 KiB
+        // block NSKBL writes into (DFAR 0x00030000).  AP = 10 grants privileged
+        // read/write on every subpage and leaves the user read-only.
+        //
+        // Round 216: an instruction *fetch* needs XN (bit 15) cleared as well, and the
+        // KBL sets it on all of these large pages.  That is what turned NSKBL's own
+        // abort into an endless loop once the table substitution let it run far
+        // enough to fault: the non-secure vector base is VA 0x40100 (VBAR_NS), so the
+        // data-abort vector lands inside the VA 0x40000-0x7FFFF large page, the fetch
+        // there raises a *permission* fault of its own (IFSR 0xF, IFAR 0x4010C) and
+        // the handler can never report anything.  A page that holds exception vectors
+        // has to be executable, so clear XN only for the fetch case.
+        u32 patched = (existing & ~0x30u) | (2u << 4);
+        if (fetch) patched &= ~(1u << 15);
+        arm_bus_->write32(slot, patched);
+        ++boot_fault_fixes_;
+        ZLB_LOG_INFO("machine",
+                     "NSKBL low window: arm%u large page 0x%08X for VA 0x%08X granted "
+                     "privileged access (AP field -> 2%s, now 0x%08X; development substitution)",
+                     core, existing, va, fetch ? ", XN cleared for the fetch" : "", patched);
+        add_milestone("NSKBL low window large page made writable (development substitution)");
+        return true;
+    }
 
     u32 pa = va;
     if (low_map == 1 && va >= 0x40000u) pa = 0x40000000u + (va - 0x40000u);
     else if (low_map == 2 && va >= 0x40000u) pa = 0x40000000u + va;
     else if (low_map == 3 && va >= 0x40000u) pa = 0x40118000u + (va - 0x40000u);
+    else if (!arm->secure_state() && va >= 0x10000u && va < 0x40000u) {
+        // Round 233: the same correction as below, for the second quarter of the low
+        // window.  The window rule above (0x40118000 + VA - 0x40000) is the *KBL's*
+        // MeP boot mirror; NSKBL's own tables place this range at VA + 0x40310000 -
+        // measured with `vpa`: VA 0x10000 -> PA 0x40320000, 0x20000 -> 0x40330000,
+        // 0x30000 -> 0x40340000, which is exactly what the KBL's large-page descriptors
+        // there hold (0x4032941D for VA 0x10000, 0x4033941D for 0x20000, 0x4034941D for
+        // 0x30000 - the round-213 patch only changes their AP field).  Use the guest's
+        // rule for the non-secure stage; ZLB_NSKBL_LOWIDENT=2 keeps the window rule.
+        static const char* const window_rule = std::getenv("ZLB_NSKBL_LOWIDENT");
+        if (window_rule == nullptr || window_rule[0] != '2') pa = va + 0x40310000u;
+    }
+    else if (!arm->secure_state() && va < 0x10000u) {
+        // Round 231: the identity rule above belongs to the *secure* KBL, whose low
+        // window really is at PA 0 (= VA) - its vector page is the model's own example
+        // (VA 0x16100 -> PA 0x16100).  NSKBL's low window is relocated: measured with
+        // `vpa`, VA 0x47C0 -> 0x403047C0, 0x4900 -> 0x40304900, 0x5300 -> 0x40305300,
+        // 0x60C0 -> 0x403060C0, 0x6940 -> 0x40306940, i.e. PA = VA + 0x40300000, and
+        // every other NSKBL substitution in this file assumes exactly that rule
+        // (boot-config VA 0x47C0 -> PA 0x403047C0, the partition at VA 0x5300, the
+        // physical pool, ...).  Substituting *identity* for the handful of low VAs the
+        // guest's own tables leave unmapped therefore hands NSKBL the CMeP scratch
+        // mirror instead of its own low window: the run logs five such mappings
+        // (VA 0x10, 0x38, 0x10B0, 0x19FF8, 0x1A12C) and the guest then reads words
+        // there and uses them as pointers (the garbage-pointer aborts this file has been
+        // chasing since round 2: DFAR 0x656C7398 / 0xF8D1B178).  Use the rule the guest
+        // itself uses.  ZLB_NSKBL_LOWIDENT=1 restores identity.
+        // Round 232: it has to cover the whole first 64 KiB.  Restricting it (identity
+        // for VA < 0x1000, so that the guest would read the ARM boot alias at VA 0)
+        // brings the panic 0xAD straight back: `VA 0x10 -> PA 0x10` hands NSKBL the CMeP
+        // scratch mirror (0xFFFFFFFF), which it then uses as a pointer.  Measured both
+        // ways; the panic-free rule is the one below.
+        static const bool low_identity = [] {
+            const char* value = std::getenv("ZLB_NSKBL_LOWIDENT");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (!low_identity) pa = va + 0x40300000u;
+    }
+
+    // Substitution gate (round 230): optionally let an instruction fetch in the low
+    // window reach the *non-secure* stage's own abort handler instead of being papered
+    // over.  Measured in the `ZLB_NSKBL_PHYSPOOL=1` state: the core fetches 0x40110,
+    // 0x41000, 0x42000, ... and the substitution maps every one of them on the fly (98
+    // substitutions), after which the core runs through the zeros behind those pages for
+    // tens of millions of instructions - a silent wander.  With
+    // ZLB_NSKBL_FETCH_FAULT=1 the fault reaches NSKBL's handler (round 216 mirrors its
+    // vector page into the physical page VBAR_NS points at, below) and the state becomes
+    // diagnosable: IFSR = 7 / IFAR = 0x41000 (page translation fault) on top of the
+    // original data abort (DFSR = 5, DFAR = 0xF8D1B178).  The handler then retries the
+    // same instruction, so the run loops instead of advancing - hence opt-in, off by
+    // default, with the documented state unchanged.
+    static const bool deliver_fetch_faults = [] {
+        const char* value = std::getenv("ZLB_NSKBL_FETCH_FAULT");
+        return value != nullptr && value[0] != '0';
+    }();
+    const bool vector_page =
+        fetch && !arm->secure_state() && arm->vbar_nonsecure != 0u &&
+        (va & 0xFFFFF000u) == (arm->vbar_nonsecure & 0xFFFFF000u);
+    if (deliver_fetch_faults && fetch && !arm->secure_state() && !vector_page) {
+        return false;
+    }
 
     // Take the attribute bits from the KBL's own first entry so the substituted
     // page has the same cacheability/permissions as the pages it installed.
     u32 attributes = arm_bus_->read32(l2_base) & 0xFFFu;
     if ((attributes & 3u) != 2u) attributes = 0x47Eu;           // small page, AP=11
     arm_bus_->write32(slot, (pa & 0xFFFFF000u) | attributes);
+
+    // Substitution (round 216): the *non-secure vector page*.  NSKBL writes VBAR
+    // twice - first 0x51000000 (its own image's vector table, `mcr` at 0x51000388)
+    // and then VA 0x00040100 (`mcr` at 0x5100049C) - and the model has nothing there:
+    // the low-window rule backs VA 0x40000+ with the KBL's own copy of the low 32 KiB
+    // (PA 0x40118000+), which holds no NSKBL vectors.  So the first abort lands on
+    // foreign code and the handler either faults again or loops, and NSKBL's own
+    // checkpoint is never written.  The model already mirrors a vector page for the
+    // KBL ("SKBL vector page mirrored to PA 0x00016100"); do the same for the
+    // non-secure base: copy the 0xC0-byte ARM vector table that starts the NSKBL image
+    // into the page VBAR_NS points at.  The table is position independent
+    // (`ldr pc,[pc,#0x18]` plus absolute literals), so it works at any address.
+    if (vector_page) {
+        const u32 destination = pa & 0xFFFFF000u;
+        for (u32 i = 0; i < 0xC0u; ++i) {
+            arm_bus_->write8(destination + i, arm_bus_->read8(0x51000000u + i));
+        }
+        ++boot_fault_fixes_;
+        ZLB_LOG_INFO("machine",
+                     "NSKBL vector page mirrored to PA 0x%08X (VBAR_NS 0x%08X, %u bytes; "
+                     "development substitution)",
+                     destination, arm->vbar_nonsecure, 0xC0u);
+        add_milestone("NSKBL non-secure vector page mirrored (development substitution)");
+    }
 
     ++boot_fault_fixes_;
     ZLB_LOG_INFO("machine",
@@ -1058,25 +1202,201 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (trace_pc != 0u && pc == trace_pc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
-                if (trace_pc_hits_ < 64u) {
+                if (trace_pc_hits_ < 512u) {
                     ++trace_pc_hits_;
-                    u64 r[8] = {0}, lr = 0, sp = 0;
+                    u64 r[8] = {0}, lr = 0, sp = 0, r12 = 0;
                     for (u32 i = 0; i < 8; ++i) {
                         arm->get_register("r" + std::to_string(i), r[i]);
                     }
                     arm->get_register("r14", lr);
                     arm->get_register("r13", sp);
+                    // Round 218: r12 as well - a string copy takes its destination in
+                    // `ip`, which is what tells apart two VAs that the model maps to
+                    // the same physical page.
+                    arm->get_register("r12", r12);
                     ZLB_LOG_INFO("machine",
-                                 "trace pc=0x%08X arm%u from pc=0x%08X lr=0x%08X sp=0x%08X "
+                                 "trace pc=0x%08X arm%u from pc=0x%08X insns=%llu lr=0x%08X sp=0x%08X "
                                  "r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X "
-                                 "r6=0x%08X r7=0x%08X",
-                                 pc, core, previous_pc, static_cast<u32>(lr), static_cast<u32>(sp),
+                                 "r6=0x%08X r7=0x%08X r12=0x%08X",
+                                 pc, core, previous_pc,
+                                 static_cast<unsigned long long>(total_instructions()),
+                                 static_cast<u32>(lr), static_cast<u32>(sp),
                                  static_cast<u32>(r[0]), static_cast<u32>(r[1]),
                                  static_cast<u32>(r[2]), static_cast<u32>(r[3]),
                                  static_cast<u32>(r[4]), static_cast<u32>(r[5]),
-                                 static_cast<u32>(r[6]), static_cast<u32>(r[7]));
+                                 static_cast<u32>(r[6]), static_cast<u32>(r[7]),
+                                 static_cast<u32>(r12));
+                    // Round 220: translate the four argument registers too.  The
+                    // question this answers is which *physical* page a virtual address
+                    // names at this instant - the partition's node array lives at the
+                    // constant VA 0x00100000, and the run both writes and reads it, so
+                    // comparing the two translations says whether the guest's own
+                    // tables changed under the model's feet.
+                    for (u32 i = 0; i < 4; ++i) {
+                        const u32 va = static_cast<u32>(r[i]);
+                        if (va < 0x1000u) continue;
+                        u32 pa = 0;
+                        std::string fault;
+                        if (arm->translate(va, false, false, pa, fault)) {
+                            if (arm->mmu.last_walk.used_l2) {
+                                ZLB_LOG_INFO("machine",
+                                             "trace   r%u=0x%08X -> PA 0x%08X (ttbr%u L1[0x%03X]@0x%08X="
+                                             "0x%08X L2[0x%02X]@0x%08X=0x%08X)",
+                                             i, va, pa, arm->mmu.last_walk.ttbr_num,
+                                             (va >> 20) & 0xFFFu, arm->mmu.last_walk.l1_addr,
+                                             arm->mmu.last_walk.l1_desc, (va >> 12) & 0xFFu,
+                                             arm->mmu.last_walk.l2_addr, arm->mmu.last_walk.l2_desc);
+                            } else {
+                                ZLB_LOG_INFO("machine",
+                                             "trace   r%u=0x%08X -> PA 0x%08X (ttbr%u L1[0x%03X]@0x%08X="
+                                             "0x%08X, section)",
+                                             i, va, pa, arm->mmu.last_walk.ttbr_num,
+                                             (va >> 20) & 0xFFFu, arm->mmu.last_walk.l1_addr,
+                                             arm->mmu.last_walk.l1_desc);
+                            }
+                        } else {
+                            ZLB_LOG_INFO("machine", "trace   r%u=0x%08X -> %s", i, va, fault.c_str());
+                        }
+                    }
+                    // Round 222: the four stack words, translated.  Helpers like the
+                    // L2 page filler 0x510152A0 take their physical base as a *stack*
+                    // argument, which is exactly what decides where the partition's
+                    // node array ends up (docs/NSKBL.md 8.56).
+                    {
+                        u32 sp_pa = 0;
+                        std::string fault;
+                        if (arm->translate(static_cast<u32>(sp), false, false, sp_pa, fault)) {
+                            ZLB_LOG_INFO("machine",
+                                         "trace   sp[0]=0x%08X sp[4]=0x%08X sp[8]=0x%08X "
+                                         "sp[12]=0x%08X",
+                                         arm_bus_->read32(sp_pa), arm_bus_->read32(sp_pa + 4u),
+                                         arm_bus_->read32(sp_pa + 8u), arm_bus_->read32(sp_pa + 12u));
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    // Diagnostic (round 212): full instruction trace of a VA range.  The
+    // round-209 measurements could only name branch targets because the other
+    // diagnostics sample one pc; the NSKBL memory-manager failure
+    // (0x5100C04C returning 0x80020005 for a 64 KiB request) needs the whole
+    // path through the function.  ZLB_ARM_TRACE_RANGE=<lo>-<hi> logs every
+    // instruction executed inside the range, with the register file and the
+    // return-address words on the stack, until ZLB_ARM_TRACE_LIMIT (default
+    // 4000) lines are printed or the core leaves the range.  One core is
+    // traced at a time (the first one to enter).
+    static const bool trace_range_on = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_RANGE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    static const u32 trace_range_lo = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_RANGE");
+        if (value == nullptr) return 0u;
+        return static_cast<u32>(std::strtoul(value, nullptr, 16));
+    }();
+    static const u32 trace_range_hi = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_RANGE");
+        if (value == nullptr) return 0u;
+        const char* dash = std::strchr(value, '-');
+        if (dash == nullptr) return 0u;
+        return static_cast<u32>(std::strtoul(dash + 1, nullptr, 16));
+    }();
+    static const u32 trace_range_limit = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_LIMIT");
+        if (value == nullptr) return 4000u;
+        return static_cast<u32>(std::strtoul(value, nullptr, 10));
+    }();
+    static int trace_range_core = -1;
+    static u32 trace_range_lines = 0;
+    static bool trace_range_inside = false;
+    static bool trace_range_armed = false;
+    // Optional trigger pc: tracing starts at that instruction and then covers the
+    // whole range, which is how the *first* call of a shared helper (0x5100C04C)
+    // from a specific caller (0x51005700) can be isolated.
+    static const u32 trace_range_trigger = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_TRIGGER");
+        if (value == nullptr) return 0xFFFFFFFFu;
+        return static_cast<u32>(std::strtoul(value, nullptr, 16));
+    }();
+    if (trace_range_on && trace_range_trigger != 0xFFFFFFFFu && !trace_range_armed &&
+        pc == trace_range_trigger) {
+        trace_range_armed = true;
+    }
+    if (trace_range_on && (trace_range_trigger == 0xFFFFFFFFu || trace_range_armed) &&
+        trace_range_lines < trace_range_limit &&
+        core < static_cast<u32>(kArmCoreCount)) {
+        const bool inside = pc >= trace_range_lo && pc < trace_range_hi;
+        if (inside && (trace_range_core < 0 || trace_range_core == static_cast<int>(core))) {
+            if (!trace_range_inside) {
+                trace_range_core = static_cast<int>(core);
+                ZLB_LOG_INFO("machine", "trace-range arm%u ENTER 0x%08X from 0x%08X", core, pc,
+                             previous_pc);
+                trace_range_inside = true;
+            }
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(this->arm_cores_[core].get())) {
+                unsigned length = 0;
+                std::string text = arm->disassemble(pc, length);
+                u64 r[8] = {0}, lr = 0, sp = 0;
+                for (u32 i = 0; i < 8; ++i) {
+                    arm->get_register("r" + std::to_string(i), r[i]);
+                }
+                arm->get_register("r14", lr);
+                arm->get_register("r13", sp);
+                ++trace_range_lines;
+                ZLB_LOG_INFO("machine",
+                             "  [%u] %08X  %-28s r0=%08X r1=%08X r2=%08X r3=%08X "
+                             "r4=%08X r5=%08X r6=%08X r7=%08X sp=%08X lr=%08X",
+                             trace_range_lines, pc, text.c_str(), static_cast<u32>(r[0]),
+                             static_cast<u32>(r[1]), static_cast<u32>(r[2]),
+                             static_cast<u32>(r[3]), static_cast<u32>(r[4]),
+                             static_cast<u32>(r[5]), static_cast<u32>(r[6]),
+                             static_cast<u32>(r[7]), static_cast<u32>(sp),
+                             static_cast<u32>(lr));
+            }
+        } else if (trace_range_inside && !inside) {
+            ZLB_LOG_INFO("machine", "trace-range arm%u LEAVE to 0x%08X", core, pc);
+            trace_range_inside = false;
+        }
+    }
+
+    // Diagnostic (round 214): ZLB_ARM_TRACE_RING=<pc> keeps a ring of the last
+    // instructions each core executed and dumps the whole ring when the listed pc
+    // is reached.  The other diagnostics sample one pc per slice (the debugger's
+    // `history`) or need a range to be entered first, so the instruction *path*
+    // into an abort handler - which is what "the object pointer is a string"
+    // needs - was not visible at all.  ZLB_ARM_TRACE_RING=0x51000C74 dumps 4096
+    // instructions of every core that reaches it.
+    static const u32 trace_ring_pc = [] {
+        const char* value = std::getenv("ZLB_ARM_TRACE_RING");
+        if (value == nullptr) return 0u;
+        return static_cast<u32>(std::strtoul(value, nullptr, 16));
+    }();
+    if (trace_ring_pc != 0u && core < static_cast<u32>(kArmCoreCount)) {
+        constexpr u32 kRingSize = 16384u;
+        static std::array<std::array<u32, kRingSize>, kArmCoreCount> ring{};
+        static std::array<u32, kArmCoreCount> ring_pos{};
+        auto& slot = ring[core];
+        auto& pos = ring_pos[core];
+        if (pc == trace_ring_pc) {
+            ZLB_LOG_INFO("machine", "trace-ring arm%u reached 0x%08X; last %u instructions:",
+                         core, pc, kRingSize < pos ? kRingSize : pos);
+            const u32 count = kRingSize < pos ? kRingSize : pos;
+            std::string line;
+            for (u32 i = 0; i < count; ++i) {
+                const u32 entry = slot[(pos - count + i) % kRingSize];
+                line += format(" %08X", entry);
+                if ((i % 8u) == 7u) {
+                    ZLB_LOG_INFO("machine", "  %s", line.c_str());
+                    line.clear();
+                }
+            }
+            if (!line.empty()) ZLB_LOG_INFO("machine", "  %s", line.c_str());
+            trace_ring_pc_dumped_ = true;
+        } else if (!trace_ring_pc_dumped_) {
+            slot[pos % kRingSize] = pc;
+            ++pos;
         }
     }
 
@@ -1352,12 +1672,179 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         const u32 bootcfg_pa = 0x403047C0u;
         if (!stamped) {
             arm_bus_->write8(bootcfg_pa + 0x33u, 0xFFu);
+            // Round 261: the first external load is gated on bit 0 of the boot config's
+            // +0x6C field.  The dispatcher 0x51018F6C calls 0x51010F00 for the object call
+            // 0x10005 ("open path"), and that helper is literally
+            //     r3 = [obj+0x3C] (boot config) ; r0 = [r3+0x6C] ; r0 &= 1 ; bx lr
+            // A zero result sends the dispatcher to its failure exit 0x51019116, which is
+            // why NSKBL's open of os0:psp2bootconfig.skprx returns 0x803FF007.  Bit 0 means
+            // "storage loading enabled" for the boot configuration the model supplies.
+            const u32 gate_pa = bootcfg_pa + 0x6Cu;
+            // Bit 0 gates the dispatcher's first check (0x51010F00) and the firmware sets
+            // it itself (pc 0x5101587C writes 1 there), so supplying it matches the
+            // guest's own intent.  Bit 2 gates the second check (0x51010EEC,
+            // `ubfx r0, r0, #2, #1`), but setting it did not change the run and the guest
+            // never writes it - so the model does not fabricate it.
+            arm_bus_->write32(gate_pa, arm_bus_->read32(gate_pa) | 1u);
             stamped = true;
             ZLB_LOG_INFO("machine",
-                         "boot-config marker written (PA 0x%08X = 0xFF; development "
+                         "boot-config marker written (PA 0x%08X = 0xFF; PA 0x%08X |= 1; development "
                          "substitution)",
-                         bootcfg_pa + 0x33u);
+                         bootcfg_pa + 0x33u, gate_pa);
             add_milestone("NSKBL boot-config marker stamped (development substitution)");
+        }
+    }
+
+    // Substitution (round 236): remember the section NSKBL replaces with a page table, so
+    // that the window's content can be measured with and without it (docs/NSKBL.md 8.69).
+    // The guest builds its per-frame state table through the 2 MiB section
+    // `VA 0x00100000 -> PA 0x40400000` (installed at pc 0x51014F28) and then switches the
+    // same VA to a page table (pc 0x51014D9E, `insns = 52 891 619`) whose table maps a
+    // single 4 KiB page, after which every allocation verification reads zeros and NSKBL
+    // ends in its own fatal sink.  Opt-in: ZLB_NSKBL_SECTION_KEEP=1.
+    // Substitution (round 236-238): keep the window's content across the mapping switch.
+    // The guest builds its per-frame state table through the 2 MiB section
+    // `VA 0x00100000 -> PA 0x40400000` (installed at pc 0x51014F28) and then replaces it
+    // with a page table (pc 0x51014D9E, `insns = 52 891 619`) whose table maps a single
+    // 4 KiB page, so the records written through the section become unreachable and every
+    // allocation verification reads zeros (`0x80024300`), leaving NSKBL's object registry
+    // NULL and ending the run in its own fatal sink (0x51015B7C).  Measured effect of
+    // carrying the section's page over at the first record read: stage 0xA7 without the
+    // fatal sink, the run stops waiting in the lock area (pc 0x510147DC) after 99.5M
+    // instructions instead of running to 153.2M and calling 0x51015B7C.  Default on;
+    // ZLB_NSKBL_SECTION_KEEP=0 disables (ZLB_NO_SUBSTITUTION=1 wins).
+    static const bool keep_section = [] {
+        const char* value = std::getenv("ZLB_NSKBL_SECTION_KEEP");
+        if (value != nullptr && value[0] == '0') return false;
+        return substitutions_enabled_static();
+    }();
+    if (keep_section && pc == 0x51014D9Eu) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 va = arm->r[7];
+            const u32 l1_addr = (arm->mmu.ttbr0 & 0xFFFFC000u) | (((va >> 20) & 0xFFFu) << 2);
+            const u32 old = arm_bus_->read32(l1_addr);
+            if ((old & 3u) == 2u) {
+                arm->mmu.replaced_section = old;
+                arm->mmu.replaced_section_va = va & 0xFFF00000u;
+                ZLB_LOG_INFO("machine",
+                             "window section kept: VA 0x%08X had section 0x%08X -> PA 0x%08X "
+                             "(development substitution)",
+                             va, old, old & 0xFFF00000u);
+                add_milestone("NSKBL window section remembered (development substitution)");
+            }
+        }
+    }
+    // The guest attaches the page table first (above) and only then maps pages into it.
+    // The unique window caller is 0x51005C92 (`bl 0x51009A54`, measured: target VA in r2
+    // = 0x00100000, the physical page on the stack), so hook the instruction after it and
+    // carry the section's page over into whatever page the window now resolves to.  That
+    // is the measurement that decides whether the per-frame records written through the
+    // section before the switch are what the allocation verification needs.
+    if (keep_section && pc == 0x51005C96u) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 section = arm->mmu.replaced_section;
+            const u32 va = arm->mmu.replaced_section_va;
+            if ((section & 3u) == 2u && va != 0u) {
+                const u32 l1_addr = (arm->mmu.ttbr0 & 0xFFFFC000u) | (((va >> 20) & 0xFFFu) << 2);
+                const u32 l1 = arm_bus_->read32(l1_addr);
+                u32 pa = 0;
+                if ((l1 & 3u) == 1u) {
+                    const u32 l2 = arm_bus_->read32((l1 & 0xFFFFFC00u) | (((va >> 12) & 0xFFu) << 2));
+                    // A small page is bits[1:0] = 0b1x (bit 1 = 1, bit 0 = XN), so the
+                    // check is "bit 1 set", not "== 2": NSKBL's own entry here is
+                    // 0x4030245F (XN set) and the stricter test silently made the whole
+                    // migration below dead code (round 238 measurement).
+                    if ((l2 & 2u) != 0u) pa = l2 & 0xFFFFF000u;
+                }
+                if (pa != 0u && pa != (section & 0xFFF00000u)) {
+                    const u32 source = section & 0xFFF00000u;
+                    for (u32 b = 0; b < 0x1000u; ++b) {
+                        arm_bus_->write8(pa + b, arm_bus_->read8(source + b));
+                    }
+                    ZLB_LOG_INFO("machine",
+                                 "window page migrated: VA 0x%08X -> PA 0x%08X (from PA 0x%08X; "
+                                 "development substitution)",
+                                 va, pa, source);
+                    add_milestone("NSKBL window page migrated (development substitution)");
+                }
+            }
+        }
+    }
+    // Round 238: the mapping above happens *before* the switch (measured 52 889 526 <
+    // 52 891 619), so at the switch the attached table is still empty and nothing can be
+    // migrated there.  Where the loss actually shows is the class path's own record read
+    // (`pc 0x5100C1F8`, address `[partition+0x20] + index*4` = VA 0x0010000C), which after
+    // the switch resolves into the freshly mapped page and reads zeros.  Carry the
+    // section's page over there - once per page - and measure whether the allocation
+    // verification passes.
+    if (keep_section && pc == 0x5100C1F8u) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 section = arm->mmu.replaced_section;
+            const u32 base = arm->mmu.replaced_section_va;
+            const u32 slot_va = arm->r[2];
+            const u32 page_va = slot_va & 0xFFFFF000u;
+            if ((section & 3u) == 2u && base != 0u && page_va >= base &&
+                page_va < base + 0x00100000u) {
+                const u32 l1_addr = (arm->mmu.ttbr0 & 0xFFFFC000u) | (((page_va >> 20) & 0xFFFu) << 2);
+                const u32 l1 = arm_bus_->read32(l1_addr);
+                u32 pa = 0;
+                if ((l1 & 3u) == 1u) {
+                    const u32 l2 = arm_bus_->read32((l1 & 0xFFFFFC00u) | (((page_va >> 12) & 0xFFu) << 2));
+                    // A small page is bits[1:0] = 0b1x (bit 1 = 1, bit 0 = XN), so the
+                    // check is "bit 1 set", not "== 2": NSKBL's own entry here is
+                    // 0x4030245F (XN set) and the stricter test silently made the whole
+                    // migration below dead code (round 238 measurement).
+                    if ((l2 & 2u) != 0u) pa = l2 & 0xFFFFF000u;
+                }
+                const u32 source = (section & 0xFFF00000u) | (page_va - base);
+                static bool migrated_once = false;
+                if (!migrated_once) {
+                    migrated_once = true;
+                    ZLB_LOG_INFO("machine",
+                                 "window record read: slot=0x%08X page=0x%08X section=0x%08X "
+                                 "base=0x%08X pa=0x%08X source=0x%08X",
+                                 slot_va, page_va, section, base, pa, source);
+                }
+                if (pa != 0u && pa != source) {
+                    static bool copied_once = false;
+                    if (!copied_once) {
+                        copied_once = true;
+                        for (u32 b = 0; b < 0x1000u; ++b) {
+                            arm_bus_->write8(pa + b, arm_bus_->read8(source + b));
+                        }
+                        ZLB_LOG_INFO("machine",
+                                     "window page restored at the record read: VA 0x%08X -> "
+                                     "PA 0x%08X (from PA 0x%08X; development substitution)",
+                                     page_va, pa, source);
+                        add_milestone("NSKBL window page restored (development substitution)");
+                    }
+                }
+            }
+        }
+    }
+
+    // Diagnostic (round 270): NSKBL's first external load fails inside 0x510232EC, which
+    // returns zero from its shared tail (0x510238F4) without ever walking a directory.
+    // Static reading of that function's branches did not match the run (pc 0x5102413A is
+    // never executed), so take the predecessor from the machine's own last-pc record
+    // instead of guessing: point ZLB_NSKBL_OPEN_EXIT at the pc of interest (see
+    // docs/NSKBL.md section 8) and it prints the pc that led there.  Off by default.
+    static const bool log_open_exit = [] {
+        const char* value = std::getenv("ZLB_NSKBL_OPEN_EXIT");
+        return value != nullptr && value[0] != '0';
+    }();
+    static const u32 open_exit_pc = [] {
+        const char* value = std::getenv("ZLB_NSKBL_OPEN_EXIT_PC");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0x510238F4u;
+    }();
+    if (log_open_exit && pc == open_exit_pc) {
+        static unsigned reported = 0;
+        if (reported++ < 8u && core < static_cast<u32>(kArmCoreCount)) {
+            if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+                ZLB_LOG_INFO("machine", "nskbl pc 0x%08X: r0=0x%08X r1=0x%08X from pc=0x%08X", pc,
+                             static_cast<u32>(arm->r[0]), static_cast<u32>(arm->r[1]),
+                             previous_pc);
+            }
         }
     }
 
@@ -1371,13 +1858,16 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // physical memory ranges; here the model hands out free DRAM pages, refilling
     // the record whenever the firmware has consumed all of them.
     // ZLB_NSKBL_PHYSPOOL=0 and ZLB_NO_SUBSTITUTION=1 disable it.
+    // Round 215/216: still opt-in.  Supplying the table makes the run execute ~38M
+    // instructions *more* (114.8M -> 153.2M) and it no longer panics: after the MMU
+    // XN fix (round 216) NSKBL's abort handler works, so instead of stopping at its
+    // own checkpoint 0xAD the non-secure core keeps running through the low window
+    // (`pc` wanders between 0x5B60C and 0x64CFC over 150k-250k slices) - a state that
+    // is harder to attribute than the clean stop below.  The default therefore keeps
+    // NSKBL's diagnosable panic (0xAD at 0x5100EEB8, docs/NSKBL.md 8.50) and the
+    // substitution stays available as ZLB_NSKBL_PHYSPOOL=1.
     static const bool physpool = [] {
         const char* value = std::getenv("ZLB_NSKBL_PHYSPOOL");
-        // Opt-in: supplying range values does advance the flow past the gate
-        // (checkpoint 0xA7 -> 0xAD), but the guest then dereferences the value
-        // as a *virtual* address it has not mapped and aborts, so the default
-        // run keeps the previous, documented state.  ZLB_NSKBL_PHYSPOOL=1
-        // enables the experiment.
         if (value == nullptr || value[0] == '0') return false;
         return substitutions_enabled_static();
     }();
@@ -1385,8 +1875,18 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             // VA 0x01500000 <-> PA 0x41500000: the dram-abs rule the other
             // arenas use, so the section can be mapped for the guest (below).
+            //
+            // Round 217: the page pool and the frame-number words used to share one
+            // megabyte (words at PA 0x41580000, pages counting up from 0x41500000), so
+            // after 128 handed-out pages the pool overwrote its own descriptors and
+            // NSKBL read garbage frame numbers back - which is how the non-secure core
+            // ended up executing uninitialised low-window memory.  The words now live
+            // in their own section (VA 0x01F00000 -> PA 0x41F00000, room for 256 Ki
+            // frames) and the pool is capped below it.
             constexpr u32 kPhysPoolBase = 0x41500000u;
             constexpr u32 kPhysPoolPages = 7u;           // the record holds seven ranges
+            constexpr u32 kPhysPoolMaxPages = 2560u;     // 10 MiB, below 0x41F00000
+            constexpr u32 kPhysPoolWordsVa = 0x01F00000u;
             const u32 partition_va = static_cast<u32>(arm->r[0]);
             const u32 partition_pa =
                 partition_va < 0x40000u ? partition_va + 0x40300000u : partition_va;
@@ -1394,10 +1894,20 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 table_pa = table_va < 0x40000u ? table_va + 0x40300000u : table_va;
             if (table_va != 0u) {
                 ensure_arena_section(arm, arm_bus_.get(), kPhysPoolBase - 0x40000000u);
+                ensure_arena_section(arm, arm_bus_.get(), kPhysPoolWordsVa);
                 bool filled = false;
                 for (u32 index = 0; index < kArmCoreCount; ++index) {
                     const u32 record = table_pa + index * 32u;
                     if (arm_bus_->read16(record + 2u) != 0u) continue;
+                    if (nskbl_physpool_next_ + kPhysPoolPages > kPhysPoolMaxPages) {
+                        if (nskbl_physpool_fills_ < 8u) {
+                            ZLB_LOG_WARN("machine",
+                                         "NSKBL physical-memory pool exhausted at page %u "
+                                         "(development substitution)",
+                                         nskbl_physpool_next_);
+                        }
+                        continue;
+                    }
                     arm_bus_->write16(record + 2u, static_cast<u16>(kPhysPoolPages));
                     for (u32 slot = 0; slot < kPhysPoolPages; ++slot) {
                         const u32 page = kPhysPoolBase +
@@ -1408,8 +1918,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                         // The consumer (0x5100C010) does `r0 = *value; r0 <<= 12`, so
                         // the record holds the address of a word with the frame number.
                         const u32 descriptor_va =
-                            (kPhysPoolBase - 0x40000000u) + 0x80000u +
-                            (nskbl_physpool_next_ + slot) * 4u;
+                            kPhysPoolWordsVa + (nskbl_physpool_next_ + slot) * 4u;
                         arm_bus_->write32(descriptor_va, page >> 12);
                         arm_bus_->write32(record + 4u + slot * 4u, descriptor_va);
                     }
@@ -1443,10 +1952,14 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             const s32 result = static_cast<s32>(arm->r[0]);
             if (result < 0) {
+                // Round 217: the frame-number words of this path live in their own
+                // section too (VA 0x01F80000 -> PA 0x41F80000), so they cannot be
+                // overwritten by the pages the other path hands out.
                 constexpr u32 kExperimentBase = 0x41500000u;
+                constexpr u32 kExperimentWordsVa = 0x01F80000u;
+                ensure_arena_section(arm, arm_bus_.get(), kExperimentWordsVa);
                 const u32 descriptor_va =
-                    (kExperimentBase - 0x40000000u) + 0x90000u +
-                    (nskbl_physpool_next_ & 0x3FFu) * 4u;
+                    kExperimentWordsVa + (nskbl_physpool_next_ & 0x3FFu) * 4u;
                 const u32 page = kExperimentBase + (nskbl_physpool_next_ & 0xFFu) * 0x1000u;
                 arm_bus_->write32(descriptor_va, page >> 12);
                 const u32 out_slot = static_cast<u32>(arm->r[13]) + 0x1Cu;
@@ -1574,6 +2087,13 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // a real object.  Skip the acquire when the lock address is below the first page,
     // the same treatment the KBL's own locks get.  ZLB_NSKBL_NOLOCK=0 and
     // ZLB_NO_SUBSTITUTION=1 disable it.
+    //
+    // Round 215: the same helper is also entered with an *unaligned* address, which
+    // cannot be a lock object at all - ARM `ldrex`/`strex` require word alignment and
+    // the address the run passes is a Thumb code pointer (`0x40021D51`, i.e. the value
+    // of `[fixedheap+0x4C] + 8`, a field the object's constructor would have filled
+    // with a lock).  Adding the alignment test to the "bogus address" predicate keeps
+    // the substitution's meaning ("that is not a lock") while covering this case.
     static const bool nskbl_nolock = [] {
         const char* value = std::getenv("ZLB_NSKBL_NOLOCK");
         if (value != nullptr && value[0] == '0') return false;
@@ -1582,7 +2102,8 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (nskbl_nolock && pc == 0x51014970u) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
-                if (static_cast<u32>(arm->r[0]) < 0x1000u) {
+                const u32 lock_va = static_cast<u32>(arm->r[0]);
+                if (lock_va < 0x1000u || (lock_va & 3u) != 0u) {
                     arm->set_pc(arm->r[14] & ~1u);          // bx lr - skip the acquire
                     arm->set_register("THUMB", 1u);
                     ++boot_pc_fixes_;
@@ -1591,7 +2112,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                         ZLB_LOG_INFO("machine",
                                      "NSKBL spinlock skipped at bogus address 0x%08X (arm%u, "
                                      "development substitution)",
-                                     static_cast<u32>(arm->r[0]), core);
+                                     lock_va, core);
                         add_milestone("NSKBL spinlock skipped at a bogus address (development "
                                       "substitution)");
                     }
@@ -3368,7 +3889,7 @@ void Vita::poll_boot_chain() {
     // so somebody on the ARM side has to read it back as zero before it goes on.
     // That "somebody" is the ARM's boot ROM, which our model stands in for.
     if (boot_.stage == BootStage::CmepSecureKernel && boot_.cmep_status != 0u) {
-        const u32 status = boot_.cmep_status;
+        const u32 status = static_cast<u32>(boot_.cmep_status);
         cmep_block_->set_cmep_status(0);
         boot_.cmep_status = 0;
         // The secure kernel's start-up is a handshake: it clears the ARM->CMeP

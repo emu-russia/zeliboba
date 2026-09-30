@@ -428,6 +428,8 @@ private:
     u32 cookie_stamps_ = 0;
     /// Lines already emitted by the ZLB_KBL_TRACE_PC diagnostic (round 111).
     u32 trace_pc_hits_ = 0;
+    /// Set once the ZLB_ARM_TRACE_RING dump has been printed (round 214).
+    bool trace_ring_pc_dumped_ = false;
     /// Lines already emitted by the fatal-stub diagnostic (round 111): the stubs end
     /// in `b .`, so without the cap the log grows without bound.
     u32 fatal_stub_hits_ = 0;

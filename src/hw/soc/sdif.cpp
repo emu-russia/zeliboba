@@ -349,8 +349,15 @@ void Sdif::write_word(u32 offset, u64 value) {
                 data_.clear();
                 data_index_ = 0;
                 data_pending_ = false;
-                // Self clearing: the bit reads back zero once the reset is done.
-                RegisterBlock::write(base_ + kSoftwareReset, 1, 0);
+                // Self clearing: the bit reads back zero once the reset is done - and it
+                // has to be cleared in the *stored* word as well.  The write that
+                // triggered the reset is merged into this word, and re-registering the
+                // reset byte set the very bit the caller polls.  NSKBL issues its first SD
+                // command exactly this way (byte write 1 to 0xE0B0002F, then a poll of that
+                // byte at 0x5101D788..0x5101D790) and the non-secure boot loader spun there
+                // forever after reaching stage 0xA9 (round 241).
+                RegisterBlock::write(base_ + kSoftwareReset, 0, 0);
+                store(kClockControl, peek(kClockControl) & ~(static_cast<u64>(1u) << 24));
             }
             return;
         }
@@ -559,6 +566,20 @@ void Sdif::execute_command() {
                 const u32 count = index == 17 ? 1 : blocks;
                 data_.assign(static_cast<size_t>(count) * 512u, 0);
                 const bool ok = card_->read_blocks(EmmcPartition::User, current_lba(), count, data_.data());
+                // Round 277 diagnostic: NSKBL's file lookup (0x510232EC) reports "not found"
+                // for os0:psp2bootconfig.skprx although the entry is in the image, so log the
+                // sectors the guest actually reads while it searches.  ZLB_EMMC_LOG=1.
+                static const bool log_reads = [] {
+                    const char* value = std::getenv("ZLB_EMMC_LOG");
+                    return value != nullptr && value[0] != '0';
+                }();
+                if (log_reads) {
+                    static unsigned logged = 0;
+                    if (logged < 400u) {
+                        ++logged;
+                        ZLB_LOG_INFO("mmc", "read lba=%u count=%u ok=%d", current_lba(), count, ok ? 1 : 0);                    }
+                }
+
                 command_ok_ = ok;
                 data_index_ = 0;
                 data_pending_ = true;

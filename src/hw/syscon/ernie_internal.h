@@ -4,6 +4,8 @@
 // SC bridge device and the eMMC host so that ernie.cpp, ernie_sc.cpp,
 // ernie_emmc.cpp and ernie_power.cpp can share them without widening the public
 // surface (src/hw/syscon.h).
+
+#include <functional>
 //
 // ---------------------------------------------------------------------------
 // The SC protocol, reconstructed
@@ -470,10 +472,20 @@ public:
     bool dirty() const { return dirty_; }
     void clear_dirty() { dirty_ = false; }
 
+    /// Round 245: the command window's "start" bit (byte 0x2F bit 0) used to be
+    /// stored like any other byte, and nothing ever dispatched the descriptor, so a
+    /// command posted by the *ARM* (NSKBL writes 1 to 0xE0B0002F and polls it, pc
+    /// 0x5101D784..0x5101D790 after stage 0xA9) was never answered and the bit never
+    /// cleared.  ErnieBlock::command_posted existed for exactly this and had no caller.
+    void set_command_posted(std::function<void(const u8*, size_t)> callback) {
+        command_posted_ = std::move(callback);
+    }
+
 private:
     std::vector<u8> bytes_;
     bool response_ = false;
     bool dirty_ = false;
+    std::function<void(const u8*, size_t)> command_posted_;
 };
 
 // ---------------------------------------------------------------------------

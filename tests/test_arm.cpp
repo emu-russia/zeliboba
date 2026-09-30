@@ -1406,6 +1406,203 @@ ZLB_TEST(mmu_coarse_page_translate) {
     ZLB_EXPECT_EQ(pa, 0x80010ABCu);
 }
 
+ZLB_TEST(arm_thumb2_bitfield_matches_reference) {
+    // The kernel's object dispatch reads an object's type with `ubfx r5, r1, #24, #4`
+    // (0x5100A546) and compares it against 10, so a wrong UBFX would send NSKBL down
+    // the wrong branch.  Expected values come from Unicorn (a real ARMv7 core model)
+    // running the same encodings, produced by keystone.
+    Fixture f;
+    struct Case {
+        u32 word;       // little-endian halfword pair: hw1 | (hw2 << 16)
+        u32 r3_in;
+        u32 r5_in;
+        u32 expect;
+    };
+    const Case cases[] = {
+        {0x2307F3C5u, 0u, 0x12345678u, 0x00000056u},  // ubfx r3, r5, #8, #8
+        {0x2307F345u, 0u, 0x12345678u, 0x00000056u},  // sbfx r3, r5, #8, #8
+        {0x230FF365u, 0xDEADBEEFu, 0x12345678u, 0xDEAD78EFu},  // bfi r3, r5, #8, #8
+    };
+    for (const Case& c : cases) {
+        f.load(kCodeBase, {c.word});
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(3, c.r3_in);
+        f.set_reg(5, c.r5_in);
+        f.cpu.step();
+        ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.reg(3), c.expect);
+    }
+}
+
+ZLB_TEST(arm_thumb2_ssat_usat_saturate_immediate) {
+    // Round 226, found by the differential sweep against Unicorn.  The saturate
+    // immediate of SSAT lives in hw2<4:0> as width - 1 (USAT stores the width itself),
+    // hw1 bit 5 selects the shift type (0 = LSL, 1 = ASR) and hw2<14:12>:<7:6> the
+    // amount; with a zero amount and opc 0x12/0x1A the same word is SSAT16/USAT16.
+    // Before the fix `ssat #8` saturated to 6 bits (0x1F instead of 0x7F) and every
+    // shifted form returned its input unchanged.  Expected values: Unicorn.
+    Fixture f;
+    struct Case {
+        u32 word;
+        int r5;
+        u32 r5_in;
+        u32 expect;
+    };
+    const Case cases[] = {
+        {0x0307F305u, 5, 0x7FFFFFFFu, 0x0000007Fu},  // ssat r3, #8, r5
+        {0x0307F305u, 5, 0xFFFFFF80u, 0xFFFFFF80u},  // ssat r3, #8, r5 (in range)
+        {0x130FF325u, 5, 0x0F0E0D0Cu, 0x00007FFFu},  // ssat r3, #16, r5, asr #4
+        {0x0307F325u, 5, 0x0F0E0D0Cu, 0x007F007Fu},  // ssat16 r3, #8, r5
+        {0x0384F385u, 5, 0x80018002u, 0x0000000Fu},  // usat r3, #4, r5, lsl #2
+        {0x0308F3A5u, 5, 0x0000FFFFu, 0x00000000u},  // usat16 r3, #8, r5 (signed halves)
+        {0x0308F3A5u, 5, 0x00010002u, 0x00010002u},  // usat16 r3, #8, r5
+    };
+    for (const Case& c : cases) {
+        f.load(kCodeBase, {c.word});
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(c.r5, c.r5_in);
+        f.cpu.step();
+        ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.reg(3), c.expect);
+    }
+}
+
+ZLB_TEST(arm_multiply_mls_operand_order) {
+    // Round 226: MLS is Ra - Rn x Rm; both the ARM and the Thumb decoder computed
+    // Rn x Rm - Ra, i.e. the negated result.  Unicorn for `mls r3, r5, r6, r7` with
+    // r5 = 0xFFFFFFFF, r6 = 1, r7 = 1 gives 2 (1 - (-1)).
+    // Thumb encoding `mls r3, r5, r6, r7` = hw1 0xFB05, hw2 0x7316; the ARM one is
+    // 0xE0673596 (`mls r3, r5, r6, r7`).
+    Fixture f;
+    struct Case {
+        u32 word;
+        bool thumb;
+        u32 expect;
+    };
+    const Case cases[] = {
+        {0x7316FB05u, true, 0x00000002u},
+        {0xE0637695u, false, 0x00000002u},
+    };
+    for (const Case& c : cases) {
+        f.load(kCodeBase, {c.word});
+        f.cpu.reset(c.thumb ? (kCodeBase | 1u) : kCodeBase);
+        f.set_reg(5, 0xFFFFFFFFu);
+        f.set_reg(6, 1u);
+        f.set_reg(7, 1u);
+        f.cpu.step();
+        ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.reg(3), c.expect);
+    }
+}
+
+ZLB_TEST(arm_dp_register_shift_without_s_leaves_flags_alone) {
+    // Round 225: the carry-out of a register-specified shift only reaches C when the
+    // instruction has S == 1.  `shift_reg` used to write C unconditionally, so
+    // `mov r3, r5, lsl r6` (encoding 0xE1A03615, no S) set C.  Reference: Unicorn runs
+    // the same word with r5 = 0xFFFFFFFF, r6 = 1 and reports r3 = 0xFFFFFFFE with the
+    // flags unchanged; `movs` (0xE1B03615) must set C.
+    Fixture f;
+    f.load(kCodeBase, {0xE1A03615u});
+    f.cpu.reset(kCodeBase);
+    f.set_reg(5, 0xFFFFFFFFu);
+    f.set_reg(6, 1u);
+    f.cpu.cpsr &= ~(arm::kFlagN | arm::kFlagZ | arm::kFlagC | arm::kFlagV);
+    f.cpu.step();
+    ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+    ZLB_EXPECT_EQ(f.reg(3), 0xFFFFFFFEu);
+    ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagC) == 0u);
+
+    // The flag-setting form still has to update C.
+    f.load(kCodeBase, {0xE1B03615u});
+    f.cpu.reset(kCodeBase);
+    f.set_reg(5, 0xFFFFFFFFu);
+    f.set_reg(6, 1u);
+    f.cpu.cpsr &= ~(arm::kFlagN | arm::kFlagZ | arm::kFlagC | arm::kFlagV);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(3), 0xFFFFFFFEu);
+    ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagC) != 0u);
+    ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagN) != 0u);
+}
+
+ZLB_TEST(arm_thumb32_multiply_long_accumulate) {
+    // Round 225: the differential sweep against Unicorn (tools/arm_probe + one
+    // instruction per case) found that SMLAL and UMLAL were reported undefined - the
+    // decoder only knew the plain SMULL (op1 = 0x8) and UMULL (op1 = 0xA) slots,
+    // while the accumulating forms are op1 = 0xC and 0xE.  Expected values come from
+    // Unicorn running the same encodings (keystone: `smlal r3, r4, r5, r6` is
+    // hw1 = 0xFBC5, hw2 = 0x3406).
+    Fixture f;
+    struct Case {
+        u32 word;
+        u32 r3_in;
+        u32 r4_in;
+        u32 r5_in;
+        u32 r6_in;
+        u32 expect_lo;
+        u32 expect_hi;
+    };
+    const Case cases[] = {
+        // smlal r3, r4, r5, r6  - signed product added to RdHi:RdLo
+        {0x3406FBC5u, 0x11111111u, 0x22222222u, 0x00010002u, 0xFFFFFFFFu, 0x1110110Fu,
+         0x22222222u},
+        // umlal r3, r4, r5, r6  - unsigned counterpart
+        {0x3406FBE5u, 0x11111111u, 0x22222222u, 0x00010002u, 0xFFFFFFFFu, 0x1110110Fu,
+         0x22232224u},
+        // smlal with a negative product (-0x20000) added to zero
+        {0x3406FBC5u, 0x00000000u, 0x00000000u, 0xFFFF0000u, 0x00000002u, 0xFFFE0000u,
+         0xFFFFFFFFu},
+    };
+    for (const Case& c : cases) {
+        f.load(kCodeBase, {c.word});
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(3, c.r3_in);
+        f.set_reg(4, c.r4_in);
+        f.set_reg(5, c.r5_in);
+        f.set_reg(6, c.r6_in);
+        f.cpu.step();
+        ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.reg(3), c.expect_lo);
+        ZLB_EXPECT_EQ(f.reg(4), c.expect_hi);
+    }
+}
+
+ZLB_TEST(mmu_small_page_xn_is_bit_zero) {    // Round 216: XN lives in bit 0 of a small-page descriptor, not bit 15 - bit 15
+    // is part of PA[31:12] for a 4 KiB page.  Reading bit 15 there made every page
+    // whose physical address has bit 15 set execute-never, and PA 0x40118000 (where
+    // the model backs the ARM low window) is one of them: the first instruction
+    // fetch of a vector there raised IFSR = 0xF and NSKBL's abort handler could
+    // never run.
+    Fixture f;
+    ArmMmu& mmu = f.cpu.mmu;
+    const u32 l1 = 0x80010000u;
+    const u32 l2 = 0x80018000u;
+    mmu.ttbr0 = l1;
+    mmu.dacr = 0x00000001u;
+    mmu.sctlr |= 1u;
+
+    const u32 index1 = (0x81000000u >> 20) & 0xFFFu;
+    const u32 index2 = (0x81000000u >> 12) & 0xFFu;
+    f.bus.write32(l1 + index1 * 4u, l2 | 1u);        // coarse table, domain 0
+    // PA 0x80010000 has bit 15 set; AP = 0b011 (privileged RW); bit 0 = 0 -> XN = 0.
+    f.bus.write32(l2 + index2 * 4u, 0x80010000u | 2u | (3u << 4));
+
+    u32 pa = 0;
+    std::string fault;
+    ZLB_EXPECT_TRUE(f.cpu.translate(0x81000ABCu, false, false, pa, fault));
+    ZLB_EXPECT_EQ(pa, 0x80010ABCu);
+    pa = 0;
+    ZLB_EXPECT_TRUE(f.cpu.translate(0x81000ABCu, false, true, pa, fault));  // fetch
+    ZLB_EXPECT_EQ(pa, 0x80010ABCu);
+
+    // Setting bit 0 marks the page execute-never: the fetch faults, the read does not.
+    f.bus.write32(l2 + index2 * 4u, 0x80010000u | 3u | (3u << 4));
+    pa = 0;
+    ZLB_EXPECT_FALSE(f.cpu.translate(0x81000ABCu, false, true, pa, fault));
+    pa = 0;
+    ZLB_EXPECT_TRUE(f.cpu.translate(0x81000ABCu, false, false, pa, fault));
+    ZLB_EXPECT_EQ(pa, 0x80010ABCu);
+}
+
 // ===========================================================================
 // Disassembler
 // ===========================================================================
@@ -2554,7 +2751,10 @@ ZLB_TEST(arm_multiply_mla_and_mls) {
     f.cpu.step();
     ZLB_EXPECT_EQ(f.reg(3), 142u);  // 6*7 + 100
     f.cpu.step();
-    ZLB_EXPECT_EQ(f.reg(5), 0xFFFFFFC6u);  // 42 - 100
+    // Round 226: MLS is Ra - Rn x Rm, so 100 - 42 = 58.  This expectation used to be
+    // 0xFFFFFFC6 (42 - 100), i.e. it had been written from the implementation, which
+    // had the operands the other way round; Unicorn gives 0x3A for the same encoding.
+    ZLB_EXPECT_EQ(f.reg(5), 0x3Au);
     ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
 
     // MLAS sets N/Z from the 32 bit result.
@@ -3635,13 +3835,106 @@ ZLB_TEST(arm_media_extend) {
 
 ZLB_TEST(arm_media_sel) {
     Fixture f;
-    // SEL Rd, Rn, Rm picks Rm bytes where the CPSR GE bit is set (GE[3:0] is
-    // CPSR[19:16]).
+    // SEL Rd, Rn, Rm takes its bytes from Rn where the corresponding GE bit is
+    // set and from Rm otherwise (ARM ARM A8.8.157).  The operand order used to be
+    // the other way round, which every `usub8`/`sadd8` + `sel` idiom (byte-wise
+    // min/max in the firmware) ran backwards.  Reference: a real ARMv7 core.
     f.load(kCodeBase, {0xE6810FB2u});  // sel r0, r1, r2
     f.cpu.reset(kCodeBase);
     f.set_reg(1, 0x11111111u);
     f.set_reg(2, 0x22222222u);
     f.cpu.cpsr = (f.cpu.cpsr & ~arm::kFlagGE) | (0x5u << 16);  // GE0 and GE2 set
     f.cpu.step();
-    ZLB_EXPECT_EQ(f.reg(0), 0x11221122u);
+    ZLB_EXPECT_EQ(f.reg(0), 0x22112211u);  // GE set -> Rn = r1
+}
+
+ZLB_TEST(arm_thumb2_data_processing_register_family) {
+    // 1111 1010 op1 Rn | 1111 Rd op2 Rm - data-processing (register).  Every
+    // instruction below used to run as an arbitrary parallel add/sub because the
+    // decoder read the ARM (32-bit) selector layout out of the Thumb fields.  CLZ
+    // in particular broke NSKBL's size classifier (`clz r3, r5` returned 0 instead
+    // of 15), so no 64 KiB allocation ever succeeded and the kernel heap was never
+    // created (docs/NSKBL.md round 212).  All expected values, GE and Q bits come
+    // from Unicorn (a real ARMv7 core model) run on the same encoding.
+    Fixture f;
+    struct Case {
+        u32 hw1;
+        u32 hw2;
+        u32 r5;
+        u32 r6;
+        u32 expect;
+        u32 ge;       // expected CPSR GE nibble
+        bool q;       // expected CPSR Q flag
+    };
+    const Case cases[] = {
+        {0xFAB5u, 0xF385u, 0x00010002u, 0u, 0x0000000Fu, 0u, false},  // clz r3, r5
+        {0xFAB5u, 0xF385u, 0x00000000u, 0u, 0x00000020u, 0u, false},  // clz of zero = 32
+        {0xFAB5u, 0xF385u, 0x80000000u, 0u, 0x00000000u, 0u, false},
+        {0xFA95u, 0xF385u, 0x12345678u, 0u, 0x78563412u, 0u, false},  // rev.w
+        {0xFA95u, 0xF395u, 0x12345678u, 0u, 0x34127856u, 0u, false},  // rev16.w
+        {0xFA95u, 0xF3B5u, 0x00001234u, 0u, 0x00003412u, 0u, false},  // revsh.w
+        {0xFA95u, 0xF3B5u, 0x0000ABCDu, 0u, 0xFFFFCDABu, 0u, false},  // revsh sign extends
+        // parallel add/sub with the operand in r6
+        {0xFA95u, 0xF306u, 0x00010002u, 0x00030004u, 0x00040006u, 0xFu, false},  // sadd16
+        {0xFAC5u, 0xF306u, 0x00000000u, 0x01000000u, 0xFF000000u, 0x7u, false},  // ssub8
+        {0xFA85u, 0xF346u, 0x80018002u, 0x80018002u, 0x00020004u, 0xAu, false},  // uadd8 carry
+        {0xFAC5u, 0xF346u, 0x10203040u, 0x01020304u, 0x0F1E2D3Cu, 0xFu, false},  // usub8
+        {0xFAA5u, 0xF306u, 0x80018002u, 0x80018002u, 0x00030001u, 0x3u, false},  // sasx
+        {0xFAE5u, 0xF306u, 0x00010002u, 0x00030004u, 0xFFFD0005u, 0x3u, false},  // ssax
+        {0xFA95u, 0xF315u, 0x12345678u, 0x12345678u, 0x24687FFFu, 0u, false},    // qadd16
+        {0xFA95u, 0xF325u, 0x00040006u, 0x00020002u, 0x00040006u, 0u, false},    // shadd16
+        {0xFA85u, 0xF386u, 0x40000000u, 0x40000000u, 0x7FFFFFFFu, 0u, true},     // qadd
+        {0xFA85u, 0xF396u, 0x00000001u, 0x00000000u, 0x00000002u, 0u, false},    // qdadd doubles Rn
+        {0xFA85u, 0xF3A6u, 0x00000001u, 0x00000000u, 0xFFFFFFFFu, 0u, false},    // qsub is Rm - Rn
+        {0xFA85u, 0xF3B6u, 0x40000000u, 0x40000000u, 0xC0000001u, 0u, true},     // qdsub
+        // extend-and-add
+        {0xFA05u, 0xF386u, 0x00010002u, 0x00008001u, 0x00008003u, 0u, false},    // sxtah
+        {0xFA55u, 0xF386u, 0x00010002u, 0x000000F0u, 0x000100F2u, 0u, false},    // uxtab
+        {0xFA45u, 0xF386u, 0x00010002u, 0x00000080u, 0x0000FF82u, 0u, false},    // sxtab
+        {0xFA25u, 0xF386u, 0x00010002u, 0x00008080u, 0x0001FF82u, 0u, false},    // sxtab16
+        {0xFA05u, 0xF3A6u, 0x00010002u, 0x80010000u, 0x00008003u, 0u, false},    // sxtah ror #16
+        {0xFA1Fu, 0xF385u, 0x00008001u, 0u, 0x00008001u, 0u, false},             // uxth (Rn == 15)
+        {0xFA2Fu, 0xF385u, 0x00008080u, 0u, 0x0000FF80u, 0u, false},             // sxtb16
+    };
+    for (const Case& c : cases) {
+        // `load` writes a little-endian word, so hw1 (the halfword at the lower
+        // address) is the low half of the stored value.
+        f.load(kCodeBase, {c.hw1 | (c.hw2 << 16)});
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(5, c.r5);
+        f.set_reg(6, c.r6);
+        f.cpu.cpsr = (f.cpu.cpsr & ~arm::kFlagGE) & ~arm::kFlagQ;
+        f.cpu.step();
+        ZLB_EXPECT_TRUE(!f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.reg(3), c.expect);
+        ZLB_EXPECT_EQ((f.cpu.cpsr >> 16) & 0xFu, c.ge);
+        ZLB_EXPECT_EQ((f.cpu.cpsr & arm::kFlagQ) != 0u, c.q);
+    }
+
+    // SEL (op1 = 0xA, op2 = 8) reads Rn = r5 and Rm = r6 and picks Rn where GE is
+    // set: GE = 0101 -> bytes 0 and 2 come from r5 (0xAA), the rest from r6 (0xBB).
+    f.load(kCodeBase, {0xF386FAA5u});
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(5, 0xAAAAAAAAu);
+    f.set_reg(6, 0xBBBBBBBBu);
+    f.cpu.cpsr = (f.cpu.cpsr & ~arm::kFlagGE) | (0x5u << 16);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(3), 0xBBAABBAAu);
+}
+
+ZLB_TEST(disasm_thumb2_data_processing_register) {
+    // The disassembler shared the interpreter's wrong table and named all of these
+    // after a parallel add/sub (an `sadd16`-based name for `revsh`).
+    Fixture f;
+    f.load(kCodeBase, {0xF385FAB5u, 0xF395FA95u, 0xF3B5FA95u, 0xF386FAA5u,
+                       0xF386FA85u, 0xF386FA45u, 0xF346FAC5u, 0xF306FA95u});
+    unsigned length = 0;
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase, true, length).find("clz r3, r5") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 4, true, length).find("rev16.w r3, r5") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 8, true, length).find("revsh.w r3, r5") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 12, true, length).find("sel r3, r5, r6") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 16, true, length).find("qadd r3, r6, r5") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 20, true, length).find("sxtab r3, r5, r6") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 24, true, length).find("usub8 r3, r5, r6") != std::string::npos);
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 28, true, length).find("sadd16 r3, r5, r6") != std::string::npos);
 }

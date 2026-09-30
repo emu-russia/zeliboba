@@ -61,6 +61,19 @@ public:
     /// Translation table walks performed (statistics for the debugger).
     u64 walks = 0;
 
+    /// Development substitution (round 236, docs/NSKBL.md 8.69).  NSKBL builds its
+    /// per-frame state table through a 2 MiB *section* (`VA 0x00100000 -> PA
+    /// 0x40400000`, installed at pc 0x51014F28) and then switches the same VA to a
+    /// page-table descriptor (pc 0x51014D9E, insns 52 891 619) whose table maps a single
+    /// 4 KiB page - orphaning the table's content, after which every allocation
+    /// verification reads zeros and NSKBL ends in its own fatal sink.  With
+    /// `ZLB_NSKBL_SECTION_KEEP=1` the model stores the replaced section here and keeps it
+    /// serving the pages the new table leaves unmapped, which is the measurement that
+    /// decides whether the missing content is the blocker.
+    u32 replaced_section = 0;
+    u32 replaced_section_va = 0;
+    u32 replaced_section_hits = 0;
+
     // ---- translation / fault records --------------------------------------
     //
     // The debugger's first question after an abort is "why", and the answer is

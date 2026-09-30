@@ -289,6 +289,13 @@ void Vita::wire_bridges() {
         const bool soc_facing = (base >= 0xE0000000u && base < 0xF0000000u) ||
                                 (base >= 0x30000000u && base < 0x30010000u);
         if (!soc_facing) continue;
+        // Note (measured, round 260): 0xE0B00000 is *SDIF port 0* in the ARM address space
+        // (see kermit.cpp's table), but the mirrored Ernie SC command/reply windows claim
+        // the same address and, being the smaller windows, win Bus::find_device.  An
+        // experiment that kept those two windows off the ARM bus changed nothing at all -
+        // the same 153 205 277 instructions and the same halt - so NSKBL never touches
+        // 0xE0B00000 on the failing path and the shadowing is not the cause.  See
+        // docs/NSKBL.md section 8.93.
         arm_bus_->add_device(std::make_unique<DeviceMirror>(*device, base, device->size()));
     }
 

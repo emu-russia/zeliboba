@@ -202,7 +202,7 @@ private:
     // ---- shifter -----------------------------------------------------------
 
     u32 shift_imm(u32 value, int type, int amount, bool set_carry);
-    u32 shift_reg(u32 value, int type, u32 amount);
+    u32 shift_reg(u32 value, int type, u32 amount, bool set_carry = true);
 
     static u32 add_with_carry(u32 a, u32 b, bool carry_in, bool& carry_out, bool& overflow);
     static u32 sub_with_carry(u32 a, u32 b, bool carry_in, bool& carry_out, bool& overflow);
@@ -210,6 +210,11 @@ private:
     // ---- memory ------------------------------------------------------------
 
     void set_access_pc();
+    /// Physical address behind a virtual one, for the bus-side exclusive monitor
+    /// (round 240).  Falls back to the virtual address when the MMU is off or the
+    /// translation faults.
+    u32 exclusive_phys(u32 va);
+
     u32 mem_read_word(u32 va, bool fetch);
     u32 mem_read_half(u32 va);
     u32 mem_read_byte(u32 va);
@@ -298,7 +303,9 @@ private:
     void thumb32_data_processing_modified();
     void thumb32_data_processing_plain();
     void thumb32_data_processing_register();
-    void parallel_add_sub32(u32 op1, u32 op2, int rd, int rn, int rm);
+    void thumb32_parallel_add_sub(u32 op1, u32 op2, int rd, int rn, int rm);
+    void thumb32_extend_add(u32 op1, u32 op2, int rd, int rn, int rm);
+    void thumb32_misc_register(u32 op1, u32 op2, int rd, int rn, int rm);
     void thumb32_load_store_dual_excl_table();
     void thumb32_load_store_single();
     void thumb32_coprocessor();

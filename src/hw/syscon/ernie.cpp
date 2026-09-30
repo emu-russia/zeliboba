@@ -670,6 +670,9 @@ void ErnieBlock::install() {
     impl.bus.add_device(std::unique_ptr<Device>(impl.sc_window));
 
     impl.sc_cmd_window = new ernie::ScMessageWindow(ernie::kScCmdWindow, 0x200, false);
+    impl.sc_cmd_window->set_command_posted([this](const u8* descriptor, size_t length) {
+        command_posted(descriptor, length);
+    });
     impl.bus.add_device(std::unique_ptr<Device>(impl.sc_cmd_window));
     impl.sc_resp_window = new ernie::ScMessageWindow(ernie::kScRespWindow, 0x200, true);
     impl.bus.add_device(std::unique_ptr<Device>(impl.sc_resp_window));
@@ -825,6 +828,26 @@ void ErnieBlock::command_posted(const u8* descriptor, size_t length) {
     if (descriptor == nullptr || length == 0) return;
     impl.channel.post_descriptor(descriptor, length, ernie::kScCmdWindow);
     const ernie::ScRegs& regs = impl.channel.regs();
+    // Round 246: publish the reply where the ARM reads it.  The non-secure boot loader
+    // polls bit 17 of the command window's control word (0xE0B00024, pc 0x5101D7B6) and
+    // then consumes the two halfwords at 0xE0B00030/0xE0B00032 (pc 0x5101D7C6..0x5101D7D8)
+    // - the same two data ports the SC register file models as engine30/engine32.
+    if (impl.sc_cmd_window != nullptr && impl.sc_cmd_window->bytes().size() >= 0x34u) {
+        const std::vector<u8>& bytes = impl.sc_cmd_window->bytes();
+        u32 control = static_cast<u32>(bytes[0x24]) | (static_cast<u32>(bytes[0x25]) << 8) |
+                      (static_cast<u32>(bytes[0x26]) << 16) | (static_cast<u32>(bytes[0x27]) << 24);
+        control |= 0x00020000u;
+        const u8 control_bytes[4] = {static_cast<u8>(control & 0xFFu),
+                                     static_cast<u8>((control >> 8) & 0xFFu),
+                                     static_cast<u8>((control >> 16) & 0xFFu),
+                                     static_cast<u8>((control >> 24) & 0xFFu)};
+        impl.sc_cmd_window->store(0x24, control_bytes, 4);
+        const u16 data0 = static_cast<u16>(regs.engine30 & 0xFFFFu);
+        const u16 data1 = static_cast<u16>(regs.engine32 & 0xFFFFu);
+        const u8 data_bytes[4] = {static_cast<u8>(data0 & 0xFFu), static_cast<u8>(data0 >> 8),
+                                  static_cast<u8>(data1 & 0xFFu), static_cast<u8>(data1 >> 8)};
+        impl.sc_cmd_window->store(0x30, data_bytes, 4);
+    }
     commands_served_ = regs.commands;
     response_ = regs.response;
     response_ready_ = !response_.empty();

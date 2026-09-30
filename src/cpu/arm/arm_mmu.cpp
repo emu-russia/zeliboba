@@ -340,7 +340,21 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     const u32 l2_base = l1 & 0xFFFFFC00u;
     const u32 l2_index = (va >> 12) & 0xFFu;
     const u32 l2_addr = l2_base | (l2_index << 2);
-    const u32 l2 = read_table(l2_addr);
+    u32 l2 = read_table(l2_addr);
+    // Development substitution (round 236, docs/NSKBL.md 8.69): keep a section that the
+    // guest replaced with this page table serving the pages the table leaves unmapped.
+    // The synthesized descriptor is the small-page equivalent of the section's
+    // attributes (AP[2:0] = {bit 15, bit 11, bit 10} -> {bit 9, bit 5, bit 4},
+    // TEX 14:12 -> 8:6, C/B stay bits 3/2, XN bit 4 -> bit 0) and the section's
+    // physical address with the in-section offset.
+    if ((l2 & 3u) == 0u && replaced_section != 0u &&
+        (va & 0xFFF00000u) == (replaced_section & 0xFFF00000u)) {
+        const u32 pa = (replaced_section & 0xFFF00000u) | (va & 0x000FF000u);
+        l2 = pa | ((replaced_section & 0x00007000u) >> 6) |
+             (((replaced_section >> 10) & 3u) << 4) | (((replaced_section >> 15) & 1u) << 9) |
+             (replaced_section & 0x0000000Cu) | ((replaced_section >> 4) & 1u) | 2u;
+        ++replaced_section_hits;
+    }
     last_walk.used_l2 = true;
     last_walk.l2_addr = l2_addr;
     last_walk.l2_desc = l2;
@@ -394,7 +408,14 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
         tex = (l2 >> 6) & 7u;
         c = (l2 >> 3) & 1u;
         b = (l2 >> 2) & 1u;
-        xn = (l2 >> 15) & 1u;
+        // XN is *bit 0* of a small-page descriptor (bits [1:0] = 0b1x select the
+        // format, so bit 0 is free for it) - bit 15 belongs to the physical address
+        // here, because a 4 KiB page carries PA[31:12].  Reading bit 15 made every
+        // page whose PA has bit 15 set execute-never: PA 0x40118000 (where the model
+        // backs the ARM low window) is one of them, so the very first instruction
+        // fetch of an exception vector there raised IFSR = 0xF.  Evidence:
+        // `arm_mmu_small_page_xn_is_bit_zero` in tests/test_arm.cpp.
+        xn = l2 & 1u;
         phys = (l2 & 0xFFFFF000u) | (va & 0x00000FFFu);
     }
 

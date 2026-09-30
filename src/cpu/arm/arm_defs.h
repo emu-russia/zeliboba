@@ -179,6 +179,15 @@ inline s32 saturate_signed(s64 v, unsigned bits) {
     return static_cast<s32>(v);
 }
 
+/// Saturate an unsigned value into `bits` bits (ARM ARM A2.3.2), used by the
+/// unsigned saturating parallel forms UQADD8/16, UQSUB8/16, UQASX, UQSAX.
+inline u32 saturate_unsigned(s64 v, unsigned bits) {
+    const s64 max = (static_cast<s64>(1) << bits) - 1;
+    if (v < 0) return 0u;
+    if (v > max) return static_cast<u32>(max);
+    return static_cast<u32>(v);
+}
+
 /// ThumbExpandImm - expand a T32 12-bit modified immediate (ARM ARM A7.4.3).
 inline u32 thumb_expand_imm(u32 imm12) {
     const u32 top8 = (imm12 >> 8) & 0xFu;

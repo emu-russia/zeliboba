@@ -217,7 +217,7 @@ u32 ArmCore::shift_imm(u32 value, int type, int amount, bool set_carry) {
     return value;
 }
 
-u32 ArmCore::shift_reg(u32 value, int type, u32 amount) {
+u32 ArmCore::shift_reg(u32 value, int type, u32 amount, bool set_carry) {
     u32 carry = flag_c() ? 1u : 0u;
     if (amount == 0) return value;
     switch (type) {
@@ -265,8 +265,15 @@ u32 ArmCore::shift_reg(u32 value, int type, u32 amount) {
             break;
         }
     }
-    if (carry != 0) cpsr |= arm::kFlagC;
-    else cpsr &= ~arm::kFlagC;
+    // Round 225: the carry-out of a *register-specified* shift only reaches the C flag
+    // when the instruction asks for it (S == 1).  This used to write C unconditionally,
+    // so `mov r3, r5, lsl r6` (no S) set C from the shifter - found by the differential
+    // sweep against Unicorn (tools/arm_probe + one instruction per case); evidence:
+    // arm_dp_register_shift_without_s_leaves_flags_alone.
+    if (set_carry) {
+        if (carry != 0) cpsr |= arm::kFlagC;
+        else cpsr &= ~arm::kFlagC;
+    }
     return value;
 }
 
@@ -320,6 +327,21 @@ arm::MmResult ArmCore::translate_or_fix(u32 va, bool write, bool fetch) {
     if (result.ok || !fault_hook) return result;
     if (!fault_hook(core_id_, va, write, fetch)) return result;
     return mmu.translate(va, write, fetch, mode());
+}
+
+u32 ArmCore::exclusive_phys(u32 va) {
+    // Round 240: the exclusive monitor lives in the bus, which only ever sees *physical*
+    // addresses (`Bus::clear_exclusive` is called from every write path with the
+    // translated address).  The LDREX/STREX sites used to register the *virtual* address
+    // instead, so as soon as a reservation was made through a translated mapping - which
+    // is the normal case for NSKBL, whose low window VA 0x4038 maps to PA 0x40304038 - no
+    // write ever overlapped the reservation and STREX kept succeeding.  Measured effect of
+    // that: the kernel boot loader's four-core barrier (ldrexh/strexh counter at
+    // PA 0x40304038) lost decrements ("... val=2 core=#1, val=2 core=#2, val=1 core=#0")
+    // and all four cores deadlocked in their WFE wait loop at pc 0x510158EC.
+    if (!mmu.enabled()) return va;
+    const arm::MmResult result = mmu.translate(va, false, false, mode());
+    return result.ok ? result.phys_addr : va;
 }
 
 u32 ArmCore::mem_read_word(u32 va, bool fetch) {
@@ -929,7 +951,7 @@ u32 ArmCore::shifter_operand(u32 instr, bool set_carry) {
         const u32 amount = (arm::read_pc_value(false, cur_instr_addr_) + 4u) & 0xFFu;
         return shift_imm(read_reg(static_cast<int>(rm)), type, static_cast<int>(amount), false);
     }
-    return shift_reg(read_reg(static_cast<int>(rm)), type, r[rs] & 0xFFu);
+    return shift_reg(read_reg(static_cast<int>(rm)), type, r[rs] & 0xFFu, set_carry);
 }
 
 void ArmCore::execute_data_processing(u32 instr, u32 op, bool immediate) {
@@ -1066,7 +1088,7 @@ void ArmCore::execute_arm_exclusive(u32 instr) {
 
         // The reservation lives in the bus (the SCU's global monitor) so that a
         // write by another core makes this core's STREX fail, as on hardware.
-        bus->mark_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr);
+        bus->mark_exclusive(exclusive_phys(address), width, static_cast<int>(core_id_), mmu.context_idr);
         exclusive_valid_ = true;
         exclusive_addr_ = address;
         exclusive_id_ = mmu.context_idr;
@@ -1078,7 +1100,7 @@ void ArmCore::execute_arm_exclusive(u32 instr) {
                             : ((kind == 0xEu) ? (base & ~1u)
                                               : (base & ~(is_doubleword ? 7u : 3u)));
         u32 status = 1u;
-        if (bus->take_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr)) {
+        if (bus->take_exclusive(exclusive_phys(address), width, static_cast<int>(core_id_), mmu.context_idr)) {
             if (is_doubleword) {
                 // STREXD Rd, Rt, Rt2, [Rn]: the opcode has a single register field
                 // (bits [3:0] = Rt) and Rt2 is Rt + 1 - QEMU's a32.decode notes
@@ -1161,7 +1183,11 @@ void ArmCore::decode_arm_mul_media(u32 instr) {
         r[rdh] = value;
         if (s) set_nz(value);
     } else if (op == 0x3u) {  // MLS Rd, Rn, Rm, Ra
-        r[rdh] = r[rn] * r[rm] - r[rdl];
+        // Round 226: MLS is Ra - Rn x Rm (ARM ARM A7.7.45); the operands were the
+        // other way round, so every `mls` returned the negated result.  Found by the
+        // differential sweep against Unicorn (ARM and Thumb alike); evidence:
+        // arm_multiply_mls_operand_order.
+        r[rdh] = r[rdl] - r[rn] * r[rm];
     } else {
         // The 64 bit forms: UMAAL (unsigned, accumulate, no flags), UMULL,
         // UMLAL, SMULL and SMLAL.
@@ -1260,7 +1286,11 @@ void ArmCore::decode_arm_media(u32 instr) {
             break;
         case 0x68u:
             if ((instr & 0xFF0u) == 0xFB0u) {
-                r[rd] = select_bytes(r[rn], r[rm], cpsr);
+                // SEL Rd, Rn, Rm: the byte comes from Rn where GE[x] is set and
+                // from Rm otherwise (ARM ARM A8.8.157).  The operands used to be
+                // the other way round, which every `usub8/sadd8` + `sel` idiom
+                // (round 212: NSKBL's own byte selects) got backwards.
+                r[rd] = select_bytes(r[rm], r[rn], cpsr);
                 break;
             }
             if ((o2 & 3u) == 0u) {
@@ -1503,10 +1533,17 @@ void ArmCore::parallel_add_sub(u32 instr, int rd, int rn, int rm, u32 op1, u32 o
                 y = static_cast<s8>(y);
             }
             s32 res = subtract ? x - y : x + y;
+            // GE[x] is defined on the precise (pre-saturation) result: the sign of
+            // the signed byte result, the carry out of an unsigned addition and
+            // "no borrow" for an unsigned subtraction (ARM ARM A2.5.3, verified
+            // against a real ARMv7 core model).  The unsigned addition used to
+            // report every lane as positive.
+            const bool ge_set = is_unsigned ? (subtract ? (res >= 0) : (res > 0xFF))
+                                            : (res >= 0);
             if (saturating) res = arm::saturate_signed(res, 8);
             else if (halving) res >>= 1;
             result |= static_cast<u32>(res & 0xFF) << (k * 8);
-            if (res >= 0) ge |= 0x00010000u << k;
+            if (ge_set) ge |= 0x00010000u << k;
         }
     } else if (is_asx || is_sax) {
         s32 a0 = static_cast<s32>(a & 0xFFFFu);
@@ -3606,19 +3643,43 @@ void ArmCore::thumb32_data_processing_plain() {
                    ((((hw1 & 0xFu) << 12) | (i << 11) | (imm3v << 8) | imm8) << 16);
             break;
         case 0x10u: {  // SSAT
-            const u32 sat = hw1 & 0xFu;
-            const u32 value = shift_imm(r[rn], shift_type, lsb, false);
-            r[rd] = static_cast<u32>(arm::saturate_signed(static_cast<s32>(value),
-                                                          static_cast<unsigned>(sat) + 1u));
+            // Round 226: the saturate immediate is hw2<4:0> + 1, not `hw1 & 0xF` (that
+            // field is Rn!), and the shift of SSAT is *always* ASR.  Measured against
+            // keystone: `ssat r3, #8, r5` = hw1 0xF305, hw2 0x0307 (sat-1 = 7), and
+            // `ssat r3, #16, r5, asr #4` = hw2 0x130F (imm3:imm2 = 4).  The old decode
+            // saturated to 6 bits for `ssat #8` (0x1F instead of 0x7F) - found by the
+            // differential sweep; evidence: arm_thumb2_ssat_usat_saturate_immediate.
+            // `lsb == 0` means "no shift": routing it through shift_imm() would ask for
+            // the A32 "ASR #0 == ASR #32" special case and shift everything out.
+            const u32 sat = (hw2 & 0x1Fu) + 1u;
+            const u32 value = lsb == 0 ? r[rn] : shift_imm(r[rn], 0, lsb, false);  // opc bit 1 = 0 -> LSL
+            r[rd] = static_cast<u32>(arm::saturate_signed(static_cast<s32>(value), sat));
             break;
         }
-        case 0x12u: {  // SSAT16
-            const int sat = static_cast<int>(hw1 & 0xFu);
-            const s32 v0 = static_cast<s16>(r[rn] & 0xFFFFu);
-            const s32 v1 = static_cast<s16>(r[rn] >> 16);
-            r[rd] = static_cast<u32>(
-                ((arm::saturate_signed(v1, static_cast<unsigned>(sat) + 1u) & 0xFFFF) << 16) |
-                (arm::saturate_signed(v0, static_cast<unsigned>(sat) + 1u) & 0xFFFF));
+        case 0x12u: {  // SSAT16 (no shift) or SSAT with shift
+            // Round 226: opc 0x12 covers *two* encodings and the shift fields decide
+            // which.  Measured with the oracle: `F325 0307` (imm3:imm2 = 0) is SSAT16
+            // and saturates the two halves independently (Unicorn: 0x0F0E0D0C ->
+            // 0x007F007F), while `F325 130F` (imm3:imm2 = 4) is SSAT with `asr #4`
+            // (Unicorn: -> 0x00007FFF).  The old code always took the SSAT16 path, so
+            // every shifted SSAT returned its input unchanged.
+            const int shift_amount = static_cast<int>(imm3v << 2 | ((hw2 >> 6) & 3u));
+            if (shift_amount == 0) {
+                const int sat = static_cast<int>(hw2 & 0xFu) + 1;
+                const s32 v0 = static_cast<s16>(r[rn] & 0xFFFFu);
+                const s32 v1 = static_cast<s16>(r[rn] >> 16);
+                r[rd] = static_cast<u32>(
+                    ((arm::saturate_signed(v1, static_cast<unsigned>(sat)) & 0xFFFF) << 16) |
+                    (arm::saturate_signed(v0, static_cast<unsigned>(sat)) & 0xFFFF));
+            } else {
+                // hw1 bit 5 selects the shift type: 0 = LSL, 1 = ASR (measured with
+                // keystone: `ssat r3, #8, r5, lsl #2` is hw1 0xF305 / hw2 0x0387 and
+                // `... asr #2` is hw1 0xF325 / hw2 0x0387).
+                const u32 sat = (hw2 & 0x1Fu) + 1u;
+                const int type = ((hw1 >> 5) & 1u) != 0u ? 2 : 0;
+                const u32 value = shift_imm(r[rn], type, shift_amount, false);
+                r[rd] = static_cast<u32>(arm::saturate_signed(static_cast<s32>(value), sat));
+            }
             break;
         }
         case 0x14u:  // SBFX
@@ -3657,10 +3718,14 @@ void ArmCore::thumb32_data_processing_plain() {
             break;
         }
         case 0x18u: {  // USAT
-            const u32 sat = hw1 & 0xFu;
-            const u32 value = shift_imm(r[rn], shift_type, lsb, false);
+            // Round 226: USAT encodes the width *directly* in hw2<4:0> (ssat encodes
+            // width - 1; measured with keystone: `usat r3, #1, r5` has hw2 = 0x0301,
+            // `ssat r3, #1, r5` has hw2 = 0x0300), and its shift is always ASR with
+            // "no shift" when the field is zero.
+            const u32 sat = hw2 & 0x1Fu;
+            const u32 value = lsb == 0 ? r[rn] : shift_imm(r[rn], 0, lsb, false);  // opc bit 1 = 0 -> LSL
             const s64 lv = static_cast<s32>(value);
-            const s32 max = sat >= 32u ? 0x7FFFFFFF : (1 << static_cast<s32>(sat)) - 1;
+            const s32 max = sat >= 31u ? 0x7FFFFFFF : (1 << static_cast<s32>(sat)) - 1;
             u32 res;
             if (lv > max) res = static_cast<u32>(max);
             else if (lv < 0) res = 0u;
@@ -3668,13 +3733,33 @@ void ArmCore::thumb32_data_processing_plain() {
             r[rd] = res;
             break;
         }
-        case 0x1Au: {  // USAT16
-            const int sat = static_cast<int>(hw1 & 0xFu);
-            const int max = sat >= 16 ? 0xFFFF : (1 << sat) - 1;
-            const int v0 = static_cast<int>(r[rn] & 0xFFFFu);
-            const int v1 = static_cast<int>(r[rn] >> 16);
-            r[rd] = static_cast<u32>((((v1 > max ? max : v1) & 0xFFFF) << 16) |
-                                     ((v0 > max ? max : v0) & 0xFFFF));
+        case 0x1Au: {  // USAT16 (no shift) or USAT with shift
+            // Same split as SSAT16/SSAT above, with the unsigned width encoding
+            // (USAT stores the width itself, SSAT stores width - 1).
+            const int shift_amount = static_cast<int>(imm3v << 2 | ((hw2 >> 6) & 3u));
+            if (shift_amount == 0) {
+                // USAT16 saturates the *signed* halves into the unsigned range, so a
+                // halfword of 0xFFFF (i.e. -1) saturates to 0, not to the maximum
+                // (Unicorn for `usat16 r3, #8, r5` with r5 = 0x0000FFFF gives 0).
+                const int sat = static_cast<int>(hw2 & 0xFu);
+                const int max = sat >= 16 ? 0xFFFF : (1 << sat) - 1;
+                const s32 v0 = static_cast<s16>(r[rn] & 0xFFFFu);
+                const s32 v1 = static_cast<s16>(r[rn] >> 16);
+                const u32 s0 = v0 < 0 ? 0u : static_cast<u32>(v0 > max ? max : v0);
+                const u32 s1 = v1 < 0 ? 0u : static_cast<u32>(v1 > max ? max : v1);
+                r[rd] = (s1 << 16) | s0;
+            } else {
+                const u32 sat = hw2 & 0x1Fu;
+                const int type = ((hw1 >> 5) & 1u) != 0u ? 2 : 0;
+                const u32 value = shift_imm(r[rn], type, shift_amount, false);
+                const s64 lv = static_cast<s32>(value);
+                const s32 max = sat >= 31u ? 0x7FFFFFFF : (1 << static_cast<s32>(sat)) - 1;
+                u32 res;
+                if (lv > max) res = static_cast<u32>(max);
+                else if (lv < 0) res = 0u;
+                else res = static_cast<u32>(lv);
+                r[rd] = res;
+            }
             break;
         }
         default:
@@ -3694,21 +3779,40 @@ void ArmCore::thumb32_data_processing_register() {
     const int rm = static_cast<int>(hw2 & 0xFu);
     const u32 op2 = (hw2 >> 4) & 0xFu;
 
-    // LSL/LSR/ASR/ROR (register) T2: 1111 1010 op1(4) Rn | 1111 Rd 0000 00 Rm.
-    // op1 = 0/1 LSL, 2/3 LSR, 4/5 ASR, 6/7 ROR (odd = set flags).  These share the
-    // 1111 1010 prefix with the parallel add/sub group, but only op1 <= 7 are
-    // shifts, and an AND.W Rd, Rn, Rm (1110 1010 0000 Rn ...) must NOT land here.
-    if (ra == 15 && op2 == 0u && op1 <= 7u && ((hw1 >> 8) & 0xFu) == 0xAu) {
-        const u32 shifted = shift_reg(r[rn], static_cast<int>(op1 >> 1), r[rm] & 0xFFu);
-        r[rd] = shifted;
-        if ((op1 & 1u) != 0u) set_nz(shifted);
-        write_r15(cur_instr_addr_ + 4u);
-        return;
-    }
-
-    if (((hw1 >> 8) & 0xFu) == 0xAu) {
-        parallel_add_sub32(op1, op2, rd, rn, rm);
-        write_r15(cur_instr_addr_ + 4u);
+    // Two prefixes share this decoder: 1111 1010 is data-processing (register),
+    // 1111 1011 is the multiply/divide group.  The old test looked at hw1[11:8]
+    // and sent *everything* under the 1010 prefix to the parallel add/sub helper,
+    // reading the signed/unsigned, saturating/halving and add/subtract selectors
+    // out of op1 and the operation out of op2 (the ARM, not the Thumb, layout).
+    // CLZ, REV/REV16/REVSH, SEL, QADD/QDADD/QSUB/QDSUB and every SXT*/UXT* byte
+    // and halfword form therefore ran as arbitrary parallel arithmetic.  Evidence
+    // (round 212): NSKBL computes a size class with `clz r3, r5` and got 0
+    // instead of 15, so every 64 KiB allocation failed and the kernel heap was
+    // never created.
+    if (((hw1 >> 8) & 0xFFu) == 0xFAu) {
+        // LSL/LSR/ASR/ROR (register) T2: 1111 1010 op1(4) Rn | 1111 Rd 0000 00 Rm.
+        // op1 = 0/1 LSL, 2/3 LSR, 4/5 ASR, 6/7 ROR (odd = set flags).
+        if (ra == 15 && op2 == 0u && op1 <= 7u) {
+            const u32 shifted = shift_reg(r[rn], static_cast<int>(op1 >> 1), r[rm] & 0xFFu,
+                                          (op1 & 1u) != 0u);
+            r[rd] = shifted;
+            if ((op1 & 1u) != 0u) set_nz(shifted);
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+        // SXTAH/UXTAH/SXTAB16/UXTAB16/SXTAB/UXTAB (op1 0..5, op2 10xx with the
+        // rotation in op2[1:0]); Rn == 15 is the plain SXTH/UXTB... form.
+        if (ra == 15 && op1 <= 5u && op2 >= 8u) {
+            thumb32_extend_add(op1, op2, rd, rn, rm);
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+        if (ra == 15 && op1 >= 8u) {
+            thumb32_parallel_add_sub(op1, op2, rd, rn, rm);
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+        undefined("T32 data-processing register");
         return;
     }
 
@@ -3723,8 +3827,9 @@ void ArmCore::thumb32_data_processing_register() {
             if (op2 == 1u) {
                 // MLS T1 (A7.7.45): op1 = 0000, op2 = 0001. This lived in the
                 // op1 == 1 slot, which is the halfword multiply group, so real
-                // MLS was undefined and SMULxy/SMLAxy ran as MLS.
-                r[rd] = r[rn] * r[rm] - r[ra];                   // MLS
+                // MLS was undefined and SMULxy/SMLAxy ran as MLS.  Round 226: the
+                // operands were also swapped - MLS is Ra - Rn x Rm, not Rn x Rm - Ra.
+                r[rd] = r[ra] - r[rn] * r[rm];                   // MLS
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
@@ -3755,6 +3860,12 @@ void ArmCore::thumb32_data_processing_register() {
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
+            if (op2 == 1u) {
+                // Round 225: this slot is not a defined encoding (the long multiply
+                // with an accumulate is op1 = 1100/1110, see case 0xC/0xE); keep the
+                // original behaviour of reporting rather than guessing.
+                break;
+            }
             break;
         case 0x9u:  // SDIV (op2 == 1111)
             if (op2 == 0xFu) {
@@ -3780,6 +3891,41 @@ void ArmCore::thumb32_data_processing_register() {
                 write_r15(cur_instr_addr_ + 4u);
                 return;
             }
+            if (op2 == 1u) {
+                // Round 225: not a defined encoding here either; see case 0xC/0xE.
+                break;
+            }
+            break;
+        case 0xCu:
+            // SMLAL RdLo, RdHi, Rn, Rm (A7.7.138): the signed 32x32 product added to
+            // the 64-bit value already in RdHi:RdLo.  Missing entirely until the
+            // round-224 differential sweep against Unicorn flagged it (`smlal` was
+            // reported undefined); encoding check: `smlal r3, r4, r5, r6` has
+            // hw1 = 0xFBC5, i.e. op1 = 0xC, op2 = 0.  Evidence:
+            // arm_thumb32_multiply_long_accumulate.
+            if (op2 == 0u) {
+                const s64 addend =
+                    static_cast<s64>((static_cast<u64>(r[rd]) << 32) | static_cast<u64>(r[ra]));
+                const s64 product = static_cast<s64>(static_cast<s32>(r[rn])) *
+                                    static_cast<s32>(r[rm]);
+                const u64 sum = static_cast<u64>(addend + product);
+                r[ra] = static_cast<u32>(sum);
+                r[rd] = static_cast<u32>(sum >> 32);
+                write_r15(cur_instr_addr_ + 4u);
+                return;
+            }
+            break;
+        case 0xEu:
+            // UMLAL RdLo, RdHi, Rn, Rm (A7.7.171): the unsigned counterpart
+            // (`umlal r3, r4, r5, r6` has hw1 = 0xFBE5, op1 = 0xE, op2 = 0).
+            if (op2 == 0u) {
+                const u64 sum = ((static_cast<u64>(r[rd]) << 32) | static_cast<u64>(r[ra])) +
+                                static_cast<u64>(r[rn]) * static_cast<u64>(r[rm]);
+                r[ra] = static_cast<u32>(sum);
+                r[rd] = static_cast<u32>(sum >> 32);
+                write_r15(cur_instr_addr_ + 4u);
+                return;
+            }
             break;
         case 0xBu:  // UDIV (op2 == 1111)
             if (op2 == 0xFu) {
@@ -3794,21 +3940,48 @@ void ArmCore::thumb32_data_processing_register() {
     undefined("T32 data-processing register");
 }
 
-void ArmCore::parallel_add_sub32(u32 op1, u32 op2, int rd, int rn, int rm) {
-    const bool is_unsigned = (op1 & 4u) != 0u;
-    const bool saturating = (op1 & 3u) == 2u;
-    const bool halving = (op1 & 3u) == 3u;
+// 1111 1010 <op1> Rn | 1111 Rd <op2> Rm - the family that shares the group.
+//
+// op1 selects the operation, op2 the variant:
+//   op1 0..5, op2 0       LSL/LSR/ASR/ROR (register)      - handled by the caller
+//   op1 0..5, op2 10rr    SXTAH/UXTAH/SXTAB16/UXTAB16/SXTAB/UXTAB (rr = rotation/8)
+//   op1 8..E, op2 0..6    parallel add/sub: op1 bit 2 = subtract, op1[1:0] = 8 bit /
+//                         16 bit / exchange, op2 bit 2 = unsigned, op2[1:0] = plain /
+//                         saturating / halving
+//   op2 8..F              miscellaneous: QADD group (op1 = 8), REV group (op1 = 9),
+//                         SEL (op1 = 0xA), CLZ (op1 = 0xB)
+// Every branch below was checked against a real ARMv7 core model (Unicorn) over
+// 1408 operand vectors - results, GE and Q - before being written here.
+void ArmCore::thumb32_parallel_add_sub(u32 op1, u32 op2, int rd, int rn, int rm) {
+    if (op1 < 8u) {
+        undefined("T32 parallel op1");
+        return;
+    }
+    if (op2 >= 8u) {
+        thumb32_misc_register(op1, op2, rd, rn, rm);
+        return;
+    }
+    if (op2 == 3u || op2 == 7u) {
+        undefined("T32 parallel op2");
+        return;
+    }
+    const u32 mode = op1 & 3u;                 // 0: 8 bit, 1: 16 bit, 2: exchange
+    const bool subtract = (op1 & 4u) != 0u;
+    if (mode == 3u) {
+        undefined("T32 parallel 16-bit exchange");
+        return;
+    }
+    const bool is_unsigned = op2 >= 4u;
+    const u32 kind = op2 & 3u;                 // 0 plain, 1 saturating, 2 halving
+    const bool saturating = kind == 1u;
+    const bool halving = kind == 2u;
 
     const u32 a = r[rn];
     const u32 b = r[rm];
-    u32 result;
-    const bool is8 = (op2 & 1u) != 0u;
-    const bool is_asx = op2 == 2u || op2 == 6u;
-    const bool is_sax = op2 == 3u || op2 == 7u;
-    const bool subtract = op2 >= 4u;
+    u32 result = 0;
+    u32 ge = 0;
 
-    if (is8) {
-        result = 0;
+    if (mode == 0u) {
         for (int k = 0; k < 4; ++k) {
             s32 x = static_cast<s32>((a >> (k * 8)) & 0xFFu);
             s32 y = static_cast<s32>((b >> (k * 8)) & 0xFFu);
@@ -3817,68 +3990,170 @@ void ArmCore::parallel_add_sub32(u32 op1, u32 op2, int rd, int rn, int rm) {
                 y = static_cast<s8>(y);
             }
             s32 res = subtract ? x - y : x + y;
-            if (saturating) res = arm::saturate_signed(res, 8);
-            else if (halving) res >>= 1;
+            // GE[x] uses the *precise* (pre-saturation) result: the sign of the
+            // signed byte result, the carry out of an unsigned addition, or "no
+            // borrow" for an unsigned subtraction (ARM ARM A2.5.3).
+            if (kind == 0u) {
+                const bool set = is_unsigned ? (subtract ? (res >= 0) : (res > 0xFF))
+                                             : (res >= 0);
+                if (set) ge |= 0x00010000u << k;
+            }
+            if (saturating) {
+                res = is_unsigned ? static_cast<s32>(arm::saturate_unsigned(res, 8))
+                                  : arm::saturate_signed(res, 8);
+            } else if (halving) {
+                res >>= 1;
+            }
             result |= static_cast<u32>(res & 0xFF) << (k * 8);
         }
-    } else if (is_asx || is_sax) {
-        s32 a0 = static_cast<s32>(a & 0xFFFFu);
-        s32 a1 = static_cast<s32>(a >> 16);
-        s32 b0 = static_cast<s32>(b & 0xFFFFu);
-        s32 b1 = static_cast<s32>(b >> 16);
-        if (!is_unsigned) {
-            a0 = static_cast<s16>(a0);
-            a1 = static_cast<s16>(a1);
-            b0 = static_cast<s16>(b0);
-            b1 = static_cast<s16>(b1);
-        }
-        s32 r0;
-        s32 r1;
-        if (is_asx) {
-            r0 = a0 + (subtract ? -b1 : b1);
-            r1 = a1 + (subtract ? -b0 : b0);
-        } else {
-            r0 = a0 + (subtract ? -b0 : b0);
-            r1 = a1 + (subtract ? -b1 : b1);
-        }
-        if (saturating) {
-            r0 = arm::saturate_signed(r0, 16);
-            r1 = arm::saturate_signed(r1, 16);
-        } else if (halving) {
-            r0 >>= 1;
-            r1 >>= 1;
-        }
-        result = static_cast<u32>(((r1 & 0xFFFF) << 16) | (r0 & 0xFFFF));
     } else {
-        s32 a0 = static_cast<s32>(a & 0xFFFFu);
-        s32 a1 = static_cast<s32>(a >> 16);
-        s32 b0 = static_cast<s32>(b & 0xFFFFu);
-        s32 b1 = static_cast<s32>(b >> 16);
-        if (!is_unsigned) {
-            a0 = static_cast<s16>(a0);
-            a1 = static_cast<s16>(a1);
-            b0 = static_cast<s16>(b0);
-            b1 = static_cast<s16>(b1);
+        for (int k = 0; k < 2; ++k) {
+            s32 x = static_cast<s32>((a >> (k * 16)) & 0xFFFFu);
+            s32 y = static_cast<s32>((b >> (k * 16)) & 0xFFFFu);
+            if (!is_unsigned) {
+                x = static_cast<s16>(x);
+                y = static_cast<s16>(y);
+            }
+            bool sub_here = subtract;
+            if (mode == 2u) {
+                // ASX / SAX exchange the halves: SASX is `Rn.low - Rm.high` in the
+                // low half and `Rn.high + Rm.low` in the high half, SSAX the other
+                // way round.
+                y = static_cast<s32>((b >> ((1 - k) * 16)) & 0xFFFFu);
+                if (!is_unsigned) y = static_cast<s16>(y);
+                sub_here = (k == 0) ? !subtract : subtract;
+            }
+            s32 res = sub_here ? x - y : x + y;
+            if (kind == 0u) {
+                const bool set = is_unsigned ? (sub_here ? (res >= 0) : (res > 0xFFFF))
+                                             : (res >= 0);
+                if (set) ge |= 0x00030000u << (k * 2);
+            }
+            if (saturating) {
+                res = is_unsigned ? static_cast<s32>(arm::saturate_unsigned(res, 16))
+                                  : arm::saturate_signed(res, 16);
+            } else if (halving) {
+                res >>= 1;
+            }
+            result |= static_cast<u32>(res & 0xFFFF) << (k * 16);
         }
-        s32 r0;
-        s32 r1;
-        if (subtract) {
-            r0 = a0 - b0;
-            r1 = a1 - b1;
-        } else {
-            r0 = a0 + b0;
-            r1 = a1 + b1;
-        }
-        if (saturating) {
-            r0 = arm::saturate_signed(r0, 16);
-            r1 = arm::saturate_signed(r1, 16);
-        } else if (halving) {
-            r0 >>= 1;
-            r1 >>= 1;
-        }
-        result = static_cast<u32>(((r1 & 0xFFFF) << 16) | (r0 & 0xFFFF));
     }
     r[rd] = result;
+    if (kind == 0u) cpsr = (cpsr & ~arm::kFlagGE) | ge;
+}
+
+// SXTAH/UXTAH/SXTAB16/UXTAB16/SXTAB/UXTAB (Rn != 15) and the plain SXTH/UXTH/
+// SXTB16/UXTB16/SXTB/UXTB forms (Rn == 15).  op1 selects the width and the
+// signedness, op2[1:0] the rotation of the source by 0/8/16/24 bits.
+void ArmCore::thumb32_extend_add(u32 op1, u32 op2, int rd, int rn, int rm) {
+    const int rot = static_cast<int>(op2 & 3u) * 8;
+    const u32 src = arm::rotate_right(r[rm], rot);
+    const bool is_unsigned = (op1 & 1u) != 0u;
+    u32 ext = 0;
+    switch (op1 >> 1) {
+        case 0u: {   // halfword
+            const u32 v = src & 0xFFFFu;
+            ext = is_unsigned ? v : static_cast<u32>(static_cast<s32>(static_cast<s16>(v)));
+            break;
+        }
+        case 1u: {   // two bytes to two halfwords
+            const u32 lo = src & 0xFFu;
+            const u32 hi = (src >> 16) & 0xFFu;
+            const u32 elo = is_unsigned ? lo : static_cast<u32>(static_cast<s32>(static_cast<s8>(lo)));
+            const u32 ehi = is_unsigned ? hi : static_cast<u32>(static_cast<s32>(static_cast<s8>(hi)));
+            ext = (elo & 0xFFFFu) | ((ehi & 0xFFFFu) << 16);
+            break;
+        }
+        default: {   // byte
+            const u32 v = src & 0xFFu;
+            ext = is_unsigned ? v : static_cast<u32>(static_cast<s32>(static_cast<s8>(v)));
+            break;
+        }
+    }
+    if (rn == 15) {
+        r[rd] = ext;
+    } else if ((op1 >> 1) == 1u) {
+        // SXTAB16/UXTAB16 add the two extended bytes into the two halfwords.
+        const u32 lo = ((r[rn] & 0xFFFFu) + (ext & 0xFFFFu)) & 0xFFFFu;
+        const u32 hi = ((r[rn] >> 16) + (ext >> 16)) & 0xFFFFu;
+        r[rd] = lo | (hi << 16);
+    } else {
+        r[rd] = r[rn] + ext;
+    }
+}
+
+// QADD/QDADD/QSUB/QDSUB (op1 == 8), REV/REV16/REVSH (op1 == 9), SEL (op1 == 0xA)
+// and CLZ (op1 == 0xB).  The assembly syntax of the Q* forms is `QADD Rd, Rm, Rn`
+// (the doubled operand of QDADD/QDSUB is Rn, and the subtraction is Rm - Rn),
+// which is why the roles look swapped in the code below.
+void ArmCore::thumb32_misc_register(u32 op1, u32 op2, int rd, int rn, int rm) {
+    switch (op1) {
+        case 0x8u: {   // QADD / QDADD / QSUB / QDSUB
+            if (op2 < 8u || op2 > 0xBu) {
+                undefined("T32 QADD group");
+                return;
+            }
+            s64 rn64 = static_cast<s32>(r[rn]);
+            const s64 rm64 = static_cast<s32>(r[rm]);
+            bool q = false;
+            if (op2 == 9u || op2 == 0xBu) {
+                const s64 doubled = rn64 * 2;
+                if (doubled > 0x7FFFFFFFll || doubled < -0x80000000ll) q = true;
+                rn64 = doubled > 0x7FFFFFFFll ? 0x7FFFFFFFll
+                                              : (doubled < -0x80000000ll ? -0x80000000ll : doubled);
+            }
+            s64 sum = (op2 == 8u || op2 == 9u) ? rm64 + rn64 : rm64 - rn64;
+            if (sum > 0x7FFFFFFFll || sum < -0x80000000ll) {
+                q = true;
+                sum = sum > 0x7FFFFFFFll ? 0x7FFFFFFFll : -0x80000000ll;
+            }
+            r[rd] = static_cast<u32>(static_cast<s32>(sum));
+            if (q) cpsr |= arm::kFlagQ;
+            return;
+        }
+        case 0x9u: {   // REV / REV16 / REVSH / RBIT
+            const u32 v = r[rm];
+            if (op2 == 8u) {
+                r[rd] = arm::reverse_bytes(v);
+            } else if (op2 == 9u) {
+                r[rd] = ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);
+            } else if (op2 == 0xAu) {
+                // RBIT reverses the bit order.  The KBL itself executes one of
+                // these (0x4002F15C, `rbit r2, r7`), so it cannot be left as an
+                // undefined instruction.
+                u32 out = 0;
+                for (u32 b = 0; b < 32u; ++b) {
+                    out = (out << 1) | ((v >> b) & 1u);
+                }
+                r[rd] = out;
+            } else if (op2 == 0xBu) {
+                const u32 swapped = ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu);
+                r[rd] = static_cast<u32>(static_cast<s32>(static_cast<s16>(swapped)));
+            } else {
+                undefined("T32 REV group");
+            }
+            return;
+        }
+        case 0xAu: {   // SEL
+            if (op2 != 8u) {
+                undefined("T32 SEL");
+                return;
+            }
+            r[rd] = select_bytes(r[rm], r[rn], cpsr);
+            return;
+        }
+        case 0xBu: {   // CLZ
+            if (op2 != 8u) {
+                undefined("T32 CLZ");
+                return;
+            }
+            r[rd] = arm::count_leading_zeros(r[rm]);
+            return;
+        }
+        default:
+            undefined("T32 data-processing misc");
+            return;
+    }
 }
 
 void ArmCore::thumb32_load_store_dual_excl_table() {
@@ -3950,7 +4225,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         if (!l) {
             const int rd = static_cast<int>((hw2 >> 8) & 0xFu);
             u32 status = 1u;
-            if (bus->take_exclusive(read_reg(rn), 4u, static_cast<int>(core_id_), mmu.context_idr)) {
+            if (bus->take_exclusive(exclusive_phys(read_reg(rn)), 4u, static_cast<int>(core_id_), mmu.context_idr)) {
                 mem_write_word(read_reg(rn), r[rt]);
                 if (pending_fault_ != arm::FaultKind::None) return;
                 status = 0u;
@@ -3963,7 +4238,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         const u32 address = read_reg(rn) + imm;
         const u32 value = mem_read_word(address, false);
         if (pending_fault_ != arm::FaultKind::None) return;
-        bus->mark_exclusive(address, 4u, static_cast<int>(core_id_), mmu.context_idr);
+        bus->mark_exclusive(exclusive_phys(address), 4u, static_cast<int>(core_id_), mmu.context_idr);
         exclusive_valid_ = true;
         exclusive_addr_ = address;
         exclusive_id_ = mmu.context_idr;
@@ -3979,7 +4254,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         if (!load) {
             const int rd = static_cast<int>(hw2 & 0xFu);
             u32 status = 1u;
-            if (bus->take_exclusive(address, 2u, static_cast<int>(core_id_), mmu.context_idr)) {
+            if (bus->take_exclusive(exclusive_phys(address), 2u, static_cast<int>(core_id_), mmu.context_idr)) {
                 mem_write_half(address, r[rt] & 0xFFFFu);
                 if (pending_fault_ != arm::FaultKind::None) return;
                 status = 0u;
@@ -3989,7 +4264,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         } else {
             const u32 value = mem_read_half(address);
             if (pending_fault_ != arm::FaultKind::None) return;
-            bus->mark_exclusive(address, 2u, static_cast<int>(core_id_), mmu.context_idr);
+            bus->mark_exclusive(exclusive_phys(address), 2u, static_cast<int>(core_id_), mmu.context_idr);
             exclusive_valid_ = true;
             exclusive_addr_ = address;
             exclusive_id_ = mmu.context_idr;
@@ -4037,7 +4312,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         if (!load) {
             const int rd = static_cast<int>(hw2 & 0xFu);
             u32 status = 1u;
-            if (bus->take_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr)) {
+            if (bus->take_exclusive(exclusive_phys(address), width, static_cast<int>(core_id_), mmu.context_idr)) {
                 if (half) mem_write_half(address, r[rt] & 0xFFFFu);
                 else mem_write_byte(address, r[rt] & 0xFFu);
                 if (pending_fault_ != arm::FaultKind::None) return;
@@ -4048,7 +4323,7 @@ void ArmCore::thumb32_load_store_dual_excl_table() {
         } else {
             const u32 value = half ? mem_read_half(address) : mem_read_byte(address);
             if (pending_fault_ != arm::FaultKind::None) return;
-            bus->mark_exclusive(address, width, static_cast<int>(core_id_), mmu.context_idr);
+            bus->mark_exclusive(exclusive_phys(address), width, static_cast<int>(core_id_), mmu.context_idr);
             exclusive_valid_ = true;
             exclusive_addr_ = address;
             exclusive_id_ = mmu.context_idr;

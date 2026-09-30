@@ -2229,6 +2229,69 @@ void t32_branch_misc(DState& s, u32 addr, u32 instr) {
     s.hex(((addr + 4u) & ~3u) + static_cast<u32>(offx));
 }
 
+// 1111 1010 <op1> Rn | 1111 Rd <op2> Rm with op1 >= 8: the parallel add/sub
+// group (op2 <= 6) and the miscellaneous group (op2 >= 8).
+void t32_dp_register_misc(DState& s, u32 instr, u32 op1, u32 op2, int rd, int rn, int rm) {
+    auto word = [&]() {
+        char tmp[16];
+        std::snprintf(tmp, sizeof(tmp), "%08X", instr);
+        s.s(".word 0x");
+        s.s(tmp);
+    };
+    if (op2 >= 8u) {
+        switch (op1) {
+            case 0x8u:
+                if (op2 <= 0xBu) {
+                    static const char* n[4] = {"qadd", "qdadd", "qsub", "qdsub"};
+                    s.s(n[op2 - 8u]); s.c(' ');
+                    s.reg(rd); s.s(", "); s.reg(rm); s.s(", "); s.reg(rn);
+                    return;
+                }
+                break;
+            case 0x9u:
+                if (op2 == 8u || op2 == 9u || op2 == 0xAu || op2 == 0xBu) {
+                    s.s(op2 == 8u ? "rev.w "
+                                  : (op2 == 9u ? "rev16.w "
+                                               : (op2 == 0xAu ? "rbit " : "revsh.w ")));
+                    s.reg(rd); s.s(", "); s.reg(rm);
+                    return;
+                }
+                break;
+            case 0xAu:
+                if (op2 == 8u) {
+                    s.s("sel "); s.reg(rd); s.s(", "); s.reg(rn); s.s(", "); s.reg(rm);
+                    return;
+                }
+                break;
+            case 0xBu:
+                if (op2 == 8u) {
+                    s.s("clz "); s.reg(rd); s.s(", "); s.reg(rm);
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        word();
+        return;
+    }
+    if (op2 == 3u || op2 == 7u || (op1 & 3u) == 3u) {
+        word();
+        return;
+    }
+    const u32 mode = op1 & 3u;                  // 0: 8 bit, 1: 16 bit, 2: exchange
+    const bool subtract = (op1 & 4u) != 0u;
+    const bool uns = op2 >= 4u;
+    const u32 kind = op2 & 3u;                  // 0 plain, 1 saturating, 2 halving
+    const char* prefix = kind == 0u ? (uns ? "u" : "s")
+                                    : (kind == 1u ? (uns ? "uq" : "q") : (uns ? "uh" : "sh"));
+    const char* base = mode == 0u ? (subtract ? "sub8" : "add8")
+                                  : (mode == 1u ? (subtract ? "sub16" : "add16")
+                                                : (subtract ? "sax" : "asx"));
+    s.s(prefix); s.s(base); s.c(' ');
+    s.reg(rd); s.s(", "); s.reg(rn); s.s(", "); s.reg(rm);
+}
+
 void t32_multiply(DState& s, u32 instr) {
     const u32 hw1 = (instr >> 16) & 0xFFFFu;
     const u32 hw2 = instr & 0xFFFFu;
@@ -2239,17 +2302,34 @@ void t32_multiply(DState& s, u32 instr) {
     const int rm = static_cast<int>(hw2 & 0xFu);
     const u32 op2 = (hw2 >> 4) & 0xFu;
 
-    if (((hw1 >> 8) & 0xFu) == 0xAu) {
-        static const char* names[6] = {"add16", "asx", "sax", "sub16", "add8", "sub8"};
-        const char* base = names[(op2 >> 1) & 7u];
-        if (op1 >= 4u) s.s("u");
-        else if ((op1 & 3u) == 2u) s.s("q");
-        else if ((op1 & 3u) == 3u) s.s("sh");
-        else s.s("s");
-        s.s(base);
-        s.c(' ');
-        s.reg(rd); s.s(", "); s.reg(rn); s.s(", "); s.reg(rm);
-        return;
+    // 1111 1010 ... is data-processing (register), not one of the multiplies;
+    // see ArmCore::thumb32_data_processing_register for the table.  The old code
+    // named every one of them after a parallel add/sub, so CLZ, REV, SEL and the
+    // SXT*/UXT* forms all disassembled as `uadd8`/`sadd16`/... .
+    if ((hw1 & 0xFF00u) == 0xFA00u) {
+        if (ra == 15 && op2 == 0u && op1 <= 7u) {
+            static const char* names[4] = {"lsl", "lsr", "asr", "ror"};
+            s.s(names[op1 >> 1]);
+            s.s((op1 & 1u) != 0u ? "s.w " : ".w ");
+            s.reg(rd); s.s(", "); s.reg(rn); s.s(", "); s.reg(rm);
+            return;
+        }
+        if (ra == 15 && op1 <= 5u && op2 >= 8u) {
+            static const char* names[6] = {"sxtah", "uxtah", "sxtab16", "uxtab16", "sxtab", "uxtab"};
+            static const char* short_names[6] = {"sxth", "uxth", "sxtb16", "uxtb16", "sxtb", "uxtb"};
+            s.s(rn == 15 ? short_names[op1] : names[op1]);
+            s.c(' ');
+            s.reg(rd); s.s(", ");
+            if (rn != 15) { s.reg(rn); s.s(", "); }
+            s.reg(rm);
+            const u32 rot = (op2 & 3u) * 8u;
+            if (rot != 0u) { s.s(", ror #"); s.u(rot); }
+            return;
+        }
+        if (ra == 15 && op1 >= 8u) {
+            t32_dp_register_misc(s, instr, op1, op2, rd, rn, rm);
+            return;
+        }
     }
 
     if (op1 == 0u && op2 == 0u) {

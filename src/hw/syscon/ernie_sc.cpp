@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "common/log.h"
 #include "common/util.h"
 #include "hw/syscon.h"
 #include "hw/syscon/ernie_internal.h"
@@ -432,6 +433,26 @@ void ScMessageWindow::write(u32 address, unsigned size, u64 value) {
         if (index < bytes_.size()) bytes_[index] = static_cast<u8>((value >> (8 * i)) & 0xFF);
     }
     if (!response_) dirty_ = true;
+    // Round 245: byte 0x2F bit 0 is the command window's start bit.  On hardware the
+    // block clears it once the descriptor has been handed to the syscon, and the poster
+    // polls exactly that bit (NSKBL: byte write 1 then a poll at pc 0x5101D788..0x5101D790,
+    // after reaching stage 0xA9).  Dispatch the descriptor and clear the bit so the poll
+    // completes, instead of leaving it set forever.
+    if (!response_ && bytes_.size() > 0x2Fu && (bytes_[0x2F] & 0x01u) != 0u) {
+        bytes_[0x2F] = static_cast<u8>(bytes_[0x2F] & ~0x01u);
+        if (command_posted_) command_posted_(bytes_.data(), bytes_.size());
+    }
+    // Round 248: only a write *to the two data ports* means "the poster consumed the
+    // reply" - the earlier version checked the ports after every write, so the trigger
+    // write itself (offset 0x2F, with an empty reply and therefore zero ports) cleared
+    // the "reply available" bit in the same call that had just set it, and the guest
+    // never saw bit 17 (measured: pc 0x5101D7C6 is reached zero times).
+    const bool touches_data_ports = offset <= 0x33u && offset + size > 0x30u;
+    if (!response_ && bytes_.size() >= 0x34u && touches_data_ports) {
+        const u16 data0 = static_cast<u16>(bytes_[0x30] | (bytes_[0x31] << 8));
+        const u16 data1 = static_cast<u16>(bytes_[0x32] | (bytes_[0x33] << 8));
+        if (data0 == 0u && data1 == 0u) bytes_[0x26] = static_cast<u8>(bytes_[0x26] & ~0x02u);
+    }
 }
 
 void ScMessageWindow::reset() {
