@@ -743,6 +743,34 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         previous_pc = last_arm_pc_[core];
         last_arm_pc_[core] = pc;
     }
+    // Diagnostic (ZLB_NSKBL_ERR_TRAP=1): find the real builder of an error code by
+    // watching the register file instead of trusting a stale address registry.  The
+    // first instruction that puts 0x80320002 into a general register names the site
+    // that builds it (docs/NSKBL.md round 392): the round-387 registry no longer
+    // matches this configuration - its 0x510207E2 site is never executed.
+    static const bool err_trap = [] {
+        const char* on = std::getenv("ZLB_NSKBL_ERR_TRAP");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (err_trap && nskbl_err_trap_ < 8u && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            constexpr u32 kWant = 0x80320002u;
+            int hit = -1;
+            for (int i = 0; i < 13; ++i) {
+                if (arm->r[i] == kWant) { hit = i; break; }
+            }
+            if (hit < 0 && static_cast<u32>(arm->r[14]) == kWant) hit = 14;
+            if (hit >= 0) {
+                ++nskbl_err_trap_;
+                ZLB_LOG_INFO("machine",
+                             "nskbl err trap #%u: pc=0x%08X produced 0x%08X in r%d lr=0x%08X "
+                             "sp=0x%08X r0=0x%08X r7=0x%08X",
+                             nskbl_err_trap_, pc, kWant, hit, static_cast<u32>(arm->r[14]),
+                             static_cast<u32>(arm->r[13]), static_cast<u32>(arm->r[0]),
+                             static_cast<u32>(arm->r[7]));
+            }
+        }
+    }
     // Diagnostic (ZLB_NSKBL_POLL_LOG=1): the NSKBL poll loop (0x510207CA) reads the
     // completion word from the node it submitted, `r9 = [r8+0x10]`, and treats a
     // *negative* value as done - anything else retries until the 64 tries run out and
