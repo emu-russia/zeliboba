@@ -2,7 +2,8 @@
 
 Документ описывает, что именно эмулируется, на основании чего это установлено и
 где кончаются факты и начинаются модельные допущения. Текущее состояние и метрики
-— `docs/STATUS.md`; подробности по звеньям — `docs/KBL.md` (ARM-загрузчик
+— `docs/STATUS.md`; подробности по звеньям — `docs/FIRST_LOADER.md` (CMeP
+first_loader по шагам, с листингами и измерениями), `docs/KBL.md` (ARM-загрузчик
 `kernel_boot_loader`), `docs/NSKBL.md` (небезопасный загрузчик ядра), `docs/SYSCON.md`
 (Ernie/RL78).
 
@@ -11,7 +12,7 @@
 | Артефакт | Что это | Как используется |
 |---|---|---|
 | `dumps/vita_prototype_bootrom.bin` | first_loader CMeP (DEM, 16 КиБ, база `0x5C000`) | исполняется как есть |
-| `dumps/pch-5c-cold_first_loader.bin` | retail-снимок first_loader | второй набор для проверки (retail-сборка отвергает наш образ на валидации заголовка) |
+| `dumps/pch-5c-cold_first_loader.bin` | retail-снимок first_loader | второй набор для проверки: заголовок он принимает, но останавливается позже — на RSA, потому что dev-ключ собран под ROM-константы прототипа (`docs/FIRST_LOADER.md` §17) |
 | `dumps/bootrom_analysis/` | разбор first_loader | карта регистров и логика |
 | `ernie-master/USS-1001.bin` | прошивка syscon (RL78, 1 МиБ, reset `0xE000`) | исполняется как есть |
 | `Vita_104_Firmware/PSP2UPDAT104.PUP` | пакет обновления 1.04 | источник разделов |
@@ -77,8 +78,11 @@ main    (0x5C4FE) init_emmc_keyrings -> check_boot_mode -> выбор пути
    отказ: *(0xE0000000) = 2 и вечный цикл
 ```
 
-В измеренном прогоне boot mode = `0x41` (`'A'`), то есть образ приходит от ARM
-через mailbox.
+В измеренном прогоне гость вычисляет boot mode = `0x21` (`'!'`): `StrapDevice`
+отдаёт `0xE0062020` с битом 0 сброшенным. Поле модели `CmepBlock::boot_mode_`
+(`0x41`) — другое значение и в отчётах печатается именно оно; оба режима содержат
+`bit0`, поэтому образ приходит от ARM через mailbox (подробности — `docs/FIRST_LOADER.md`
+§3 и §16).
 
 ### 3.1 Проверка заголовка (`validate_header`, `0x5C61C`)
 

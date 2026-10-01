@@ -7,6 +7,7 @@
 Карта документации:
 
 * `docs/BOOT.md` — цепочка загрузки 1.04 по шагам: что подтверждено, что модель;
+* `docs/FIRST_LOADER.md` — CMeP first_loader по шагам с листингами и измерениями;
 * `docs/KBL.md` — справочник по ARM-загрузчику `kernel_boot_loader`;
 * `docs/NSKBL.md` — справочник по небезопасному загрузчику ядра (NSKBL);
 * `docs/SYSCON.md` — Ernie (RL78): SFR, SC/SPI, DRAM, JIG;
