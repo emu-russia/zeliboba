@@ -203,7 +203,8 @@ pc), `ZLB_SKBL_ORDER_LOG=1` (порядок событий SKBL: входы `0x4
 барьера: без флага — 23 правки и `0xA9`, с 12 — `0xA4`, с 1 — `0x49`; `docs/KBL.md`
 7.1.13), `ZLB_ARM_CORE_STAGGER=<n>` (удерживает ядро `i` на `i*n` инструкций —
 проверка гипотезы о разбеге ядер: без флага `0x8D`, с разбегом `0x84`, `docs/KBL.md`
-7.1.21),
+7.1.21), `ZLB_ARM_BUDGET=<n>` (блочное планирование: ядру даётся `n` инструкций подряд;
+в честном режиме `0x8D` при `n=1` и `0x54` при `n=4/16`, `docs/KBL.md` 7.1.23),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
