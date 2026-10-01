@@ -648,6 +648,11 @@ private:
     /// PERIPHCLK ticks left before Transfer Complete is reported after the last
     /// data byte was consumed.
     u32 transfer_complete_in_ = 0;
+    /// Set when a command was deliberately left unanswered (CMD5 on an eMMC, CMD8
+    /// without the check pattern).  Such a command must not raise an error interrupt:
+    /// reporting it as a command failure put error-status bit 0 into the request
+    /// status and NSKBL read that as 0x80320002 (docs/NSKBL.md round 403).
+    bool command_no_response_ = false;
     /// PERIPHCLK ticks left before a *failed* command reports its error interrupt
     /// status.  On hardware the error (e.g. a command timeout) arrives after the
     /// driver has posted the request it belongs to; raising it synchronously inside

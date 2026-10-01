@@ -476,6 +476,7 @@ void Sdif::execute_command() {
     if (block_size == 0) blocks = 0;
 
     command_ok_ = true;
+    command_no_response_ = false;
     response_.fill(0);
     last_lba_ = current_lba();
     last_count_ = blocks;
@@ -529,6 +530,7 @@ void Sdif::execute_command() {
             // failed with 0x80320017.  The card behind this controller is an eMMC,
             // i.e. not SDIO, so it must not answer.
             command_ok_ = false;
+            command_no_response_ = true;
             break;
         }
         case 2: {  // ALL_SEND_CID
@@ -595,6 +597,7 @@ void Sdif::execute_command() {
                 }();
                 if (cmd8_no_response && (argument & 0xF00u) == 0u) {
                     command_ok_ = false;
+                    command_no_response_ = true;
                     break;
                 }
                 respond_short(argument);   // R7: echo the check pattern
@@ -746,7 +749,7 @@ void Sdif::execute_command() {
     }
     if (command_ok_) {
         poke(kNormalIntStatus, peek(kNormalIntStatus) | status);
-    } else {
+    } else if (!command_no_response_) {
         // Defer the error the way the data phase is deferred: on hardware the
         // interrupt arrives after the driver has posted the request it belongs to,
         // and the driver's completion path (0x5101EBE4) only maps the error status
@@ -756,6 +759,11 @@ void Sdif::execute_command() {
             return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8u;
         }();
     }
+    // A deliberate "do not answer this command" (CMD5 on an eMMC, CMD8 without the
+    // check pattern) is NOT a command failure.  Reporting it as one raised error-status
+    // bit 0, which NSKBL's completion path maps to 0x80320002 and stores in the request
+    // status, so the driver's serve loop never saw the request as finished
+    // (docs/NSKBL.md round 403).  Such a command now stays silent instead.
     // The model executes a command synchronously, so the command inhibit bits
     // have to clear immediately: the CMeP second loader polls Present State bit 0
     // between command issues (0x477E8) and a fixed inhibit window longer than its
