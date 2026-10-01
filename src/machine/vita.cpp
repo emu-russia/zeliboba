@@ -462,6 +462,7 @@ bool Vita::attach_emmc(const std::string& path) {
     }
     ZLB_LOG_INFO("machine", "eMMC attached: %s (%s)", full.c_str(), human_size(emmc_->capacity_bytes()).c_str());
     add_milestone("eMMC image attached: " + human_size(emmc_->capacity_bytes()));
+    apply_os0_elf_form();
     return true;
 }
 
@@ -469,6 +470,43 @@ bool Vita::rebuild_emmc_if_missing() {
     std::string full = resolve_workspace_path(config_.emmc_image);
     if (file_exists(full)) return true;
     return attach_emmc(config_.emmc_image);
+}
+
+// Substitution (round 396): put the ELF form of os0's modules on the card.
+//
+// Measured in rounds 394/395: the workspace holds the os0 modules only in their *decrypted*
+// form - `fs/os0/psp2bootconfig.skprx` starts with 53 43 45 00 ("SCE\0") - while NSKBL's
+// format validator (0x5101A4B0) accepts only 7F 45 4C 46 ("\x7FELF") and returns 0 for
+// "SCE\0" (the both-movs `iteq` at 0x5101A4D2-0x5101A4D6).  The same extraction provides the
+// ELF form in `fs_dec/os0/<name>.elf`, so write it into the file's clusters, keyed on the
+// layout measured from the volume: psp2bootconfig.skprx ("PSP2BO~1") sits at cluster 903,
+// i.e. LBA 72816, in a volume whose data area starts at LBA 65608 with 8 sectors/cluster.
+// Gated by ZLB_OS0_ELF=1; by default the card is untouched.
+void Vita::apply_os0_elf_form() {
+    static const bool enabled = [] {
+        const char* on = std::getenv("ZLB_OS0_ELF");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (!enabled || !emmc_) return;
+    constexpr u64 kFileLba = 72816u;      // cluster 903 of the os0 volume
+    constexpr u64 kFileBlocks = 11u;      // 5330 bytes in the directory entry (rounded up)
+    const std::string elf_path =
+        resolve_workspace_path("Vita_104_Firmware/Out/fs_dec/os0/psp2bootconfig.elf");
+    auto elf = read_file(elf_path);
+    if (!elf || elf->empty()) {
+        ZLB_LOG_WARN("machine", "os0 ELF form not found: %s (ZLB_OS0_ELF=1 ignored)", elf_path.c_str());
+        return;
+    }
+    std::vector<u8> blocks(static_cast<size_t>(kFileBlocks) * 512u, 0u);
+    std::memcpy(blocks.data(), elf->data(), std::min<size_t>(elf->size(), blocks.size()));
+    if (emmc_->write_blocks(EmmcPartition::User, kFileLba, static_cast<u32>(kFileBlocks), blocks.data())) {
+        ZLB_LOG_INFO("machine",
+                     "os0 ELF form written to the card: %s -> LBA %llu (%zu bytes in %llu blocks, "
+                     "ZLB_OS0_ELF=1, development substitution)",
+                     path_filename(elf_path).c_str(), static_cast<unsigned long long>(kFileLba),
+                     elf->size(), static_cast<unsigned long long>(kFileBlocks));
+        add_milestone("os0 ELF form written to the eMMC card (development substitution)");
+    }
 }
 
 bool Vita::fit_parts() {

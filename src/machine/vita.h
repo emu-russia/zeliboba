@@ -252,6 +252,10 @@ public:
     bool attach_emmc(const std::string& path);
     /// Build the eMMC image from the extracted firmware when it is missing.
     bool rebuild_emmc_if_missing();
+    /// Substitution (round 396): write the ELF form of the os0 modules onto the card, because
+    /// the workspace only holds their decrypted "SCE\0" form while NSKBL validates "\x7FELF"
+    /// (gated by ZLB_OS0_ELF=1, see docs/NSKBL.md rounds 394/395).
+    void apply_os0_elf_form();
 
     // ------------------------------------------------------------------
     // Diagnostics

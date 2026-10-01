@@ -1,4 +1,4 @@
-// zeliboba - boot chain orchestration.
+﻿// zeliboba - boot chain orchestration.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -340,7 +340,7 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
                      core, va, fetch ? "fetch" : (write ? "write" : "read"),
                      arm != nullptr ? arm->get_pc() : 0u, static_cast<u32>(lr),
                      fetch ? "prefetch" : "data", fault_trace_hits_);
-        // A fetch fault on a garbage address usually means a `pop {…,pc}` took a
+        // A fetch fault on a garbage address usually means a `pop {вЂ¦,pc}` took a
         // corrupted return address off the stack, so dump the frame too: the slot
         // that must be watched is the word just below SP (the pop has already
         // updated SP when the fetch faults).
@@ -703,7 +703,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 length = static_cast<u32>(arm->r[1]);
             std::string bytes;
             std::string text;
-            for (u32 i = 0; i < 24u && i < length; ++i) {
+            for (u32 i = 0; i < 32u && i < length; ++i) {
                 const arm::MmResult r = arm->translate_or_fix(buffer + i, false, false);
                 const u8 value = r.ok ? arm_bus_->read8(r.phys_addr) : 0u;
                 bytes += format(" %02X", value);
@@ -1679,7 +1679,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
 
     // Substitution (round 180): NSKBL's general allocator 0x5100D400 asks the heap
     // resolver 0x5100567C for a block, which reads the heap object from the map
-    // (`[[0x5113B5AC] + 0x8C]`) and searches a free block in it (0x510049F4 → 0x5100B82C).
+    // (`[[0x5113B5AC] + 0x8C]`) and searches a free block in it (0x510049F4 в†’ 0x5100B82C).
     // In the model that field is zero - and a write trap over the whole run shows it is
     // only ever written with zero (the page wipe at 0x5101354C and the map init at
     // 0x510064D6), so nothing creates the heap.  The failure then aborts NSKBL's class
@@ -2779,7 +2779,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // Same diagnostic (round 110) for the KBL's "fatal code" stubs: the block around
     // 0x40021998 is a table of them
     //     0x40021998  push {r3,lr} / movs r0,#0x8A / bl 0x40036998 / b .
-    //     0x400219A4  … r0 = 0x8B …, 0x400219B8 … r0 = 0x8C …
+    //     0x400219A4  вЂ¦ r0 = 0x8B вЂ¦, 0x400219B8 вЂ¦ r0 = 0x8C вЂ¦
     // and every one of them ends in `b .`, so the pc alone says nothing about which
     // check failed.  The previous pc is the branch that entered the stub - i.e. the
     // failing test.  ZLB_KBL_PANIC_TRACE=1 enables it.
@@ -2848,7 +2848,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     //      40034A18  bne.w 0x4003596E         ; -> the panic stub
     // and the heap object the loader builds for itself (VA 0x400C1000) never gets
     // +0x24 written: a write trap over 0x400C1000-0x400C1040 lists every store its
-    // constructor makes (+8, +0xC, +0xE, +0x10, +0x14 = 0xFFFFFFFF, +0x20, +0x28 …
+    // constructor makes (+8, +0xC, +0xE, +0x10, +0x14 = 0xFFFFFFFF, +0x20, +0x28 вЂ¦
     // +0x3C) and +0x24 is not among them, so the field stays 0 and the second
     // validation (the first one runs before the cookie exists, when both sides are
     // 0) fails.  Stand in for whatever is supposed to leave that stamp: when the
@@ -2862,7 +2862,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 u64 heap = 0;
                 if (arm->get_register("r0", heap)) {
                     // Round 135: route a garbage heap pointer (measured 0x4B656353 =
-                    // the first word of the string "SceKernel…" read little-endian, a
+                    // the first word of the string "SceKernelвЂ¦" read little-endian, a
                     // never-initialised [pool] word) to the real created heap 0x5900,
                     // and zero its cookie so the 0x40034A16 comparison against the
                     // (still zero) global cookie 0x400B2974 passes.
@@ -3007,7 +3007,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     //     (0x00010001 means "class empty", as the loader itself initialises it);
     //   * the page-table entry at [pool+0x20] + n*4 with state 0x20000000, the class
     //     in bits 20..24 and the size in 4 KiB units (states 0x10000000/0x20000000
-    //     are the two the carve path accepts, docs/KBL.md §95.1).
+    //     are the two the carve path accepts, docs/KBL.md В§95.1).
     // ZLB_NO_SUBSTITUTION=1 disables it; ZLB_KBL_CARVE_STATE=<hex> overrides the state.
     constexpr u32 kCarvePathEntryPc = 0x40032366u;
     static const bool carry_supply = [] {
