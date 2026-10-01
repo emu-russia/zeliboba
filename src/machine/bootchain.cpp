@@ -4279,8 +4279,14 @@ bool Vita::start_arm_kernel_boot_loader() {
     // (ZLB_NO_SUBSTITUTION=1): the honest run read 0 at VA 0x1C4 on 0x40020290 and
     // proceeded on a record that was never there, while the substituted run read
     // the wakeup factor 0x0000FF14 (docs/KBL.md 7.1.31/7.1.32).
-    const bool kbl_param_from_loader = substitutions_enabled_static();
-    const bool kbl_param_built_early = !kbl_param_from_loader;
+    // The record has to reach the ARM the same way in both modes: the substituted run
+    // used to skip the builder entirely (its second loader is expected to write the
+    // record itself, but it stops at checkpoint 0x49 and the record stays the model's
+    // zero-filled one), while the fallback run built it.  Measured consequence: the
+    // ARM read 0 at VA 0x1C4 on 0x40020290 in the substituted run and 0xFF14 in the
+    // honest one, which made the two runs' first divergence a construction artefact
+    // rather than a hardware difference (docs/KBL.md 7.1.31-7.1.35).
+    const bool kbl_param_built_early = true;
     if (kbl_param_built_early) build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
@@ -4292,23 +4298,9 @@ bool Vita::start_arm_kernel_boot_loader() {
     // The record the ARM reads through that alias has to be laid down after the
     // mirror, not before it (see the note above): in the fallback run the mirror
     // used to overwrite it with the (empty) CMeP scratch.
-    if (kbl_param_built_early) {
-        build_kbl_param();
-        // Diagnostic (ZLB_KBL_PARAM_LOG=1): read the record back through the alias the
-        // ARM reads it from (PA 0x1C0 = SPAD32K + 0xC0) right after the build, to tell
-        // "the builder did not write" apart from "something zeroed it afterwards"
-        // (docs/KBL.md 7.1.32).
-        static const bool param_log = [] {
-            const char* value = std::getenv("ZLB_KBL_PARAM_LOG");
-            return value != nullptr && value[0] != '0';
-        }();
-        if (param_log) {
-            ZLB_LOG_INFO("machine",
-                         "kbl param after mirror: PA 0x1C0=0x%08X PA 0x1C4=0x%08X "
-                         "(expected 0x00000060 / 0x0000FF14)",
-                         arm_bus_->read32(0x1C0u), arm_bus_->read32(0x1C4u));
-        }
-    }
+    // The record is already there from the pre-mirror build; the post-mirror rebuild is
+    // only needed when the mirror could have replaced it with the CMeP scratch.
+    if (!kbl_param_built_early) build_kbl_param();
 
     // The syscon releases the whole Kermit cluster, not just the boot core: the
     // kernel boot loader brings the other three cores up itself (each reads MPIDR,

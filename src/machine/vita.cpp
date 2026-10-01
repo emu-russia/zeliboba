@@ -1039,6 +1039,24 @@ void Vita::run_slice() {
     }
 
     if (kermit_) kermit_->tick(static_cast<u64>(budget_.arm));
+    // Diagnostic (ZLB_KBL_PARAM_LOG=1): follow the ARM-visible copy of the KBL record
+    // (PA 0x1C0/0x1C4 in the SPAD32K window) across the run.  The debugger's `mem`
+    // reads the same bus, so a mismatch here means the word really is overwritten
+    // after the builder, not that two views disagree (docs/KBL.md 7.1.34).
+    static const bool param_log = [] {
+        const char* value = std::getenv("ZLB_KBL_PARAM_LOG");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (param_log && arm_bus_ != nullptr) {
+        static u64 last_slice = ~0ull;
+        const u64 slice = boot_.steps_in_stage;
+        if (last_slice == ~0ull || slice >= last_slice + 2048u) {
+            last_slice = slice;
+            ZLB_LOG_INFO("machine", "kbl param follow: slice=%llu PA 0x1C0=0x%08X PA 0x1C4=0x%08X",
+                         static_cast<unsigned long long>(slice), arm_bus_->read32(0x1C0u),
+                         arm_bus_->read32(0x1C4u));
+        }
+    }
     if (ernie_) {
         // The syscon's clock/RTC model counts RL78 core cycles: the firmware's
         // start-up blocks on the X1 stabilisation status (OSTC == 0xC0), so the
