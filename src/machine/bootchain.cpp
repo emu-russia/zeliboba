@@ -736,8 +736,25 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (order_log && core < static_cast<u32>(kArmCoreCount)) {
         static u32 order_events = 0;
         static u32 enter_events = 0;
+        static u32 order_29f34 = 0;
         static u32 line_events = 0;
         ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+        if (pc == 0x40029F34u && order_29f34 < 4u) {
+            ++order_29f34;
+            ZLB_LOG_INFO("machine",
+                         "skbl 29F34 #%u: r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X "
+                         "r5=0x%08X r6=0x%08X r7=0x%08X lr=0x%08X sp=0x%08X",
+                         order_29f34, o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[1]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[2]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[3]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[4]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[5]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[6]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[7]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u);
+        }
         if (pc == 0x40030D1Cu && line_events < 8u) {
             ++line_events;
             ZLB_LOG_INFO("machine",
