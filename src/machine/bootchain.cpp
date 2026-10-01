@@ -1,4 +1,4 @@
-﻿// zeliboba - boot chain orchestration.
+// zeliboba - boot chain orchestration.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -697,8 +697,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         const char* on = std::getenv("ZLB_NSKBL_VALIDATOR_LOG");
         return on != nullptr && on[0] != '0';
     }();
-    if (validator_log && pc == 0x5101A4B0u && core < static_cast<u32>(kArmCoreCount)) {
-        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+    if (validator_log && pc == 0x5101A4B0u && core < static_cast<u32>(kArmCoreCount)) {        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             const u32 buffer = static_cast<u32>(arm->r[0]);
             const u32 length = static_cast<u32>(arm->r[1]);
             std::string bytes;
@@ -714,6 +713,28 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             ZLB_LOG_INFO("machine",
                          "NSKBL validator 0x5101A4B0: buffer 0x%08X len %u caller 0x%08X bytes%s | %s",
                          buffer, length, caller, bytes.c_str(), text.c_str());
+        }
+    }
+    // Diagnostic (round 399): the allocator's list walk (0x5100C192-0x5100C1C4, next at
+    // +0xA0) rejects a block whose `[node] & 0x30000000` is neither 0x10000000 nor
+    // 0x20000000, returning 0x80024300 (built at 0x5100C20E).  Log each candidate node and
+    // its flag word at the check itself (r2 = node, r1 = its word).  ZLB_NSKBL_BLOCK_LOG=1.
+    static const bool block_log = [] {
+        const char* on = std::getenv("ZLB_NSKBL_BLOCK_LOG");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (block_log && pc == 0x5100C1FAu && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 word = static_cast<u32>(arm->r[1]);
+            const u32 bits = word & 0x30000000u;
+            if (bits != 0x10000000u && bits != 0x20000000u && nskbl_service_fail_logs_ < 16u) {
+                ++nskbl_service_fail_logs_;
+                ZLB_LOG_INFO("machine",
+                             "NSKBL allocator block REJECTED: node 0x%08X word 0x%08X (bits 0x%08X) "
+                             "lr 0x%08X r5 0x%08X r8 0x%08X (ZLB_NSKBL_BLOCK_LOG=1)",
+                             static_cast<u32>(arm->r[2]), word, bits, static_cast<u32>(arm->r[14]),
+                             static_cast<u32>(arm->r[5]), static_cast<u32>(arm->r[8]));
+            }
         }
     }
     // Experiment (round 391): fix the transfer parameters at the last possible moment.
