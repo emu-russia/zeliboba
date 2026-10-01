@@ -829,26 +829,33 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                          o != nullptr ? o->r[2] : 0u, va, pa_out, value, ok ? 1 : 0,
                          o != nullptr ? static_cast<u32>(o->r[14]) : 0u, ld_events);
         }
-        // The spin lock at 0x4003A148 (arm0 stalled there when the rendezvous
-        // substitution is off): log the lock word it waits on, its value, and who last
-        // wrote it, to name the owner (docs/KBL.md 7.1.37).
+        // The spin lock around 0x4003A148, sampled at the *right* instructions: the loop
+        // is `0x4003A14C ldrex r1,[r0]` / `0x4003A158 strexeq r1,r2,[r0]` /
+        // `0x4003A160 bne 0x4003A14C`, so r1 is only meaningful after the ldrex has run.
+        // Recording it at 0x4003A148 (`mov r13, r2` of the entry stub) mixed the entry
+        // registers into the loop and produced a contradictory reading that cost a round
+        // (docs/KBL.md 7.1.38).  Off by default: `ZLB_EXCL_LOG=1` already answers the
+        // question this was meant for, and with the loop sampled correctly it shows the
+        // lock being acquired normally (ldrex -> 0, strex -> 1, word becomes 1).
+        static const bool spin2_on = [] { return std::getenv("ZLB_SPIN_TRACE") != nullptr; }();
         static u32 spin2_events = 0;
-        if ((pc == 0x4003A148u || pc == 0x4003A14Cu || pc == 0x4003A158u) &&
+        if (spin2_on && (pc == 0x4003A14Cu || pc == 0x4003A158u || pc == 0x4003A160u) &&
             spin2_events < 40u) {
             ++spin2_events;
             u32 word = 0;
-            bool ok = false;
             if (o != nullptr) {
                 u32 pa = 0;
                 std::string fault;
-                ok = o->translate(static_cast<u32>(o->r[0]) & ~3u, false, false, pa, fault);
-                if (ok) word = arm_bus_->read32(pa);
+                if (o->translate(static_cast<u32>(o->r[0]) & ~3u, false, false, pa, fault)) {
+                    word = arm_bus_->read32(pa);
+                }
             }
             ZLB_LOG_INFO("machine",
                          "spin2 arm%u pc=0x%08X r0=0x%08X [r0]=0x%08X r1=0x%08X r2=0x%08X "
-                         "lr=0x%08X sp=0x%08X [#%u] lastpc=%08X/%08X/%08X/%08X",
+                         "cpsr=0x%08X lr=0x%08X sp=0x%08X [#%u] lastpc=%08X/%08X/%08X/%08X",
                          core, pc, o != nullptr ? o->r[0] : 0u, word,
                          o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
+                         o != nullptr ? o->cpsr : 0u,
                          o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
                          o != nullptr ? o->r[13] : 0u, spin2_events,
                          last_pc_seen[0], last_pc_seen[1], last_pc_seen[2], last_pc_seen[3]);
