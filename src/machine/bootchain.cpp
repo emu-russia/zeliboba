@@ -754,7 +754,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return on != nullptr && on[0] != '0';
     }();
     if (poll_log && (pc == 0x510207CAu || pc == 0x510207B2u || pc == 0x51020790u) &&
-        nskbl_poll_log_ < 24u) {
+        nskbl_poll_log_ < 200u) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
             const u32 node = static_cast<u32>(arm->r[8]);
             u32 gate = 0, polled = 0, arg = 0;
