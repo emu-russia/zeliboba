@@ -318,7 +318,38 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
         const char* value = std::getenv("ZLB_NO_SUBSTITUTION");
         return value != nullptr && value[0] != '0';
     }();
-    if (disabled) return false;
+    // Diagnostic (ZLB_ARM_FAULT_LOG=1): the *unsubstituted* behaviour is what an
+    // honest run needs to see, and with ZLB_NO_SUBSTITUTION=1 this function returns
+    // before its own trace, so the fault that reaches the guest's abort handler is
+    // invisible.  This branch only logs - it never repairs the mapping.
+    if (disabled) {
+        static const bool fault_log = [] {
+            return std::getenv("ZLB_ARM_FAULT_LOG") != nullptr;
+        }();
+        static u32 logged = 0;
+        if (fault_log && logged < 24u && core < static_cast<u32>(kArmCoreCount)) {
+            ++logged;
+            ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+            u32 dfsr = 0, ifsr = 0, dfar = 0, ifar = 0, sctlr = 0, ttbr0 = 0, ttbr1 = 0;
+            if (arm != nullptr) {
+                dfsr = arm->mmu.dfsr;
+                ifsr = arm->mmu.ifsr;
+                dfar = arm->mmu.dfar;
+                ifar = arm->mmu.ifar;
+                sctlr = arm->mmu.sctlr;
+                ttbr0 = arm->mmu.ttbr0;
+                ttbr1 = arm->mmu.ttbr1;
+            }
+            ZLB_LOG_INFO("machine",
+                         "ARM fault (unsubstituted) arm%u VA=0x%08X %s pc=0x%08X sctlr=0x%08X M=%d "
+                         "ttbr0=0x%08X ttbr1=0x%08X dfsr=0x%X ifsr=0x%X dfar=0x%08X ifar=0x%08X [%u]",
+                         core, va, fetch ? "fetch" : (write ? "write" : "read"),
+                         arm != nullptr ? arm->get_pc() : 0u, sctlr,
+                         arm != nullptr ? (arm->mmu.enabled() ? 1 : 0) : -1, ttbr0, ttbr1, dfsr, ifsr,
+                         dfar, ifar, logged);
+        }
+        return false;
+    }
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
 
     // Diagnostic (round 112): every ARM translation the model cannot fix is logged in
@@ -340,7 +371,7 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
                      core, va, fetch ? "fetch" : (write ? "write" : "read"),
                      arm != nullptr ? arm->get_pc() : 0u, static_cast<u32>(lr),
                      fetch ? "prefetch" : "data", fault_trace_hits_);
-        // A fetch fault on a garbage address usually means a `pop {вЂ¦,pc}` took a
+        // A fetch fault on a garbage address usually means a `pop {…,pc}` took a
         // corrupted return address off the stack, so dump the frame too: the slot
         // that must be watched is the word just below SP (the pop has already
         // updated SP when the fetch faults).
@@ -365,6 +396,29 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
             }
         }
     }
+    Cpu* cpu = arm_cores_[core].get();
+    ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
+    if (!arm || !arm->mmu.enabled()) return false;
+
+    // Diagnostic (ZLB_SECURE_FAULT_LOG=1): the secure stage's repairs below are
+    // skipped for the *unsubstituted* run, so a fault there is invisible - and when
+    // the secure low window is left to the guest it is exactly what has to be seen.
+    // This only logs; nothing is repaired here.
+    static const bool secure_fault_log = [] {
+        return std::getenv("ZLB_SECURE_FAULT_LOG") != nullptr;
+    }();
+    static u32 secure_faults = 0;
+    if (secure_fault_log && secure_faults < 24u) {
+        ++secure_faults;
+        ZLB_LOG_INFO("machine",
+                     "ARM fault arm%u: VA=0x%08X %s pc=0x%08X lr=0x%08X secure=%d ttbr0=0x%08X "
+                     "ttbr1=0x%08X dfsr=0x%X dfar=0x%08X ifsr=0x%X ifar=0x%08X [%u]",
+                     core, va, fetch ? "fetch" : (write ? "write" : "read"),
+                     arm->get_pc(), static_cast<u32>(arm->r[14]), arm->secure_state() ? 1 : 0,
+                     arm->mmu.ttbr0, arm->mmu.ttbr1, arm->mmu.dfsr, arm->mmu.dfar, arm->mmu.ifsr,
+                     arm->mmu.ifar, secure_faults);
+    }
+
     // VA >= 1 MiB is handled by the section-level branch below (round 110); the
     // L2 walk after it only ever runs for the inherited low window.
 
@@ -392,10 +446,6 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
         if (std::strcmp(value, "dram-abs") == 0) return 2;
         return 3;
     }();
-
-    Cpu* cpu = arm_cores_[core].get();
-    ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
-    if (!arm || !arm->mmu.enabled()) return false;
 
     // Substitution (round 110): the KBL also keeps a *low* kernel memory area that
     // its own tables never map.  Measured: the class method 0x4002B3DC is called
@@ -1700,7 +1750,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
 
     // Substitution (round 180): NSKBL's general allocator 0x5100D400 asks the heap
     // resolver 0x5100567C for a block, which reads the heap object from the map
-    // (`[[0x5113B5AC] + 0x8C]`) and searches a free block in it (0x510049F4 в†’ 0x5100B82C).
+    // (`[[0x5113B5AC] + 0x8C]`) and searches a free block in it (0x510049F4 → 0x5100B82C).
     // In the model that field is zero - and a write trap over the whole run shows it is
     // only ever written with zero (the page wipe at 0x5101354C and the map init at
     // 0x510064D6), so nothing creates the heap.  The failure then aborts NSKBL's class
@@ -2800,7 +2850,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // Same diagnostic (round 110) for the KBL's "fatal code" stubs: the block around
     // 0x40021998 is a table of them
     //     0x40021998  push {r3,lr} / movs r0,#0x8A / bl 0x40036998 / b .
-    //     0x400219A4  вЂ¦ r0 = 0x8B вЂ¦, 0x400219B8 вЂ¦ r0 = 0x8C вЂ¦
+    //     0x400219A4  … r0 = 0x8B …, 0x400219B8 … r0 = 0x8C …
     // and every one of them ends in `b .`, so the pc alone says nothing about which
     // check failed.  The previous pc is the branch that entered the stub - i.e. the
     // failing test.  ZLB_KBL_PANIC_TRACE=1 enables it.
@@ -2869,7 +2919,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     //      40034A18  bne.w 0x4003596E         ; -> the panic stub
     // and the heap object the loader builds for itself (VA 0x400C1000) never gets
     // +0x24 written: a write trap over 0x400C1000-0x400C1040 lists every store its
-    // constructor makes (+8, +0xC, +0xE, +0x10, +0x14 = 0xFFFFFFFF, +0x20, +0x28 вЂ¦
+    // constructor makes (+8, +0xC, +0xE, +0x10, +0x14 = 0xFFFFFFFF, +0x20, +0x28 …
     // +0x3C) and +0x24 is not among them, so the field stays 0 and the second
     // validation (the first one runs before the cookie exists, when both sides are
     // 0) fails.  Stand in for whatever is supposed to leave that stamp: when the
@@ -2883,7 +2933,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 u64 heap = 0;
                 if (arm->get_register("r0", heap)) {
                     // Round 135: route a garbage heap pointer (measured 0x4B656353 =
-                    // the first word of the string "SceKernelвЂ¦" read little-endian, a
+                    // the first word of the string "SceKernel…" read little-endian, a
                     // never-initialised [pool] word) to the real created heap 0x5900,
                     // and zero its cookie so the 0x40034A16 comparison against the
                     // (still zero) global cookie 0x400B2974 passes.
@@ -3028,7 +3078,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     //     (0x00010001 means "class empty", as the loader itself initialises it);
     //   * the page-table entry at [pool+0x20] + n*4 with state 0x20000000, the class
     //     in bits 20..24 and the size in 4 KiB units (states 0x10000000/0x20000000
-    //     are the two the carve path accepts, docs/KBL.md В§95.1).
+    //     are the two the carve path accepts, docs/KBL.md §95.1).
     // ZLB_NO_SUBSTITUTION=1 disables it; ZLB_KBL_CARVE_STATE=<hex> overrides the state.
     constexpr u32 kCarvePathEntryPc = 0x40032366u;
     static const bool carry_supply = [] {

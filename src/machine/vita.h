@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <set>
 #include <string>

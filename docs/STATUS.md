@@ -144,7 +144,8 @@ Stage 1 **не достигнут**. Цепочка до NSKBL проходит�
 | Рукопожатие secure kernel | доставки прерываний в MeP нет → ответ ARM превращается в событие `state = 9` | там же |
 | Пробуждение CMeP | то же → после записи события модель снимает `halted` | там же |
 | Отпускание ARM | SC-пути для сообщения нет → «done»-прыжок secure kernel вызывает `release_soc()` | там же |
-| Низкое окно ARM (VA < 1 МиБ) | при translation fault модель дописывает отображение в L2 ядра и повторяет доступ; правило по умолчанию `window` (`VA 0x40000 → PA 0x40118000`), `ZLB_ARM_LOW_MAP=identity\|dram\|dram-abs` дают альтернативы | `src/machine/bootchain.cpp` + `ArmCore::fault_hook` |
+| Низкое окно ARM (VA < 1 МиБ) | при translation fault модель дописывает отображение в L2 ядра и повторяет доступ; правило по умолчанию `window` (`VA 0x40000 → PA 0x40118000`), `ZLB_ARM_LOW_MAP=identity\|dram\|dram-abs` дают альтернативы. Нужна только secure-этапу: собственные таблицы KBL не описывают `L2[0x00]`, `[0x01]`, `[0x10]`, `[0x19]`, `[0x1A]` (замеры — `docs/KBL.md` 7.1) | `src/machine/bootchain.cpp` + `ArmCore::fault_hook` |
+| Распарковка барьера и WFE-кластера | таймерное прерывание не доставляется ядру в WFE, а фазовая машина барьера дедлочится на разделяемом стеке вторичных ядер; 7 срабатываний за прогон `--stage kbl` (`0x4003B3C8`/`0x4003B3D6`) | `src/machine/vita.cpp` (`run_slice`) |
 | Страница векторов `PA 0x16100` | 0xC0 байт векторов KBL (сегмент `vaddr=0` его ELF) ставятся туда, куда он наводит `VBAR` | `src/machine/bootchain.cpp` |
 | Кэш блоков раздела KBL | выдаются блоки `0x1000`, которые сам KBL в кэш не кладёт (`ZLB_PART_BLOCK_CACHE=<n>`, по умолчанию 4) | там же |
 | Таблица классов по глобалу `0x400B291C` | KBL её не пишет вовсе (`ZLB_KBL_CLASS_TABLE=0` отключает) | там же |
@@ -187,6 +188,9 @@ $env:ZLB_NO_SUBSTITUTION=1
 Диагностические переменные: `ZLB_SDIF_TRACE`, `ZLB_BIGMAC_TRACE`, `ZLB_EMMC_LOG`,
 `ZLB_BOOTKEY_TRACE` (раскладка констант fitted-загрузчика и три дайджеста
 провижининга: digest_info, SHA-256 заголовка, SHA-256 подписываемого блока),
+`ZLB_ARM_FAULT_LOG` (отказы ARM в режиме `ZLB_NO_SUBSTITUTION=1` — там хук выходит
+раньше своей трассы), `ZLB_SECURE_FAULT_LOG` (отказы ARM с признаком `secure`,
+TTBR0/TTBR1 и DFSR/DFAR/IFSR/IFAR; работает и при включённых подстановках),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
