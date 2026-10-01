@@ -829,6 +829,30 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                          o != nullptr ? o->r[2] : 0u, va, pa_out, value, ok ? 1 : 0,
                          o != nullptr ? static_cast<u32>(o->r[14]) : 0u, ld_events);
         }
+        // The spin lock at 0x4003A148 (arm0 stalled there when the rendezvous
+        // substitution is off): log the lock word it waits on, its value, and who last
+        // wrote it, to name the owner (docs/KBL.md 7.1.37).
+        static u32 spin2_events = 0;
+        if ((pc == 0x4003A148u || pc == 0x4003A14Cu || pc == 0x4003A158u) &&
+            spin2_events < 40u) {
+            ++spin2_events;
+            u32 word = 0;
+            bool ok = false;
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                ok = o->translate(static_cast<u32>(o->r[0]) & ~3u, false, false, pa, fault);
+                if (ok) word = arm_bus_->read32(pa);
+            }
+            ZLB_LOG_INFO("machine",
+                         "spin2 arm%u pc=0x%08X r0=0x%08X [r0]=0x%08X r1=0x%08X r2=0x%08X "
+                         "lr=0x%08X sp=0x%08X [#%u] lastpc=%08X/%08X/%08X/%08X",
+                         core, pc, o != nullptr ? o->r[0] : 0u, word,
+                         o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? o->r[13] : 0u, spin2_events,
+                         last_pc_seen[0], last_pc_seen[1], last_pc_seen[2], last_pc_seen[3]);
+        }
         if ((pc == 0x4003A3F0u || pc == 0x4003A424u || pc == 0x4003A158u ||
              pc == 0x4003A408u || pc == 0x400211C8u) &&
             cas_events < 80u) {
