@@ -769,6 +769,14 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         // spinning in the 0x4003A3EC helper while the other three sat in WFE, so the
         // pair (who holds it, what arm0 does next) is what has to be observed.
         static u32 lock_events = 0;
+        // Which core is actually progressing: on every ARM instruction record the
+        // per-core pc, so the trace can print the *other* cores' last known position.
+        static u32 last_pc_seen[kArmCoreCount] = {0, 0, 0, 0};
+        static u64 last_insns_seen[kArmCoreCount] = {0, 0, 0, 0};
+        if (core < static_cast<u32>(kArmCoreCount) && o != nullptr) {
+            last_pc_seen[core] = pc;
+            last_insns_seen[core] = o->instructions;
+        }
         if ((pc == 0x4003A190u || pc == 0x4003A3ECu || pc == 0x4003A41Cu ||
              pc == 0x4003A42Cu || pc == 0x4003A010u || pc == 0x40020AD0u ||
              pc == 0x400211C8u || pc == 0x40020E90u || pc == 0x40020EA0u ||
@@ -785,11 +793,12 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             }
             ZLB_LOG_INFO("machine",
                          "lock arm%u pc=0x%08X lr=0x%08X r0=0x%08X [r0]=0x%08X r1=0x%08X "
-                         "r2=0x%08X r3=0x%08X sp=0x%08X [#%u]",
+                         "r2=0x%08X r3=0x%08X sp=0x%08X [#%u] lastpc=0x%08X/0x%08X/0x%08X/0x%08X",
                          core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
                          o != nullptr ? o->r[0] : 0u, lock_word,
                          o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
-                         o != nullptr ? o->r[3] : 0u, o != nullptr ? o->r[13] : 0u, lock_events);
+                         o != nullptr ? o->r[3] : 0u, o != nullptr ? o->r[13] : 0u, lock_events,
+                         last_pc_seen[0], last_pc_seen[1], last_pc_seen[2], last_pc_seen[3]);
         }
         if ((pc == 0x4003B384u || pc == 0x4003B3C8u || pc == 0x4003B3D6u ||
              pc == 0x4003A010u || pc == 0x4003A018u || pc == 0x4003B3E2u) &&
@@ -4802,6 +4811,23 @@ std::string Vita::boot_report() const {
                       static_cast<unsigned long long>(wfe_irq_wakeups_),
                       static_cast<unsigned long long>(barrier_unstuck_),
                       static_cast<unsigned long long>(wfe_wakeups_));
+    }
+    // Every ARM core's final position: a stall is usually "one core is elsewhere",
+    // and the single `ARM :` line only shows arm0 (docs/KBL.md 7.1.25).
+    for (size_t i = 0; i < arm_cores_.size(); ++i) {
+        if (arm_cores_[i] == nullptr) continue;
+        Cpu* core = arm_cores_[i].get();
+        ArmCore* arm = dynamic_cast<ArmCore*>(core);
+        out += format("ARM arm%u    : pc=%s insns=%llu halted=%d%s%s\n", static_cast<unsigned>(i),
+                      hex(core->get_pc(), 8).c_str(), (unsigned long long)core->instructions,
+                      core->halted ? 1 : 0, core->halt_reason.empty() ? "" : " reason=",
+                      core->halt_reason.c_str());
+        if (arm != nullptr) {
+            out += format("             lr=%s sp=%s r0=%s r1=%s r2=%s r3=%s\n",
+                          hex(arm->r[14], 8).c_str(), hex(arm->r[13], 8).c_str(),
+                          hex(arm->r[0], 8).c_str(), hex(arm->r[1], 8).c_str(),
+                          hex(arm->r[2], 8).c_str(), hex(arm->r[3], 8).c_str());
+        }
     }
     if (!milestones_.empty()) {
         out += "milestones   :\n";
