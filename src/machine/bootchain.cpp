@@ -689,6 +689,33 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     if (nskbl_service && pc == 0x5101D6E8u) {
         if (serve_nskbl_device_call(core)) return true;
     }
+    // Diagnostic (round 394): the os0: open fails because the validator 0x5101A4B0 rejects
+    // the buffer it is given (it wants "SC-" = 53 43 2D, the buffer held "SCE\0" =
+    // 53 43 45 00).  Log the buffer's first bytes at the validator's entry (r0 = buffer,
+    // r1 = length) to see what string is actually being checked.  ZLB_NSKBL_VALIDATOR_LOG=1.
+    static const bool validator_log = [] {
+        const char* on = std::getenv("ZLB_NSKBL_VALIDATOR_LOG");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (validator_log && pc == 0x5101A4B0u && core < static_cast<u32>(kArmCoreCount)) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 buffer = static_cast<u32>(arm->r[0]);
+            const u32 length = static_cast<u32>(arm->r[1]);
+            std::string bytes;
+            std::string text;
+            for (u32 i = 0; i < 24u && i < length; ++i) {
+                const arm::MmResult r = arm->translate_or_fix(buffer + i, false, false);
+                const u8 value = r.ok ? arm_bus_->read8(r.phys_addr) : 0u;
+                bytes += format(" %02X", value);
+                text += (value >= 0x20 && value < 0x7F) ? static_cast<char>(value) : '.';
+            }
+            u32 caller = 0;
+            caller = static_cast<u32>(arm->r[14]);
+            ZLB_LOG_INFO("machine",
+                         "NSKBL validator 0x5101A4B0: buffer 0x%08X len %u caller 0x%08X bytes%s | %s",
+                         buffer, length, caller, bytes.c_str(), text.c_str());
+        }
+    }
     // Experiment (round 391): fix the transfer parameters at the last possible moment.
     // Measured with the command writer's own trace (ZLB_KBL_TRACE_PC=0x51022664): the
     // failing CMD18 is written for the substitution's node 0x00000300 with `[node+0x7C] = 0`
