@@ -311,6 +311,22 @@ void Vita::build_cores() {
                     }
                 }
             };
+            // An asserted IRQ line takes the core out of WFE even when the interrupt
+            // is masked (see ArmCore::set_irq), which is how the timer tick releases
+            // the boot loader's barrier waits.  The tick itself is driven from
+            // run_slice via KermitBlock::raise_irq, so this only clears the sleep.
+            arm->irq_hook = [this, i]() {
+                Cpu* cpu = arm_cores_[static_cast<size_t>(i)].get();
+                ArmCore* self = dynamic_cast<ArmCore*>(cpu);
+                if (self == nullptr) return;
+                if (self->wfe_waiting_) {
+                    self->wfe_waiting_ = false;
+                    self->event_pending_ = true;
+                    self->halted = false;
+                    self->halt_reason.clear();
+                    ++wfe_irq_wakeups_;
+                }
+            };
         }
     }
     arm_ = arm_cores_[0].get();
@@ -750,29 +766,106 @@ void Vita::run_slice() {
             if (core->halt_reason != "wfe") all_wfe = false;
         }
         if (!any_awake && all_wfe && released) {
-            // Round 160: the barrier's phase machine also deadlocks on the shared
-            // stack the secondary cores run on (see round 140 in bootchain.cpp): after
-            // a few hundred clean rounds one core stops decrementing and all four park
-            // in the same wait, counter included.  Since the whole cluster is asleep,
-            // put each waiter's counter at the value its own loop tests - 4 for the
-            // arrival wait (`ldrh r2,[r4,#4] / cmp r2,#4`), 0 for the leave wait
-            // (`sxth r0 / cmp r0,#0 / bgt`) - and then wake it.  On hardware the next
-            // timer interrupt would run the same re-check; here nothing else can move
-            // the counter, so the barrier would simply stay parked.
+            // Round 161: the honest fix for "the whole cluster is asleep and nothing
+            // can wake it" is the periodic tick a core's timer would deliver: an
+            // asserted interrupt line takes a core out of WFE, the core re-checks
+            // its loop condition and goes back to sleep if it has to.  The model
+            // does not reproduce whatever arms that timer (the guest programs none
+            // of the MPCore timers and no other interrupt fires - docs/KBL.md
+            // 7.1.8), so the driver raises the tick itself.  ZLB_KBL_WFE_TICK=0
+            // keeps the strict WFE; ZLB_KBL_WFE_WATCHDOG=1 restores the old
+            // substitution that wrote the barrier's counter directly, which is kept
+            // only to compare the two states.
+            static const bool tick_driver = [] {
+                const char* value = std::getenv("ZLB_KBL_WFE_TICK");
+                return value != nullptr && value[0] != '0';
+            }();
+            // The default is the engine the boot chain has always used (the counter
+            // patch below), because measuring showed the timer tick alone is not
+            // enough: with only the tick the cluster wakes, re-checks and sleeps
+            // again, and the run ends at checkpoint 0x88 instead of reaching NSKBL
+            // (docs/KBL.md 7.1.9).  ZLB_KBL_WFE_TICK=1 selects the tick path.
+            static const bool legacy_watchdog = [] {
+                const char* value = std::getenv("ZLB_KBL_WFE_WATCHDOG");
+                if (value != nullptr && value[0] == '0') return false;
+                return std::getenv("ZLB_KBL_WFE_TICK") == nullptr;
+            }();
+            u64 retired = 0;
             for (const auto& core : arm_cores_) {
-                if (!core) continue;
-                ArmCore* arm = dynamic_cast<ArmCore*>(core.get());
-                if (arm == nullptr) continue;
-                const u32 wait_at = static_cast<u32>(arm->r[14]) & ~1u;
-                u32 want = 0xFFFFFFFFu;
-                if (wait_at == 0x4003B3C8u) want = 4u;        // arrival wait
-                else if (wait_at == 0x4003B3D6u) want = 0u;   // leave wait
-                if (want == 0xFFFFFFFFu) continue;
-                u32 pa = 0;
-                std::string fault;
-                if (!arm->translate(static_cast<u32>(arm->r[4]) + 4u, true, false, pa, fault)) {
-                    continue;
+                if (core) retired += core->instructions;
+            }
+            if (retired == last_arm_instructions_) {
+                ++all_wfe_streak_;
+            } else {
+                all_wfe_streak_ = 0;
+            }
+            last_arm_instructions_ = retired;
+            // One tick per `kTickSlices` slices with no progress at all: a shorter
+            // period would inject interrupts into a healthy idle loop, a longer one
+            // just costs slices.
+            constexpr u32 kTickSlices = 64u;
+            if (tick_driver && all_wfe_streak_ >= kTickSlices && kermit_ != nullptr) {
+                all_wfe_streak_ = 0;
+                ++wfe_ticks_;
+                u32 woke = 0;
+                for (const auto& core : arm_cores_) {
+                    if (core == nullptr) continue;
+                    if (!core->halted) continue;
+                    core->halted = false;
+                    core->halt_reason.clear();
+                    if (ArmCore* arm = dynamic_cast<ArmCore*>(core.get())) {
+                        arm->wfe_waiting_ = false;
+                        arm->event_pending_ = true;
+                    }
+                    ++woke;
                 }
+                wfe_irq_wakeups_ += woke;
+                // PPI 29: the private timer of this MPCore.  The line is raised and
+                // lowered again on the next slice so the level-triggered distributor
+                // does not keep it pending after the re-check.  The wake-up itself
+                // does not depend on the distributor accepting the interrupt: on
+                // hardware an *asserted* line takes a core out of WFE even when the
+                // interrupt is masked or not enabled at the distributor, and the
+                // model's Gic::refresh_line only asserts for an interrupt that would
+                // actually be taken - so the tick also notifies the cores directly.
+                kermit_->raise_irq(kermit::kIrqPpiPrivateTimer, true);
+                for (const auto& core : arm_cores_) {
+                    if (core == nullptr) continue;
+                    if (ArmCore* arm = dynamic_cast<ArmCore*>(core.get())) {
+                        if (arm->irq_hook) arm->irq_hook();
+                    }
+                }
+                tick_pending_ = true;
+                if (wfe_ticks_ <= 8u || (wfe_ticks_ % 1000u) == 0u) {
+                    ZLB_LOG_INFO("machine",
+                                 "timer tick %llu: cluster idle for %u slices, raising PPI %u "
+                                 "(pc=0x%08X/0x%08X/0x%08X/0x%08X)",
+                                 static_cast<unsigned long long>(wfe_ticks_), kTickSlices,
+                                 kermit::kIrqPpiPrivateTimer,
+                                 arm_cores_[0] ? arm_cores_[0]->get_pc() : 0u,
+                                 arm_cores_[1] ? arm_cores_[1]->get_pc() : 0u,
+                                 arm_cores_[2] ? arm_cores_[2]->get_pc() : 0u,
+                                 arm_cores_[3] ? arm_cores_[3]->get_pc() : 0u);
+                }
+            }
+            if (legacy_watchdog) {
+                // The old substitution: put each waiter's counter at the value its own
+                // loop tests - 4 for the arrival wait (`ldrh r2,[r4,#4] / cmp r2,#4`),
+                // 0 for the leave wait (`sxth r0 / cmp r0,#0 / bgt`) - and then wake it.
+                for (const auto& core : arm_cores_) {
+                    if (!core) continue;
+                    ArmCore* arm = dynamic_cast<ArmCore*>(core.get());
+                    if (arm == nullptr) continue;
+                    const u32 wait_at = static_cast<u32>(arm->r[14]) & ~1u;
+                    u32 want = 0xFFFFFFFFu;
+                    if (wait_at == 0x4003B3C8u) want = 4u;        // arrival wait
+                    else if (wait_at == 0x4003B3D6u) want = 0u;   // leave wait
+                    if (want == 0xFFFFFFFFu) continue;
+                    u32 pa = 0;
+                    std::string fault;
+                    if (!arm->translate(static_cast<u32>(arm->r[4]) + 4u, true, false, pa, fault)) {
+                        continue;
+                    }
                 ++barrier_unstuck_;
                 if (barrier_unstuck_ <= 8u) {
                     ZLB_LOG_INFO("machine",
@@ -803,6 +896,13 @@ void Vita::run_slice() {
                              arm_cores_[2] ? arm_cores_[2]->get_pc() : 0u,
                              arm_cores_[3] ? arm_cores_[3]->get_pc() : 0u);
             }
+            }   // legacy_watchdog
+        }
+        // Lower the tick line again: the distributor is level triggered, so a line
+        // left asserted would keep PPI 29 pending and turn the tick into a storm.
+        if (tick_pending_) {
+            tick_pending_ = false;
+            if (kermit_ != nullptr) kermit_->raise_irq(kermit::kIrqPpiPrivateTimer, false);
         }
     }
 

@@ -688,7 +688,12 @@ void ArmCore::set_irq(int line, bool asserted) {
                          asserted ? "asserted" : "cleared", cpsr,
                          (cpsr & arm::kFlagI) != 0 ? "masked" : "open", cur_instr_addr_);
         }
+        const bool rising = asserted && !irq_line_;
         irq_line_ = asserted;
+        // Hardware takes a core out of WFE on an asserted interrupt line even when
+        // the interrupt is masked and therefore not taken; without this a cluster
+        // whose only wake-up source is a timer tick stays asleep forever.
+        if (rising && irq_hook) irq_hook();
     } else if (line == static_cast<int>(IrqLine::FiQ)) {
         fiq_line_ = asserted;
     }

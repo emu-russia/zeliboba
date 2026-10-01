@@ -94,6 +94,13 @@ public:
     /// races under instruction-level round-robin, so WFE must sleep until SEV).
     std::function<void()> sev_hook;
 
+    /// Optional hook called when this core's IRQ line is asserted.  On hardware an
+    /// asserted interrupt takes a core out of WFE whether or not the interrupt is
+    /// then taken (the wake-up happens before the CPSR mask is consulted), which is
+    /// how a timer tick releases the kernel boot loader's barrier wait; this hook
+    /// lets the machine model that without the core knowing about the machine.
+    std::function<void()> irq_hook;
+
     /// Set when this core is blocked in WFE (wait for event); cleared by SEV.
     bool wfe_waiting_ = false;
     /// ARM event register: SEV sets it, WFE consumes it (and skips blocking).

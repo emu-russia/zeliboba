@@ -375,6 +375,20 @@ private:
     /// Round 160: how many parked barrier counters the same watchdog put back to
     /// the value the waiting core's loop tests.
     u64 barrier_unstuck_ = 0;
+    /// Round 161: how many times a periodic timer tick took a core out of WFE (see
+    /// ArmCore::irq_hook and the tick driver in run_slice).
+    u64 wfe_irq_wakeups_ = 0;
+    /// Round 161: how many timer ticks the driver raised because the whole cluster
+    /// retired no instruction for a while.
+    u64 wfe_ticks_ = 0;
+    /// The tick driver keeps the private-timer line asserted for one slice and lowers
+    /// it again on the next one (the distributor is level triggered).
+    bool tick_pending_ = false;
+    /// Instructions retired by the cluster at the end of the previous slice.
+    u64 last_arm_instructions_ = 0;
+    /// Slices in a row in which the whole ARM cluster retired no instruction; the
+    /// tick driver uses it so a genuinely stuck cluster still gets a tick.
+    u32 all_wfe_streak_ = 0;
 
     /// Development substitution for the page tables the stage *before*
     /// kernel_boot_loader leaves behind.  The ARM boot ROM / the second loader's
