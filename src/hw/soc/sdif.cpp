@@ -854,14 +854,20 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
         std::fprintf(stderr, "[sdif] adma table=0x%08X moved=%u/%u ok=%d\n", table, adma_bytes_,
                      static_cast<unsigned>(payload.size()), adma_ok_ ? 1 : 0);
     }
-    // The DMA transfer is finished the moment the table walk ends, so the controller
-    // has to publish Transfer Complete (and DMA-complete) now.  `finish_transfer` used
-    // to be dead code - declared and defined but called from nowhere - so a DMA read
-    // reported Command Complete only, and NSKBL's status dispatcher (0x5101EBE4, which
-    // branches on the *status word*: bit 0 -> 0x80320002, bit 1 -> normal completion)
-    // turned every DMA read into 0x80320002.  That is the wall at checkpoint 0xA9
-    // (docs/NSKBL.md round 393).
-    finish_transfer(adma_ok_);
+    // Two raises are needed, and each was measured separately (docs/NSKBL.md 7.1.40 /
+    // round 393):
+    //  * immediately - otherwise the DMA read reports Command Complete only, and
+    //    NSKBL's status dispatcher (0x5101EBE4, bit 0 -> 0x80320002, bit 1 -> normal)
+    //    turns it into 0x80320002.  With only the *delayed* raise the run fell back to
+    //    the terminal loop 0x51000D0C;
+    //  * again a few ticks later - the driver acknowledges the first with a write that
+    //    clears bits 1/4/5, then polls 0x5101EDE4 for the next status word and would
+    //    otherwise wait forever on a zero.
+    if (adma_ok_) {
+        finish_transfer(true);
+        dma_complete_ = true;
+        if (transfer_complete_in_ == 0) transfer_complete_in_ = 16;
+    }
     return adma_ok_;
 }
 
