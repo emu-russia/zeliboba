@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <cstdio>
 #include <cstddef>
 #include <memory>
 #include <set>
@@ -367,6 +368,14 @@ private:
     u32 pc_trace_lo_ = 0;
     u32 pc_trace_hi_ = 0;
     bool pc_trace_enabled_ = false;
+    /// Optional per-instruction PC log for the ARM cluster (ZLB_ARM_PC_LOG=<file>):
+    /// one `core:pc` line per executed instruction, capped per core by
+    /// ZLB_ARM_PC_LIMIT (default 400000).  Diffing two runs' logs is how the branch
+    /// that separates an honest run from a substituted one is located, which no
+    /// single-pc diagnostic can show (docs/KBL.md 7.1.29).
+    bool arm_pc_log_enabled_ = false;
+    u32 arm_pc_log_limit_ = 0;
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> arm_pc_log_{nullptr, nullptr};
 
     /// Round 160: how many times the cluster was woken out of an all-WFE sleep
     /// (see the watchdog in run_slice: the loader's barrier spins also wait on the

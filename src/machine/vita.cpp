@@ -186,6 +186,21 @@ void Vita::build_buses() {
     if (const char* excl = std::getenv("ZLB_EXCL_LOG"); excl != nullptr && excl[0] != '0') {
         arm_bus_->exclusive_trace = true;
     }
+    // ZLB_ARM_PC_LOG=<file>: per-instruction PC trace of the ARM cluster, for the
+    // two-run diff that locates a divergence (docs/KBL.md 7.1.29).
+    if (const char* path = std::getenv("ZLB_ARM_PC_LOG");
+        path != nullptr && path[0] != '\0') {
+        if (std::FILE* file = std::fopen(path, "wb")) {
+            arm_pc_log_ = {file, &std::fclose};
+            arm_pc_log_enabled_ = true;
+            arm_pc_log_limit_ = 400000u;
+            if (const char* limit = std::getenv("ZLB_ARM_PC_LIMIT"); limit != nullptr) {
+                arm_pc_log_limit_ = static_cast<u32>(std::strtoul(limit, nullptr, 10));
+            }
+            ZLB_LOG_INFO("machine", "ARM pc log -> %s (limit %u instructions per core)", path,
+                         arm_pc_log_limit_);
+        }
+    }
     cmep_bus_ = std::make_unique<Bus>();
     syscon_bus_ = std::make_unique<Bus>();
 
@@ -960,6 +975,14 @@ void Vita::run_slice() {
             for (int b = 0; b < core_budget; ++b) {
             if (core->halted) break;
             if (pc_trace_enabled_) trace_arm_boot_pc(static_cast<u32>(i), core->get_pc());
+            if (arm_pc_log_enabled_ && arm_pc_log_ != nullptr) {
+                // Cap per core so the KBL phase (which is over well before a million
+                // instructions) is always covered in both runs.
+                const u64 logged = core->instructions;
+                if (logged < static_cast<u64>(arm_pc_log_limit_)) {
+                    std::fprintf(arm_pc_log_.get(), "%d:%08X\n", i, core->get_pc());
+                }
+            }
             if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
                 // Leave the instruction pending: the debugger resumes from it.
                 pc_hook_stopped_ = true;
