@@ -725,6 +725,49 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         previous_pc = last_arm_pc_[core];
         last_arm_pc_[core] = pc;
     }
+    // Diagnostic (ZLB_SKBL_ORDER_LOG=1): the low-window entries are planted by the
+    // loader's own code at 0x40029F34/0x4002DBD0, so the order between those stores
+    // and the first access that needs them (0x4002F074, a read of VA 0x34) is what
+    // separates an honest run from a substituted one.  Print both events with the
+    // callers so the divergent path can be named.
+    static const bool order_log = [] {
+        return std::getenv("ZLB_SKBL_ORDER_LOG") != nullptr;
+    }();
+    if (order_log && core < static_cast<u32>(kArmCoreCount)) {
+        static u32 order_events = 0;
+        static u32 enter_events = 0;
+        ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+        if (pc == 0x40031CB0u && enter_events < 8u) {
+            ++enter_events;
+            u32 st[4] = {0, 0, 0, 0};
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                for (u32 i = 0; i < 4; ++i) {
+                    if (o->translate(static_cast<u32>(o->r[13]) + i * 4u, false, false, pa, fault)) {
+                        st[i] = arm_bus_->read32(pa);
+                    }
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "skbl order arm%u ENTER 0x40031CB0 lr=0x%08X r0=0x%08X r1=0x%08X "
+                         "r2=0x%08X sp=0x%08X stack=%08X %08X %08X %08X",
+                         core, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[1]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[2]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u, st[0], st[1], st[2], st[3]);
+        }
+        if ((pc == 0x40029F34u || pc == 0x4002DBD0u || pc == 0x4002F070u || pc == 0x40020394u) &&
+            order_events < 32u) {
+            ++order_events;
+            ZLB_LOG_INFO("machine", "skbl order arm%u pc=0x%08X lr=0x%08X r0=0x%08X sp=0x%08X",
+                         core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u);
+        }
+    }
+
     // Substitution (round 378): the storage device's method.  The driver calls it
     // through `[device+0x24A0]` at 0x5101D6E8 with the request in r0; no image in the
     // workspace contains it (round 377), so it is modelled in C++ - see
