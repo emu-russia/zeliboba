@@ -758,10 +758,64 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         static u32 line_events = 0;
         ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
         static u32 walk_events = 0;
-        // A control-flow trace: which pc actually jumps into the block around the
-        // builder call (0x4002C160), and what the caller's return address is.  The
-        // BL decoding keeps pointing at addresses the run never enters, so the path
-        // has to be observed instead of derived from the bytes.
+        // Barrier trace (ZLB_SKBL_ORDER_LOG=1): the leave/arrival waits, the WFE/SEV
+        // pair and the entry of the barrier at 0x4003B384, each with the barrier's own
+        // fields.  This is what shows what the counter-patching substitution stands in
+        // for (docs/KBL.md 7.1.25).
+        static u32 barrier_events = 0;
+        // Lock trace: 0x4003A190 caches a word and issues a memory barrier (the exit
+        // path of the barrier), 0x4003A3EC/0x4003A41C are the entry/exit helpers of
+        // the barrier's own lock, and 0x4003A010 loads a word.  arm0 was left
+        // spinning in the 0x4003A3EC helper while the other three sat in WFE, so the
+        // pair (who holds it, what arm0 does next) is what has to be observed.
+        static u32 lock_events = 0;
+        if ((pc == 0x4003A190u || pc == 0x4003A3ECu || pc == 0x4003A41Cu ||
+             pc == 0x4003A42Cu || pc == 0x4003A010u || pc == 0x40020AD0u ||
+             pc == 0x400211C8u || pc == 0x40020E90u || pc == 0x40020EA0u ||
+             pc == 0x4003B3E2u || pc == 0x4003B3CCu) &&
+            lock_events < 400u) {
+            ++lock_events;
+            u32 lock_word = 0;
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                if (o->translate(static_cast<u32>(o->r[0]) & ~3u, false, false, pa, fault)) {
+                    lock_word = arm_bus_->read32(pa);
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "lock arm%u pc=0x%08X lr=0x%08X r0=0x%08X [r0]=0x%08X r1=0x%08X "
+                         "r2=0x%08X r3=0x%08X sp=0x%08X [#%u]",
+                         core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? o->r[0] : 0u, lock_word,
+                         o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
+                         o != nullptr ? o->r[3] : 0u, o != nullptr ? o->r[13] : 0u, lock_events);
+        }
+        if ((pc == 0x4003B384u || pc == 0x4003B3C8u || pc == 0x4003B3D6u ||
+             pc == 0x4003A010u || pc == 0x4003A018u || pc == 0x4003B3E2u) &&
+            barrier_events < 160u) {
+            ++barrier_events;
+            u32 words[4] = {0, 0, 0, 0};   // [base+0], +4, +8, +0xC
+            if (o != nullptr) {
+                const u32 base = static_cast<u32>(o->r[6]) & 0xFFFFF000u;
+                for (u32 k = 0; k < 4u; ++k) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (o->translate(base + k * 4u, false, false, pa, fault)) {
+                        words[k] = arm_bus_->read32(pa);
+                    }
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "barrier arm%u pc=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X "
+                         "r4=0x%08X r5=0x%08X r6=0x%08X "
+                         "base+0=0x%08X +4=0x%08X +8=0x%08X +C=0x%08X lr=0x%08X [#%u]",
+                         core, pc, o != nullptr ? o->r[0] : 0u, o != nullptr ? o->r[1] : 0u,
+                         o != nullptr ? o->r[2] : 0u, o != nullptr ? o->r[3] : 0u,
+                         o != nullptr ? o->r[4] : 0u, o != nullptr ? o->r[5] : 0u,
+                         o != nullptr ? o->r[6] : 0u, words[0], words[1], words[2], words[3],
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u, barrier_events);
+        }
         if (pc >= 0x4002C15Cu && pc <= 0x4002C160u && walk_events < 12u) {
             ++walk_events;
             ZLB_LOG_INFO("machine",
