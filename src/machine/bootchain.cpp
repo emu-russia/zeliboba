@@ -777,6 +777,23 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             last_pc_seen[core] = pc;
             last_insns_seen[core] = o->instructions;
         }
+        // The two exclusive helpers that touch the barrier's arrival index: 0x4003A3EC
+        // is `ldrexh/strexh` (16-bit) and 0x4003A9C0-ish is the byte variant; the
+        // substituted and honest runs use different ones, so log the arguments of the
+        // store itself plus the surrounding state.
+        static u32 cas_events = 0;
+        if ((pc == 0x4003A3F0u || pc == 0x4003A424u || pc == 0x4003A158u ||
+             pc == 0x4003A408u || pc == 0x400211C8u) &&
+            cas_events < 80u) {
+            ++cas_events;
+            ZLB_LOG_INFO("machine",
+                         "cas arm%u pc=0x%08X lr=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X "
+                         "sp=0x%08X [#%u] lastpc=0x%08X/0x%08X/0x%08X/0x%08X",
+                         core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? o->r[0] : 0u, o != nullptr ? o->r[1] : 0u,
+                         o != nullptr ? o->r[2] : 0u, o != nullptr ? o->r[13] : 0u, cas_events,
+                         last_pc_seen[0], last_pc_seen[1], last_pc_seen[2], last_pc_seen[3]);
+        }
         if ((pc == 0x4003A190u || pc == 0x4003A3ECu || pc == 0x4003A41Cu ||
              pc == 0x4003A42Cu || pc == 0x4003A010u || pc == 0x40020AD0u ||
              pc == 0x400211C8u || pc == 0x40020E90u || pc == 0x40020EA0u ||
