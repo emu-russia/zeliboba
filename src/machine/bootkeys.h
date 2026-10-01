@@ -49,4 +49,36 @@ bool provision_boot_keys(Bus& cmep_bus, std::vector<u8>& image, std::string& why
 /// Describe what provisioning would do without changing anything.
 std::string describe_boot_keys(Bus& cmep_bus, const std::vector<u8>& image = {});
 
+/// Which resident first-loader build is fitted to `cmep_bus`.
+///
+/// The prototype (clean) image and the retail PCH RAM snapshot are the same
+/// program with `.data`/`.bss` shifted by -0x80 (`dumps/bootrom_analysis/
+/// COMPARISON.md`), so every ROM constant provisioning needs moves with the
+/// build.  The DER/RSA parameter blob is preceded by a 16-byte marker, which pins
+/// the build without comparing whole images; `image` is accepted for symmetry
+/// with `provision_boot_keys` and is not needed for the search.
+struct FirstLoaderLayout {
+    /// Address of the DER/RSA parameter blob in the fitted build.
+    u32 parameter_blob = bootkey_addrs::kExpectedHead;
+    /// Address of the 18-byte DigestInfo reference.
+    u32 digest_info = bootkey_addrs::kDigestInfo;
+    /// Address of the keyring-0x20 key material.
+    u32 tail_key = bootkey_addrs::kTailKey;
+    /// Signed distance from the prototype layout (0 or -0x80 for the two builds
+    /// in this workspace).
+    int shift = 0;
+    /// True when the marker was found at the prototype address.
+    bool prototype = true;
+    /// False when no known layout matched (the fitted loader is another build).
+    bool known = false;
+    /// Build-marker bytes that match at `parameter_blob` (0 when the bus is empty).
+    size_t verified = 0;
+    const char* name() const {
+        return prototype ? "prototype (clean image)" : "retail PCH (RAM snapshot)";
+    }
+};
+
+/// Locate the ROM constants of the fitted first loader.
+FirstLoaderLayout detect_first_loader_layout(Bus& cmep_bus, const std::vector<u8>& image = {});
+
 }  // namespace zlb

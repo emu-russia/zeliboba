@@ -15,6 +15,7 @@
 #include "hw/emmc.h"
 #include "hw/soc.h"
 #include "hw/syscon.h"
+#include "machine/bootkeys.h"
 
 namespace zlb {
 
@@ -1075,6 +1076,13 @@ bool Debugger::execute(const std::string& line) {
         emit(cmd_keyring(args));
         return true;
     }
+    if (command == "bootkeys") {
+        // Which resident first-loader build is fitted and which signed block its
+        // RSA check expects (see machine/bootkeys.cpp).  Useful when a differently
+        // built first loader is loaded with --first-loader.
+        emit(describe_boot_keys(vita_.cmep_bus()));
+        return true;
+    }
     if (command == "faults") {
         emit(cmd_faults(args));
         return true;
@@ -1180,6 +1188,7 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  bootctx                ARM boot context: CMeP DRAM source and the PA 0 mirror\n"
         "  faults [all]           MMU fault ring: faulting pc, VA and page-table entry\n"
         "  keyring                captured CMeP keyring state\n"
+        "  bootkeys               fitted first-loader build and the block its RSA check expects\n"
         "  cov [mep] [start] [n]  PC coverage map (ZLB_ARM_COV / ZLB_MEP_COV);\n"
         "                         cov save <file> [mep] writes the raw bitmap\n"
         "  boot                   boot chain report and plan\n"
@@ -1503,7 +1512,8 @@ std::vector<std::string> Debugger::complete(const std::string& prefix) const {
     static const std::vector<std::string> commands = {
         "step", "run", "runm", "until", "reset", "core", "bp", "bpc", "bpl", "watch", "watchc",
         "wpl", "regs", "reg", "dis", "mem", "poke", "save", "trace", "devices", "map", "devget",
-        "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "faults", "stage", "keyring", "info", "load",
+        "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "faults", "stage", "keyring",
+        "bootkeys", "info", "load",
         "log", "help", "quit"};
     std::vector<std::string> out;
     for (const auto& command : commands) {

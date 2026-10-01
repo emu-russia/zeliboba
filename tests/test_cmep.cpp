@@ -11,9 +11,12 @@
 
 #include "bus/bus.h"
 #include "common/log.h"
+#include "common/util.h"
 #include "hw/cmep.h"
 #include "hw/cmep/cmep_internal.h"
+#include "machine/bootkeys.h"
 #include "machine/bootkeys_data.h"
+#include "machine/vita.h"
 #include "test_framework.h"
 
 using namespace zlb;
@@ -495,6 +498,53 @@ ZLB_TEST(bignum_verifies_the_development_boot_key) {
     u8 digest[32] = {};
     sha256(block.data(), block.size(), digest);
     ZLB_EXPECT_EQ(std::memcmp(digest, bootkeys::kExpectedMessageDigest, 32), 0);
+}
+
+ZLB_TEST(first_loader_layout_detection_matches_both_dumps) {
+    // The prototype image and the retail PCH RAM snapshot are the same program
+    // with `.data`/`.bss` shifted by -0x80, so provisioning has to locate the ROM
+    // constants instead of hard-coding them.  The marker is easy to get wrong by
+    // four bytes (the blob is preceded by a `00 00 C0 E0` filler word that also
+    // satisfies an 8-byte prefix match), and a four-byte error is invisible: the
+    // only symptom is a failed RSA comparison at boot.
+    struct Build {
+        const char* path;
+        int shift;
+        bool prototype;
+        bool present;
+    };
+    Build builds[] = {
+        {"dumps/vita_prototype_bootrom.bin", 0, true, false},
+        {"dumps/pch-5c-cold_first_loader.bin", -0x80, false, false},
+    };
+    for (Build& build : builds) {
+        Fixture f;
+        const std::string path = resolve_workspace_path(build.path);
+        auto data = read_file(path);
+        if (!data) continue;
+        build.present = true;
+        ZLB_EXPECT_TRUE(f.bus.load(0x5C000, data->data(), data->size(), "first_loader"));
+
+        const FirstLoaderLayout layout = detect_first_loader_layout(f.bus, *data);
+        ZLB_EXPECT_TRUE(layout.known);
+        ZLB_EXPECT_EQ(layout.shift, build.shift);
+        ZLB_EXPECT_EQ(layout.prototype, build.prototype);
+        ZLB_EXPECT_EQ(layout.verified, 16u);  // the full build marker
+        // The three constants the RSA path needs, at their documented addresses
+        // for the prototype build (docs/BOOT.md 3).
+        if (build.prototype) {
+            ZLB_EXPECT_EQ(layout.parameter_blob, 0x5E764u);
+            ZLB_EXPECT_EQ(layout.tail_key, 0x5E744u);
+        }
+        ZLB_EXPECT_EQ(layout.digest_info, layout.parameter_blob + 0x10u);
+        ZLB_EXPECT_EQ(layout.tail_key, layout.parameter_blob - 0x20u);
+        // The digest reference the loader memcmps must be the DER prefix in both.
+        ZLB_EXPECT_EQ(f.bus.read8(layout.digest_info), 0x30u);
+        ZLB_EXPECT_EQ(f.bus.read8(layout.digest_info + 3), 0x0Cu);
+    }
+    // Both dumps exist in this workspace; a missing one means the checkout is
+    // incomplete rather than that the detection is wrong.
+    ZLB_EXPECT_TRUE(builds[0].present && builds[1].present);
 }
 
 ZLB_TEST(bignum_streams_the_exponent) {

@@ -40,9 +40,9 @@ Stage 1 **не достигнут**. Цепочка до NSKBL проходит�
 | Что | Подтверждение |
 |---|---|
 | Сборка | `build.ps1` → `build/bin/zeliboba.exe`, `zeliboba_ui.exe`, `zlb_tests.exe`, `emmc_rebuild.exe`, `zdis.exe` |
-| Самотесты | `zlb_tests.exe`: **436 прогонов, 0 падений, 0 нарушений ассертов** |
+| Самотесты | `zlb_tests.exe`: **437 прогонов, 0 падений, 0 нарушений ассертов** |
 | Реконструкция eMMC | `verify.ps1` → `emmc_rebuild --verify`: **992 файла, 0 расхождений** (os0 63/63, vs0 929/929 файлов) |
-| CMeP first loader | реальный дамп `dumps/vita_prototype_bootrom.bin` в окне `0x5C000`; сообщает `first loader reported SUCCESS to the ARM mailbox` и передаёт управление образу на `0x40000` |
+| CMeP first loader | реальный дамп `dumps/vita_prototype_bootrom.bin` в окне `0x5C000`; сообщает `first loader reported SUCCESS to the ARM mailbox` и передаёт управление образу на `0x40000`. Вторая сборка — `dumps/pch-5c-cold_first_loader.bin` (retail PCH): `--first-loader` исполняет и её, раскладка констант определяется автоматически (`detect_first_loader_layout`, сдвиг `.data` −0x80) |
 | CMeP second loader | исполняется из `0x40000` после настоящего AES-128-CBC (ключ — слот keyring 10, `ENC_KEY‖ENC_IV`); ~4121 чтение eMMC; заканчивается вызовом сервиса `jmp 0x5FF00` |
 | CMeP secure kernel | загружается по адресу компоновки `0x800000`, проходит рукопожатия `0x9/0x101/0x102/0x106`, ~117 тыс. инструкций |
 | ARM KBL | работает на всех четырёх ядрах (барьер `0x4003B384`), печатает `Starting PSP2 Kernel Boot Loader [0x 01040011]: 300`, сам распаковывает NSKBL (`sceArlzDecode` `0x4003C330` + `sceArlzArmFilter` `0x4003CB40`, поток `0x50000004` → `0x51000000`) и уходит в Non-Secure через `0x40021AE0` (`SCR.NS=1`) |
@@ -140,7 +140,7 @@ Stage 1 **не достигнут**. Цепочка до NSKBL проходит�
 | SCE: диспетчер команд и валидатор ответа | результат форсирован | там же |
 | SMI RSA | результат форсирован | там же |
 | ARM boot ROM | дампа нет → шаг реализован на C++ (стейджинг `second_loader.enc` в DRAM, ящик `0xE0000010`) | `src/machine/bootchain.cpp` |
-| Сервис first loader'а `0x5FF00` | кода в дампах нет (прототипный загрузчик содержит там нули/остатки стека) → перехват `pc_hook` и перезапуск CMeP в `secure_kernel.enp` | там же |
+| Сервис первой стадии по `0x5FF00` | кода нет **ни в одном** дампе (прототип — нули, retail-снимок — таблица указателей на затёртый `.bss`); вторая стадия сама пишет туда 32-словный дескриптор и уходит `jmp` → перехват `pc_hook` и перезапуск CMeP в `secure_kernel.enp`. Передача «первый → второй» (шаг 15) при этом **честная**, хук стоит только на обратном вызове | там же |
 | Рукопожатие secure kernel | доставки прерываний в MeP нет → ответ ARM превращается в событие `state = 9` | там же |
 | Пробуждение CMeP | то же → после записи события модель снимает `halted` | там же |
 | Отпускание ARM | SC-пути для сообщения нет → «done»-прыжок secure kernel вызывает `release_soc()` | там же |
@@ -185,6 +185,8 @@ $env:ZLB_NO_SUBSTITUTION=1
 остановки ставить как `bp arm <addr>` (без архитектуры адрес уходит в MeP).
 
 Диагностические переменные: `ZLB_SDIF_TRACE`, `ZLB_BIGMAC_TRACE`, `ZLB_EMMC_LOG`,
+`ZLB_BOOTKEY_TRACE` (раскладка констант fitted-загрузчика и три дайджеста
+провижининга: digest_info, SHA-256 заголовка, SHA-256 подписываемого блока),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
@@ -221,11 +223,12 @@ $env:ZLB_NO_SUBSTITUTION=1
 
 | Метрика | Значение |
 |---|---|
-| Самотесты | **436 прогонов / 0 падений / 0 нарушений ассертов**; `verify.ps1` требует ноль падений по умолчанию |
+| Самотесты | **437 прогонов / 0 падений / 0 нарушений ассертов**; `verify.ps1` требует ноль падений по умолчанию |
 | eMMC | 992 файла, 0 расхождений (`verify.ps1`: все шаги ok) |
 | Цепочка | Syscon → first_loader → second_loader → secure_kernel → ARM KBL → NSKBL одним прогоном, без команд `stage` |
 | CMeP | вторая стадия ~4121 чтение eMMC; secure kernel ~117 тыс. инструкций, рукопожатия `0x9/0x101/0x102/0x106` |
 | NSKBL | чекпойнт **`0xA9`**; 22 чтения eMMC за прогон; первый кластер данных файла не читается |
 | Покрытие (прогон `runm 700000`, детерминированный: 268 406 285 инструкций) | CMeP: first_loader 935 исполненных сайтов, second_loader 9559, secure_kernel 603; ARM: KBL 11 828 (исполнены все точки входа, кроме `panic`/`abort`), NSKBL 20 552 (все чекпойнты `0xA1`–`0xA9`) |
 | Насыщенность покрытия | прогон `runm 1400000` даёт **побитово тот же** битмап NSKBL (20552 сайта, 0 отличающихся байт): в текущей конфигурации новых исполняемых участков не появляется |
+| Зеркальный прогон на retail-сборке first loader'а | `--first-loader dumps\pch-5c-cold_first_loader.bin` + `ZLB_NO_SUBSTITUTION=1`: первый загрузчик проходит целиком (`SUCCESS` → передача на `0x402FA`), вторая стадия — те же **4883** сайта, стоп на том же `0x5FF1E`, GPO `0x54` |
 | Ядро | не загружено (стадия `kernel` грузит `bootimage.elf` напрямую — это отладочный путь, а не загрузка ядра) |
