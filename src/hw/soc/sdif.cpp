@@ -854,6 +854,14 @@ bool Sdif::adma_transfer(bool read, const std::vector<u8>& payload, std::vector<
         std::fprintf(stderr, "[sdif] adma table=0x%08X moved=%u/%u ok=%d\n", table, adma_bytes_,
                      static_cast<unsigned>(payload.size()), adma_ok_ ? 1 : 0);
     }
+    // The DMA transfer is finished the moment the table walk ends, so the controller
+    // has to publish Transfer Complete (and DMA-complete) now.  `finish_transfer` used
+    // to be dead code - declared and defined but called from nowhere - so a DMA read
+    // reported Command Complete only, and NSKBL's status dispatcher (0x5101EBE4, which
+    // branches on the *status word*: bit 0 -> 0x80320002, bit 1 -> normal completion)
+    // turned every DMA read into 0x80320002.  That is the wall at checkpoint 0xA9
+    // (docs/NSKBL.md round 393).
+    finish_transfer(adma_ok_);
     return adma_ok_;
 }
 
