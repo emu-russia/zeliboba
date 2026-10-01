@@ -436,6 +436,15 @@ private:
     u64 accumulator_ = 0;  ///< fractional PERIPHCLK cycles
     bool enabled_ = false;
     bool irq_state_ = false;
+    /// Event latch: `armed_` is set while the counter is below the comparator, and
+    /// the status bit is set on the crossing (a *front*, not the `counter >=
+    /// comparator` level).  Deriving it from the level made the interrupt
+    /// unacknowledgeable: clearing the status register re-asserted it on the very
+    /// next evaluation because the counter is still past the comparator - measured,
+    /// the status bit stayed 1 and the core's IRQ line never dropped
+    /// (docs/KBL.md 7.1.40).
+    bool armed_ = true;
+    bool fired_ = false;
     std::function<void(u32, bool)> irq_;
 };
 

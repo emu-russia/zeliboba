@@ -115,8 +115,13 @@ void GlobalTimer::write_word(u32 offset, u64 value) {
             refresh_irq();
             return;
         case kGlobalStatus:
-            // Write one to clear.
+            // Write one to clear.  The latch has to go with it, otherwise the next
+            // refresh_irq() re-derives "fired" from counter >= comparator and puts the
+            // bit (and the line) straight back, so the interrupt could never be
+            // acknowledged - measured: the status bit stayed 1 after the clear and the
+            // core's IRQ line never dropped (docs/KBL.md 7.1.40).
             if (value & 1u) {
+                fired_ = false;
                 poke(kGlobalStatus, 0);
                 refresh_irq();
             }
@@ -137,22 +142,39 @@ void GlobalTimer::write_word(u32 offset, u64 value) {
 
 void GlobalTimer::refresh_irq() {
     // TRM 4.3: "the comparators for each processor with the global timer fire
-    // when the timer value is greater than or equal to [the comparator]".
-    const bool fired = enabled_ && counter_ >= comparator_ && comparator_ != 0;
-    if (fired) poke(kGlobalStatus, 1);
-    const bool want = fired || (peek(kGlobalStatus) & 1u) != 0;
+    // when the timer value is greater than or equal to [the comparator]".  The
+    // event is a *crossing*, latched in the status register and cleared by the
+    // guest; the counter staying past the comparator must not re-assert it, or the
+    // interrupt can never be acknowledged (the core would take it forever on an
+    // edge-triggered line and spin in a level-triggered one).
+    const bool reached = enabled_ && comparator_ != 0 && counter_ >= comparator_;
+    if (!reached) {
+        armed_ = true;    // below the comparator again: ready for the next crossing
+    } else if (armed_) {
+        armed_ = false;
+        fired_ = true;
+        poke(kGlobalStatus, 1);
+    }
+    const bool want = fired_ || (peek(kGlobalStatus) & 1u) != 0;
     if (want == irq_state_) return;
     irq_state_ = want;
     if (irq_) irq_(kIrqPpiGlobalTimer, irq_state_);
 }
 
 void GlobalTimer::tick(u64 cycles) {
-    if (!enabled_) return;
     // KermitBlock::tick hands out PERIPHCLK ticks, which is what the global
     // timer counts.
     const u64 ticks = cycles;
     if (ticks == 0) return;
+    // The counter is free running: on the Cortex-A9 the global timer's GTCNT
+    // counts PERIPHCLK as long as the block is clocked, and the enable bit only
+    // gates the comparator/interrupt logic - not the count itself.  Gating the
+    // increment on `enabled_` made GTCNT stand still for a guest that reads it
+    // without programming the control register (measured: the boot chain never
+    // writes the MPCore timers at all, so the counter stayed 0 for the whole run
+    // and no timer could ever be a wake-up source - docs/KBL.md 7.1.40).
     counter_ += ticks;
+    if (!enabled_) return;
     if (comparator_ != 0 && counter_ >= comparator_) refresh_irq();
 }
 

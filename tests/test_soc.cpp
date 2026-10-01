@@ -200,15 +200,56 @@ ZLB_TEST(kermit_global_timer_counts_microseconds) {
     ZLB_EXPECT_EQ(fx.bus.read32(counter_lo), 3003u);
     ZLB_EXPECT_EQ(fx.bus.read32(status) & 1u, 1u);
 
-    // Stopping the timer freezes the counter.
+    // The counter is free running: clearing the control bit stops the
+    // comparator/interrupt logic, not the count.  The old test pinned the opposite
+    // (frozen while disabled), which made GTCNT stand still for a guest that reads
+    // it without programming the timer - and left the model with no timer that could
+    // ever be a WFE wake-up source (docs/KBL.md 7.1.40).
     fx.bus.write32(control, 0);
-    const u32 frozen = fx.bus.read32(counter_lo);
+    const u32 before = fx.bus.read32(counter_lo);
     fx.kermit.tick(1000000);
-    ZLB_EXPECT_EQ(fx.bus.read32(counter_lo), frozen);
+    ZLB_EXPECT_EQ(fx.bus.read32(counter_lo), before + 3003u);
 
     // Reset returns it to zero.
     fx.kermit.reset();
     ZLB_EXPECT_EQ(fx.bus.read32(counter_lo), 0u);
+}
+
+// The global timer is the only interrupt source a core in WFE can be woken by in
+// the boot chain (the kernel boot loader never programs the MPCore timers), so the
+// whole path "comparator -> distributor -> cpu interface -> core IRQ line" is pinned
+// here: assert, stay asserted while the event bit is set, and drop on write-1-to-clear.
+ZLB_TEST(kermit_global_timer_reaches_the_core_irq_line) {
+    Fixture fx("build/soc_test_gt_irq.img");
+    const u32 base = kermit::kScuBase + kermit::kGlobalTimerOffset;
+    const u32 control = base + 0x08;
+    const u32 status = base + 0x0C;
+    const u32 comparator_lo = base + 0x10;
+
+    fx.gic_start();
+    fx.enable_irq(kermit::kIrqPpiGlobalTimer);
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
+
+    fx.bus.write32(control, 1);
+    fx.bus.write32(comparator_lo, 1000);
+    fx.kermit.tick(1000000);   // 3003 PERIPHCLK ticks, past the comparator
+    ZLB_EXPECT_EQ(fx.bus.read32(status) & 1u, 1u);
+    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 1u);
+    ZLB_EXPECT_TRUE(kermit_irq_line(fx.bus));
+
+    // The event is a crossing, not the level `counter >= comparator`: clearing the
+    // status register must stick (the old level-derived check re-asserted it on the
+    // next evaluation, so the interrupt could never be acknowledged).
+    fx.bus.write32(status, 1);
+    ZLB_EXPECT_EQ(fx.bus.read32(status) & 1u, 0u);
+    fx.kermit.tick(1000000);
+    ZLB_EXPECT_EQ(fx.bus.read32(status) & 1u, 0u);
+
+    // Acknowledge and EOI the interrupt the crossing latched: now the line drops,
+    // because the source is no longer asserting.
+    fx.drain_irqs();
+    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 0u);
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
 }
 
 ZLB_TEST(kermit_private_timer_and_watchdog) {
