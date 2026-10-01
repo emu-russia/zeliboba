@@ -757,6 +757,41 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         static u32 order_29f34 = 0;
         static u32 line_events = 0;
         ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+        static u32 call_events = 0;
+        if (pc == 0x4002C160u && call_events < 4u) {
+            ++call_events;
+            // The window builder (0x40029EE0) is called from here in both runs, but
+            // with different frames; the state at this call is the closest point to
+            // the divergence that can be compared directly (docs/KBL.md 7.1.7).
+            u32 st[6] = {0, 0, 0, 0, 0, 0};
+            if (o != nullptr) {
+                for (u32 i = 0; i < 6; ++i) {
+                    u32 pa = 0;
+                    std::string fault;
+                    if (o->translate(static_cast<u32>(o->r[13]) + i * 4u, false, false, pa, fault)) {
+                        st[i] = arm_bus_->read32(pa);
+                    }
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "skbl 2C160 #%u: r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X "
+                         "r5=0x%08X r6=0x%08X r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X "
+                         "sp=0x%08X stack=%08X %08X %08X %08X %08X %08X",
+                         call_events, o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[1]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[2]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[3]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[4]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[5]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[6]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[7]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[8]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[9]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[10]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u,
+                         st[0], st[1], st[2], st[3], st[4], st[5]);
+        }
         if (pc == 0x40029EE0u && order_29f34 < 4u) {
             ++order_29f34;
             u32 st0 = 0, st1 = 0, st2 = 0, st3 = 0;
