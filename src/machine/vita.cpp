@@ -927,6 +927,17 @@ void Vita::run_slice() {
 
     for (int step = 0; step < budget_.arm; ++step) {
         bool stop_slice = false;
+        // ZLB_ARM_BUDGET=<n> gives each core n instructions before the next one runs
+        // (default 1: instruction-level round robin).  Real cores run in parallel, so
+        // a block is closer to the hardware; the KBL's barrier was the reason the
+        // default was lowered to 1 (see the note above), and this knob measures both
+        // ends (docs/KBL.md 7.1.23).
+        static const int core_budget = [] {
+            const char* value = std::getenv("ZLB_ARM_BUDGET");
+            if (value == nullptr) return 1;
+            const int parsed = std::atoi(value);
+            return parsed >= 1 ? parsed : 1;
+        }();
         for (int i = 0; i < kArmCoreCount; ++i) {
             Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
             if (!core || core->halted) continue;
@@ -940,6 +951,8 @@ void Vita::run_slice() {
                 return static_cast<u64>(std::strtoull(value, nullptr, 10));
             }();
             if (stagger != 0ull && core->instructions < stagger * static_cast<u64>(i)) continue;
+            for (int b = 0; b < core_budget; ++b) {
+            if (core->halted) break;
             if (pc_trace_enabled_) trace_arm_boot_pc(static_cast<u32>(i), core->get_pc());
             if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
                 // Leave the instruction pending: the debugger resumes from it.
@@ -974,6 +987,7 @@ void Vita::run_slice() {
                 continue;
             }
             core->run(1, no_abort);
+            }
         }
         if (stop_slice) break;
     }
