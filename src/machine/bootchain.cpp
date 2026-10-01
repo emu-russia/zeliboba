@@ -743,6 +743,37 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         previous_pc = last_arm_pc_[core];
         last_arm_pc_[core] = pc;
     }
+    // Diagnostic (ZLB_NSKBL_POLL_LOG=1): the NSKBL poll loop (0x510207CA) reads the
+    // completion word from the node it submitted, `r9 = [r8+0x10]`, and treats a
+    // *negative* value as done - anything else retries until the 64 tries run out and
+    // 0x80320002 is built (docs/NSKBL.md round 387).  Logging the node, its gate word
+    // and the polled word says which node the driver actually waits on and why the
+    // completion never arrives.
+    static const bool poll_log = [] {
+        const char* on = std::getenv("ZLB_NSKBL_POLL_LOG");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (poll_log && (pc == 0x510207CAu || pc == 0x510207B2u || pc == 0x51020790u) &&
+        nskbl_poll_log_ < 24u) {
+        if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
+            const u32 node = static_cast<u32>(arm->r[8]);
+            u32 gate = 0, polled = 0, arg = 0;
+            if (node != 0u) {
+                u32 pa = 0;
+                std::string fault;
+                if (arm->translate(node + 4u, false, false, pa, fault)) gate = arm_bus_->read32(pa);
+                if (arm->translate(node + 0x10u, false, false, pa, fault)) polled = arm_bus_->read32(pa);
+                if (arm->translate(node + 0x14u, false, false, pa, fault)) arg = arm_bus_->read32(pa);
+            }
+            ++nskbl_poll_log_;
+            ZLB_LOG_INFO("machine",
+                         "nskbl poll #%u pc=0x%08X node=0x%08X +4=0x%08X +0x10=0x%08X "
+                         "+0x14=0x%08X r9=0x%08X r11=0x%08X lr=0x%08X",
+                         nskbl_poll_log_, pc, node, gate, polled, arg,
+                         static_cast<u32>(arm->r[9]), static_cast<u32>(arm->r[11]),
+                         static_cast<u32>(arm->r[14]));
+        }
+    }
     // Diagnostic (ZLB_SKBL_ORDER_LOG=1): the low-window entries are planted by the
     // loader's own code at 0x40029F34/0x4002DBD0, so the order between those stores
     // and the first access that needs them (0x4002F074, a read of VA 0x34) is what

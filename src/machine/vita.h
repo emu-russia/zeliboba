@@ -470,6 +470,8 @@ private:
     u32 nskbl_service_fail_logs_ = 0;
     /// Device completion sequence (round 379) - see serve_nskbl_device_call().
     u32 nskbl_service_state_ = 0;
+    /// How many poll-loop entries the ZLB_NSKBL_POLL_LOG diagnostic has printed.
+    u32 nskbl_poll_log_ = 0;
     std::set<u64> nskbl_service_seen_;
     /// Nodes handed back to the device's pool, so the driver's wait keeps popping.
     u32 nskbl_service_completions_ = 0;
