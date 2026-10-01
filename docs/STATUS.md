@@ -205,6 +205,17 @@ pc), `ZLB_SKBL_ORDER_LOG=1` (порядок событий SKBL: входы `0x4
 проверка гипотезы о разбеге ядер: без флага `0x8D`, с разбегом `0x84`, `docs/KBL.md`
 7.1.21), `ZLB_ARM_BUDGET=<n>` (блочное планирование: ядру даётся `n` инструкций подряд;
 в честном режиме `0x8D` при `n=1` и `0x54` при `n=4/16`, `docs/KBL.md` 7.1.23),
+
+**Пункт 1 цели (зеркало CMeP scratch → ARM PA 0) закрыт.** `mirror_cmep_scratch_to_arm()`
+копирует все 32 КиБ (`shared_sram_` → `arm_bus_` VA `0..0x7FFF`) и вызывается на обоих
+путях release, без подстановок. Проверено по шине ARM (`map 0x34`): `region=arm_bootrom`,
+`page-region arm_bootrom base=0x00000000 size=0x40000`; после полного boot чтение ARM по
+PA `0x40000` отдаёт данные загрузчика (`00 B0 00 00 12 70 00 00 …`), то есть диапазон
+действительно виден ARM. Ранний диагноз «`arm_bootrom` отдаёт нули» был ошибкой
+измерения: дамп шёл по шине CMeP (`active_core()` по умолчанию — MeP). Остаточное
+наблюдение: слова по PA `0x100` в конце прогона — `0xFFFFFFFF`, то есть зеркало к этому
+моменту перезаписано (нулевой слепок в момент самого зеркала виден в логе; контекст
+пишется позже). На поведение SKBL это не влияет.
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
