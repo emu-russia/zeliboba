@@ -729,6 +729,8 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 command = read32_at(node + 0x08u, ok32);
             const u32 argument = read32_at(node + 0x0Cu, ok32);
             const u32 table = read32_at(node + 0x7Cu, ok32);
+            const u32 buffer_va = read32_at(node + 0x20u, ok32);
+            const u32 size_count = read32_at(node + 0x24u, ok32);
             const u32 size = static_cast<u32>(arm->r[0] & 0xFFFFu);
             if (ok32 && (command & 0xFFu) == 0x12u && node < 0x00100000u) {
                 u32 changes = 0;
@@ -739,6 +741,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 }
                 if (argument > 0x00100000u && (argument % 512u) == 0u) {
                     if (write32_at(node + 0x0Cu, argument / 512u)) ++changes;
+                }
+                // Round 392: the descriptor must point at the *driver's* buffer (the node's
+                // +0x20), not at a scratch page: the open path validates the first 64 bytes
+                // it read (0x5101A4B0 wants "SC-" or 0x7F '-L.'), and with the data landing
+                // in the substitution's own buffer that check failed with 0x80025001.
+                {
+                    const u32 count = static_cast<u16>((size_count >> 16) & 0xFFFFu);
+                    const u32 bytes = count != 0u ? count * 512u : 0x4000u;
+                    const arm::MmResult target = arm->translate_or_fix(buffer_va, true, false);
+                    if (buffer_va != 0u && target.ok) {
+                        const arm::MmResult t0 = arm->translate_or_fix(0x510FF000u, true, false);
+                        const arm::MmResult t1 = arm->translate_or_fix(0x510FF004u, true, false);
+                        if (t0.ok && t1.ok) {
+                            arm_bus_->write32(t0.phys_addr, (bytes << 16) | 0x0023u);
+                            arm_bus_->write32(t1.phys_addr, target.phys_addr);
+                            ++changes;
+                            if (nskbl_async_bit_logs_ < 12u) {
+                                ++nskbl_async_bit_logs_;
+                                ZLB_LOG_INFO("machine",
+                                             "NSKBL transfer for node 0x%08X: descriptor -> buffer "
+                                             "0x%08X (PA 0x%08X), %u bytes (ZLB_NSKBL_DMA_FIX=1)",
+                                             node, buffer_va, target.phys_addr, bytes);
+                            }
+                        }
+                    }
                 }
                 if (changes != 0u && nskbl_async_bit_logs_ < 24u) {
                     ++nskbl_async_bit_logs_;
