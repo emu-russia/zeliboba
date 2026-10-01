@@ -740,7 +740,13 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                     ++changes;
                 }
                 if (argument > 0x00100000u && (argument % 512u) == 0u) {
-                    if (write32_at(node + 0x0Cu, argument / 512u)) ++changes;
+                    // Measured with tools/emmc_os0_fat.py: the os0 volume starts at LBA 65536
+                    // (data area at 65608, 8 sectors per cluster) and psp2bootconfig.skprx
+                    // ("PSP2BO~1") has first cluster 903 -> LBA 72816, where the card really
+                    // holds a module header ("SCE\0" = 53 43 45 00).  The loader's own
+                    // argument converts to LBA 72800 (16 blocks earlier, arbitrary data), so
+                    // the byte-offset-to-block conversion carries a constant 16-block bias.
+                    if (write32_at(node + 0x0Cu, argument / 512u + 16u)) ++changes;
                 }
                 // Round 392: the descriptor must point at the *driver's* buffer (the node's
                 // +0x20), not at a scratch page: the open path validates the first 64 bytes
