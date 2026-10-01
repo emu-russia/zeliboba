@@ -4454,9 +4454,13 @@ bool Vita::start_nskbl() {
     // scratchpad) and the scratchpad mirror at PA 0.  A full cold boot leaves the
     // record there itself; entering this stage directly does not, so the model's
     // builder fills it in (that is the same fallback the KBL stage uses).
+    //
+    // The mirror has to come first for the same reason as in the KBL stage: SPAD32K
+    // is the ARM's PA 0..0x3FFF window, so mirroring the CMeP scratch after building
+    // the record overwrites the record the ARM is about to read (docs/KBL.md 7.1.32).
     const bool have_record = arm_bus_->read32(board::kKblParamBase) != 0;
-    if (!substitutions_enabled_static() || !have_record) build_kbl_param();
     mirror_cmep_scratch_to_arm();
+    if (!substitutions_enabled_static() || !have_record) build_kbl_param();
 
     const u32 compressed = arm_bus_->read32(kNskblCompressedPa);
     if (compressed != 0x4C5A5241u) {   // "ARZL"
