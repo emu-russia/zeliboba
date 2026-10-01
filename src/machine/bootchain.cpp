@@ -4320,29 +4320,21 @@ bool Vita::start_arm_kernel_boot_loader() {
     ZLB_LOG_INFO("boot", "KBL first word at 0x%08X = 0x%08X (ram=%d)", kbl_entry_,
                  arm_bus_->read32(kbl_entry_), arm_bus_->is_ram(kbl_entry_, 64) ? 1 : 0);
 
-    // SceKblParam is built by the second loader itself: its cold path reaches
-    // checkpoint 0x5A and the builder at 0x41B4A writes the record at base
-    // 0x1F000100 (docs/SYSCON.md 8.15, verified field by field against the
-    // wiki's KBL_Param layout).  The C++ builder below is only the fallback for
-    // the run where the development substitutions are off and the loader cannot
-    // get that far; the mirror is always needed, because the ARM reads the
-    // record through the PA 0 alias of the power scratchpad.
+    // SceKblParam - the 0x100-byte record the secure and non-secure kernel boot
+    // loaders read.  The second loader normally writes it itself (its builder at
+    // 0x41B4A targets base 0x1F000100), but in this model it stops at checkpoint
+    // 0x49 and the record would stay zero-filled, so the documented fields are laid
+    // down here instead - in *both* modes, because a record that only exists when
+    // the substitutions are off makes the two runs differ for construction reasons
+    // rather than hardware ones.  That asymmetry was measured: the ARM read 0 at
+    // VA 0x1C4 on 0x40020290 in the substituted run and the wakeup factor
+    // 0x0000FF14 in the honest one (docs/KBL.md 7.1.31-7.1.35).
     //
-    // The fallback has to run *after* the mirror below: SPAD32K is what the ARM
-    // sees as PA 0..0x3FFF, so mirroring the CMeP scratch afterwards used to
-    // overwrite the record it had just written.  Measured effect of the old order
-    // (ZLB_NO_SUBSTITUTION=1): the honest run read 0 at VA 0x1C4 on 0x40020290 and
-    // proceeded on a record that was never there, while the substituted run read
-    // the wakeup factor 0x0000FF14 (docs/KBL.md 7.1.31/7.1.32).
-    // The record has to reach the ARM the same way in both modes: the substituted run
-    // used to skip the builder entirely (its second loader is expected to write the
-    // record itself, but it stops at checkpoint 0x49 and the record stays the model's
-    // zero-filled one), while the fallback run built it.  Measured consequence: the
-    // ARM read 0 at VA 0x1C4 on 0x40020290 in the substituted run and 0xFF14 in the
-    // honest one, which made the two runs' first divergence a construction artefact
-    // rather than a hardware difference (docs/KBL.md 7.1.31-7.1.35).
-    const bool kbl_param_built_early = true;
-    if (kbl_param_built_early) build_kbl_param();
+    // It is built *before* the mirror below on purpose: SPAD32K is what the ARM sees
+    // as PA 0..0x3FFF, so the mirror has to run last or it overwrites the record it
+    // was meant to publish (the old order built it first and mirrored after, which
+    // wiped it - docs/KBL.md 7.1.32).
+    build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
     // "mirror mapped to 0x00000000 on ARM", and the second loader copies its ARM
@@ -4350,12 +4342,6 @@ bool Vita::start_arm_kernel_boot_loader() {
     // scratch+0x100).  The model keeps the scratch in the shared boot SRAM, so
     // mirror its first 32 KiB into the ARM's low window before the release.
     mirror_cmep_scratch_to_arm();
-    // The record the ARM reads through that alias has to be laid down after the
-    // mirror, not before it (see the note above): in the fallback run the mirror
-    // used to overwrite it with the (empty) CMeP scratch.
-    // The record is already there from the pre-mirror build; the post-mirror rebuild is
-    // only needed when the mirror could have replaced it with the CMeP scratch.
-    if (!kbl_param_built_early) build_kbl_param();
 
     // The syscon releases the whole Kermit cluster, not just the boot core: the
     // kernel boot loader brings the other three cores up itself (each reads MPIDR,
