@@ -805,6 +805,30 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                          o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
                          o != nullptr ? o->r[3] : 0u, spin_events);
         }
+        // The first data divergence between the honest and substituted runs shows up as
+        // r1 differing at 0x40020290, which is `ldr r1,[r0,#0xC4]` with r0=0x100: the
+        // load and the value it returns are what separates the two runs
+        // (docs/KBL.md 7.1.30).  Log the access and the surrounding reads.
+        static u32 ld_events = 0;
+        if ((pc >= 0x4002026Cu && pc <= 0x400202A0u) && ld_events < 60u) {
+            ++ld_events;
+            // Log the *operand* address the instruction itself uses (r0 + 0xC4) with the
+            // physical address it resolves to and the value read, for both runs.
+            u32 va = 0, pa_out = 0, value = 0;
+            bool ok = false;
+            if (o != nullptr) {
+                va = static_cast<u32>(o->r[0]) + 0xC4u;
+                std::string fault;
+                ok = o->translate(va, false, false, pa_out, fault);
+                if (ok) value = arm_bus_->read32(pa_out);
+            }
+            ZLB_LOG_INFO("machine",
+                         "ld arm%u pc=0x%08X r0=0x%08X r1=0x%08X r2=0x%08X va=0x%08X pa=0x%08X "
+                         "val=0x%08X ok=%d lr=0x%08X [#%u]",
+                         core, pc, o != nullptr ? o->r[0] : 0u, o != nullptr ? o->r[1] : 0u,
+                         o != nullptr ? o->r[2] : 0u, va, pa_out, value, ok ? 1 : 0,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u, ld_events);
+        }
         if ((pc == 0x4003A3F0u || pc == 0x4003A424u || pc == 0x4003A158u ||
              pc == 0x4003A408u || pc == 0x400211C8u) &&
             cas_events < 80u) {

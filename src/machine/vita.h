@@ -374,6 +374,7 @@ private:
     /// that separates an honest run from a substituted one is located, which no
     /// single-pc diagnostic can show (docs/KBL.md 7.1.29).
     bool arm_pc_log_enabled_ = false;
+    bool arm_pc_log_regs_ = false;
     u32 arm_pc_log_limit_ = 0;
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> arm_pc_log_{nullptr, nullptr};
 

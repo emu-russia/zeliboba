@@ -197,6 +197,9 @@ void Vita::build_buses() {
             if (const char* limit = std::getenv("ZLB_ARM_PC_LIMIT"); limit != nullptr) {
                 arm_pc_log_limit_ = static_cast<u32>(std::strtoul(limit, nullptr, 10));
             }
+            if (const char* regs = std::getenv("ZLB_ARM_PC_REGS"); regs != nullptr && regs[0] != '0') {
+                arm_pc_log_regs_ = true;
+            }
             ZLB_LOG_INFO("machine", "ARM pc log -> %s (limit %u instructions per core)", path,
                          arm_pc_log_limit_);
         }
@@ -977,10 +980,24 @@ void Vita::run_slice() {
             if (pc_trace_enabled_) trace_arm_boot_pc(static_cast<u32>(i), core->get_pc());
             if (arm_pc_log_enabled_ && arm_pc_log_ != nullptr) {
                 // Cap per core so the KBL phase (which is over well before a million
-                // instructions) is always covered in both runs.
+                // instructions) is always covered in both runs.  ZLB_ARM_PC_REGS=1
+                // adds r0..r3, sp, lr and the flags: two runs can follow the same path
+                // yet carry different data, and only the full tuple shows that.
                 const u64 logged = core->instructions;
                 if (logged < static_cast<u64>(arm_pc_log_limit_)) {
-                    std::fprintf(arm_pc_log_.get(), "%d:%08X\n", i, core->get_pc());
+                    if (arm_pc_log_regs_) {
+                        const ArmCore* a = dynamic_cast<const ArmCore*>(core);
+                        if (a != nullptr) {
+                            std::fprintf(arm_pc_log_.get(),
+                                         "%d:%08X %08X %08X %08X %08X %08X %08X %08X\n", i,
+                                         core->get_pc(), a->r[0], a->r[1], a->r[2], a->r[3],
+                                         a->r[13], a->r[14], a->cpsr);
+                        } else {
+                            std::fprintf(arm_pc_log_.get(), "%d:%08X\n", i, core->get_pc());
+                        }
+                    } else {
+                        std::fprintf(arm_pc_log_.get(), "%d:%08X\n", i, core->get_pc());
+                    }
                 }
             }
             if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
