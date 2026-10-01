@@ -1,9 +1,0 @@
-core mep
-bp 0x4499C
-run 400000
-mem 0x55B38 3
-bpc 0x4499C
-bp 0x449A6
-run 400000
-mem 0x55B38 3
-quit

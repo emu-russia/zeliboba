@@ -1,5 +1,0 @@
-core mep
-map 0x800000
-map 0x00040000
-map 0x40000000
-quit

@@ -1,5 +1,0 @@
-map 0xE20B6000
-map 0xE8000000
-map 0xE3110000
-devices
-quit

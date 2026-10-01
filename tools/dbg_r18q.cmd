@@ -1,7 +1,0 @@
-core mep
-run 200000000
-mem 0x40001500 4
-mem 0x40001580 4
-mem 0x40000500 2
-mem 0x55C70 1
-quit

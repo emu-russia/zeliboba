@@ -1,7 +1,0 @@
-log debug
-core mep
-poke 0xE0040400 0x00010001
-poke 0xE0040108 2
-poke 0xE0040808 65537
-poke 0xE0040800 0x90040200
-quit

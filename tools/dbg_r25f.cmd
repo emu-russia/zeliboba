@@ -1,5 +1,0 @@
-bp 0x449A6
-run 400000
-mem 0x40001500 2
-mem 0x55BF0 3
-quit
