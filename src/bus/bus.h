@@ -158,6 +158,11 @@ public:
     static constexpr int kMaxReservations = 8;
 
     /// Reserve [address, address+size) for `core` (LDREX).
+    /// Trace every reservation change (ZLB_EXCL_LOG=1): the KBL's spin locks are
+    /// taken and released faster than a breakpoint can observe, and a failed STREX
+    /// only tells you that *some* write overlapped - not which one.
+    bool exclusive_trace = false;
+
     void mark_exclusive(u32 address, unsigned size, int core, u32 asid);
     /// Consume the reservation if `core` still holds one covering the range.
     bool take_exclusive(u32 address, unsigned size, int core, u32 asid);

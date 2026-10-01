@@ -112,6 +112,10 @@ bool ranges_overlap(u32 a, unsigned a_size, u32 b, unsigned b_size) {
 }  // namespace
 
 void Bus::mark_exclusive(u32 address, unsigned size, int core, u32 asid) {
+    if (exclusive_trace) {
+        ZLB_LOG_INFO("bus", "excl: mark core=%d asid=0x%X addr=0x%08X size=%u", core, asid, address,
+                     size);
+    }
     // One reservation per core, like the SCU's per-core monitor slots.
     ExclusiveReservation* slot = nullptr;
     for (ExclusiveReservation& reservation : reservations_) {
@@ -141,8 +145,19 @@ bool Bus::take_exclusive(u32 address, unsigned size, int core, u32 asid) {
         if (!reservation.valid || reservation.owner != core) continue;
         const bool ok = reservation.address == address && reservation.size == size &&
                         reservation.asid == asid;
+        if (exclusive_trace) {
+            ZLB_LOG_INFO("bus",
+                         "excl: take core=%d asid=0x%X addr=0x%08X size=%u -> %s "
+                         "(held addr=0x%08X size=%u asid=0x%X)",
+                         core, asid, address, size, ok ? "OK" : "FAIL", reservation.address,
+                         reservation.size, reservation.asid);
+        }
         reservation.valid = false;
         return ok;
+    }
+    if (exclusive_trace) {
+        ZLB_LOG_INFO("bus", "excl: take core=%d asid=0x%X addr=0x%08X size=%u -> FAIL (no slot)",
+                     core, asid, address, size);
     }
     return false;
 }
@@ -157,6 +172,13 @@ void Bus::clear_exclusive(u32 address, unsigned size) {
     for (ExclusiveReservation& reservation : reservations_) {
         if (!reservation.valid) continue;
         if (ranges_overlap(reservation.address, reservation.size, address, size)) {
+            if (exclusive_trace) {
+                ZLB_LOG_INFO("bus",
+                             "excl: clear by write addr=0x%08X size=%u dropped core=%d "
+                             "reservation addr=0x%08X size=%u",
+                             address, size, reservation.owner, reservation.address,
+                             reservation.size);
+            }
             reservation.valid = false;
         }
     }

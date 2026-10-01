@@ -782,6 +782,29 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         // substituted and honest runs use different ones, so log the arguments of the
         // store itself plus the surrounding state.
         static u32 cas_events = 0;
+        // The spin lock at 0x4003A3EC guards the barrier's arrival index.  Log every
+        // call with its arguments, the lock word, and the outcome (ZLB_SKBL_ORDER_LOG=1):
+        // the honest run's STREX writes r1=0 instead of the incremented index, and the
+        // exclusive monitor itself is innocent (ZLB_EXCL_LOG shows no failed take).
+        static u32 spin_events = 0;
+        if ((pc == 0x4003A3ECu || pc == 0x4003A3FCu) && spin_events < 120u) {
+            ++spin_events;
+            u32 lock_word = 0;
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                if (o->translate(static_cast<u32>(o->r[0]) & ~1u, false, false, pa, fault)) {
+                    lock_word = arm_bus_->read16(pa);
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "spin arm%u pc=0x%08X lr=0x%08X r0=0x%08X lock=0x%04X r1=0x%08X "
+                         "r2=0x%08X r3=0x%08X [#%u]",
+                         core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? o->r[0] : 0u, lock_word,
+                         o != nullptr ? o->r[1] : 0u, o != nullptr ? o->r[2] : 0u,
+                         o != nullptr ? o->r[3] : 0u, spin_events);
+        }
         if ((pc == 0x4003A3F0u || pc == 0x4003A424u || pc == 0x4003A158u ||
              pc == 0x4003A408u || pc == 0x400211C8u) &&
             cas_events < 80u) {

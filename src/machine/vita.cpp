@@ -180,6 +180,12 @@ void Vita::build(const VitaConfig& config) {
 
 void Vita::build_buses() {
     arm_bus_ = std::make_unique<Bus>();
+    // ZLB_EXCL_LOG=1 traces every exclusive-monitor reservation change; the KBL's
+    // spin locks are the reason the secure boot loader stalls without the barrier
+    // substitution (docs/KBL.md 7.1.27).
+    if (const char* excl = std::getenv("ZLB_EXCL_LOG"); excl != nullptr && excl[0] != '0') {
+        arm_bus_->exclusive_trace = true;
+    }
     cmep_bus_ = std::make_unique<Bus>();
     syscon_bus_ = std::make_unique<Bus>();
 
