@@ -4687,6 +4687,18 @@ std::string Vita::boot_report() const {
                                    (unsigned long long)cmep_block_->sc_transfers());
     if (ernie_) out += format("SC commands  : %llu served\n", (unsigned long long)ernie_->commands_served());
     out += format("emulated time: %.4f s\n", emulated_seconds());
+    if (wfe_ticks_ != 0u || wfe_irq_wakeups_ != 0u || barrier_unstuck_ != 0u || wfe_wakeups_ != 0u) {
+        // How the model got the cluster past its WFE waits: the timer tick
+        // (ZLB_KBL_WFE_TICK=1) or the counter-patching engine, plus how many cores
+        // each of them actually woke.  Without these counters the two paths look
+        // identical in the report (docs/KBL.md 7.1.11).
+        out += format("WFE          : ticks=%llu irq_wakeups=%llu counter_patches=%llu "
+                      "cluster_wakeups=%llu\n",
+                      static_cast<unsigned long long>(wfe_ticks_),
+                      static_cast<unsigned long long>(wfe_irq_wakeups_),
+                      static_cast<unsigned long long>(barrier_unstuck_),
+                      static_cast<unsigned long long>(wfe_wakeups_));
+    }
     if (!milestones_.empty()) {
         out += "milestones   :\n";
         for (const auto& milestone : milestones_) out += "  * " + milestone + "\n";

@@ -803,7 +803,17 @@ void Vita::run_slice() {
             // One tick per `kTickSlices` slices with no progress at all: a shorter
             // period would inject interrupts into a healthy idle loop, a longer one
             // just costs slices.
-            constexpr u32 kTickSlices = 64u;
+            // One tick per `tick_slices` slices with no progress at all: a shorter
+            // period wakes the cores so often that the barrier's interleaving breaks
+            // (measured: 2402 ticks / 9608 wake-ups over 200k slices end at 0x49
+            // instead of 0xA9, docs/KBL.md 7.1.12), so the period is a knob.
+            static const u32 tick_slices = [] {
+                const char* value = std::getenv("ZLB_KBL_WFE_TICK_SLICES");
+                if (value == nullptr) return 64u;
+                const u32 parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
+                return parsed >= 8u ? parsed : 64u;
+            }();
+            const u32 kTickSlices = tick_slices;
             if (tick_driver && all_wfe_streak_ >= kTickSlices && kermit_ != nullptr) {
                 all_wfe_streak_ = 0;
                 ++wfe_ticks_;

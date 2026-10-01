@@ -197,7 +197,9 @@ TTBR0/TTBR1 и DFSR/DFAR/IFSR/IFAR; работает и при включённ�
 pc), `ZLB_SKBL_ORDER_LOG=1` (порядок событий SKBL: входы `0x40031CB0`,
 `0x4002F070` с `r0`, описание окна `0x40029F34`/`0x4002DBD0` с `r8`/`r9`),
 `ZLB_KBL_WFE_TICK=1` (будит кластер таймерным тиком `PPI 29` через `ArmCore::irq_hook`
-вместо правки счётчика барьера — измеренный путь даёт `0x88`, см. `docs/KBL.md` 7.1.9),
+вместо правки счётчика барьера; период — `ZLB_KBL_WFE_TICK_SLICES=<слайсов>`, по
+умолчанию 64. Измерено: тик при любой частоте доводит прогон только до `0x49`/`0x88`,
+`docs/KBL.md` 7.1.12),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
