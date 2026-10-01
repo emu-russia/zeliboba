@@ -1653,12 +1653,21 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return static_cast<u32>(std::strtoul(value, nullptr, 16));
     }();
     if (trace_ring_pc != 0u && core < static_cast<u32>(kArmCoreCount)) {
-        constexpr u32 kRingSize = 16384u;
-        static std::array<std::array<u32, kRingSize>, kArmCoreCount> ring{};
+        // ZLB_ARM_TRACE_RING_SIZE narrows the ring: the default 16 K dump floods the
+        // log, and naming a divergence usually needs the last few hundred
+        // instructions rather than the whole history.
+        static const u32 ring_size = [] {
+            const char* value = std::getenv("ZLB_ARM_TRACE_RING_SIZE");
+            if (value == nullptr) return 16384u;
+            const u32 parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
+            return parsed >= 64u ? parsed : 16384u;
+        }();
+        const u32 kRingSize = ring_size;
+        static std::array<std::array<u32, 16384u>, kArmCoreCount> ring{};
         static std::array<u32, kArmCoreCount> ring_pos{};
         auto& slot = ring[core];
         auto& pos = ring_pos[core];
-        if (pc == trace_ring_pc) {
+        if (pc == trace_ring_pc && !trace_ring_pc_dumped_[core]) {
             ZLB_LOG_INFO("machine", "trace-ring arm%u reached 0x%08X; last %u instructions:",
                          core, pc, kRingSize < pos ? kRingSize : pos);
             const u32 count = kRingSize < pos ? kRingSize : pos;
@@ -1672,8 +1681,8 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 }
             }
             if (!line.empty()) ZLB_LOG_INFO("machine", "  %s", line.c_str());
-            trace_ring_pc_dumped_ = true;
-        } else if (!trace_ring_pc_dumped_) {
+            trace_ring_pc_dumped_[core] = true;
+        } else if (!trace_ring_pc_dumped_[core]) {
             slot[pos % kRingSize] = pc;
             ++pos;
         }

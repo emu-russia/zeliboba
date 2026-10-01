@@ -191,6 +191,9 @@ $env:ZLB_NO_SUBSTITUTION=1
 `ZLB_ARM_FAULT_LOG` (отказы ARM в режиме `ZLB_NO_SUBSTITUTION=1` — там хук выходит
 раньше своей трассы), `ZLB_SECURE_FAULT_LOG` (отказы ARM с признаком `secure`,
 TTBR0/TTBR1 и DFSR/DFAR/IFSR/IFAR; работает и при включённых подстановках),
+`ZLB_ARM_TRACE_RING=<pc>` + `ZLB_ARM_TRACE_RING_SIZE=<n>` (кольцо последних инструкций
+до указанного pc; размер по умолчанию 16384, а в петле `b .` дамп теперь делается один
+раз на ядро),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
