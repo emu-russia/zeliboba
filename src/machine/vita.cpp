@@ -930,6 +930,16 @@ void Vita::run_slice() {
         for (int i = 0; i < kArmCoreCount; ++i) {
             Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
             if (!core || core->halted) continue;
+            // Diagnostic: ZLB_ARM_CORE_STAGGER=<n> holds core i back for i*n of its
+            // own instructions, modelling the natural start skew real cores have.
+            // Round-robin lockstep is what makes the KBL's per-core phases
+            // order-sensitive (docs/KBL.md 7.1.20), so this measures the effect.
+            static const u64 stagger = [] {
+                const char* value = std::getenv("ZLB_ARM_CORE_STAGGER");
+                if (value == nullptr) return 0ull;
+                return static_cast<u64>(std::strtoull(value, nullptr, 10));
+            }();
+            if (stagger != 0ull && core->instructions < stagger * static_cast<u64>(i)) continue;
             if (pc_trace_enabled_) trace_arm_boot_pc(static_cast<u32>(i), core->get_pc());
             if (pc_hook && pc_hook(Arch::Arm, i, core->get_pc())) {
                 // Leave the instruction pending: the debugger resumes from it.

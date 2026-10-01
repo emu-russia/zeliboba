@@ -201,7 +201,9 @@ pc), `ZLB_SKBL_ORDER_LOG=1` (порядок событий SKBL: входы `0x4
 умолчанию 64. Измерено: тик при любой частоте доводит прогон только до `0x49`/`0x88`,
 `docs/KBL.md` 7.1.12), `ZLB_KBL_WFE_PATCH_LIMIT=<n>` (ограничивает число правок счётчика
 барьера: без флага — 23 правки и `0xA9`, с 12 — `0xA4`, с 1 — `0x49`; `docs/KBL.md`
-7.1.13),
+7.1.13), `ZLB_ARM_CORE_STAGGER=<n>` (удерживает ядро `i` на `i*n` инструкций —
+проверка гипотезы о разбеге ядер: без флага `0x8D`, с разбегом `0x84`, `docs/KBL.md`
+7.1.21),
 `ZLB_MEP_PC=addr[,addr…]`, `ZLB_WTRAP=lo-hi`, `ZLB_RTRAP=lo-hi`,
 `ZLB_ARM_LOW_MAP=identity|dram|dram-abs|window`, `ZLB_KBL_FAULT_TRACE`,
 `ZLB_KBL_PANIC_TRACE`, `ZLB_KBL_TRACE_PC=<hex>`, `ZLB_ARM_TRACE_RANGE=lo-hi`,
