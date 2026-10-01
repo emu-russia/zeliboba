@@ -489,10 +489,11 @@ private:
     /// Lines already emitted by the ZLB_KBL_TRACE_PC diagnostic (round 111).
     u32 trace_pc_hits_ = 0;
     /// Set once the ZLB_ARM_TRACE_RING dump has been printed (round 214).
-    /// Per core: the trace ring for ZLB_ARM_TRACE_RING has been dumped.  Without the
-    /// per-core split a trap loop (`b .`) re-enters the same pc forever and dumps the
-    /// whole ring on every iteration, which floods the log and slows the run down.
-    std::array<bool, 4> trace_ring_pc_dumped_{};
+    /// Per core: how many trace-ring dumps have been emitted, and the cap.  The cap
+    /// exists because a trap loop (`b .`) re-enters the same pc forever, while an
+    /// honest path sometimes needs the second or third visit of one function.
+    std::array<u32, 4> trace_ring_dumps_{};
+    u32 trace_ring_max_dumps = 1;
     /// Lines already emitted by the fatal-stub diagnostic (round 111): the stubs end
     /// in `b .`, so without the cap the log grows without bound.
     u32 fatal_stub_hits_ = 0;

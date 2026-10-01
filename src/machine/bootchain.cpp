@@ -758,7 +758,14 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                          o != nullptr ? static_cast<u32>(o->r[2]) : 0u,
                          o != nullptr ? static_cast<u32>(o->r[13]) : 0u, st[0], st[1], st[2], st[3]);
         }
-        if ((pc == 0x40029F34u || pc == 0x4002DBD0u || pc == 0x4002F070u || pc == 0x40020394u) &&
+        if (pc == 0x4002F070u && order_events < 32u) {
+            ++order_events;
+            ZLB_LOG_INFO("machine", "skbl r0 at 0x4002F070 #%u: r0=0x%08X lr=0x%08X r1=0x%08X",
+                         order_events, o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[1]) : 0u);
+        }
+        if ((pc == 0x40029F34u || pc == 0x4002DBD0u || pc == 0x40020394u) &&
             order_events < 32u) {
             ++order_events;
             u32 r8 = 0;
@@ -1680,12 +1687,22 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             const u32 parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
             return parsed >= 64u ? parsed : 16384u;
         }();
+        // ZLB_ARM_TRACE_RING_DUMPS=<n> allows comparing the 1st, 2nd, ... visit of the
+        // same pc; the cap also keeps a trap loop from flooding the log.
+        static const u32 ring_dumps = [] {
+            const char* value = std::getenv("ZLB_ARM_TRACE_RING_DUMPS");
+            if (value == nullptr) return 1u;
+            const u32 parsed = static_cast<u32>(std::strtoul(value, nullptr, 10));
+            return parsed >= 1u ? parsed : 1u;
+        }();
+        trace_ring_max_dumps = ring_dumps;
         const u32 kRingSize = ring_size;
         static std::array<std::array<u32, 16384u>, kArmCoreCount> ring{};
         static std::array<u32, kArmCoreCount> ring_pos{};
         auto& slot = ring[core];
         auto& pos = ring_pos[core];
-        if (pc == trace_ring_pc && !trace_ring_pc_dumped_[core]) {
+        if (pc == trace_ring_pc && trace_ring_dumps_[core] < trace_ring_max_dumps) {
+            ++trace_ring_dumps_[core];
             ZLB_LOG_INFO("machine", "trace-ring arm%u reached 0x%08X; last %u instructions:",
                          core, pc, kRingSize < pos ? kRingSize : pos);
             const u32 count = kRingSize < pos ? kRingSize : pos;
@@ -1699,8 +1716,12 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 }
             }
             if (!line.empty()) ZLB_LOG_INFO("machine", "  %s", line.c_str());
-            trace_ring_pc_dumped_[core] = true;
-        } else if (!trace_ring_pc_dumped_[core]) {
+            // Restart the ring so the next dump covers the *next* visit: several
+            // calls of the same function have to be compared one by one, and a
+            // running ring would carry the previous visit's tail into the dump.
+            pos = 0;
+            slot.fill(0u);
+        } else if (trace_ring_dumps_[core] < trace_ring_max_dumps) {
             slot[pos % kRingSize] = pc;
             ++pos;
         }
