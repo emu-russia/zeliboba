@@ -859,6 +859,15 @@ void Vita::run_slice() {
                 }
             }
             if (legacy_watchdog) {
+                // ZLB_KBL_WFE_PATCH_LIMIT=<n> stops patching after n stalls, so the
+                // question "does the barrier need every patch or only the first one"
+                // becomes measurable (docs/KBL.md 7.1.13).
+                static const u64 patch_limit = [] {
+                    const char* value = std::getenv("ZLB_KBL_WFE_PATCH_LIMIT");
+                    if (value == nullptr) return ~0ull;
+                    return static_cast<u64>(std::strtoull(value, nullptr, 10));
+                }();
+                if (barrier_unstuck_ >= patch_limit) return;
                 // The old substitution: put each waiter's counter at the value its own
                 // loop tests - 4 for the arrival wait (`ldrh r2,[r4,#4] / cmp r2,#4`),
                 // 0 for the leave wait (`sxth r0 / cmp r0,#0 / bgt`) - and then wake it.
