@@ -507,6 +507,20 @@ void Vita::apply_os0_elf_form() {
                      elf->size(), static_cast<unsigned long long>(kFileBlocks));
         add_milestone("os0 ELF form written to the eMMC card (development substitution)");
     }
+    // Experiment (round 397): the validator's very first failing call receives *psp2config*'s
+    // data (its +0x18 is B0 09; psp2bootconfig's is 18 0A - measured with the 32-byte diagnostic
+    // ZLB_NSKBL_VALIDATOR_LOG).  The workspace has no ELF form for psp2config.skprx (only
+    // fs_dec/os0/psp2config.skprx.seg00/.seg01/.seg02), so to tell "format was the blocker"
+    // apart from "content matters", serve the same ELF there as well and see whether the
+    // loader's format check passes.
+    constexpr u64 kSecondFileLba = 72832u;   // cluster 905 of the volume
+    if (emmc_->write_blocks(EmmcPartition::User, kSecondFileLba, static_cast<u32>(kFileBlocks),
+                            blocks.data())) {
+        ZLB_LOG_INFO("machine",
+                     "os0 ELF form also written for the second file (LBA %llu, experiment, "
+                     "ZLB_OS0_ELF=1)",
+                     static_cast<unsigned long long>(kSecondFileLba));
+    }
 }
 
 bool Vita::fit_parts() {
