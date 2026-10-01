@@ -757,6 +757,34 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         static u32 order_29f34 = 0;
         static u32 line_events = 0;
         ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+        static u32 walk_events = 0;
+        // The caller at 0x4002C15C branches to 0x4002B96C (not the function start at
+        // 0x4002B95C), so watch the whole range that carries the walk and its errors.
+        if (pc >= 0x4002B95Cu && pc <= 0x4002B9C0u && walk_events < 24u) {
+            ++walk_events;
+            // What the list walk (0x4002B95C) is looking for and what it walks: the
+            // object it searches for is in r5, the list is reached from r7+0x9C.
+            u32 node = 0, node_key = 0, head = 0;
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                const u32 list = static_cast<u32>(o->r[3]);
+                if (list >= 0x1000u && o->translate(list, false, false, pa, fault)) {
+                    head = arm_bus_->read32(pa);
+                    if (head >= 0x1000u && o->translate(head, false, false, pa, fault)) {
+                        node = head;
+                        node_key = arm_bus_->read32(pa + 0x10u);
+                    }
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "skbl walk #%u pc=0x%08X r0=0x%08X r1=0x%08X r3=0x%08X r5=0x%08X r7=0x%08X "
+                         "list=0x%08X head=0x%08X head[+0x10]=0x%08X lr=0x%08X",
+                         walk_events, pc, o != nullptr ? o->r[0] : 0u, o != nullptr ? o->r[1] : 0u,
+                         o != nullptr ? o->r[3] : 0u, o != nullptr ? o->r[5] : 0u,
+                         o != nullptr ? o->r[7] : 0u, o != nullptr ? o->r[3] : 0u, node, node_key,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u);
+        }
         static u32 call_events = 0;
         if (pc == 0x4002C160u && call_events < 4u) {
             ++call_events;
