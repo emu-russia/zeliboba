@@ -340,12 +340,30 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
                 ttbr0 = arm->mmu.ttbr0;
                 ttbr1 = arm->mmu.ttbr1;
             }
+            // The page-table state at the fault decides what the guest was entitled
+            // to: `l1` is the first-level entry the faulting VA resolves through (in
+            // whichever of TTBR0/TTBR1 TTBCR selects for that VA), so a zero `l1`
+            // means "the guest never described this VA" and a non-zero one points at
+            // the descriptor that was rejected instead.
+            u32 l1 = 0;
+            u32 l2 = 0;
+            if (arm != nullptr && arm->mmu.enabled()) {
+                const bool ttbr1_range = va >= 0x40000000u && (arm->mmu.ttbcr & 7u) != 0u;
+                const u32 ttbr = ttbr1_range ? arm->mmu.ttbr1 : arm->mmu.ttbr0;
+                const u32 l1_base = ttbr & 0xFFFFC000u;
+                l1 = arm_bus_->read32(l1_base + ((va >> 20) & 0xFFFu) * 4u);
+                if ((l1 & 3u) == 1u) {
+                    l2 = arm_bus_->read32((l1 & 0xFFFFFC00u) + ((va >> 12) & 0xFFu) * 4u);
+                }
+            }
             ZLB_LOG_INFO("machine",
                          "ARM fault (unsubstituted) arm%u VA=0x%08X %s pc=0x%08X sctlr=0x%08X M=%d "
-                         "ttbr0=0x%08X ttbr1=0x%08X dfsr=0x%X ifsr=0x%X dfar=0x%08X ifar=0x%08X [%u]",
+                         "ttbr0=0x%08X ttbr1=0x%08X ttbcr=0x%X L1=0x%08X L2=0x%08X "
+                         "dfsr=0x%X ifsr=0x%X dfar=0x%08X ifar=0x%08X [%u]",
                          core, va, fetch ? "fetch" : (write ? "write" : "read"),
                          arm != nullptr ? arm->get_pc() : 0u, sctlr,
-                         arm != nullptr ? (arm->mmu.enabled() ? 1 : 0) : -1, ttbr0, ttbr1, dfsr, ifsr,
+                         arm != nullptr ? (arm->mmu.enabled() ? 1 : 0) : -1, ttbr0, ttbr1,
+                         arm != nullptr ? arm->mmu.ttbcr : 0u, l1, l2, dfsr, ifsr,
                          dfar, ifar, logged);
         }
         return false;
