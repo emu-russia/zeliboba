@@ -1265,7 +1265,31 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // rendezvous a no-op: the loader's per-core setup is idempotent in this model
     // (cores run round-robin, not truly in parallel), so no rendezvous is needed.
     // Gated by the same ZLB_KBL_OBJMGR_NOLOCK / ZLB_NO_SUBSTITUTION flags.
-    if (objmgr_nolock && pc == 0x4003B34Cu) {
+    // The rendezvous and the halfword exclusive-store helper were introduced together
+    // under one flag (round 136), which made it impossible to measure their separate
+    // contributions: the first is a control-flow rewrite, the second replaces an
+    // atomic read-modify-write.  ZLB_KBL_RENDEZVOUS=0 / ZLB_KBL_LOCK=0 now disable them
+    // individually so each can be removed on its own (docs/KBL.md 7.1.35).
+    static const bool rendezvous_sub = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_RENDEZVOUS");
+        return on == nullptr || on[0] != '0';
+    }();
+    // The lock helper substitution that used to live here (round 136: replace the
+    // `ldrexh/strexh` helper at 0x4003A3EC with a plain 16-bit store) is gone: measured
+    // with the exclusive monitor traced over a whole run (ZLB_EXCL_LOG=1, 1797 events,
+    // zero failed takes, zero foreign clears, docs/KBL.md 7.1.28) the helper is sound,
+    // and the barrier reaches 0xA9 with the substitution disabled
+    // (ZLB_KBL_LOCK=0, docs/KBL.md 7.1.35), so the rewrite was masking nothing.
+    // ZLB_KBL_LOCK=1 re-enables the old behaviour for comparison only.
+    static const bool lock_sub = [] {
+        const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
+        if (off != nullptr && off[0] != '0') return false;
+        const char* on = std::getenv("ZLB_KBL_LOCK");
+        return on != nullptr && on[0] != '0';
+    }();
+    if (rendezvous_sub && pc == 0x4003B34Cu) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 arm->set_pc(arm->r[14] & ~1u);          // bx lr - skip the rendezvous
@@ -1281,7 +1305,7 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // Make it a plain non-exclusive 16-bit store of r1 to [r0]: with no true
     // parallel execution the exclusivity is unnecessary.  Same gate as the other
     // round-136 substitutions.
-    if (objmgr_nolock && pc == 0x4003A3ECu) {
+    if (lock_sub && pc == 0x4003A3ECu) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u32 pa = 0;
