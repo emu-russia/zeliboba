@@ -4272,7 +4272,16 @@ bool Vita::start_arm_kernel_boot_loader() {
     // the run where the development substitutions are off and the loader cannot
     // get that far; the mirror is always needed, because the ARM reads the
     // record through the PA 0 alias of the power scratchpad.
-    if (!substitutions_enabled_static()) build_kbl_param();
+    //
+    // The fallback has to run *after* the mirror below: SPAD32K is what the ARM
+    // sees as PA 0..0x3FFF, so mirroring the CMeP scratch afterwards used to
+    // overwrite the record it had just written.  Measured effect of the old order
+    // (ZLB_NO_SUBSTITUTION=1): the honest run read 0 at VA 0x1C4 on 0x40020290 and
+    // proceeded on a record that was never there, while the substituted run read
+    // the wakeup factor 0x0000FF14 (docs/KBL.md 7.1.31/7.1.32).
+    const bool kbl_param_from_loader = substitutions_enabled_static();
+    const bool kbl_param_built_early = !kbl_param_from_loader;
+    if (kbl_param_built_early) build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
     // "mirror mapped to 0x00000000 on ARM", and the second loader copies its ARM
@@ -4280,6 +4289,26 @@ bool Vita::start_arm_kernel_boot_loader() {
     // scratch+0x100).  The model keeps the scratch in the shared boot SRAM, so
     // mirror its first 32 KiB into the ARM's low window before the release.
     mirror_cmep_scratch_to_arm();
+    // The record the ARM reads through that alias has to be laid down after the
+    // mirror, not before it (see the note above): in the fallback run the mirror
+    // used to overwrite it with the (empty) CMeP scratch.
+    if (kbl_param_built_early) {
+        build_kbl_param();
+        // Diagnostic (ZLB_KBL_PARAM_LOG=1): read the record back through the alias the
+        // ARM reads it from (PA 0x1C0 = SPAD32K + 0xC0) right after the build, to tell
+        // "the builder did not write" apart from "something zeroed it afterwards"
+        // (docs/KBL.md 7.1.32).
+        static const bool param_log = [] {
+            const char* value = std::getenv("ZLB_KBL_PARAM_LOG");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (param_log) {
+            ZLB_LOG_INFO("machine",
+                         "kbl param after mirror: PA 0x1C0=0x%08X PA 0x1C4=0x%08X "
+                         "(expected 0x00000060 / 0x0000FF14)",
+                         arm_bus_->read32(0x1C0u), arm_bus_->read32(0x1C4u));
+        }
+    }
 
     // The syscon releases the whole Kermit cluster, not just the boot core: the
     // kernel boot loader brings the other three cores up itself (each reads MPIDR,
