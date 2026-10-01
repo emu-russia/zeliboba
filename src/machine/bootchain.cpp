@@ -739,6 +739,36 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         static u32 order_29f34 = 0;
         static u32 line_events = 0;
         ArmCore* o = dynamic_cast<ArmCore*>(arm_cores_[core].get());
+        if (pc == 0x40029EE0u && order_29f34 < 4u) {
+            ++order_29f34;
+            u32 st0 = 0, st1 = 0, st2 = 0, st3 = 0;
+            if (o != nullptr) {
+                u32 pa = 0;
+                std::string fault;
+                for (u32 i = 0; i < 4; ++i) {
+                    if (o->translate(static_cast<u32>(o->r[13]) + i * 4u, false, false, pa, fault)) {
+                        const u32 v = arm_bus_->read32(pa);
+                        if (i == 0) st0 = v;
+                        else if (i == 1) st1 = v;
+                        else if (i == 2) st2 = v;
+                        else st3 = v;
+                    }
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "skbl 29EE0 entry #%u: r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X "
+                         "r5=0x%08X r6=0x%08X r7=0x%08X lr=0x%08X sp=0x%08X stack=%08X %08X %08X %08X",
+                         order_29f34, o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[1]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[2]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[3]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[4]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[5]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[6]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[7]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u, st0, st1, st2, st3);
+        }
         if (pc == 0x40029F34u && order_29f34 < 4u) {
             ++order_29f34;
             ZLB_LOG_INFO("machine",
