@@ -875,6 +875,40 @@ bool build_fat_volume(EmmcCard& card, EmmcPartition partition, u64 start_block, 
                 child.clusters = 0;
                 continue;
             }
+            // Substitution (round 395): the workspace holds only the *decrypted* os0
+            // content - fs/os0/*.skprx start with the SCE module magic 53 43 45 00 - while
+            // NSKBL's format validator (0x5101A4B0) accepts only 7F 45 4C 46 = "\x7FELF"
+            // (see docs/NSKBL.md round 394).  The same extraction also provides the ELF form
+            // (fs_dec/os0/psp2bootconfig.elf), so put that on the card instead when
+            // ZLB_OS0_ELF=1.  Gated: by default the volume stays byte-identical to fs/.
+            static const bool os0_elf = [] {
+                const char* on = std::getenv("ZLB_OS0_ELF");
+                return on != nullptr && on[0] != '0';
+            }();
+            if (os0_elf && !child.directory) {
+                std::string candidate = child.path;
+                bool swapped = false;
+                for (const char* pair : {"fs/os0", "fs\\os0"}) {
+                    const std::string from = pair;
+                    const std::string to = from.substr(0, 3) + "_dec" + from.substr(3);
+                    const size_t at = candidate.find(from);
+                    if (at != std::string::npos) {
+                        candidate.replace(at, from.size(), to);
+                        swapped = true;
+                        break;
+                    }
+                }
+                const size_t dot = candidate.rfind('.');
+                if (swapped && dot != std::string::npos) {
+                    candidate.replace(dot, std::string::npos, ".elf");
+                    std::error_code size_ec;
+                    const auto elf_size = fs::file_size(candidate, size_ec);
+                    if (!size_ec && elf_size != 0) {
+                        child.path = candidate;
+                        child.size = elf_size;
+                    }
+                }
+            }
             const u64 needed =
                 (child.size + cluster_bytes - 1) / static_cast<u64>(cluster_bytes);
             u32 first = 0;
