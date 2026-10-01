@@ -761,10 +761,28 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         if ((pc == 0x40029F34u || pc == 0x4002DBD0u || pc == 0x4002F070u || pc == 0x40020394u) &&
             order_events < 32u) {
             ++order_events;
-            ZLB_LOG_INFO("machine", "skbl order arm%u pc=0x%08X lr=0x%08X r0=0x%08X sp=0x%08X",
+            u32 r8 = 0;
+            u32 r9 = 0;
+            u32 st0 = 0;
+            u32 st1 = 0;
+            if (o != nullptr) {
+                r8 = static_cast<u32>(o->r[8]);
+                r9 = static_cast<u32>(o->r[9]);
+                // The walker takes its array base from r8; the first two entries say
+                // whether the array the two runs walk is the same one.
+                u32 pa = 0;
+                std::string fault;
+                if (r8 >= 0x1000u && o->translate(r8, false, false, pa, fault)) {
+                    st0 = arm_bus_->read32(pa);
+                    st1 = arm_bus_->read32(pa + 4u);
+                }
+            }
+            ZLB_LOG_INFO("machine",
+                         "skbl order arm%u pc=0x%08X lr=0x%08X r0=0x%08X sp=0x%08X r8=0x%08X "
+                         "[r8]=%08X [r8+4]=%08X r9=0x%08X",
                          core, pc, o != nullptr ? static_cast<u32>(o->r[14]) : 0u,
                          o != nullptr ? static_cast<u32>(o->r[0]) : 0u,
-                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u);
+                         o != nullptr ? static_cast<u32>(o->r[13]) : 0u, r8, st0, st1, r9);
         }
     }
 
