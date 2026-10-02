@@ -93,6 +93,11 @@ megabytes.
 * The eMMC image file itself is external input: a state records the card's mode
   and the image path/size, not the 3.8 GiB image. A run that wrote to the card
   is reported before saving, because the state then depends on that file.
+* Each bus checks that the state's device count matches the build's
+  (`state file: bus has N devices, this build has M`). Adding a device in
+  `KermitBlock::install()` therefore rejects every older snapshot - deliberately,
+  because a state whose sections no longer line up would otherwise restore a
+  half-built machine. Regenerate snapshots after such a change.
 
 ## Testing
 
