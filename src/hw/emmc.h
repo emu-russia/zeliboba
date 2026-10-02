@@ -103,6 +103,17 @@ public:
     u64 reads() const { return reads_; }
     u64 writes() const { return writes_; }
 
+    // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+
+    /// Serialise the card's mode, registers and counters. The image file is
+    /// external input: `path_`, `file_` and `attached_` are deliberately not
+    /// written. The machine re-attaches (and verifies) the image separately,
+    /// and `load_state` leaves the live handle and attachment untouched.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
+
 private:
     void build_registers();
 

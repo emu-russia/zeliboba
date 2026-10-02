@@ -71,6 +71,12 @@ public:
         return format("%s of flash fitted", human_size(bytes ? bytes : kFlashSize).c_str());
     }
 
+    /// The device owns no state of its own: the flash bytes live in the bus RAM
+    /// region ("ernie_flash"), which `Bus::save_state` writes, and `region_` is
+    /// only a lazily resolved pointer into that region (wiring, not state).
+    void save_state(StateWriter& writer) const override { (void)writer; }
+    void load_state(StateReader& reader) override { (void)reader; }
+
 private:
     Bus& bus_;
     MemRegion* region_ = nullptr;
@@ -888,6 +894,200 @@ void ErnieBlock::release_soc() {
     impl_->power.release_soc();
     if (impl_->soc_gate != nullptr) impl_->soc_gate->set_released(true);
     soc_released_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+void ErnieBlock::save_state(StateWriter& writer) const {
+    const Impl& impl = *impl_;
+
+    // ErnieBlock's own latches (the bus-owned devices it points at are written
+    // by Bus::save_state; cpu_raw_ is a non-owning mirror of cpu_).
+    writer.put_bool(run_firmware_);
+    writer.put_bool(firmware_loaded_);
+    writer.put_u32(reset_vector_);
+    writer.put_bool(response_ready_);
+    writer.put_bool(busy_);
+    writer.list(response_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u64(commands_served_);
+    writer.put_u64(spi_transfers_);
+    writer.put_u64(spi_bad_packets_);
+    writer.put_u32(last_spi_command_);
+    writer.list(last_spi_request_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.list(last_spi_response_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u64(milliseconds_);
+    writer.put_u64(rtc_seconds_);
+    writer.put_i32(battery_percent_);
+    writer.put_i32(charger_state_);
+    writer.put_bool(soc_released_);
+
+    // Impl scalars that are not devices.
+    writer.put_bool(impl.installed);
+    writer.put_u64(impl.cycles);
+    writer.put_u64(impl.ticks);
+    writer.put_u64(impl.irqs_raised);
+
+    // The board model. PowerState::sfr / PowerState::emmc are wiring and are
+    // rebuilt by install()/reset(), so they are not written.
+    writer.begin("power");
+    writer.put_u64(impl.power.milliseconds);
+    writer.put_u64(impl.power.rtc_seconds);
+    writer.put_i32(impl.power.battery_percent);
+    writer.put_i32(impl.power.charger_state);
+    writer.put_u32(impl.power.voltage_mv);
+    writer.put_i32(impl.power.current_ma);
+    writer.put_u16(impl.power.design_capacity_mah);
+    writer.put_u16(impl.power.temperature_dk);
+    writer.put_bool(impl.power.power_button);
+    writer.put_bool(impl.power.ps_button);
+    writer.put_bool(impl.power.volume_up);
+    writer.put_bool(impl.power.volume_down);
+    writer.put_bool(impl.power.soc_released);
+    writer.put_u64(impl.power.soc_release_count);
+    writer.put_u64(impl.power.power_button_events);
+    writer.put_u64(impl.power.power_button_held_ms);
+    writer.put_bool(impl.power.shutdown_requested);
+    writer.end();
+
+    writer.begin("policy");
+    writer.put_u64(impl.policy.power_off_hold_ms);
+    writer.put_bool(impl.policy.power_off_on_hold);
+    writer.put_bool(impl.policy.reset_on_ps_hold);
+    writer.end();
+
+    // The SC channel owns the live register file but is not bus registered, so
+    // it is serialised here (the window device only carries its own fallback).
+    writer.begin("channel");
+    impl.channel.save_state(writer);
+    writer.end();
+
+    writer.begin("sc_regs");
+    impl.sc_regs.save_state(writer);
+    writer.end();
+
+    writer.begin("nvs");
+    impl.nvs.save_state(writer);
+    writer.end();
+
+    writer.begin("scratch");
+    impl.scratch.save_state(writer);
+    writer.end();
+
+    writer.begin("emmc_host");
+    impl.emmc_host.save_state(writer);
+    writer.end();
+
+    writer.begin("recent_commands");
+    writer.list(impl.recent_commands, [&](const std::pair<u32, u32>& entry) {
+        writer.put_u32(entry.first);
+        writer.put_u32(entry.second);
+    });
+    writer.end();
+
+    writer.begin("record_reads");
+    writer.map(impl.record_reads, [&](u8 index, unsigned reads) {
+        writer.put_u8(index);
+        writer.put_u32(reads);
+    });
+    writer.end();
+
+    // The RL78 core is only reachable through ErnieBlock.
+    writer.begin("cpu");
+    if (cpu_) cpu_->save_state(writer);
+    writer.end();
+}
+
+void ErnieBlock::load_state(StateReader& reader) {
+    Impl& impl = *impl_;
+
+    run_firmware_ = reader.get_bool();
+    firmware_loaded_ = reader.get_bool();
+    reset_vector_ = reader.get_u32();
+    response_ready_ = reader.get_bool();
+    busy_ = reader.get_bool();
+    reader.list(response_, [&](u8& byte) { byte = reader.get_u8(); });
+    commands_served_ = reader.get_u64();
+    spi_transfers_ = reader.get_u64();
+    spi_bad_packets_ = reader.get_u64();
+    last_spi_command_ = reader.get_u32();
+    reader.list(last_spi_request_, [&](u8& byte) { byte = reader.get_u8(); });
+    reader.list(last_spi_response_, [&](u8& byte) { byte = reader.get_u8(); });
+    milliseconds_ = reader.get_u64();
+    rtc_seconds_ = reader.get_u64();
+    battery_percent_ = reader.get_i32();
+    charger_state_ = reader.get_i32();
+    soc_released_ = reader.get_bool();
+
+    impl.installed = reader.get_bool();
+    impl.cycles = reader.get_u64();
+    impl.ticks = reader.get_u64();
+    impl.irqs_raised = reader.get_u64();
+
+    reader.begin("power");
+    impl.power.milliseconds = reader.get_u64();
+    impl.power.rtc_seconds = reader.get_u64();
+    impl.power.battery_percent = reader.get_i32();
+    impl.power.charger_state = reader.get_i32();
+    impl.power.voltage_mv = reader.get_u32();
+    impl.power.current_ma = reader.get_i32();
+    impl.power.design_capacity_mah = reader.get_u16();
+    impl.power.temperature_dk = reader.get_u16();
+    impl.power.power_button = reader.get_bool();
+    impl.power.ps_button = reader.get_bool();
+    impl.power.volume_up = reader.get_bool();
+    impl.power.volume_down = reader.get_bool();
+    impl.power.soc_released = reader.get_bool();
+    impl.power.soc_release_count = reader.get_u64();
+    impl.power.power_button_events = reader.get_u64();
+    impl.power.power_button_held_ms = reader.get_u64();
+    impl.power.shutdown_requested = reader.get_bool();
+    reader.end();
+
+    reader.begin("policy");
+    impl.policy.power_off_hold_ms = reader.get_u64();
+    impl.policy.power_off_on_hold = reader.get_bool();
+    impl.policy.reset_on_ps_hold = reader.get_bool();
+    reader.end();
+
+    reader.begin("channel");
+    impl.channel.load_state(reader);
+    reader.end();
+
+    reader.begin("sc_regs");
+    impl.sc_regs.load_state(reader);
+    reader.end();
+
+    reader.begin("nvs");
+    impl.nvs.load_state(reader);
+    reader.end();
+
+    reader.begin("scratch");
+    impl.scratch.load_state(reader);
+    reader.end();
+
+    reader.begin("emmc_host");
+    impl.emmc_host.load_state(reader);
+    reader.end();
+
+    reader.begin("recent_commands");
+    reader.list(impl.recent_commands, [&](std::pair<u32, u32>& entry) {
+        entry.first = reader.get_u32();
+        entry.second = reader.get_u32();
+    });
+    reader.end();
+
+    reader.begin("record_reads");
+    reader.map(impl.record_reads, [&](u8& index, unsigned& reads) {
+        index = reader.get_u8();
+        reads = reader.get_u32();
+    });
+    reader.end();
+
+    reader.begin("cpu");
+    if (cpu_) cpu_->load_state(reader);
+    reader.end();
 }
 
 // ---------------------------------------------------------------------------

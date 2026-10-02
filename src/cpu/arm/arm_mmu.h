@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "bus/bus.h"
+#include "common/state.h"
 #include "common/types.h"
 #include "cpu/arm/arm_defs.h"
 
@@ -114,6 +115,14 @@ public:
     bool record_walks = false;
 
     void reset();
+
+    // ---- save states ------------------------------------------------------
+
+    /// Plain helper class (no base to chain to). Writes the CP15 registers, the
+    /// walk statistics and the fault records. `record_walks` is an environment
+    /// configuration flag and `bus_` is a wiring pointer: neither is state.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 
     bool enabled() const { return (sctlr & 1u) != 0; }
     bool strict_alignment() const { return (sctlr & 2u) != 0; }

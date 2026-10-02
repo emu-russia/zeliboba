@@ -497,6 +497,84 @@ void EmmcCard::build_registers() {
 }
 
 // ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+//
+// The image file is external input: `path_`, `file_` and `attached_` are never
+// written and load leaves them exactly as the live machine has them. Only the
+// mode flags, the geometry/registers derived from the image and the transfer
+// counters travel in the state.
+
+void EmmcCard::save_state(StateWriter& writer) const {
+    writer.put_bool(readonly_);
+    writer.put_bool(dirty_);
+
+    writer.put_u64(user_blocks_);
+    writer.put_u64(boot0_offset_);
+    writer.put_u64(boot1_offset_);
+    writer.put_u64(rpmb_offset_);
+    writer.put_u64(boot_blocks_);
+    writer.put_u64(rpmb_blocks_);
+
+    writer.fixed(cid_, [&](u8 value) { writer.put_u8(value); });
+    writer.fixed(csd_, [&](u8 value) { writer.put_u8(value); });
+    writer.list(ext_csd_, [&](u8 value) { writer.put_u8(value); });
+
+    // EmmcCid: the source bytes/fields the CID and CSD were built from.
+    writer.put_u8(cid_source_.manufacturer_id);
+    writer.put_u16(cid_source_.oem_id);
+    writer.str(cid_source_.product_name);
+    writer.put_u8(cid_source_.revision);
+    writer.put_u32(cid_source_.serial);
+    writer.put_u16(cid_source_.manufacturing_date);
+
+    writer.put_u32(rca_);
+    writer.put_u32(static_cast<u32>(partition_));
+    writer.put_u64(reads_);
+    writer.put_u64(writes_);
+}
+
+void EmmcCard::load_state(StateReader& reader) {
+    readonly_ = reader.get_bool();
+    dirty_ = reader.get_bool();
+
+    user_blocks_ = reader.get_u64();
+    boot0_offset_ = reader.get_u64();
+    boot1_offset_ = reader.get_u64();
+    rpmb_offset_ = reader.get_u64();
+    boot_blocks_ = reader.get_u64();
+    rpmb_blocks_ = reader.get_u64();
+
+    reader.fixed(cid_, [&](u8& value) { value = reader.get_u8(); });
+    reader.fixed(csd_, [&](u8& value) { value = reader.get_u8(); });
+
+    // EXT_CSD is a fixed 512 byte register image (build_registers assigns it)
+    // and describe()/select_partition() index it directly, so consume the
+    // length the writer recorded but do not resize it to whatever the file
+    // claims.
+    const u32 ext_csd_size = reader.get_u32();
+    if (!reader.ok()) return;
+    if (ext_csd_size != ext_csd_.size()) {
+        reader.fail(format("state file: eMMC EXT_CSD is %u bytes, this build has %llu", ext_csd_size,
+                           static_cast<unsigned long long>(ext_csd_.size())));
+        return;
+    }
+    reader.fixed(ext_csd_, [&](u8& value) { value = reader.get_u8(); });
+
+    cid_source_.manufacturer_id = reader.get_u8();
+    cid_source_.oem_id = reader.get_u16();
+    cid_source_.product_name = reader.str();
+    cid_source_.revision = reader.get_u8();
+    cid_source_.serial = reader.get_u32();
+    cid_source_.manufacturing_date = reader.get_u16();
+
+    rca_ = reader.get_u32();
+    partition_ = static_cast<EmmcPartition>(reader.get_u32());
+    reads_ = reader.get_u64();
+    writes_ = reader.get_u64();
+}
+
+// ---------------------------------------------------------------------------
 // Debugger helpers
 // ---------------------------------------------------------------------------
 

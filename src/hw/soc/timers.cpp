@@ -191,6 +191,29 @@ void GlobalTimer::describe(std::vector<std::string>& lines) const {
                            static_cast<unsigned long long>(comparator_), irq_state_ ? "asserted" : "idle"));
 }
 
+void GlobalTimer::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    writer.put_u64(counter_);
+    writer.put_u64(comparator_);
+    writer.put_u64(accumulator_);
+    writer.put_bool(enabled_);
+    writer.put_bool(irq_state_);
+    writer.put_bool(armed_);
+    writer.put_bool(fired_);
+    // `irq_` is a host callback: never serialised.
+}
+
+void GlobalTimer::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    counter_ = reader.get_u64();
+    comparator_ = reader.get_u64();
+    accumulator_ = reader.get_u64();
+    enabled_ = reader.get_bool();
+    irq_state_ = reader.get_bool();
+    armed_ = reader.get_bool();
+    fired_ = reader.get_bool();
+}
+
 // ---------------------------------------------------------------------------
 // PrivateTimer
 // ---------------------------------------------------------------------------
@@ -368,6 +391,68 @@ void PrivateTimer::describe(std::vector<std::string>& lines) const {
     lines.push_back(format("    watchdog: %s load=%u counter=%u reset_status=%u disabled=%u",
                            watchdog_.running ? "running" : "stopped", watchdog_.load, watchdog_.value,
                            watchdog_reset_status_ ? 1u : 0u, watchdog_disabled_ ? 1u : 0u));
+}
+
+namespace {
+
+/// One Cortex-A9 private timer Counter (both the timer and the watchdog use it).
+void write_counter(StateWriter& writer, const char* section, u32 load, u32 value, bool running,
+                   bool auto_reload, bool irq_enable, u8 prescaler, u32 prescale_left, bool event) {
+    writer.begin(section);
+    writer.put_u32(load);
+    writer.put_u32(value);
+    writer.put_bool(running);
+    writer.put_bool(auto_reload);
+    writer.put_bool(irq_enable);
+    writer.put_u8(prescaler);
+    writer.put_u32(prescale_left);
+    writer.put_bool(event);
+    writer.end();
+}
+
+void read_counter(StateReader& reader, const char* section, u32& load, u32& value, bool& running,
+                  bool& auto_reload, bool& irq_enable, u8& prescaler, u32& prescale_left, bool& event) {
+    reader.begin(section);
+    load = reader.get_u32();
+    value = reader.get_u32();
+    running = reader.get_bool();
+    auto_reload = reader.get_bool();
+    irq_enable = reader.get_bool();
+    prescaler = reader.get_u8();
+    prescale_left = reader.get_u32();
+    event = reader.get_bool();
+    reader.end();
+}
+
+}  // namespace
+
+void PrivateTimer::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    // core_/timer_irq_/watchdog_irq_ are construction-time configuration.
+    writer.put_u64(accumulator_);
+    writer.put_u64(expiries_);
+    write_counter(writer, "PrivateTimer.timer", timer_.load, timer_.value, timer_.running,
+                  timer_.auto_reload, timer_.irq_enable, timer_.prescaler, timer_.prescale_left,
+                  timer_.event);
+    write_counter(writer, "PrivateTimer.watchdog", watchdog_.load, watchdog_.value, watchdog_.running,
+                  watchdog_.auto_reload, watchdog_.irq_enable, watchdog_.prescaler,
+                  watchdog_.prescale_left, watchdog_.event);
+    writer.put_bool(watchdog_reset_status_);
+    writer.put_bool(watchdog_disabled_);
+}
+
+void PrivateTimer::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    accumulator_ = reader.get_u64();
+    expiries_ = reader.get_u64();
+    read_counter(reader, "PrivateTimer.timer", timer_.load, timer_.value, timer_.running,
+                 timer_.auto_reload, timer_.irq_enable, timer_.prescaler, timer_.prescale_left,
+                 timer_.event);
+    read_counter(reader, "PrivateTimer.watchdog", watchdog_.load, watchdog_.value, watchdog_.running,
+                 watchdog_.auto_reload, watchdog_.irq_enable, watchdog_.prescaler,
+                 watchdog_.prescale_left, watchdog_.event);
+    watchdog_reset_status_ = reader.get_bool();
+    watchdog_disabled_ = reader.get_bool();
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +661,28 @@ void VitaSystemTimer::describe(std::vector<std::string>& lines) const {
                            longrange_ ? 48000000u : kVitaTimerSysClockHz,
                            (registers_[config_offset() / 4] >> 24) + 1,
                            longrange_ ? "" : "; SysClock222 MHz is a modeled board input"));
+}
+
+void VitaSystemTimer::save_state(StateWriter& writer) const {
+    // longrange_ and irq_id_ are construction-time configuration; irq_ is a
+    // host callback. Everything the guest can program is state.
+    writer.fixed(registers_, [&](u32 value) { writer.put_u32(value); });
+    writer.put_u64(fractional_);
+    writer.put_u64(comparisons_);
+    writer.put_u64(unsupported_configs_);
+    writer.put_bool(armed_);
+    writer.put_bool(unsupported_);
+    writer.put_bool(irq_state_);
+}
+
+void VitaSystemTimer::load_state(StateReader& reader) {
+    reader.fixed(registers_, [&](u32& value) { value = reader.get_u32(); });
+    fractional_ = reader.get_u64();
+    comparisons_ = reader.get_u64();
+    unsupported_configs_ = reader.get_u64();
+    armed_ = reader.get_bool();
+    unsupported_ = reader.get_bool();
+    irq_state_ = reader.get_bool();
 }
 
 }  // namespace zlb::kermit

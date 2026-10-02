@@ -15,6 +15,7 @@
 
 #include <string>
 
+#include "common/state.h"
 #include "common/types.h"
 
 namespace zlb {
@@ -49,6 +50,14 @@ public:
     static constexpr u32 kVs = 1u << 28;
 
     void reset();
+
+    // ---- save states ------------------------------------------------------
+
+    /// Plain helper class (no base to chain to). The register file and
+    /// FPSCR/FPEXC are the mutable state; FPSID/MVFR0/MVFR1 are build-time
+    /// feature IDs and are deliberately not written.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 
     bool enabled() const { return (fpexc & kFpexcEn) != 0; }
 

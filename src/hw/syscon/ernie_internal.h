@@ -224,6 +224,10 @@ public:
         return true;
     }
 
+    /// The store is a fixed-size byte image: written raw, never resized.
+    void save_state(StateWriter& writer) const { writer.bytes(bytes_.data(), bytes_.size()); }
+    void load_state(StateReader& reader) { reader.bytes(bytes_.data(), bytes_.size()); }
+
 private:
     std::vector<u8> bytes_ = std::vector<u8>(kSize, 0xFF);
 };
@@ -263,6 +267,10 @@ public:
         std::copy(data, data + count, bytes_.begin() + offset);
         return true;
     }
+
+    /// The pad is a fixed-size byte image: written raw, never resized.
+    void save_state(StateWriter& writer) const { writer.bytes(bytes_.data(), bytes_.size()); }
+    void load_state(StateReader& reader) { reader.bytes(bytes_.data(), bytes_.size()); }
 
 private:
     std::array<u8, kSize> bytes_{};
@@ -312,6 +320,10 @@ struct ScRegs {
 
     void reset();
     std::string summary() const;
+
+    /// Plain helper class: every register, latch, response buffer and counter.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 };
 
 // ---------------------------------------------------------------------------
@@ -350,6 +362,11 @@ public:
     bool busy() const { return (regs_.stat24 & 0x01u) != 0; }
     u64 commands() const { return regs_.commands; }
 
+    /// The channel is not a Device (ErnieBlock owns and serialises it); its
+    /// whole state is the register file it shares with ScWindowDevice.
+    void save_state(StateWriter& writer) const { regs_.save_state(writer); }
+    void load_state(StateReader& reader) { regs_.load_state(reader); }
+
 private:
     ErnieBlock& owner_;
     ScRegs regs_;
@@ -377,6 +394,12 @@ public:
     void enumerate_registers(std::vector<RegisterInfo>& out) const override;
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// `fallback_` is the only register file this standalone device owns; when
+    /// bound, the live registers belong to the channel (see set_channel) and are
+    /// serialised by ErnieBlock instead.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 private:
     ScRegs& regs();
@@ -421,6 +444,9 @@ public:
     const char* register_name(u32 address) const override;
     std::string summary() const override;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     static constexpr u32 kBase = 0x30000100;
     static constexpr u32 kSize = 0x200;
     static constexpr u32 kBootState = 0x30000118;
@@ -442,6 +468,9 @@ public:
     void reset() override;
     const char* register_name(u32 address) const override;
     std::string summary() const override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     static constexpr u32 kBase = 0xE0064060;
     static constexpr u32 kSize = 4;
@@ -470,6 +499,12 @@ public:
     const char* register_name(u32 address) const override;
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// `bytes_` is a fixed-size window written raw; `response_` and `dirty_` are
+    /// the runtime flags the write path maintains. The command_posted_ hook is
+    /// wiring and stays in the build.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     const std::vector<u8>& bytes() const { return bytes_; }
     void load(const std::vector<u8>& data);
@@ -538,6 +573,11 @@ public:
 
     std::string summary() const;
     void describe(std::vector<std::string>& lines) const;
+
+    /// Plain helper: the cached card identity, bus configuration and transfer
+    /// statistics. `card_` points at the machine-owned EmmcCard and is wiring.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 
 private:
     EmmcCard* card_ = nullptr;

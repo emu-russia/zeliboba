@@ -164,6 +164,66 @@ std::string ScRegs::summary() const {
                   static_cast<unsigned long long>(commands), stat24, irq124, reg1190);
 }
 
+void ScRegs::save_state(StateWriter& writer) const {
+    writer.put_u32(cmd10A0);
+    writer.put_u32(ack10A4);
+    writer.put_u32(resp20A0);
+    writer.put_u32(resp20A4);
+    writer.put_u32(reg1190);
+    writer.put_u32(stat24);
+    writer.put_u32(stat36);
+    writer.put_u32(req122);
+    writer.put_u32(irq124);
+    writer.put_u32(reg1100);
+    writer.put_u32(reg2100);
+    writer.put_u32(reg3040);
+    writer.put_u32(reg3050);
+    writer.put_u32(reg0194);
+    writer.put_u32(engine30);
+    writer.put_u32(engine32);
+    writer.put_u32(stat1000);
+    writer.put_u32(command);
+    writer.put_u32(error);
+    writer.put_u8(status_byte);
+    writer.put_u8(payload_length);
+    // The response is a runtime buffer (never longer than the 32 byte record),
+    // so a length prefix is the right shape; the read cursor follows it.
+    writer.list(response, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u64(static_cast<u64>(response_byte));
+    writer.put_u64(commands);
+    writer.put_u64(request_polls);
+    writer.put_u64(ack_polls);
+}
+
+void ScRegs::load_state(StateReader& reader) {
+    cmd10A0 = reader.get_u32();
+    ack10A4 = reader.get_u32();
+    resp20A0 = reader.get_u32();
+    resp20A4 = reader.get_u32();
+    reg1190 = reader.get_u32();
+    stat24 = reader.get_u32();
+    stat36 = reader.get_u32();
+    req122 = reader.get_u32();
+    irq124 = reader.get_u32();
+    reg1100 = reader.get_u32();
+    reg2100 = reader.get_u32();
+    reg3040 = reader.get_u32();
+    reg3050 = reader.get_u32();
+    reg0194 = reader.get_u32();
+    engine30 = reader.get_u32();
+    engine32 = reader.get_u32();
+    stat1000 = reader.get_u32();
+    command = reader.get_u32();
+    error = reader.get_u32();
+    status_byte = reader.get_u8();
+    payload_length = reader.get_u8();
+    reader.list(response, [&](u8& byte) { byte = reader.get_u8(); });
+    response_byte = static_cast<size_t>(reader.get_u64());
+    commands = reader.get_u64();
+    request_polls = reader.get_u64();
+    ack_polls = reader.get_u64();
+}
+
 // ---------------------------------------------------------------------------
 // ScWindowDevice
 // ---------------------------------------------------------------------------
@@ -331,6 +391,30 @@ void ScWindowDevice::describe(std::vector<std::string>& lines) const {
                            static_cast<unsigned>(regs().payload_length)));
 }
 
+void ScWindowDevice::save_state(StateWriter& writer) const {
+    // Only the standalone (unbound) register file lives here; the bound channel
+    // is serialised by ErnieBlock, which owns it.
+    writer.begin("fallback");
+    fallback_.save_state(writer);
+    writer.end();
+    writer.map(scratch_, [&](u32 address, u32 value) {
+        writer.put_u32(address);
+        writer.put_u32(value);
+    });
+    writer.put_u32(events_c0_);
+}
+
+void ScWindowDevice::load_state(StateReader& reader) {
+    reader.begin("fallback");
+    fallback_.load_state(reader);
+    reader.end();
+    reader.map(scratch_, [&](u32& address, u32& value) {
+        address = reader.get_u32();
+        value = reader.get_u32();
+    });
+    events_c0_ = reader.get_u32();
+}
+
 // ---------------------------------------------------------------------------
 // SocGateDevice
 // ---------------------------------------------------------------------------
@@ -375,6 +459,18 @@ std::string SocGateDevice::summary() const {
                   released_ ? "SoC released" : "SoC held");
 }
 
+void SocGateDevice::save_state(StateWriter& writer) const {
+    writer.put_u32(boot_state_);
+    writer.put_u32(release_);
+    writer.put_bool(released_);
+}
+
+void SocGateDevice::load_state(StateReader& reader) {
+    boot_state_ = reader.get_u32();
+    release_ = reader.get_u32();
+    released_ = reader.get_bool();
+}
+
 // ---------------------------------------------------------------------------
 // ScStrapDevice
 // ---------------------------------------------------------------------------
@@ -405,6 +501,9 @@ const char* ScStrapDevice::register_name(u32 address) const {
 std::string ScStrapDevice::summary() const {
     return format("state strap 0x%08X (JIG=%d)", value_, (value_ & 0x10000u) ? 0 : 1);
 }
+
+void ScStrapDevice::save_state(StateWriter& writer) const { writer.put_u32(value_); }
+void ScStrapDevice::load_state(StateReader& reader) { value_ = reader.get_u32(); }
 
 // ---------------------------------------------------------------------------
 // ScMessageWindow
@@ -495,6 +594,20 @@ void ScMessageWindow::load(const std::vector<u8>& data) {
     const size_t count = std::min(data.size(), bytes_.size());
     std::memcpy(bytes_.data(), data.data(), count);
     dirty_ = false;
+}
+
+void ScMessageWindow::save_state(StateWriter& writer) const {
+    // The window size is a construction-time constant, so the byte image is
+    // written raw (no length): load_state must not resize it.
+    writer.bytes(bytes_.data(), bytes_.size());
+    writer.put_bool(response_);
+    writer.put_bool(dirty_);
+}
+
+void ScMessageWindow::load_state(StateReader& reader) {
+    reader.bytes(bytes_.data(), bytes_.size());
+    response_ = reader.get_bool();
+    dirty_ = reader.get_bool();
 }
 
 void ScMessageWindow::store(u32 offset, const u8* data, size_t length) {

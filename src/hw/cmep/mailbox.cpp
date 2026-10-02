@@ -1075,5 +1075,158 @@ void ScXferDevice::describe(std::vector<std::string>& lines) const {
                                             (descriptor_[0x1A] << 16) | (descriptor_[0x1B] << 24))));
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+// Every device writes its mutable fields in one fixed order. Register-file
+// devices start with RegisterFile::save_state() (the register image holds the
+// pending/arbitration words and the SC register bank), then add whatever their
+// overridden read/write keep outside that image. Pointers, references and
+// std::function wiring are rebuilt by the machine and stay in the build.
+
+void MailboxDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    // Per-direction IRQ latches: they decide whether the next refresh_irqs()
+    // raises an edge, so they are state, not wiring.
+    writer.fixed(to_cmep_levels_, [&](bool level) { writer.put_bool(level); });
+    writer.fixed(to_arm_levels_, [&](bool level) { writer.put_bool(level); });
+    writer.put_u64(debug_posts_);
+    writer.put_u64(debug_acks_);
+}
+
+void MailboxDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    reader.fixed(to_cmep_levels_, [&](bool& level) { level = reader.get_bool(); });
+    reader.fixed(to_arm_levels_, [&](bool& level) { level = reader.get_bool(); });
+    debug_posts_ = reader.get_u64();
+    debug_acks_ = reader.get_u64();
+    // The machine's interrupt lines are not part of this stream, so re-announce
+    // the restored levels once the read is known good. The call is idempotent
+    // and keeps the live lines in step with the restored latches.
+    if (reader.ok()) refresh_irqs(true);
+}
+
+void EmmcCryptoDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.put_bool(enabled_);
+}
+
+void EmmcCryptoDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    enabled_ = reader.get_bool();
+}
+
+void CmdBlockDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.fixed(command_, [&](u8 value) { writer.put_u8(value); });
+    writer.fixed(reply_, [&](u8 value) { writer.put_u8(value); });
+}
+
+void CmdBlockDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    reader.fixed(command_, [&](u8& value) { value = reader.get_u8(); });
+    reader.fixed(reply_, [&](u8& value) { value = reader.get_u8(); });
+}
+
+void SceBlockDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.begin("SceBlock.memory");
+    state_write_pages(writer, memory_.data(), memory_.size());
+    writer.end();
+    writer.fixed(prologue_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u32(prologue_words_);
+    writer.put_bool(prologue_seen_);
+    writer.put_bool(payload_written_);
+    writer.put_bool(job_done_);
+    writer.put_u64(jobs_);
+}
+
+void SceBlockDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    reader.begin("SceBlock.memory");
+    state_read_pages(reader, memory_.data(), memory_.size());
+    reader.end();
+    reader.fixed(prologue_, [&](u8& byte) { byte = reader.get_u8(); });
+    prologue_words_ = reader.get_u32();
+    prologue_seen_ = reader.get_bool();
+    payload_written_ = reader.get_bool();
+    job_done_ = reader.get_bool();
+    jobs_ = reader.get_u64();
+}
+
+void CmepFlagsDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.put_u64(sync_pulses_);
+}
+
+void CmepFlagsDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    sync_pulses_ = reader.get_u64();
+}
+
+void GpioDevice::save_state(StateWriter& writer) const {
+    writer.fixed(registers_, [&](u32 value) { writer.put_u32(value); });
+    writer.fixed(irq_states_, [&](bool state) { writer.put_bool(state); });
+    writer.put_u32(external_input_);
+    writer.put_u64(handshakes_);
+    writer.put_u64(falling_edges_);
+    writer.put_u64(unsupported_edges_);
+    writer.put_bool(legacy_jig_enabled_);
+    writer.put_bool(jig_asserted_);
+    writer.put_bool(native_phase_);
+}
+
+void GpioDevice::load_state(StateReader& reader) {
+    reader.fixed(registers_, [&](u32& value) { value = reader.get_u32(); });
+    reader.fixed(irq_states_, [&](bool& state) { state = reader.get_bool(); });
+    external_input_ = reader.get_u32();
+    handshakes_ = reader.get_u64();
+    falling_edges_ = reader.get_u64();
+    unsupported_edges_ = reader.get_u64();
+    legacy_jig_enabled_ = reader.get_bool();
+    jig_asserted_ = reader.get_bool();
+    native_phase_ = reader.get_bool();
+    // The board's IRQ gate state is not part of the stream (the callbacks are
+    // wiring): re-announce the restored gate levels so an IRQ line that was
+    // asserted when the state was taken is asserted again after the load.
+    if (reader.ok() && irq_) {
+        for (unsigned gate = 0; gate < kGateCount; ++gate) {
+            irq_(kParentIrqBase + gate, irq_states_[gate]);
+        }
+    }
+    // The output notification is a pure function of the restored registers and
+    // is idempotent, so it is safe to re-drive the board peer (Kermit.Spi0's
+    // syscon GPIO state) after a load.
+    if (reader.ok() && output_callback_) output_callback_(direction(), output_latch());
+}
+
+void ScBridgeDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.put_u64(requests_);
+    writer.put_bool(have_a0_);
+    writer.put_bool(have_20a0_);
+    writer.put_u32(events_c0_);
+}
+
+void ScBridgeDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    requests_ = reader.get_u64();
+    have_a0_ = reader.get_bool();
+    have_20a0_ = reader.get_bool();
+    events_c0_ = reader.get_u32();
+}
+
+void ScXferDevice::save_state(StateWriter& writer) const {
+    writer.list(descriptor_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u32(window_base_);
+    writer.put_bool(pending_);
+}
+
+void ScXferDevice::load_state(StateReader& reader) {
+    reader.list(descriptor_, [&](u8& byte) { byte = reader.get_u8(); });
+    window_base_ = reader.get_u32();
+    pending_ = reader.get_bool();
+}
+
 }  // namespace cmep_detail
 }  // namespace zlb

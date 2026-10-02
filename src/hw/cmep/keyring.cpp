@@ -254,5 +254,70 @@ void KeyringDevice::describe(std::vector<std::string>& lines) const {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+// The register image (staged KeyringNewValue words, query request/response and
+// the clear-flags word) comes from RegisterFile::save_state(). The slot table,
+// the write log and the counters are the controller's own state; the
+// `bus_`/`keys_`/`owner_` references are wiring and stay in the build. SceKeys'
+// mirror map is serialised by the machine, not here.
+
+void KeyringDevice::save_state(StateWriter& writer) const {
+    RegisterFile::save_state(writer);
+    writer.map(slots_, [&](u32 index, const KeyringSlot& slot) {
+        writer.put_u32(index);
+        writer.put_u32(slot.index);
+        writer.put_u32(slot.flags);
+        writer.bytes(slot.value.data(), slot.value.size());
+        writer.put_bool(slot.locked);
+        writer.put_bool(slot.present);
+    });
+    writer.list(clear_history_, [&](const std::pair<u32, u32>& entry) {
+        writer.put_u32(entry.first);
+        writer.put_u32(entry.second);
+    });
+    writer.list(writes_, [&](const KeyringWriteRecord& record) {
+        writer.put_u32(record.raw_trigger);
+        writer.put_u32(record.index);
+        writer.put_u32(record.flags);
+        writer.bytes(record.value.data(), record.value.size());
+        writer.put_bool(record.had_payload);
+    });
+    writer.put_u32(last_query_);
+    writer.bytes(fused_value_.data(), fused_value_.size());
+    writer.put_u32(flags_response_);
+    writer.put_u64(set_value_triggers_);
+    writer.put_u64(clear_flags_writes_);
+}
+
+void KeyringDevice::load_state(StateReader& reader) {
+    RegisterFile::load_state(reader);
+    reader.map(slots_, [&](u32& index, KeyringSlot& slot) {
+        index = reader.get_u32();
+        slot.index = reader.get_u32();
+        slot.flags = reader.get_u32();
+        reader.bytes(slot.value.data(), slot.value.size());
+        slot.locked = reader.get_bool();
+        slot.present = reader.get_bool();
+    });
+    reader.list(clear_history_, [&](std::pair<u32, u32>& entry) {
+        entry.first = reader.get_u32();
+        entry.second = reader.get_u32();
+    });
+    reader.list(writes_, [&](KeyringWriteRecord& record) {
+        record.raw_trigger = reader.get_u32();
+        record.index = reader.get_u32();
+        record.flags = reader.get_u32();
+        reader.bytes(record.value.data(), record.value.size());
+        record.had_payload = reader.get_bool();
+    });
+    last_query_ = reader.get_u32();
+    reader.bytes(fused_value_.data(), fused_value_.size());
+    flags_response_ = reader.get_u32();
+    set_value_triggers_ = reader.get_u64();
+    clear_flags_writes_ = reader.get_u64();
+}
+
 }  // namespace cmep_detail
 }  // namespace zlb

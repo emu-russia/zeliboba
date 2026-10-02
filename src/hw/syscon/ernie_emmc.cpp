@@ -50,6 +50,36 @@ void EmmcHost::reset() {
     last_count_ = 0;
 }
 
+void EmmcHost::save_state(StateWriter& writer) const {
+    writer.put_u32(rca_);
+    writer.put_u32(static_cast<u32>(partition_));
+    writer.put_i32(bus_width_);
+    writer.put_u32(clock_hz_);
+    writer.put_u32(card_status_);
+    writer.put_u64(block_reads_);
+    writer.put_u64(block_writes_);
+    writer.put_u64(blocks_read_);
+    writer.put_u64(blocks_written_);
+    writer.put_u64(errors_);
+    writer.put_u64(last_lba_);
+    writer.put_u32(last_count_);
+}
+
+void EmmcHost::load_state(StateReader& reader) {
+    rca_ = reader.get_u32();
+    partition_ = static_cast<EmmcPartition>(reader.get_u32());
+    bus_width_ = reader.get_i32();
+    clock_hz_ = reader.get_u32();
+    card_status_ = reader.get_u32();
+    block_reads_ = reader.get_u64();
+    block_writes_ = reader.get_u64();
+    blocks_read_ = reader.get_u64();
+    blocks_written_ = reader.get_u64();
+    errors_ = reader.get_u64();
+    last_lba_ = reader.get_u64();
+    last_count_ = reader.get_u32();
+}
+
 bool EmmcHost::init_card() {
     if (!attached()) {
         ++errors_;

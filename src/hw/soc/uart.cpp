@@ -296,4 +296,52 @@ void Uart::describe(std::vector<std::string>& lines) const {
     if (!log_line_.empty()) lines.push_back(format("    partial line: \"%s\"", log_line_.c_str()));
 }
 
+void Uart::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    writer.begin("Uart.regs");
+    writer.put_u8(r_.ier);
+    writer.put_u8(r_.fcr);
+    writer.put_u8(r_.lcr);
+    writer.put_u8(r_.mcr);
+    writer.put_u8(r_.scr);
+    writer.put_u8(r_.msr);
+    writer.put_u16(r_.divisor);
+    writer.end();
+    // The receive FIFO is a deque, so its contents travel explicitly as a
+    // length followed by the bytes.
+    writer.put_u32(static_cast<u32>(rx_.size()));
+    for (u8 byte : rx_) writer.put_u8(byte);
+    writer.str(output_);
+    writer.str(log_line_);
+    writer.put_bool(irq_line_);
+    writer.put_bool(overrun_);
+    writer.put_bool(mirror_);
+    writer.put_u64(bytes_tx_);
+    writer.put_u64(bytes_rx_);
+    // `irq_callback_` is host wiring: never serialised.
+}
+
+void Uart::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    reader.begin("Uart.regs");
+    r_.ier = reader.get_u8();
+    r_.fcr = reader.get_u8();
+    r_.lcr = reader.get_u8();
+    r_.mcr = reader.get_u8();
+    r_.scr = reader.get_u8();
+    r_.msr = reader.get_u8();
+    r_.divisor = reader.get_u16();
+    reader.end();
+    const u32 rx_size = reader.get_u32();
+    rx_.clear();
+    for (u32 i = 0; i < rx_size && reader.ok(); ++i) rx_.push_back(reader.get_u8());
+    output_ = reader.str();
+    log_line_ = reader.str();
+    irq_line_ = reader.get_bool();
+    overrun_ = reader.get_bool();
+    mirror_ = reader.get_bool();
+    bytes_tx_ = reader.get_u64();
+    bytes_rx_ = reader.get_u64();
+}
+
 }  // namespace zlb::kermit

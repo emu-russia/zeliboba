@@ -66,6 +66,17 @@ public:
     bool interrupt_pending() const override;
 
     // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+    /// Serialise `Cpu` first (counters, halt/pc/undefined flags), then the RL78
+    /// register file, the reset latch and the INTC input state.  Everything the
+    /// core keeps between steps is written; `page_` and `pc_written_` are
+    /// per-instruction latches but are part of the observable state at a step
+    /// boundary, and the statistics counters must survive a state round trip.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
+    // ------------------------------------------------------------------
     // Register file
     // ------------------------------------------------------------------
     u8 a = 0;

@@ -919,6 +919,40 @@ bool Debugger::execute(const std::string& line) {
         emit(format("saved %u bytes from %08X to %s", length, address, path.c_str()));
         return true;
     }
+    if (command == "savestate") {
+        // Whole-machine snapshot: RAM, every device, every core and the boot
+        // chain. `loadstate` restores it and the run continues from exactly this
+        // point, which is what makes a 2.5-minute cold boot cheap to re-enter.
+        if (args.empty()) {
+            emit("usage: savestate <file>");
+            return true;
+        }
+        const std::string path = resolve_workspace_path(args[0]);
+        std::string error;
+        if (!vita_.save_state(path, error)) {
+            emit("savestate failed: " + error);
+            return true;
+        }
+        emit(format("save state written: %s (stage %s)", path.c_str(), to_string(vita_.stage())));
+        return true;
+    }
+    if (command == "loadstate") {
+        if (args.empty()) {
+            emit("usage: loadstate <file>");
+            return true;
+        }
+        const std::string path = resolve_workspace_path(args[0]);
+        std::string error;
+        if (!vita_.load_state(path, error)) {
+            emit("loadstate failed: " + error);
+            return true;
+        }
+        // The loaded state replaces every register, so a pending hook stop from
+        // the interrupted run no longer describes the machine.
+        vita_.clear_pc_hook_stop();
+        emit(format("save state loaded: %s (stage %s)", path.c_str(), to_string(vita_.stage())));
+        return true;
+    }
     if (command == "vpoke") {
         // Virtual-address counterpart of `poke`: translate the VA through the
         // active core's tables and write the resulting PA.  Patching a kernel
@@ -1220,6 +1254,8 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  poke <addr> <val> [s]  write physical memory (s = 8|16|32)\n"
         "  vpoke <va> <val> [s]   translate a VA through the active core's MMU, then write\n"
         "  save <addr> <len> <f>  dump memory to a file (feed it to tools/zdis)\n"
+        "  savestate <file>       write the whole machine (RAM, devices, cores) to a file\n"
+        "  loadstate <file>       restore a machine written by savestate and continue from it\n"
         "  trace [n]              last n bus accesses\n"
         "  trace find <addr>      accesses to an address\n"
         "  devices                list MMIO devices\n"

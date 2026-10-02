@@ -423,6 +423,16 @@ void PeripheralPower::describe(std::vector<std::string>& lines) const {
                            name_.c_str(), kReadyBits, static_cast<unsigned>(peek(0x70)), kicks_));
 }
 
+void PeripheralPower::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    writer.put_u32(kicks_);
+}
+
+void PeripheralPower::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    kicks_ = reader.get_u32();
+}
+
 // ---------------------------------------------------------------------------
 // BootHandshake
 // ---------------------------------------------------------------------------
@@ -473,6 +483,18 @@ void BootHandshake::describe(std::vector<std::string>& lines) const {
                            static_cast<unsigned>(peek(kStatus))));
 }
 
+void BootHandshake::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    writer.put_u32(last_command_);
+    writer.put_u64(commands_);
+}
+
+void BootHandshake::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    last_command_ = reader.get_u32();
+    commands_ = reader.get_u64();
+}
+
 std::string SysconBridge::summary() const {
     return format("%s commands=%llu last=0x%X status=0x%X", name_.c_str(),
                   static_cast<unsigned long long>(commands_), last_command_,
@@ -487,6 +509,19 @@ void SysconBridge::describe(std::vector<std::string>& lines) const {
     lines.push_back(format("    status=0x%X %s", static_cast<unsigned>(peek(detail::kStatus) & 0xFF),
                            ernie_ ? (ernie_->running_firmware() ? "(Ernie runs its firmware)" : "(functional SC model)")
                                   : "(no syscon fitted)"));
+}
+
+void SysconBridge::save_state(StateWriter& writer) const {
+    RegisterBlock::save_state(writer);
+    // `ernie_` (a pointer to the syscon block) and `irq_callback_` are wiring.
+    writer.put_u32(last_command_);
+    writer.put_u64(commands_);
+}
+
+void SysconBridge::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    last_command_ = reader.get_u32();
+    commands_ = reader.get_u64();
 }
 
 }  // namespace zlb::kermit
@@ -941,6 +976,24 @@ std::vector<Device*> KermitBlock::devices() const {
         if (kermit::detail::is_owned(device->name())) out.push_back(device.get());
     }
     return out;
+}
+
+void KermitBlock::save_state(StateWriter& writer) const {
+    const Impl& d = *impl_;
+    // The devices Impl owns are registered on the bus, which serialises each
+    // one where it lives; writing them again here would apply them twice on
+    // load. Only the block's own scheduler state travels in this section:
+    // `bus`, `card`, the device/core pointers and `ernie_` are host wiring.
+    writer.put_bool(d.installed);
+    writer.put_u64(d.cycle_accumulator);
+    writer.put_u64(d.total_cycles);
+}
+
+void KermitBlock::load_state(StateReader& reader) {
+    Impl& d = *impl_;
+    d.installed = reader.get_bool();
+    d.cycle_accumulator = reader.get_u64();
+    d.total_cycles = reader.get_u64();
 }
 
 }  // namespace zlb

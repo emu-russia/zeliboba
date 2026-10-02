@@ -194,6 +194,35 @@ void CmepBlock::reset() {
 }
 
 // ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+// CmepBlock is not a Device: the block's devices are registered in the CMeP bus
+// (and mirrored into the ARM/Syscon buses), which serialise them once. Only the
+// block-level fields that live outside those devices are written here, plus the
+// SC transfer bookkeeping Impl keeps. `bus_`, `keys_`, the owned device
+// pointers and the Ernie/card pointers are wiring.
+
+void CmepBlock::save_state(StateWriter& writer) const {
+    writer.put_u32(keyring_flags_);
+    writer.put_u8(boot_mode_);
+    writer.put_bool(impl_->installed);
+    writer.put_u64(impl_->sc_transfers);
+    writer.put_u64(impl_->sc_failures);
+    writer.put_u32(impl_->last_sc_command);
+    writer.list(impl_->last_sc_reply, [&](u8 byte) { writer.put_u8(byte); });
+}
+
+void CmepBlock::load_state(StateReader& reader) {
+    keyring_flags_ = reader.get_u32();
+    boot_mode_ = reader.get_u8();
+    impl_->installed = reader.get_bool();
+    impl_->sc_transfers = reader.get_u64();
+    impl_->sc_failures = reader.get_u64();
+    impl_->last_sc_command = reader.get_u32();
+    reader.list(impl_->last_sc_reply, [&](u8& byte) { byte = reader.get_u8(); });
+}
+
+// ---------------------------------------------------------------------------
 // Strap / boot mode
 // ---------------------------------------------------------------------------
 

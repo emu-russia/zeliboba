@@ -275,6 +275,10 @@ struct ClockState {
     bool x1_stable = false;
     bool main_is_fmx = false;  ///< CKC.MCS
     bool clk_is_sub = false;   ///< CKC.CLS
+
+    /// Plain helper: every modelled clock-generator latch and timer.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 };
 
 /// OSTS -> stabilisation window multiplier.  OSTS[2:0] maps to 2^8 .. 2^18 / fX
@@ -305,6 +309,11 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
     void tick(u64 cycles) override;
+
+    /// The register image plus every runtime latch the register file keeps
+    /// outside it (clock state, RTC/interval timer, panel lines, counters).
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     // ------------------------------------------------------------------
     // Firmware-visible peripheral state

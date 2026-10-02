@@ -7,6 +7,10 @@ out/
 *.idb
 *.img
 *.bin.tmp
+# save states
+*.state
+*.zlbstate
+*.state.tmp
 third_party/SDL3-devel-VC.zip
 .vs/
 

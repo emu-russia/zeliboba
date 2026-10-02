@@ -1470,5 +1470,87 @@ void BigmacDevice::describe(std::vector<std::string>& lines) const {
                            static_cast<unsigned long long>(rng_.state)));
 }
 
+// ---------------------------------------------------------------------------
+// Save state
+// ---------------------------------------------------------------------------
+// The block keeps state in two places: the outer bookkeeping (last command,
+// last key/IV, counters, the deterministic RNG) and the private Impl (the
+// register image the legacy command protocol reads back, the native HMAC
+// streams, the +0x200 key window and the staging buffer). The Impl fields are
+// wrapped in a named section because they are a nested sub-object. `bus_`,
+// `owner_` and the callback-free Impl members are wiring/configuration.
+
+void BigmacDevice::save_state(StateWriter& writer) const {
+    writer.put_u32(static_cast<u32>(last_op_));
+    writer.put_u32(last_function_);
+    writer.put_u32(last_command_);
+    writer.bytes(last_key_.data(), last_key_.size());
+    writer.bytes(last_iv_.data(), last_iv_.size());
+    writer.put_u32(last_key_bits_);
+    writer.put_u32(keyring_transfer_op_);
+    writer.put_u64(operations_);
+    writer.put_u64(keyring_transfers_);
+    writer.put_u64(aes_operations_);
+    writer.put_u64(hash_operations_);
+    writer.put_u64(rng_operations_);
+    writer.put_u64(rng_.state);
+    writer.put_bool(initialized_);
+
+    writer.begin("Bigmac.impl");
+    writer.map(impl_->regs, [&](u32 address, u64 value) {
+        writer.put_u32(address);
+        writer.put_u64(value);
+    });
+    writer.map(impl_->native_hmac_states, [&](u32 address, const NativeHmacStream& stream) {
+        writer.put_u32(address);
+        writer.fixed(stream.inner, [&](u32 word) { writer.put_u32(word); });
+        writer.fixed(stream.key, [&](u8 byte) { writer.put_u8(byte); });
+        writer.put_u64(stream.inner_bytes);
+        writer.fixed(stream.image, [&](u8 byte) { writer.put_u8(byte); });
+    });
+    writer.fixed(impl_->data, [&](u32 word) { writer.put_u32(word); });
+    writer.put_u32(impl_->start);
+    writer.put_u32(impl_->status);
+    writer.put_u32(impl_->exception);
+    writer.fixed(impl_->staging, [&](u8 byte) { writer.put_u8(byte); });
+    writer.end();
+}
+
+void BigmacDevice::load_state(StateReader& reader) {
+    last_op_ = static_cast<BigmacOp>(reader.get_u32());
+    last_function_ = reader.get_u32();
+    last_command_ = reader.get_u32();
+    reader.bytes(last_key_.data(), last_key_.size());
+    reader.bytes(last_iv_.data(), last_iv_.size());
+    last_key_bits_ = reader.get_u32();
+    keyring_transfer_op_ = reader.get_u32();
+    operations_ = reader.get_u64();
+    keyring_transfers_ = reader.get_u64();
+    aes_operations_ = reader.get_u64();
+    hash_operations_ = reader.get_u64();
+    rng_operations_ = reader.get_u64();
+    rng_.state = reader.get_u64();
+    initialized_ = reader.get_bool();
+
+    reader.begin("Bigmac.impl");
+    reader.map(impl_->regs, [&](u32& address, u64& value) {
+        address = reader.get_u32();
+        value = reader.get_u64();
+    });
+    reader.map(impl_->native_hmac_states, [&](u32& address, NativeHmacStream& stream) {
+        address = reader.get_u32();
+        reader.fixed(stream.inner, [&](u32& word) { word = reader.get_u32(); });
+        reader.fixed(stream.key, [&](u8& byte) { byte = reader.get_u8(); });
+        stream.inner_bytes = reader.get_u64();
+        reader.fixed(stream.image, [&](u8& byte) { byte = reader.get_u8(); });
+    });
+    reader.fixed(impl_->data, [&](u32& word) { word = reader.get_u32(); });
+    impl_->start = reader.get_u32();
+    impl_->status = reader.get_u32();
+    impl_->exception = reader.get_u32();
+    reader.fixed(impl_->staging, [&](u8& byte) { byte = reader.get_u8(); });
+    reader.end();
+}
+
 }  // namespace cmep_detail
 }  // namespace zlb

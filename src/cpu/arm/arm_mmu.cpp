@@ -507,4 +507,111 @@ std::string ArmMmu::describe() const {
                   static_cast<unsigned long long>(walks));
     return std::string(buffer);
 }
+
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// `WalkRecord` is layout-dependent (it has padding before `u64 repeats` and
+/// around its `bool`/enum members), so it is serialised field by field: a raw
+/// `put_pod` would copy indeterminate padding and make two runs of the same
+/// state differ. `arm::MmFaultKind` is an `int`-backed enum class.
+void write_walk_record(StateWriter& writer, const ArmMmu::WalkRecord& walk) {
+    writer.put_u32(walk.va);
+    writer.put_u32(walk.pc);
+    writer.put_u32(walk.ttbr_base);
+    writer.put_i32(walk.ttbr_num);
+    writer.put_u32(walk.l1_addr);
+    writer.put_u32(walk.l1_desc);
+    writer.put_u32(walk.l2_addr);
+    writer.put_u32(walk.l2_desc);
+    writer.put_u32(walk.domain);
+    writer.put_bool(walk.used_l2);
+    writer.put_i32(static_cast<int>(walk.fault));
+    writer.put_bool(walk.ok);
+    writer.put_bool(walk.write);
+    writer.put_bool(walk.fetch);
+    writer.put_u64(walk.repeats);
+}
+
+void read_walk_record(StateReader& reader, ArmMmu::WalkRecord& walk) {
+    walk.va = reader.get_u32();
+    walk.pc = reader.get_u32();
+    walk.ttbr_base = reader.get_u32();
+    walk.ttbr_num = reader.get_i32();
+    walk.l1_addr = reader.get_u32();
+    walk.l1_desc = reader.get_u32();
+    walk.l2_addr = reader.get_u32();
+    walk.l2_desc = reader.get_u32();
+    walk.domain = reader.get_u32();
+    walk.used_l2 = reader.get_bool();
+    walk.fault = static_cast<arm::MmFaultKind>(reader.get_i32());
+    walk.ok = reader.get_bool();
+    walk.write = reader.get_bool();
+    walk.fetch = reader.get_bool();
+    walk.repeats = reader.get_u64();
+}
+
+}  // namespace
+
+void ArmMmu::save_state(StateWriter& writer) const {
+    writer.put_u32(sctlr);
+    writer.put_u32(ttbr0);
+    writer.put_u32(ttbr1);
+    writer.put_u32(ttbcr);
+    writer.put_u32(dacr);
+    writer.put_u32(dfsr);
+    writer.put_u32(dfar);
+    writer.put_u32(ifsr);
+    writer.put_u32(ifar);
+    writer.put_u32(adfsr);
+    writer.put_u32(aifsr);
+    writer.put_u32(prrr);
+    writer.put_u32(nmrr);
+    writer.put_u32(vbar);
+    writer.put_u32(context_idr);
+    writer.put_u32(par);
+    writer.put_u64(walks);
+    writer.put_u32(replaced_section);
+    writer.put_u32(replaced_section_va);
+    writer.put_u32(replaced_section_hits);
+    write_walk_record(writer, last_walk);
+    writer.fixed(faults, [&](const WalkRecord& walk) { write_walk_record(writer, walk); });
+    writer.put_i32(fault_count);
+    writer.put_u64(total_faults);
+}
+
+void ArmMmu::load_state(StateReader& reader) {
+    sctlr = reader.get_u32();
+    ttbr0 = reader.get_u32();
+    ttbr1 = reader.get_u32();
+    ttbcr = reader.get_u32();
+    dacr = reader.get_u32();
+    dfsr = reader.get_u32();
+    dfar = reader.get_u32();
+    ifsr = reader.get_u32();
+    ifar = reader.get_u32();
+    adfsr = reader.get_u32();
+    aifsr = reader.get_u32();
+    prrr = reader.get_u32();
+    nmrr = reader.get_u32();
+    vbar = reader.get_u32();
+    context_idr = reader.get_u32();
+    par = reader.get_u32();
+    walks = reader.get_u64();
+    replaced_section = reader.get_u32();
+    replaced_section_va = reader.get_u32();
+    replaced_section_hits = reader.get_u32();
+    read_walk_record(reader, last_walk);
+    reader.fixed(faults, [&](WalkRecord& walk) { read_walk_record(reader, walk); });
+    fault_count = reader.get_i32();
+    // The ring is fixed size and the reader feeds it straight to loops in
+    // describe_extended(); a corrupted file must not index past the array.
+    if (fault_count < 0) fault_count = 0;
+    if (fault_count > kFaultLogSize) fault_count = kFaultLogSize;
+    total_faults = reader.get_u64();
+}
+
 }  // namespace zlb

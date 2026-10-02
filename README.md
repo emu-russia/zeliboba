@@ -187,6 +187,28 @@ build\bin\zeliboba.exe --info
 build\bin\zeliboba_ui.exe
 ```
 
+## Save states
+
+Холодная загрузка до интересующего места занимает минуты, поэтому машину можно
+сохранить и вернуться в эту точку:
+
+```powershell
+# дойти до нужного места, сохранить, продолжить отладку
+build\bin\zeliboba.exe -ex "runm 300000" -ex "savestate kbl.state" -ex "runm 50000" -ex "quit"
+
+# в новой сессии продолжить ровно с сохранённой точки
+build\bin\zeliboba.exe -ex "loadstate kbl.state" -ex "regs" -ex "runm 50000" -ex "quit"
+```
+
+Снапшот содержит RAM и общие буферы, регистры и внутреннее состояние всех
+MMIO-устройств, четыре ARM-ядра, CMeP, Ernie/RL78, keyring и флаги цепочки
+загрузки. Продолжение после `loadstate` совпадает с непрерывным прогоном
+бит-в-бит; это проверяет шаг `save state determinism` в `verify.ps1` и тесты
+`state_*`. Образ eMMC — внешний вход: в состояние попадают путь и размер карты,
+но не сам образ (загрузка с образом другого размера отвергается). Формат описан
+в [docs/SAVE_STATE.md](docs/SAVE_STATE.md), команды — в
+[docs/DEBUGGER.md](docs/DEBUGGER.md).
+
 ## Отладчик
 
 Полный список — `help`. Кратко:

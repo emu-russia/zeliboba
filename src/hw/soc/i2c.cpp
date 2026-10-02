@@ -180,4 +180,20 @@ void I2cController::describe(std::vector<std::string>& lines) const {
     lines.push_back("  IRQ-control bits opaque; no ACK/NACK, successful completion or interrupt generated");
 }
 
+void I2cController::save_state(StateWriter& writer) const {
+    // `port_` is construction-time configuration; everything the guest can
+    // program plus the diagnostic counters travels here.
+    writer.fixed(registers_, [&](u32 value) { writer.put_u32(value); });
+    writer.put_u64(tx_writes_);
+    writer.put_u64(bus_resets_);
+    writer.put_bool(unsupported_);
+}
+
+void I2cController::load_state(StateReader& reader) {
+    reader.fixed(registers_, [&](u32& value) { value = reader.get_u32(); });
+    tx_writes_ = reader.get_u64();
+    bus_resets_ = reader.get_u64();
+    unsupported_ = reader.get_bool();
+}
+
 }  // namespace zlb::kermit

@@ -280,6 +280,12 @@ public:
     bool peek_register(const std::string& name, u64& out) const override;
     bool poke_register(const std::string& name, u64 value) override;
 
+    /// The stored register image and the wide (`store()`) values. Defaults,
+    /// widths and names are construction-time configuration and are not state.
+    /// Implemented in register_block_state.cpp.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 protected:
     /// Called for a whole-word access to a defined register. This is where a
     /// device decodes a register and applies the side effects of a write; the
@@ -330,6 +336,11 @@ public:
     bool nonsecure_access() const { return nonsecure_access_; }
 
     std::string summary() const override;
+
+    /// The register image plus the Secure/Non-secure access view of the last
+    /// access (`nonsecure_access_`); the handler hooks are wiring.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 private:
     std::function<u32()> highest_pending_;
@@ -388,6 +399,11 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    /// The register image plus every per-interrupt bit vector, priority,
+    /// target, pulse counter and SGI source set.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     size_t state_index(u32 id, unsigned core) const;
     u32 visible_word(u32 word, const std::vector<bool>& bits) const;
@@ -429,6 +445,12 @@ public:
     bool poke_register(const std::string& name, u64 value) override;
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// The distributor and the four CPU interfaces are owned here but are not
+    /// registered on the bus separately, so their state travels in nested
+    /// sections. `access_context_` is a pointer to the bus context: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     GicDistributor& distributor() { return *distributor_; }
     GicCpuInterface& cpu_interface(unsigned core = 0) { return *cpu_interfaces_[core]; }
@@ -487,6 +509,9 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     u32 counter_offset() const { return longrange_ ? 0 : 4; }
     u32 deadline_offset() const { return longrange_ ? 8 : 0; }
@@ -529,6 +554,9 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     void refresh_irq();
 
@@ -563,6 +591,9 @@ public:
     u32 core() const { return core_; }
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 private:
     struct Counter {
@@ -621,6 +652,11 @@ public:
 
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// The register image, the 16550 register file, the receive deque, the
+    /// pending output/log strings and the byte counters.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 protected:
     u64 read_word(u32 offset, u64 stored) override;
@@ -685,6 +721,12 @@ public:
     static constexpr u32 command_offset() { return 0x0E; }
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// The register image plus the response, data FIFO and every counter and
+    /// latch the ADMA2/command state machine keeps. `card_` and the two DMA
+    /// buses are wiring: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     /// Physical memory used by the ADMA2 descriptor walk. The controller is
     /// mirrored into two address spaces (the ARM's and the CMeP's), so the
@@ -844,6 +886,11 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    /// The register image, both queues, the syscon GPIO-ready wire latches and
+    /// the transfer/byte counters. The slave and the two callbacks are wiring.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     static constexpr u32 kRxFifo = 0x00;
     static constexpr u32 kTxFifo = 0x04;
     static constexpr u32 kCtl = 0x08;
@@ -918,6 +965,12 @@ public:
     void add_target(u32 base, u32 size, Device* device);
     u64 transfers() const { return transfers_; }
     u64 bytes_copied() const { return bytes_copied_; }
+
+    /// Every channel register and the global/mask/status state. A `Target`'s
+    /// geometry (base/size) is serialised; its `Device*` and the controller's
+    /// `Bus&` are wiring: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     static constexpr u32 kChannelStride = 0x20;
     static constexpr u32 kGlobalOffset = 0x00;
@@ -995,6 +1048,12 @@ public:
     void scanout_from_guest();
     u64 scanouts() const { return scanouts_; }
 
+    /// Both buffers (geometry, format and the host pixel image), the active
+    /// selection, control/status, the vsync countdown and the counters. `bus_`
+    /// and the `names_` table are wiring/configuration: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     enum class Format : u32 { Rgb565 = 0, Rgba8888 = 1 };
     static size_t bytes_per_pixel(Format format) { return format == Format::Rgb565 ? 2u : 4u; }
 
@@ -1049,6 +1108,12 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    /// The register image plus the per-plane bank selects, arm/pending/IRQ
+    /// latches and turnover counters. The scan-out pixel pointer is guest RAM:
+    /// the bus serialises that, so it is not written here.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     struct Scanout {
         const u8* pixels = nullptr;
@@ -1099,6 +1164,10 @@ public:
     void set_frame_callback(std::function<void(u64)> callback) { frame_callback_ = std::move(callback); }
     u64 frame_counter() const { return frames_; }
 
+    /// The whole register array, the frame phase and the frame counter.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     bool supported_running() const;
     void update_irq();
@@ -1127,6 +1196,11 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    /// The whole register array plus the diagnostic counters. `port_` is
+    /// construction-time configuration: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     void submit_command();
     std::array<u32, 0x30 / 4> registers_{};
@@ -1154,6 +1228,11 @@ public:
     bool poke_register(const std::string& name, u64 value) override;
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// The whole register array, the last command snapshot, the mode/command
+    /// latches and the counters.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 private:
     u32 control_status() const;
@@ -1199,6 +1278,11 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    /// The register image, the last posted command and the command counter.
+    /// `ernie_` is a pointer to the syscon block: skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     void post_command();
 
@@ -1234,6 +1318,9 @@ public:
     /// Command register: a write starts the peripheral, the read returns zero.
     static constexpr u32 kKick = 0x64;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
 private:
     u32 kicks_ = 0;
 };
@@ -1265,6 +1352,9 @@ public:
     static constexpr u32 kStatus = 0x20;
     static constexpr u32 kAckAfter2 = 0x44;
     static constexpr u32 kAckAfter1 = 0x11;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 private:
     u32 last_command_ = 0;
@@ -1431,6 +1521,11 @@ public:
 
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
+
+    /// The register image plus every queue, MMU and GXM-translation counter and
+    /// the translated-draw vector. `bus_` and the IRQ callback are wiring.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 protected:
     u64 read_word(u32 offset, u64 stored) override;

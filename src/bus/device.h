@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "common/state.h"
 #include "common/types.h"
 #include "common/util.h"
 
@@ -66,6 +67,16 @@ public:
     /// Extra state lines for the UI.
     virtual void describe(std::vector<std::string>& lines) const { (void)lines; }
 
+    // ---- save states -----------------------------------------------------
+
+    /// Persist the device's mutable state. A device that owns no state can keep
+    /// the default; a device with state writes one or more values here and reads
+    /// them back in the same order in `load_state`. Cross-device pointers and
+    /// `std::function` hooks are wiring, not state: they are rebuilt by the
+    /// machine and must not be serialised.
+    virtual void save_state(StateWriter& writer) const { (void)writer; }
+    virtual void load_state(StateReader& reader) { (void)reader; }
+
     /// Base class helper used by register-file devices.
     void register_name_entry(u32 address, const std::string& name) { names_[address] = name; }
     const char* lookup_name(u32 address) const;
@@ -109,6 +120,12 @@ public:
     }
     void describe(std::vector<std::string>& lines) const override { target_.describe(lines); }
 
+    /// A mirror holds no state of its own: the target is serialised where it is
+    /// registered. Writing nothing here keeps a state file from carrying the
+    /// same device twice (and from applying it out of order on load).
+    void save_state(StateWriter& writer) const override { (void)writer; }
+    void load_state(StateReader& reader) override { (void)reader; }
+
 private:
     Device& target_;
     u32 window_base_;
@@ -134,6 +151,11 @@ public:
     void enumerate_registers(std::vector<RegisterInfo>& out) const override;
     bool peek_register(const std::string& name, u64& out) const override;
     bool poke_register(const std::string& name, u64 value) override;
+
+    /// The stored register values (the defaults/widths/names are construction
+    /// time configuration and stay in the build).
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
 protected:
     /// Overridable decode hooks; default implementation is plain storage.

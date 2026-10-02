@@ -122,6 +122,9 @@ public:
     std::string summary() const override;
     void describe(std::vector<std::string>& lines) const override;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     /// 0xE0000000 CMeP -> ARM status.
     static constexpr u32 kCmepToArm = 0xE0000000;
     /// 0xE0000010 ARM -> CMeP command / physical address (bit 0 = present).
@@ -146,6 +149,8 @@ private:
 
 /// The same mailbox registers have opposite set/ack semantics at each CPU
 /// endpoint, so the ARM attachment must retain its port identity explicitly.
+/// It is a DeviceMirror, so it deliberately has no save/load override: the
+/// state lives in MailboxDevice, which is serialised where it is registered.
 class ArmMailboxEndpoint final : public DeviceMirror {
 public:
     explicit ArmMailboxEndpoint(MailboxDevice& mailbox)
@@ -176,6 +181,8 @@ private:
 class SysCtlDevice : public RegisterFile {
 public:
     SysCtlDevice();
+    // Plain register image: RegisterFile::save_state() already serialises the
+    // only mutable state this block has, so there is nothing to add here.
 };
 
 // ---------------------------------------------------------------------------
@@ -206,6 +213,9 @@ public:
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
     void reset() override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     /// Slots the block answers for (the loader programs five).
     static constexpr u32 kSlots = 8;
@@ -238,6 +248,9 @@ public:
     /// to learn which offsets the answer is expected at.
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     static constexpr u32 kBase = 0x5FFC0000;
     static constexpr u32 kSize = 0x00010000;
@@ -286,6 +299,7 @@ private:
 class CmepStorageDevice : public RegisterFile {
 public:
     CmepStorageDevice();
+    // Plain register image: RegisterFile::save_state() covers the mutable state.
 
     static constexpr u32 kBase = 0xE0100000;
     static constexpr u32 kSize = 0x1000;
@@ -308,6 +322,9 @@ public:
     /// (0x4BA26..0x4BA38 -> 0x800F0010), so the caller retries through the wait.
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     u64 sync_pulses() const { return sync_pulses_; }
     u32 work_state() const { return static_cast<u32>(peek(kWorkState)); }
@@ -339,6 +356,9 @@ public:
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
     void reset() override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     /// 8 x 32-bit staged "new value" registers captured into SceKeys::keyring().
     const std::map<u32, KeyringSlot>& slots() const { return slots_; }
@@ -413,6 +433,10 @@ public:
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
 
+    // Every mutable field lives in the register image (strap word, console
+    // identity slot, eMMC key select), which RegisterFile::save_state() writes.
+    // `bus_`/`owner_` are wiring and stay out of the stream.
+
     /// 0xE0062020 bit 0 selects 'A' (normal) vs '!' (service) at 0x5C116.
     void set_bit0(bool set);
     bool bit0() const { return (peek(kStrap) & 1u) != 0; }
@@ -440,6 +464,9 @@ public:
     /// keyring indexes as 0x020E020F (0x5C0E8).
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     bool enabled() const { return enabled_; }
     u32 keyring_hi() const { return (peek(kIndexes) >> 16) & 0xFFFFu; }
@@ -490,6 +517,9 @@ public:
 
     u64 handshakes() const { return handshakes_; }
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     static constexpr u32 kDirection = 0xE20A0000;
     static constexpr u32 kState = 0xE20A0004;
     static constexpr u32 kSet = 0xE20A0008;
@@ -539,6 +569,9 @@ public:
     void attach_shared_sc(Device* sc);
 
     u64 requests() const { return requests_; }
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     static constexpr u32 kCmd124 = 0xE3100124;
     static constexpr u32 kReqA0 = 0xE31010A0;
@@ -617,6 +650,9 @@ public:
     const std::vector<u8>& descriptor() const { return descriptor_; }
     bool pending() const { return pending_; }
     void clear_pending() { pending_ = false; }
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     const char* register_name(u32 address) const override;
     void enumerate_registers(std::vector<RegisterInfo>& out) const override;
@@ -711,6 +747,9 @@ public:
     using EngineFn = std::vector<u8> (*)(const std::vector<u8>&, const std::vector<u8>&,
                                          const std::vector<u8>&);
     void set_engine(EngineFn fn) { engine_ = fn; }
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     u64 operations() const { return operations_; }
     u32 result_words() const { return result_words_; }
@@ -855,6 +894,9 @@ public:
     u64 aes_operations() const { return aes_operations_; }
     u64 hash_operations() const { return hash_operations_; }
     u64 rng_operations() const { return rng_operations_; }
+
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     /// Register opcodes (see BigmacFunction).  The keyring TransferMap holds
     /// the "classic" Bigmac keyring transfer ops used by the *second* loader

@@ -306,4 +306,55 @@ void DisplayController::describe(std::vector<std::string>& lines) const {
                            static_cast<unsigned long long>(writes_)));
 }
 
+void DisplayController::save_state(StateWriter& writer) const {
+    // panel_width_/panel_height_ are construction-time configuration; `bus_`
+    // and the `names_` table are wiring, and `frame_callback_` is a host hook.
+    writer.fixed(buffers_, [&](const Buffer& buffer) {
+        writer.begin("Display.buffer");
+        writer.put_u32(buffer.address);
+        writer.put_u32(static_cast<u32>(buffer.format));
+        writer.put_i32(buffer.stride);
+        writer.put_i32(buffer.width);
+        writer.put_i32(buffer.height);
+        // The host pixel image is a raw buffer: its length is written first so
+        // the reader can size the vector before the page bitmap is consumed.
+        writer.put_u32(static_cast<u32>(buffer.pixels.size()));
+        state_write_pages(writer, buffer.pixels.data(), buffer.pixels.size());
+        writer.end();
+    });
+    writer.put_u32(active_);
+    writer.put_u32(control_);
+    writer.put_u32(status_);
+    writer.put_u32(vsync_period_);
+    writer.put_u32(vsync_left_);
+    writer.put_u64(frame_counter_);
+    writer.put_u64(frames_);
+    writer.put_u64(writes_);
+    writer.put_u64(scanouts_);
+}
+
+void DisplayController::load_state(StateReader& reader) {
+    reader.fixed(buffers_, [&](Buffer& buffer) {
+        reader.begin("Display.buffer");
+        buffer.address = reader.get_u32();
+        buffer.format = static_cast<Format>(reader.get_u32());
+        buffer.stride = reader.get_i32();
+        buffer.width = reader.get_i32();
+        buffer.height = reader.get_i32();
+        const u32 pixel_size = reader.get_u32();
+        buffer.pixels.resize(pixel_size);
+        if (pixel_size != 0) state_read_pages(reader, buffer.pixels.data(), buffer.pixels.size());
+        reader.end();
+    });
+    active_ = reader.get_u32();
+    control_ = reader.get_u32();
+    status_ = reader.get_u32();
+    vsync_period_ = reader.get_u32();
+    vsync_left_ = reader.get_u32();
+    frame_counter_ = reader.get_u64();
+    frames_ = reader.get_u64();
+    writes_ = reader.get_u64();
+    scanouts_ = reader.get_u64();
+}
+
 }  // namespace zlb::kermit

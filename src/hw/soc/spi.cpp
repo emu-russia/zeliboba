@@ -309,4 +309,60 @@ void Spi::describe(std::vector<std::string>& lines) const {
     if (!response.empty()) lines.push_back("  response bytes :" + response);
 }
 
+void Spi::save_state(StateWriter& writer) const {
+    // `port_`, the `slave_` transfer hook and the two callbacks are wiring and
+    // construction-time configuration: they are rebuilt by the machine.
+    RegisterBlock::save_state(writer);
+    writer.list(tx_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.list(rx_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u32(ctl_);
+    writer.put_u32(int_ctl_);
+    writer.put_u32(dma_ctl_);
+    writer.put_u32(reg18_);
+    writer.put_u32(reg20_);
+    writer.put_u32(int_status_);
+    writer.put_bool(busy_);
+    writer.put_bool(oled_stream_armed_);
+    writer.put_bool(syscon_peer_active_);
+    writer.put_bool(syscon_gpio_qualified_);
+    writer.put_bool(syscon_request_high_);
+    writer.put_bool(syscon_valid_generation_);
+    writer.put_bool(syscon_ready_scheduled_);
+    writer.put_bool(syscon_ready_asserted_);
+    writer.put_u64(syscon_ready_edges_);
+    writer.put_bool(irq_line_);
+    writer.put_u64(transfers_);
+    writer.put_u64(bytes_tx_);
+    writer.put_u64(bytes_rx_);
+    writer.list(last_request_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.list(last_response_, [&](u8 byte) { writer.put_u8(byte); });
+}
+
+void Spi::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    reader.list(tx_, [&](u8& byte) { byte = reader.get_u8(); });
+    reader.list(rx_, [&](u8& byte) { byte = reader.get_u8(); });
+    ctl_ = reader.get_u32();
+    int_ctl_ = reader.get_u32();
+    dma_ctl_ = reader.get_u32();
+    reg18_ = reader.get_u32();
+    reg20_ = reader.get_u32();
+    int_status_ = reader.get_u32();
+    busy_ = reader.get_bool();
+    oled_stream_armed_ = reader.get_bool();
+    syscon_peer_active_ = reader.get_bool();
+    syscon_gpio_qualified_ = reader.get_bool();
+    syscon_request_high_ = reader.get_bool();
+    syscon_valid_generation_ = reader.get_bool();
+    syscon_ready_scheduled_ = reader.get_bool();
+    syscon_ready_asserted_ = reader.get_bool();
+    syscon_ready_edges_ = reader.get_u64();
+    irq_line_ = reader.get_bool();
+    transfers_ = reader.get_u64();
+    bytes_tx_ = reader.get_u64();
+    bytes_rx_ = reader.get_u64();
+    reader.list(last_request_, [&](u8& byte) { byte = reader.get_u8(); });
+    reader.list(last_response_, [&](u8& byte) { byte = reader.get_u8(); });
+}
+
 }  // namespace zlb::kermit

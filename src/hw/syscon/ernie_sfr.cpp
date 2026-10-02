@@ -261,6 +261,38 @@ std::string clock_summary(const ClockState& state) {
                   state.main_is_fmx ? "fMX" : "fIH");
 }
 
+void ClockState::save_state(StateWriter& writer) const {
+    writer.put_u8(cmc);
+    writer.put_u8(csc);
+    writer.put_u8(osts);
+    writer.put_u8(ckc);
+    writer.put_bool(x1_running);
+    writer.put_bool(xt1_running);
+    writer.put_bool(hio_running);
+    writer.put_bool(mstop_high);
+    writer.put_u64(x1_start_cycle);
+    writer.put_u32(x1_window);
+    writer.put_bool(x1_stable);
+    writer.put_bool(main_is_fmx);
+    writer.put_bool(clk_is_sub);
+}
+
+void ClockState::load_state(StateReader& reader) {
+    cmc = reader.get_u8();
+    csc = reader.get_u8();
+    osts = reader.get_u8();
+    ckc = reader.get_u8();
+    x1_running = reader.get_bool();
+    xt1_running = reader.get_bool();
+    hio_running = reader.get_bool();
+    mstop_high = reader.get_bool();
+    x1_start_cycle = reader.get_u64();
+    x1_window = reader.get_u32();
+    x1_stable = reader.get_bool();
+    main_is_fmx = reader.get_bool();
+    clk_is_sub = reader.get_bool();
+}
+
 }  // namespace ernie
 
 // ---------------------------------------------------------------------------
@@ -296,6 +328,76 @@ void ErnieSfr::reset() {
     refresh_rtc();
     update_port_inputs();
     refresh_clock(0);
+}
+
+void ErnieSfr::save_state(StateWriter& writer) const {
+    // The register image (all SFRs, including the derived ones' latched values),
+    // then everything the model keeps outside it.
+    writer.map(regs_, [&](u32 address, u8 value) {
+        writer.put_u32(address);
+        writer.put_u8(value);
+    });
+    writer.begin("clock");
+    clock_.save_state(writer);
+    writer.end();
+    writer.put_u64(milliseconds_);
+    writer.put_u64(rtc_seconds_);
+    writer.put_u64(cycles_);
+    writer.put_bool(power_button_);
+    writer.put_bool(ps_button_);
+    writer.put_bool(volume_up_);
+    writer.put_bool(volume_down_);
+    writer.put_i32(battery_percent_);
+    writer.put_i32(charger_state_);
+    writer.put_u32(battery_mv_);
+    writer.put_bool(interval_armed_);
+    writer.put_u64(interval_period_);
+    writer.put_u64(interval_next_);
+    writer.put_u64(interval_fires_);
+    writer.put_u64(watchdog_writes_);
+    writer.put_bool(watchdog_fed_);
+    writer.list(pending_vectors_, [&](int vector) { writer.put_i32(vector); });
+    // The recent-access ring is a bounded runtime log, so a length-prefixed list
+    // is the right shape for it.
+    writer.list(recent_, [&](const std::pair<u32, u8>& entry) {
+        writer.put_u32(entry.first);
+        writer.put_u8(entry.second);
+    });
+    writer.put_u64(reads_);
+    writer.put_u64(writes_);
+}
+
+void ErnieSfr::load_state(StateReader& reader) {
+    reader.map(regs_, [&](u32& address, u8& value) {
+        address = reader.get_u32();
+        value = reader.get_u8();
+    });
+    reader.begin("clock");
+    clock_.load_state(reader);
+    reader.end();
+    milliseconds_ = reader.get_u64();
+    rtc_seconds_ = reader.get_u64();
+    cycles_ = reader.get_u64();
+    power_button_ = reader.get_bool();
+    ps_button_ = reader.get_bool();
+    volume_up_ = reader.get_bool();
+    volume_down_ = reader.get_bool();
+    battery_percent_ = reader.get_i32();
+    charger_state_ = reader.get_i32();
+    battery_mv_ = reader.get_u32();
+    interval_armed_ = reader.get_bool();
+    interval_period_ = reader.get_u64();
+    interval_next_ = reader.get_u64();
+    interval_fires_ = reader.get_u64();
+    watchdog_writes_ = reader.get_u64();
+    watchdog_fed_ = reader.get_bool();
+    reader.list(pending_vectors_, [&](int& vector) { vector = reader.get_i32(); });
+    reader.list(recent_, [&](std::pair<u32, u8>& entry) {
+        entry.first = reader.get_u32();
+        entry.second = reader.get_u8();
+    });
+    reads_ = reader.get_u64();
+    writes_ = reader.get_u64();
 }
 
 u8 ErnieSfr::peek8(u32 address) const {

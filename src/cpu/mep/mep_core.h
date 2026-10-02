@@ -54,6 +54,11 @@ public:
         /// Set by the hardware layer (or a test) to force completion.
         bool force_expired = false;
 
+        /// Plain helper class: no `override` (the base declares no virtuals).
+        /// Every mutable member above is written, `regs` as a fixed array.
+        void save_state(StateWriter& writer) const;
+        void load_state(StateReader& reader);
+
         void reset();
         /// Read one control bus word; `ldcb $rn,0x404` is the timer poll.
         u32 read(unsigned address) const;
@@ -104,6 +109,13 @@ public:
     std::string status_line() const override;
     void describe_state(std::vector<std::string>& lines) const override;
     void tick(u64 cycles_) override;
+
+    // ------------------------------------------------------------ save states
+    /// `Cpu::save_state` first (counters, pc, halt state), then the MeP
+    /// registers and the control bus model.  `pc_hook` is a host callback, not
+    /// machine state, and is deliberately skipped.
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
 
     // ------------------------------------------------------------- registers
     std::array<u32, 16> r{};   ///< $0..$12 GPRs, $13/$tp, $14/$gp, $15/$sp

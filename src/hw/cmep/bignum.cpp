@@ -416,5 +416,46 @@ void BignumDevice::describe(std::vector<std::string>& lines) const {
     lines.push_back(format("Bignum result[0..8] = %s", hex_bytes(result_.data(), 8).c_str()));
 }
 
+// ---------------------------------------------------------------------------
+// Save state
+// ---------------------------------------------------------------------------
+// The word map holds every register window (base, modulus, control, status and
+// result words) and the port stream/result copy hold the operation in flight,
+// so all of it travels. `engine_`, `bus_` and `owner_` are wiring.
+
+void BignumDevice::save_state(StateWriter& writer) const {
+    writer.map(words_, [&](u32 address, u64 value) {
+        writer.put_u32(address);
+        writer.put_u64(value);
+    });
+    writer.list(result_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.list(port_words_, [&](u32 word) { writer.put_u32(word); });
+    writer.put_u32(control_);
+    writer.put_u32(mod_words_);
+    writer.put_u32(exp_words_);
+    writer.put_u32(result_words_);
+    writer.put_u64(operations_);
+    writer.put_bool(error_);
+    writer.put_bool(busy_);
+    writer.put_bool(want_word_);
+}
+
+void BignumDevice::load_state(StateReader& reader) {
+    reader.map(words_, [&](u32& address, u64& value) {
+        address = reader.get_u32();
+        value = reader.get_u64();
+    });
+    reader.list(result_, [&](u8& byte) { byte = reader.get_u8(); });
+    reader.list(port_words_, [&](u32& word) { word = reader.get_u32(); });
+    control_ = reader.get_u32();
+    mod_words_ = reader.get_u32();
+    exp_words_ = reader.get_u32();
+    result_words_ = reader.get_u32();
+    operations_ = reader.get_u64();
+    error_ = reader.get_bool();
+    busy_ = reader.get_bool();
+    want_word_ = reader.get_bool();
+}
+
 }  // namespace cmep_detail
 }  // namespace zlb

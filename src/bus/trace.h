@@ -53,6 +53,12 @@ public:
     u64 total() const { return total_; }
     size_t count() const { return count_; }
 
+    /// Restore the monotonic sequence counter after a save state is loaded. The
+    /// ring contents themselves are not part of a state (they are a debugging
+    /// aid, not machine state), so `clear()` plus this keeps `since(sequence)`
+    /// working for watchpoints.
+    void set_total(u64 value) { total_ = value; }
+
     /// When false, RAM accesses are not recorded (MMIO always is).
     void set_trace_ram(bool enabled) { trace_ram_ = enabled; }
     bool trace_ram() const { return trace_ram_; }

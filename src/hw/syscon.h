@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "bus/bus.h"
+#include "common/state.h"
 #include "common/types.h"
 
 namespace zlb {
@@ -154,6 +155,18 @@ public:
     /// Read the modeled NVS for board handoff inputs without issuing a guest
     /// SC command or changing mailbox/protocol state.
     bool read_nvs(u16 offset, size_t length, std::vector<u8>& out) const;
+
+    // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+
+    /// ErnieBlock is not a Device: the bus serialises the devices it registered
+    /// (flash, SFR, SC window, message windows, gate and strap), so this method
+    /// adds the parts none of them own: the block's own latches, the SC channel
+    /// (the register file is not bus registered), the board/power model, the NVS
+    /// and scratch pad stores, the eMMC host statistics and the RL78 core.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 
     // ------------------------------------------------------------------
     // SPI0 link (0xE0A00000) - the boot chain's own path to the syscon

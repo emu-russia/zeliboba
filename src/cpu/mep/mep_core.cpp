@@ -1633,6 +1633,124 @@ void MePCore::describe_state(std::vector<std::string>& lines) const {
                            cbus.remaining));
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+void MePCore::ControlBus::save_state(StateWriter& writer) const {
+    writer.fixed(regs, [&](const u32& value) { writer.put_u32(value); });
+    writer.put_u32(irq_levels);
+    writer.put_u32(irq_edges);
+    writer.put_u32(count);
+    writer.put_u32(remaining);
+    writer.put_bool(running);
+    writer.put_bool(done);
+    writer.put_bool(force_expired);
+}
+
+void MePCore::ControlBus::load_state(StateReader& reader) {
+    reader.fixed(regs, [&](u32& value) { value = reader.get_u32(); });
+    irq_levels = reader.get_u32();
+    irq_edges = reader.get_u32();
+    count = reader.get_u32();
+    remaining = reader.get_u32();
+    running = reader.get_bool();
+    done = reader.get_bool();
+    force_expired = reader.get_bool();
+}
+
+void MePCore::save_state(StateWriter& writer) const {
+    // Shared core state first: instructions/cycles, halted, halt_reason, pc and
+    // undefined_instruction.
+    Cpu::save_state(writer);
+
+    writer.fixed(r, [&](const u32& value) { writer.put_u32(value); });
+    writer.put_u32(hi);
+    writer.put_u32(lo);
+    writer.put_u32(sar);
+    writer.put_u32(lp);
+    writer.put_u32(epc);
+    writer.put_u32(npc);
+    writer.put_u32(tmp);
+    writer.put_u32(psw);
+    writer.put_u32(exc);
+    writer.put_u32(cfg);
+    writer.put_u32(vid);
+    writer.put_u32(id);
+    writer.put_u32(dbg);
+    writer.put_u32(depc);
+    writer.put_u32(opt);
+    writer.put_u32(rcfg);
+    writer.put_u32(ccfg);
+    writer.put_u32(cr0);
+    writer.fixed(cond, [&](bool value) { writer.put_bool(value); });
+    writer.put_u32(rpb);
+    writer.put_u32(rpe);
+    writer.put_u32(rpc);
+    writer.put_u32(mb0);
+    writer.put_u32(me0);
+    writer.put_u32(mb1);
+    writer.put_u32(me1);
+    // The INTC registers, edge/level inputs and the delay timer live in the
+    // control bus model; its own section keeps the layout name-checked.
+    writer.begin("cbus");
+    cbus.save_state(writer);
+    writer.end();
+    writer.put_bool(vliw_mode);
+    writer.put_u32(reset_vector);
+    writer.put_bool(rep_active_);
+    writer.put_bool(rep_pending_back_);
+    writer.put_bool(rep_endless_);
+    writer.put_bool(branch_taken_);
+    writer.put_u32(boot_vector_base_);
+    // pc_hook is host wiring (the boot chain installs it), never state.
+}
+
+void MePCore::load_state(StateReader& reader) {
+    Cpu::load_state(reader);
+
+    // Read back in exactly the order save_state wrote; restore fields directly
+    // and never recompute derived state (`vliw_mode`, the repeat flags and
+    // `exc`'s hardware-pending bit are all restored from the stream).
+    reader.fixed(r, [&](u32& value) { value = reader.get_u32(); });
+    hi = reader.get_u32();
+    lo = reader.get_u32();
+    sar = reader.get_u32();
+    lp = reader.get_u32();
+    epc = reader.get_u32();
+    npc = reader.get_u32();
+    tmp = reader.get_u32();
+    psw = reader.get_u32();
+    exc = reader.get_u32();
+    cfg = reader.get_u32();
+    vid = reader.get_u32();
+    id = reader.get_u32();
+    dbg = reader.get_u32();
+    depc = reader.get_u32();
+    opt = reader.get_u32();
+    rcfg = reader.get_u32();
+    ccfg = reader.get_u32();
+    cr0 = reader.get_u32();
+    reader.fixed(cond, [&](bool& value) { value = reader.get_bool(); });
+    rpb = reader.get_u32();
+    rpe = reader.get_u32();
+    rpc = reader.get_u32();
+    mb0 = reader.get_u32();
+    me0 = reader.get_u32();
+    mb1 = reader.get_u32();
+    me1 = reader.get_u32();
+    reader.begin("cbus");
+    cbus.load_state(reader);
+    reader.end();
+    vliw_mode = reader.get_bool();
+    reset_vector = reader.get_u32();
+    rep_active_ = reader.get_bool();
+    rep_pending_back_ = reader.get_bool();
+    rep_endless_ = reader.get_bool();
+    branch_taken_ = reader.get_bool();
+    boot_vector_base_ = reader.get_u32();
+}
+
 namespace {
 
 /// Register index for the names the debugger and tests use ("$sp", "sp", "15").

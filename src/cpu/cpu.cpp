@@ -36,4 +36,22 @@ int Cpu::run(int64_t max_steps, const std::function<bool()>& abort) {
     return static_cast<int>(done);
 }
 
+void Cpu::save_state(StateWriter& writer) const {
+    writer.put_u64(instructions);
+    writer.put_u64(cycles);
+    writer.put_bool(halted);
+    writer.str(halt_reason);
+    writer.put_u32(get_pc());
+    writer.put_bool(undefined_instruction);
+}
+
+void Cpu::load_state(StateReader& reader) {
+    instructions = reader.get_u64();
+    cycles = reader.get_u64();
+    halted = reader.get_bool();
+    halt_reason = reader.str();
+    set_pc(reader.get_u32());
+    undefined_instruction = reader.get_bool();
+}
+
 }  // namespace zlb

@@ -6009,6 +6009,169 @@ void ArmCore::describe_state(std::vector<std::string>& lines) const {
 }
 
 // ===========================================================================
+// Save states
+// ===========================================================================
+
+namespace {
+
+/// `arm::MmResult` holds only scalars, but its `bool` members precede `u32`
+/// fields and introduce padding, so it is serialised field by field: a raw
+/// `put_pod` would copy indeterminate padding into the stream. `MmFaultKind`
+/// is an `int`-backed enum class.
+void write_mm_result(StateWriter& writer, const arm::MmResult& result) {
+    writer.put_bool(result.ok);
+    writer.put_u32(result.phys_addr);
+    writer.put_bool(result.strongly_ordered);
+    writer.put_bool(result.device);
+    writer.put_bool(result.normal);
+    writer.put_bool(result.supersection);
+    writer.put_i32(static_cast<int>(result.fault));
+    writer.put_u32(result.fsr_status);
+    writer.put_u32(result.fsr_full);
+}
+
+void read_mm_result(StateReader& reader, arm::MmResult& result) {
+    result.ok = reader.get_bool();
+    result.phys_addr = reader.get_u32();
+    result.strongly_ordered = reader.get_bool();
+    result.device = reader.get_bool();
+    result.normal = reader.get_bool();
+    result.supersection = reader.get_bool();
+    result.fault = static_cast<arm::MmFaultKind>(reader.get_i32());
+    result.fsr_status = reader.get_u32();
+    result.fsr_full = reader.get_u32();
+}
+
+}  // namespace
+
+void ArmCore::save_state(StateWriter& writer) const {
+    // Shared core state first: instructions/cycles, halted, halt_reason, pc and
+    // undefined_instruction.
+    Cpu::save_state(writer);
+
+    writer.fixed(r, [&](const u32& value) { writer.put_u32(value); });
+    writer.put_u32(cpsr);
+    writer.put_bool(ns_);
+    writer.put_u32(scr);
+    writer.put_u32(mvbar);
+    writer.put_u32(vbar_nonsecure);
+    writer.put_bool(thumb);
+
+    // Both Security banks of the MMU are state: `mmu` is the active one and
+    // `inactive_mmu_` is the other. Each gets its own named section.
+    writer.begin("mmu");
+    mmu.save_state(writer);
+    writer.end();
+
+    writer.begin("vfp");
+    vfp.save_state(writer);
+    writer.end();
+
+    writer.put_bool(wfe_waiting_);
+    writer.put_bool(event_pending_);
+    writer.put_u64(exception_count);
+    writer.put_u32(last_undefined_instruction);
+
+    writer.begin("inactive_mmu");
+    inactive_mmu_.save_state(writer);
+    writer.end();
+    writer.put_bool(active_mmu_nonsecure_);
+
+    writer.fixed(bank_sp_, [&](const u32& value) { writer.put_u32(value); });
+    writer.fixed(bank_lr_, [&](const u32& value) { writer.put_u32(value); });
+    writer.fixed(bank_spsr_, [&](const u32& value) { writer.put_u32(value); });
+    writer.fixed(bank_r8_, [&](const u32 (&bank)[5]) {
+        for (const u32 value : bank) writer.put_u32(value);
+    });
+
+    writer.put_bool(exclusive_valid_);
+    writer.put_u32(exclusive_addr_);
+    writer.put_u32(exclusive_id_);
+    writer.put_bool(irq_line_);
+    writer.put_bool(fiq_line_);
+    writer.put_u32(last_abort_pc_);
+    writer.put_i32(abort_loop_count_);
+    writer.put_i32(static_cast<int>(pending_fault_));
+    write_mm_result(writer, pending_mm_fault_);
+    writer.put_u32(cur_instr_addr_);
+    writer.put_u32(cur_instr_);
+    writer.put_u32(static_cast<u32>(cur_instr_len_));
+    writer.put_u32(it_state_);
+    writer.put_bool(it_state_valid_);
+    writer.fixed(thread_ids_, [&](const ThreadIdRegisters& ids) {
+        writer.put_u32(ids.user_rw);
+        writer.put_u32(ids.user_ro);
+        writer.put_u32(ids.privileged_rw);
+    });
+    // Not state: core_id_ (the machine sets it at build), the coprocessor/fault/
+    // sev/irq hooks (host wiring), and trace_instructions (debugger config).
+}
+
+void ArmCore::load_state(StateReader& reader) {
+    Cpu::load_state(reader);
+
+    // Read back in exactly the order save_state wrote. Fields are restored as
+    // they are; in particular the MMU banks are not re-synced, because
+    // sync_mmu_bank() would swap them and overwrite the NS VBAR.
+    reader.fixed(r, [&](u32& value) { value = reader.get_u32(); });
+    cpsr = reader.get_u32();
+    ns_ = reader.get_bool();
+    scr = reader.get_u32();
+    mvbar = reader.get_u32();
+    vbar_nonsecure = reader.get_u32();
+    thumb = reader.get_bool();
+
+    reader.begin("mmu");
+    mmu.load_state(reader);
+    reader.end();
+
+    reader.begin("vfp");
+    vfp.load_state(reader);
+    reader.end();
+
+    wfe_waiting_ = reader.get_bool();
+    event_pending_ = reader.get_bool();
+    exception_count = reader.get_u64();
+    last_undefined_instruction = reader.get_u32();
+
+    reader.begin("inactive_mmu");
+    inactive_mmu_.load_state(reader);
+    reader.end();
+    active_mmu_nonsecure_ = reader.get_bool();
+
+    reader.fixed(bank_sp_, [&](u32& value) { value = reader.get_u32(); });
+    reader.fixed(bank_lr_, [&](u32& value) { value = reader.get_u32(); });
+    reader.fixed(bank_spsr_, [&](u32& value) { value = reader.get_u32(); });
+    reader.fixed(bank_r8_, [&](u32 (&bank)[5]) {
+        for (u32& value : bank) value = reader.get_u32();
+    });
+
+    exclusive_valid_ = reader.get_bool();
+    exclusive_addr_ = reader.get_u32();
+    exclusive_id_ = reader.get_u32();
+    irq_line_ = reader.get_bool();
+    fiq_line_ = reader.get_bool();
+    last_abort_pc_ = reader.get_u32();
+    abort_loop_count_ = reader.get_i32();
+    pending_fault_ = static_cast<arm::FaultKind>(reader.get_i32());
+    read_mm_result(reader, pending_mm_fault_);
+    cur_instr_addr_ = reader.get_u32();
+    cur_instr_ = reader.get_u32();
+    cur_instr_len_ = reader.get_u32();
+    it_state_ = reader.get_u32();
+    it_state_valid_ = reader.get_bool();
+    reader.fixed(thread_ids_, [&](ThreadIdRegisters& ids) {
+        ids.user_rw = reader.get_u32();
+        ids.user_ro = reader.get_u32();
+        ids.privileged_rw = reader.get_u32();
+    });
+
+    // r[15] is the architectural PC and Cpu::pc mirrors it (write_r15 keeps the
+    // two in step); keep that invariant after restoring the register file.
+    pc = r[15];
+}
+
+// ===========================================================================
 // Factory
 // ===========================================================================
 

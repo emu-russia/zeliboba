@@ -125,6 +125,9 @@ public:
     std::string status_line() const override;
     void describe_state(std::vector<std::string>& lines) const override;
 
+    void save_state(StateWriter& writer) const override;
+    void load_state(StateReader& reader) override;
+
     void set_irq(int line, bool asserted) override;
     bool interrupt_pending() const override;
 

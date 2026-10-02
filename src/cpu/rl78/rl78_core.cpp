@@ -1196,6 +1196,62 @@ void Rl78Core::describe_state(std::vector<std::string>& lines) const {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+void Rl78Core::save_state(StateWriter& writer) const {
+    Cpu::save_state(writer);
+
+    writer.put_u8(a);
+    writer.put_u8(x);
+    writer.put_u8(b);
+    writer.put_u8(c);
+    writer.put_u8(d);
+    writer.put_u8(e);
+    writer.put_u8(h);
+    writer.put_u8(l);
+    writer.put_u16(sp);
+    writer.put_u16(psw);
+    writer.put_u8(es);
+    writer.put_u8(cs);
+    writer.put_u8(pmc);
+    writer.put_u32(reset_vector);
+    writer.put_u64(data_accesses);
+    writer.put_u64(unknown_instructions);
+    writer.put_i32(pending_vector);
+    writer.put_u32(page_);
+    writer.put_bool(pc_written_);
+    writer.fixed(irq_levels_, [&](bool level) { writer.put_bool(level); });
+    writer.fixed(irq_vectors_, [&](u8 vector) { writer.put_u8(vector); });
+}
+
+void Rl78Core::load_state(StateReader& reader) {
+    Cpu::load_state(reader);
+
+    a = reader.get_u8();
+    x = reader.get_u8();
+    b = reader.get_u8();
+    c = reader.get_u8();
+    d = reader.get_u8();
+    e = reader.get_u8();
+    h = reader.get_u8();
+    l = reader.get_u8();
+    sp = reader.get_u16();
+    psw = reader.get_u16();
+    es = reader.get_u8();
+    cs = reader.get_u8();
+    pmc = reader.get_u8();
+    reset_vector = reader.get_u32();
+    data_accesses = reader.get_u64();
+    unknown_instructions = reader.get_u64();
+    pending_vector = reader.get_i32();
+    page_ = reader.get_u32();
+    pc_written_ = reader.get_bool();
+    reader.fixed(irq_levels_, [&](bool& level) { level = reader.get_bool(); });
+    reader.fixed(irq_vectors_, [&](u8& vector) { vector = reader.get_u8(); });
+}
+
 }  // namespace zlb
 
 namespace zlb {

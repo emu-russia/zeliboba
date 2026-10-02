@@ -249,4 +249,66 @@ void Sgx::describe(std::vector<std::string>& lines) const {
                            event_enable_, irq_status_));
 }
 
+void Sgx::save_state(StateWriter& writer) const {
+    // `bus_` and the IRQ callback are host wiring. Everything the kernel GPU
+    // driver can publish plus the GXM translation record is state.
+    RegisterBlock::save_state(writer);
+    writer.list(last_words_, [&](u32 word) { writer.put_u32(word); });
+    writer.put_u64(queue_bytes_);
+    writer.put_u64(gxm_units_);
+    writer.put_u64(gxm_draws_);
+    writer.fixed(gxm_opcodes_, [&](u64 count) { writer.put_u64(count); });
+    writer.fixed(gxm_state_, [&](u32 word) { writer.put_u32(word); });
+    writer.list(draws_, [&](const TranslatedDraw& draw) {
+        writer.fixed(draw.state, [&](u32 word) { writer.put_u32(word); });
+        writer.put_u32(draw.argument);
+    });
+    writer.put_u32(mmu_dir_base_);
+    writer.put_u32(mmu_control_);
+    writer.put_u64(translations_);
+    writer.put_u64(faults_);
+    writer.put_u64(invalidations_);
+    writer.put_u32(events_);
+    writer.put_u32(event_enable_);
+    writer.put_u32(irq_status_);
+    writer.put_u32(queue_base_);
+    writer.put_u32(queue_size_);
+    writer.put_u32(queue_control_);
+    writer.put_u32(queue_write_);
+    writer.put_u32(queue_read_);
+    writer.put_u64(kicks_);
+    writer.put_u64(commands_);
+    writer.put_bool(irq_line_);
+}
+
+void Sgx::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    reader.list(last_words_, [&](u32& word) { word = reader.get_u32(); });
+    queue_bytes_ = reader.get_u64();
+    gxm_units_ = reader.get_u64();
+    gxm_draws_ = reader.get_u64();
+    reader.fixed(gxm_opcodes_, [&](u64& count) { count = reader.get_u64(); });
+    reader.fixed(gxm_state_, [&](u32& word) { word = reader.get_u32(); });
+    reader.list(draws_, [&](TranslatedDraw& draw) {
+        reader.fixed(draw.state, [&](u32& word) { word = reader.get_u32(); });
+        draw.argument = reader.get_u32();
+    });
+    mmu_dir_base_ = reader.get_u32();
+    mmu_control_ = reader.get_u32();
+    translations_ = reader.get_u64();
+    faults_ = reader.get_u64();
+    invalidations_ = reader.get_u64();
+    events_ = reader.get_u32();
+    event_enable_ = reader.get_u32();
+    irq_status_ = reader.get_u32();
+    queue_base_ = reader.get_u32();
+    queue_size_ = reader.get_u32();
+    queue_control_ = reader.get_u32();
+    queue_write_ = reader.get_u32();
+    queue_read_ = reader.get_u32();
+    kicks_ = reader.get_u64();
+    commands_ = reader.get_u64();
+    irq_line_ = reader.get_bool();
+}
+
 }  // namespace zlb::kermit

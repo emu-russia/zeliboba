@@ -128,6 +128,17 @@ public:
     std::string summary() const;
     std::vector<Device*> devices() const;
 
+    // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+
+    /// The devices the block installs are owned by the bus, which serialises
+    /// them where they are registered. Only the block's own scheduler state
+    /// (the install flag and the PERIPHCLK cycle accumulators) lives here.
+    /// Not virtual: KermitBlock is not a Device.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

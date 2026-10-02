@@ -208,6 +208,18 @@ std::string GicCpuInterface::summary() const {
                   highest_pending_ ? highest_pending_() : kSpurious);
 }
 
+void GicCpuInterface::save_state(StateWriter& writer) const {
+    // Register image first (RegisterBlock), then the access view. The four
+    // handler hooks are host wiring and are never written.
+    RegisterBlock::save_state(writer);
+    writer.put_bool(nonsecure_access_);
+}
+
+void GicCpuInterface::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    nonsecure_access_ = reader.get_bool();
+}
+
 // ---------------------------------------------------------------------------
 // GicDistributor
 // ---------------------------------------------------------------------------
@@ -678,6 +690,49 @@ void GicDistributor::describe(std::vector<std::string>& lines) const {
     }
 }
 
+void GicDistributor::save_state(StateWriter& writer) const {
+    // Register image (the enable/pending/active status words) first.
+    RegisterBlock::save_state(writer);
+    // `max_irq_` is construction-time configuration (it sizes every vector
+    // below); `access_core_`/`nonsecure_access_` are the per-access view.
+    writer.put_u32(access_core_);
+    writer.put_bool(nonsecure_access_);
+    writer.put_bool(secure_world_left_enabled_);
+    writer.list(group1_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(enabled_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(pending_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(active_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(level_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(sampled_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(pending_after_eoi_, [&](bool bit) { writer.put_bool(bit); });
+    writer.list(priority_, [&](u8 value) { writer.put_u8(value); });
+    writer.list(targets_, [&](u8 value) { writer.put_u8(value); });
+    writer.list(pulse_left_, [&](u32 value) { writer.put_u32(value); });
+    writer.fixed(sgi_sources_, [&](const std::array<u8, 16>& sources) {
+        writer.fixed(sources, [&](u8 source) { writer.put_u8(source); });
+    });
+}
+
+void GicDistributor::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    access_core_ = reader.get_u32();
+    nonsecure_access_ = reader.get_bool();
+    secure_world_left_enabled_ = reader.get_bool();
+    reader.list(group1_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(enabled_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(pending_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(active_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(level_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(sampled_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(pending_after_eoi_, [&](bool& bit) { bit = reader.get_bool(); });
+    reader.list(priority_, [&](u8& value) { value = reader.get_u8(); });
+    reader.list(targets_, [&](u8& value) { value = reader.get_u8(); });
+    reader.list(pulse_left_, [&](u32& value) { value = reader.get_u32(); });
+    reader.fixed(sgi_sources_, [&](std::array<u8, 16>& sources) {
+        reader.fixed(sources, [&](u8& source) { source = reader.get_u8(); });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Gic
 // ---------------------------------------------------------------------------
@@ -903,6 +958,64 @@ void Gic::describe(std::vector<std::string>& lines) const {
         for (u32 token : active_[core]) lines.push_back(format("      servicing %s", irq_label(token & 0x3FFu).c_str()));
     }
     distributor_->describe(lines);
+}
+
+void Gic::save_state(StateWriter& writer) const {
+    // The distributor and the CPU interfaces are owned here, not registered on
+    // the bus, so each travels in its own named section.
+    writer.begin("Gic.distributor");
+    distributor_->save_state(writer);
+    writer.end();
+    for (unsigned core = 0; core < kGicCoreCount; ++core) {
+        writer.begin("Gic.cpu_interface");
+        cpu_interfaces_[core]->save_state(writer);
+        writer.end();
+    }
+    // The optional generic CPU-interface alias is wiring, but it is a Device
+    // that is never walked by the bus, so its state (if fitted) is written too.
+    writer.put_bool(cpu_interface_alias_ != nullptr);
+    if (cpu_interface_alias_) {
+        writer.begin("Gic.cpu_interface_alias");
+        cpu_interface_alias_->save_state(writer);
+        writer.end();
+    }
+    writer.fixed(active_, [&](const std::vector<u32>& stack) {
+        writer.list(stack, [&](u32 token) { writer.put_u32(token); });
+    });
+    writer.fixed(irq_lines_, [&](bool asserted) { writer.put_bool(asserted); });
+    writer.fixed(fiq_lines_, [&](bool asserted) { writer.put_bool(asserted); });
+    writer.put_bool(line_);
+    writer.put_bool(secure_world_left_enabled_);
+    // `cpus_` and `line_callback_` are host wiring, `access_context_` points at
+    // the bus context: none of them is serialised.
+}
+
+void Gic::load_state(StateReader& reader) {
+    reader.begin("Gic.distributor");
+    distributor_->load_state(reader);
+    reader.end();
+    for (unsigned core = 0; core < kGicCoreCount; ++core) {
+        reader.begin("Gic.cpu_interface");
+        cpu_interfaces_[core]->load_state(reader);
+        reader.end();
+    }
+    const bool has_alias = reader.get_bool();
+    if (has_alias) {
+        reader.begin("Gic.cpu_interface_alias");
+        if (cpu_interface_alias_) cpu_interface_alias_->load_state(reader);
+        reader.end();
+    }
+    reader.fixed(active_, [&](std::vector<u32>& stack) {
+        reader.list(stack, [&](u32& token) { token = reader.get_u32(); });
+    });
+    reader.fixed(irq_lines_, [&](bool& asserted) { asserted = reader.get_bool(); });
+    reader.fixed(fiq_lines_, [&](bool& asserted) { asserted = reader.get_bool(); });
+    line_ = reader.get_bool();
+    secure_world_left_enabled_ = reader.get_bool();
+    // `line_` is derived from core 0's IRQ record; keep the two consistent with
+    // the value the state was taken with. The callback is not fired here - the
+    // CPU cores restore their own interrupt inputs right after this.
+    irq_lines_[0] = line_;
 }
 
 }  // namespace zlb::kermit

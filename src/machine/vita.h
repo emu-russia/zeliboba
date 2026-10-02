@@ -258,6 +258,20 @@ public:
     bool attach_emmc(const std::string& path);
     /// Build the eMMC image from the extracted firmware when it is missing.
     bool rebuild_emmc_if_missing();
+
+    // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+    //
+    // Write/restore the whole machine. `load_state` expects the machine to be
+    // built and reset already (the CLI/UI do that at startup); it then replaces
+    // every RAM byte, device register, CPU register and boot-chain flag. The
+    // eMMC image file itself is external input: the state records its path and
+    // size, and loading refuses a different image.
+
+    bool save_state(const std::string& path, std::string& error);
+    bool load_state(const std::string& path, std::string& error);
+
     /// Substitution (round 396): write the ELF form of the os0 modules onto the card, because
     /// the workspace only holds their decrypted "SCE\0" form while NSKBL validates "\x7FELF"
     /// (gated by ZLB_OS0_ELF=1, see docs/NSKBL.md rounds 394/395).

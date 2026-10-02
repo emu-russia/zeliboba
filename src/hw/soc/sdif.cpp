@@ -1078,4 +1078,67 @@ void Sdif::describe(std::vector<std::string>& lines) const {
     if (card_) lines.push_back(format("    card: %s", card_->summary().c_str()));
 }
 
+void Sdif::save_state(StateWriter& writer) const {
+    // `card_`, `port_`, `dma_primary_`/`dma_secondary_` (host pointers and
+    // construction-time configuration) and `irq_callback_` are not state.
+    RegisterBlock::save_state(writer);
+    writer.put_bool(irq_line_);
+    writer.put_u64(transfers_);
+    writer.put_u64(last_lba_);
+    writer.put_u32(last_count_);
+    writer.str(last_command_);
+    writer.fixed(response_, [&](u32 word) { writer.put_u32(word); });
+    writer.list(data_, [&](u8 byte) { writer.put_u8(byte); });
+    writer.put_u32(data_index_);
+    writer.put_bool(data_pending_);
+    writer.put_bool(read_direction_);
+    writer.put_bool(command_ok_);
+    writer.put_u32(rca_);
+    writer.put_u32(op_cond_polls_);
+    writer.put_u32(data_ready_in_);
+    writer.put_u32(transfer_complete_in_);
+    writer.put_bool(command_no_response_);
+    writer.put_u32(command_error_in_);
+    writer.put_u16(error_status_);
+    writer.put_bool(dma_complete_);
+    // Diagnostics for the last descriptor walk.
+    writer.put_u32(adma_address_);
+    writer.put_u32(adma_bytes_);
+    writer.put_bool(adma_ok_);
+    writer.put_bool(app_cmd_);
+    writer.put_bool(high_capacity_);
+    writer.put_u32(busy_left_);
+    writer.put_u32(last_command_register_);
+}
+
+void Sdif::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    irq_line_ = reader.get_bool();
+    transfers_ = reader.get_u64();
+    last_lba_ = reader.get_u64();
+    last_count_ = reader.get_u32();
+    last_command_ = reader.str();
+    reader.fixed(response_, [&](u32& word) { word = reader.get_u32(); });
+    reader.list(data_, [&](u8& byte) { byte = reader.get_u8(); });
+    data_index_ = reader.get_u32();
+    data_pending_ = reader.get_bool();
+    read_direction_ = reader.get_bool();
+    command_ok_ = reader.get_bool();
+    rca_ = reader.get_u32();
+    op_cond_polls_ = reader.get_u32();
+    data_ready_in_ = reader.get_u32();
+    transfer_complete_in_ = reader.get_u32();
+    command_no_response_ = reader.get_bool();
+    command_error_in_ = reader.get_u32();
+    error_status_ = reader.get_u16();
+    dma_complete_ = reader.get_bool();
+    adma_address_ = reader.get_u32();
+    adma_bytes_ = reader.get_u32();
+    adma_ok_ = reader.get_bool();
+    app_cmd_ = reader.get_bool();
+    high_capacity_ = reader.get_bool();
+    busy_left_ = reader.get_u32();
+    last_command_register_ = reader.get_u32();
+}
+
 }  // namespace zlb::kermit

@@ -103,6 +103,11 @@ public:
 
     void reset();
 
+    /// Save-state hooks for the block's own (non-device) state. The block's
+    /// devices are registered in the CMeP bus, which serialises them; only the
+    /// boot mode, keyring flags and SC transfer bookkeeping live here.
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
 
     /// The boot strap block 0xE0062020 that selects 'A' (normal) vs '!' (service).
     void set_strap_bit0(bool set);

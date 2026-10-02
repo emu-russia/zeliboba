@@ -732,4 +732,159 @@ std::string Bus::describe_map() const {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+void Bus::save_state(StateWriter& writer) const {
+    writer.begin("regions");
+    writer.put_u32(static_cast<u32>(regions_.size()));
+    for (const MemRegion& region : regions_) {
+        writer.begin("region");
+        writer.str(region.name);
+        writer.put_u32(region.base);
+        writer.put_u32(region.size);
+        writer.put_bool(region.mapped);
+        writer.put_bool(region.readonly);
+        // A region with its own storage is written out through `bytes()`, so the
+        // effective content is captured whether it currently serves from its own
+        // vector or from an external buffer the boot chain pointed it at (the
+        // CMeP mirrors its 0x40000 window onto the private SRAM while it runs).
+        // A pure alias (`add_ram_alias`, empty storage) only records its
+        // geometry: the machine section writes the shared buffer once.
+        const bool owns = !region.data.empty();
+        writer.put_bool(owns);
+        if (owns) state_write_pages(writer, region.bytes(), region.data.size());
+        writer.end();
+    }
+    writer.end();
+
+    writer.begin("devices");
+    writer.put_u32(static_cast<u32>(devices_.size()));
+    for (const auto& device : devices_) {
+        writer.begin("device");
+        writer.str(device->name());
+        // A mirror's state lives in its target, which is serialised where it is
+        // registered; writing it twice would also apply it twice on load.
+        if (dynamic_cast<DeviceMirror*>(device.get()) == nullptr) device->save_state(writer);
+        writer.end();
+    }
+    writer.end();
+
+    writer.begin("monitor");
+    writer.put_u32(static_cast<u32>(kMaxReservations));
+    for (const ExclusiveReservation& reservation : reservations_) {
+        writer.put_bool(reservation.valid);
+        writer.put_u32(reservation.address);
+        writer.put_u32(reservation.size);
+        writer.put_i32(reservation.owner);
+        writer.put_u32(reservation.asid);
+    }
+    writer.put_u64(stats.reads);
+    writer.put_u64(stats.writes);
+    writer.put_u64(stats.fetches);
+    writer.put_u64(stats.mmio);
+    writer.put_u64(stats.ram);
+    writer.put_u64(stats.unmapped);
+    writer.put_bool(trace.trace_ram());
+    writer.put_u64(trace.total());
+    writer.end();
+}
+
+void Bus::load_state(StateReader& reader) {
+    reader.begin("regions");
+    const u32 region_count = reader.get_u32();
+    if (!reader.ok()) return;
+    if (region_count != regions_.size()) {
+        reader.fail(format("state file: bus has %u RAM regions, this build has %zu", region_count,
+                           regions_.size()));
+        return;
+    }
+    for (MemRegion& region : regions_) {
+        reader.begin("region");
+        const std::string name = reader.str();
+        const u32 base = reader.get_u32();
+        const u32 size = reader.get_u32();
+        const bool mapped = reader.get_bool();
+        const bool readonly = reader.get_bool();
+        const bool owns = reader.get_bool();
+        if (!reader.ok()) return;
+        if (name != region.name || base != region.base || size != region.size) {
+            reader.fail(format("state file: RAM region '%s' does not match this build's '%s'", name.c_str(),
+                               region.name.c_str()));
+            return;
+        }
+        region.mapped = mapped;
+        region.readonly = readonly;
+        if (owns) {
+            if (region.data.empty()) {
+                reader.fail(format("state file: region '%s' carries bytes this build has no storage for",
+                                   name.c_str()));
+                return;
+            }
+            // Restore through `bytes()`: when the running machine has the region
+            // pointed at an external buffer, the bytes belong there; otherwise
+            // they belong in the region's own vector. Both describe the same
+            // window, so the state stays self-contained either way.
+            state_read_pages(reader, region.bytes(), region.data.size());
+            if (!reader.ok()) return;
+        }
+        reader.end();
+    }
+    reader.end();
+
+    reader.begin("devices");
+    const u32 device_count = reader.get_u32();
+    if (!reader.ok()) return;
+    if (device_count != devices_.size()) {
+        reader.fail(format("state file: bus has %u devices, this build has %zu", device_count,
+                           devices_.size()));
+        return;
+    }
+    for (const auto& device : devices_) {
+        reader.begin("device");
+        const std::string name = reader.str();
+        if (!reader.ok()) return;
+        if (name != device->name()) {
+            reader.fail(format("state file: device '%s' does not match this build's '%s'", name.c_str(),
+                               device->name().c_str()));
+            return;
+        }
+        if (dynamic_cast<DeviceMirror*>(device.get()) == nullptr) device->load_state(reader);
+        if (!reader.ok()) return;
+        reader.end();
+    }
+    reader.end();
+
+    reader.begin("monitor");
+    const u32 reservation_count = reader.get_u32();
+    if (!reader.ok()) return;
+    if (reservation_count != kMaxReservations) {
+        reader.fail("state file: exclusive monitor layout changed");
+        return;
+    }
+    for (ExclusiveReservation& reservation : reservations_) {
+        reservation.valid = reader.get_bool();
+        reservation.address = reader.get_u32();
+        reservation.size = reader.get_u32();
+        reservation.owner = reader.get_i32();
+        reservation.asid = reader.get_u32();
+    }
+    stats.reads = reader.get_u64();
+    stats.writes = reader.get_u64();
+    stats.fetches = reader.get_u64();
+    stats.mmio = reader.get_u64();
+    stats.ram = reader.get_u64();
+    stats.unmapped = reader.get_u64();
+    const bool trace_ram = reader.get_bool();
+    const u64 trace_total = reader.get_u64();
+    reader.end();
+    if (!reader.ok()) return;
+    trace.clear();
+    trace.set_trace_ram(trace_ram);
+    trace.set_total(trace_total);
+
+    rebuild_map();
+}
+
 }  // namespace zlb

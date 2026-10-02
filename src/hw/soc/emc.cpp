@@ -228,4 +228,40 @@ void EmcTopController::describe(std::vector<std::string>& lines) const {
     lines.push_back("  opaque config/calibration snapshots; no calibration event or electrical DRAM behavior");
 }
 
+void EmcTopController::save_state(StateWriter& writer) const {
+    // The whole register array plus the last command snapshot, the mode/command
+    // latches and every counter.
+    writer.fixed(registers_, [&](u32 value) { writer.put_u32(value); });
+    writer.put_u32(modifier_);
+    writer.put_u32(last_payload_);
+    writer.put_u32(last_control_);
+    writer.put_u64(command_count_);
+    writer.put_u64(completion_count_);
+    writer.put_u64(rejected_count_);
+    writer.put_u64(control_resets_);
+    writer.put_bool(busy_);
+    writer.put_bool(command_pending_);
+    writer.put_bool(mode_request_);
+    writer.put_bool(mode_acknowledged_);
+    writer.put_bool(mode_pending_);
+    writer.put_bool(unsupported_);
+}
+
+void EmcTopController::load_state(StateReader& reader) {
+    reader.fixed(registers_, [&](u32& value) { value = reader.get_u32(); });
+    modifier_ = reader.get_u32();
+    last_payload_ = reader.get_u32();
+    last_control_ = reader.get_u32();
+    command_count_ = reader.get_u64();
+    completion_count_ = reader.get_u64();
+    rejected_count_ = reader.get_u64();
+    control_resets_ = reader.get_u64();
+    busy_ = reader.get_bool();
+    command_pending_ = reader.get_bool();
+    mode_request_ = reader.get_bool();
+    mode_acknowledged_ = reader.get_bool();
+    mode_pending_ = reader.get_bool();
+    unsupported_ = reader.get_bool();
+}
+
 }  // namespace zlb::kermit

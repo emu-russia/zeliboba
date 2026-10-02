@@ -285,4 +285,26 @@ void IftuController::describe(std::vector<std::string>& lines) const {
     }
 }
 
+void IftuController::save_state(StateWriter& writer) const {
+    // The register image carries every programmed bank/plane register; the
+    // scan-out bank selects, deferred-turnover latches and counters follow.
+    // The `Scanout::pixels` pointer is guest RAM the bus already serialises.
+    RegisterBlock::save_state(writer);
+    writer.fixed(active_bank_, [&](u32 bank) { writer.put_u32(bank); });
+    writer.fixed(armed_, [&](bool value) { writer.put_bool(value); });
+    writer.fixed(pending_, [&](bool value) { writer.put_bool(value); });
+    writer.fixed(irq_, [&](bool value) { writer.put_bool(value); });
+    writer.fixed(turnovers_, [&](u64 value) { writer.put_u64(value); });
+    // `bus_` and `irq_callback_` are wiring: never serialised.
+}
+
+void IftuController::load_state(StateReader& reader) {
+    RegisterBlock::load_state(reader);
+    reader.fixed(active_bank_, [&](u32& bank) { bank = reader.get_u32(); });
+    reader.fixed(armed_, [&](bool& value) { value = reader.get_bool(); });
+    reader.fixed(pending_, [&](bool& value) { value = reader.get_bool(); });
+    reader.fixed(irq_, [&](bool& value) { value = reader.get_bool(); });
+    reader.fixed(turnovers_, [&](u64& value) { value = reader.get_u64(); });
+}
+
 }  // namespace zlb::kermit

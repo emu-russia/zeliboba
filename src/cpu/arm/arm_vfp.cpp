@@ -299,4 +299,21 @@ std::string ArmVfp::describe() const {
     return std::string(buffer);
 }
 
+// ---------------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------------
+
+void ArmVfp::save_state(StateWriter& writer) const {
+    // regs[] holds both the sN (32 single slots) and dN (64 half-slots) views.
+    writer.fixed(regs, [&](u32 value) { writer.put_u32(value); });
+    writer.put_u32(fpscr);
+    writer.put_u32(fpexc);
+}
+
+void ArmVfp::load_state(StateReader& reader) {
+    reader.fixed(regs, [&](u32& value) { value = reader.get_u32(); });
+    fpscr = reader.get_u32();
+    fpexc = reader.get_u32();
+}
+
 }  // namespace zlb

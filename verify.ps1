@@ -83,6 +83,36 @@ if (Test-Path $emmc) {
     Step "eMMC image" { & $emmc --firmware (Join-Path $root "..\Vita_104_Firmware\Out") --out (Join-Path $root "build\emmc.img") --verify } | Out-Null
 }
 
+# Save states: a machine that is saved mid-boot, continued, then reloaded and
+# continued the same distance must end up bit-identical. Any state the
+# serialiser forgets shows up as a different continuation.
+Step "save state determinism" {
+    $work = Join-Path $root "build\state-check"
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    $checkpoint = Join-Path $work "checkpoint.state"
+    $direct = Join-Path $work "continued-direct.state"
+    $resumed = Join-Path $work "continued-resumed.state"
+    Remove-Item $checkpoint, $direct, $resumed -ErrorAction SilentlyContinue
+    & $zeliboba -q -ex "runm 300000" -ex "savestate $checkpoint" -ex "runm 50000" -ex "savestate $direct" `
+                -ex "loadstate $checkpoint" -ex "runm 50000" -ex "savestate $resumed" -ex "quit" | Out-Null
+    if (-not (Test-Path $checkpoint) -or -not (Test-Path $direct) -or -not (Test-Path $resumed)) {
+        Write-Host "save state: the emulator did not write all three states" -ForegroundColor Red
+        $global:LASTEXITCODE = 1
+        return 1
+    }
+    $a = (Get-FileHash $direct -Algorithm SHA256).Hash
+    $b = (Get-FileHash $resumed -Algorithm SHA256).Hash
+    Write-Host ("state checkpoint {0:N0} bytes, continuation {1:N0} bytes" -f (Get-Item $checkpoint).Length, (Get-Item $direct).Length)
+    if ($a -ne $b) {
+        Write-Host "save state: the resumed continuation differs from the direct one" -ForegroundColor Red
+        $global:LASTEXITCODE = 1
+        return 1
+    }
+    Write-Host "save state: resumed continuation is identical"
+    $global:LASTEXITCODE = 0
+    return 0
+} | Out-Null
+
 Write-Host ""
 Write-Host "================ summary ================" -ForegroundColor Yellow
 foreach ($r in $results) {

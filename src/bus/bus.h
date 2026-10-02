@@ -107,6 +107,20 @@ public:
     void reset();
 
     // ------------------------------------------------------------------
+    // Save states
+    // ------------------------------------------------------------------
+    //
+    // RAM regions, every registered device's state and the SCU exclusive
+    // monitor. A region with its own storage is written through `bytes()`, so a
+    // region the boot chain re-pointed at a shared buffer is captured as well;
+    // a pure alias (empty storage, `external` set by `add_ram_alias`) only
+    // records its geometry, because the machine section writes the shared buffer
+    // once and the alias never moves.
+
+    void save_state(StateWriter& writer) const;
+    void load_state(StateReader& reader);
+
+    // ------------------------------------------------------------------
     // Access
     // ------------------------------------------------------------------
 

@@ -167,4 +167,21 @@ void DsiController::describe(std::vector<std::string>& lines) const {
     lines.push_back("  deterministic first-frame phase; board frame boundaries, no guest callback synthesis");
 }
 
+void DsiController::save_state(StateWriter& writer) const {
+    // The whole register array (including the timing words and the status/mask
+    // pair), the frame phase and the frame counter. The two callbacks are host
+    // wiring and are never serialised.
+    writer.fixed(registers_, [&](u32 value) { writer.put_u32(value); });
+    writer.put_u64(phase_);
+    writer.put_u64(frames_);
+    writer.put_bool(irq_);
+}
+
+void DsiController::load_state(StateReader& reader) {
+    reader.fixed(registers_, [&](u32& value) { value = reader.get_u32(); });
+    phase_ = reader.get_u64();
+    frames_ = reader.get_u64();
+    irq_ = reader.get_bool();
+}
+
 }  // namespace zlb::kermit

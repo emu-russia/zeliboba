@@ -108,6 +108,15 @@ public:
     /// Extra state in the debugger's state view.
     virtual void describe_state(std::vector<std::string>& lines) const { (void)lines; }
 
+    // ---- save states -----------------------------------------------------
+
+    /// Persist the core's architectural and internal state. A derived core calls
+    /// `Cpu::save_state()` first, so the common counters/pc are always present,
+    /// then writes its own registers. `load_state` reads in the same order.
+    /// Breakpoints are debugger configuration, not machine state, and stay out.
+    virtual void save_state(StateWriter& writer) const;
+    virtual void load_state(StateReader& reader);
+
     /// Interrupt input. Level triggered: `asserted == false` deasserts.
     virtual void set_irq(int line, bool asserted) { (void)line; (void)asserted; }
 

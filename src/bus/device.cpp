@@ -133,4 +133,18 @@ bool RegisterFile::poke_register(const std::string& name, u64 value) {
     return true;
 }
 
+void RegisterFile::save_state(StateWriter& writer) const {
+    writer.map(values_, [&](u32 address, u64 value) {
+        writer.put_u32(address);
+        writer.put_u64(value);
+    });
+}
+
+void RegisterFile::load_state(StateReader& reader) {
+    reader.map(values_, [&](u32& address, u64& value) {
+        address = reader.get_u32();
+        value = reader.get_u64();
+    });
+}
+
 }  // namespace zlb

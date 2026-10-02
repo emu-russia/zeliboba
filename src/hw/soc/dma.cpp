@@ -367,4 +367,72 @@ void DmaController::describe(std::vector<std::string>& lines) const {
     }
 }
 
+void DmaController::save_state(StateWriter& writer) const {
+    // `bus_` is a host reference and `names_` is a construction-time register
+    // table: neither is state.
+    writer.put_u32(static_cast<u32>(channels_.size()));
+    for (const Channel& channel : channels_) {
+        writer.begin("DmaController.channel");
+        writer.put_u32(channel.source);
+        writer.put_u32(channel.dest);
+        writer.put_u32(channel.count);
+        writer.put_u32(channel.control);
+        writer.put_u32(channel.status);
+        writer.put_bool(channel.active);
+        writer.end();
+    }
+    // A Target's geometry (base/size) is serialised; its Device* is wiring.
+    writer.put_u32(static_cast<u32>(targets_.size()));
+    for (const Target& target : targets_) {
+        writer.begin("DmaController.target");
+        writer.put_u32(target.base);
+        writer.put_u32(target.size);
+        writer.end();
+    }
+    writer.put_bool(irq_);
+    writer.put_u32(irq_mask_);
+    writer.put_u32(global_control_);
+    writer.put_u64(transfers_);
+    writer.put_u64(bytes_copied_);
+    // `irq_callback_` is host wiring: never serialised.
+}
+
+void DmaController::load_state(StateReader& reader) {
+    // The channel and target arrays are construction-time geometry, so the file
+    // must agree with this build instead of resizing them.
+    const u32 channel_count = reader.get_u32();
+    if (channel_count != channels_.size()) {
+        reader.fail(format("state file: DMA has %u channels, this build has %zu", channel_count,
+                           channels_.size()));
+        return;
+    }
+    for (Channel& channel : channels_) {
+        reader.begin("DmaController.channel");
+        channel.source = reader.get_u32();
+        channel.dest = reader.get_u32();
+        channel.count = reader.get_u32();
+        channel.control = reader.get_u32();
+        channel.status = reader.get_u32();
+        channel.active = reader.get_bool();
+        reader.end();
+    }
+    const u32 target_count = reader.get_u32();
+    if (target_count != targets_.size()) {
+        reader.fail(format("state file: DMA has %u targets, this build has %zu", target_count,
+                           targets_.size()));
+        return;
+    }
+    for (Target& target : targets_) {
+        reader.begin("DmaController.target");
+        target.base = reader.get_u32();
+        target.size = reader.get_u32();
+        reader.end();
+    }
+    irq_ = reader.get_bool();
+    irq_mask_ = reader.get_u32();
+    global_control_ = reader.get_u32();
+    transfers_ = reader.get_u64();
+    bytes_copied_ = reader.get_u64();
+}
+
 }  // namespace zlb::kermit
