@@ -1114,6 +1114,18 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // 0x4394CE loads the queue object the library links the op into:
+                    // r8 = [op+0x20], a doubly-linked list with head [r8] and tail [r8+4].
+                    // Knowing the queue address says whether anything ever consumes it.
+                    static u32 q_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004394CEu && q_logged < 4u) {
+                        ++q_logged;
+                        const ArmCore* qc = dynamic_cast<const ArmCore*>(core);
+                        if (qc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: DMA queue op=0x%08X queue=0x%08X (r8) head=0x%08X",
+                                         qc->r[4], qc->r[8], 0u);
+                        }
+                    }
                     // Trace the enqueue itself: from its call site (0x5BE956) until it
                     // returns (0x5BE95A). That shows how the DMA library reaches the kernel
                     // to submit an operation, and where the transfer should be started.
