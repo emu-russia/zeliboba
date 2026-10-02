@@ -1167,6 +1167,18 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // 0x510194C0 is NSKBL's module-start helper; its arguments carry the
+                    // entry point of the module being started, which is how a failing
+                    // module (sdif.skprx at start #23) can be located.
+                    static u32 helper_logged = 0;
+                    if (arm_pc == 0x510194C0u && helper_logged < 40u) {
+                        ++helper_logged;
+                        const ArmCore* hc = dynamic_cast<const ArmCore*>(core);
+                        if (hc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: start helper #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X core=%d",
+                                         helper_logged, hc->r[0], hc->r[1], hc->r[2], hc->r[3], i);
+                        }
+                    }
                     // ksceKernelSetEventFlag is implemented at 0x4ADEA8 (the stub 0x43AD88
                     // jumps there). If the DMA completion really signals the flag the
                     // parked thread waits on, this call must carry r0 = 0x10AB9.
