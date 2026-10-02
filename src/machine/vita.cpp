@@ -1058,6 +1058,24 @@ void Vita::run_slice() {
             }
             const u32 arm_pc = core->get_pc();
             arm_cov_mark(arm_pc);
+            // Diagnostic (ZLB_MODULE_LOG=1): the native module-start helper.  The
+            // remaining boot gap is that only 22 of the 28 modules the bootconfig
+            // lists are ever started (docs/STATUS.md), and the helper's argument is
+            // the module's UID - so the UID sequence is the direct answer to "which
+            // kernel modules actually started".  Read-only: it inspects r0 and never
+            // touches the core's state.
+            if (arm_pc == 0x510194C0u) {
+                static const bool module_log = [] {
+                    const char* value = std::getenv("ZLB_MODULE_LOG");
+                    return value != nullptr && value[0] != '\0' && value[0] != '0';
+                }();
+                static u32 module_starts = 0;
+                if (module_log) {
+                    const ArmCore* log_arm = dynamic_cast<const ArmCore*>(core);
+                    ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", ++module_starts,
+                                 log_arm != nullptr ? log_arm->r[0] : 0u, i);
+                }
+            }
             if (satisfy_arm_boot_pc(static_cast<u32>(i), arm_pc)) {
                 // Diagnostic (round 159): a development substitution can *skip* the
                 // instruction it stands in for (and sometimes retarget the PC).  If the
