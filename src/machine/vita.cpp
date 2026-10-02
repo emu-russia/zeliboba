@@ -1241,6 +1241,95 @@ void Vita::run_slice() {
             // 0x80024501 = SCE_KERNEL_ERROR_INVALID_UID (SDK kernel/error.h line 310).
             // r6 was loaded from [r10+8] at 0x51005162 and is the UID being rejected:
             // its bits 0x500000 and 0xA00000 are clear on the failing path.
+            // Division results: 0x5100B84C follows "blx 0x510258D0" (r0 = table base,
+            // r1 = count) in the UID lookup, and 0x5100B856 follows the second call
+            // (r0 = class index, r1 = the first result). Compare both with theory.
+            if (arm_pc == 0x5100B84Cu || arm_pc == 0x5100B856u) {
+                static u32 div_logged = 0;
+                if (div_logged < 20u) {
+                    ++div_logged;
+                    if (const ArmCore* dv = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "div result at 0x%08X: r0=0x%08X r1=0x%08X r2=0x%08X",
+                                     arm_pc, dv->r[0], dv->r[1], dv->r[2]);
+                    }
+                }
+            }
+            // 0x510258D0 is the software division the UID lookup uses for its bucket
+            // index. It starts with "clz r3,r0" at 0x510258EC and "clz r2,r1" at
+            // 0x510258F0, so probing 0x510258F0 (r0 = dividend, r3 = clz(r0)) and
+            // 0x510258F4 (r1 = divisor, r2 = clz(r1)) checks CLZ against theory.
+            if (arm_pc == 0x510258F0u || arm_pc == 0x510258F4u) {
+                static u32 clz_logged = 0;
+                if (clz_logged < 24u) {
+                    ++clz_logged;
+                    if (const ArmCore* cz = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "clz probe 0x%08X: r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X",
+                                     arm_pc, cz->r[0], cz->r[1], cz->r[2], cz->r[3]);
+                    }
+                }
+            }
+            // 0x5100B82C is the UID table lookup: r0 = table base, r1 = the class
+            // index derived from the UID, r2 = the out pointer. The table layout read
+            // there is +0x1C base, +0x20 count, +0x32 count2, +0x34 array, and the
+            // index is bounded by count2 (return "not found" when it is too large).
+            if (arm_pc == 0x5100B82Cu) {
+                static u32 tbl_logged = 0;
+                if (tbl_logged < 30u) {
+                    ++tbl_logged;
+                    if (ArmCore* tb = dynamic_cast<ArmCore*>(core)) {
+                        const u32 base = tb->r[0];
+                        u32 count = 0, count2 = 0;
+                        if (const arm::MmResult r1 = tb->mmu.translate(base + 0x20u, false, false, tb->mode()); r1.ok) {
+                            count = arm_bus_->read32(r1.phys_addr) & 0xFFFFu;
+                        }
+                        if (const arm::MmResult r2 = tb->mmu.translate(base + 0x32u, false, false, tb->mode()); r2.ok) {
+                            count2 = arm_bus_->read32(r2.phys_addr) & 0xFFFFu;
+                        }
+                        ZLB_LOG_INFO("machine", "uid table: base=0x%08X index=0x%X count=0x%X count2=0x%X",
+                                     base, tb->r[1], count, count2);
+                    }
+                }
+            }
+            // 0x51004A04 is "ubfx r1,r1,#1,#1": log r1 on entry and on the next
+            // instruction, so the extracted value can be compared with the expected
+            // (uid >> 1) & 1.
+            if (arm_pc == 0x51004A04u || arm_pc == 0x51004A08u) {
+                static u32 bfx_logged = 0;
+                if (bfx_logged < 14u) {
+                    ++bfx_logged;
+                    if (const ArmCore* bf = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "ubfx step 0x%08X: r1=0x%08X r4(uid)=0x%08X",
+                                     arm_pc, bf->r[1], bf->r[4]);
+                    }
+                }
+            }
+            // 0x51004A04 is "ubfx r1,r1,#1,#1" (extract the UID class bit) and
+            // 0x51004A0A is the "bl 0x5100B82C" lookup that uses it. r1 must be
+            // (uid >> 1) & 1 on entry to the lookup - for uid 0x200F3 that is 1.
+            if (arm_pc == 0x51004A0Au) {
+                static u32 class_logged = 0;
+                if (class_logged < 10u) {
+                    ++class_logged;
+                    if (const ArmCore* cls = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "uid lookup: class(r1)=0x%X uid(r4)=0x%08X r2=0x%08X",
+                                     cls->r[1], cls->r[4], cls->r[2]);
+                    }
+                }
+            }
+            // Opcode sanity: 0x51004A12/0x51004A16 are "movw r0,#0x4501" then
+            // "movt r0,#0x8002"; 0x51004A1A is the instruction after them, so r0 must
+            // be 0x80024501 there if movw/movt execute correctly. Likewise 0x51004A22
+            // compares the requested UID (r4) with the record's UID (r0).
+            if (arm_pc == 0x51004A1Au || arm_pc == 0x51004A22u) {
+                static u32 op_logged = 0;
+                if (op_logged < 16u) {
+                    ++op_logged;
+                    if (const ArmCore* op = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "opcode check at 0x%08X: r0=0x%08X r4=0x%08X",
+                                     arm_pc, op->r[0], op->r[4]);
+                    }
+                }
+            }
             // 0x51004A0E is the "cmp r0,#0" right after the UID lookup at 0x51004A0A:
             // r0 is the lookup result and r4 the UID being validated. Recording both
             // shows which UID fails, which is the object the model never created.
