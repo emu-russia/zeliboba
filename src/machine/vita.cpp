@@ -1058,22 +1058,65 @@ void Vita::run_slice() {
             }
             const u32 arm_pc = core->get_pc();
             arm_cov_mark(arm_pc);
-            // Diagnostic (ZLB_MODULE_LOG=1): the native module-start helper.  The
+            // Diagnostic (ZLB_MODULE_LOG=1): NSKBL's native module-start loop.  The
             // remaining boot gap is that only 22 of the 28 modules the bootconfig
-            // lists are ever started (docs/STATUS.md), and the helper's argument is
-            // the module's UID - so the UID sequence is the direct answer to "which
-            // kernel modules actually started".  Read-only: it inspects r0 and never
-            // touches the core's state.
-            if (arm_pc == 0x510194C0u) {
-                static const bool module_log = [] {
-                    const char* value = std::getenv("ZLB_MODULE_LOG");
-                    return value != nullptr && value[0] != '\0' && value[0] != '0';
-                }();
-                static u32 module_starts = 0;
-                if (module_log) {
+            // lists are ever started (docs/STATUS.md), so this logs both sides of the
+            // question: every slot the loop pulls out of its UID array (`r5` walks it
+            // with `ldr r9/r10, [r5], #4`) and every entry into the start helper
+            // 0x510194C0, whose argument is the module UID.  A loaded-but-skipped
+            // module then shows up as a slot with no matching start.  Read-only: it
+            // inspects registers and never touches the core's state.
+            static const bool module_log = [] {
+                const char* value = std::getenv("ZLB_MODULE_LOG");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            if (module_log) {
+                // 0x510012F4 is the batch entry (r0=records, r1=UID array, r2=count);
+                // 0x51001326 / 0x51001368 / 0x5100139C follow the three UID loads in
+                // it - the UID is in r9 at the first and in r10 at the other two;
+                // 0x510194C0 is the start helper.
+                const bool batch = arm_pc == 0x510012F4u;
+                const bool slot = arm_pc == 0x51001326u || arm_pc == 0x51001368u || arm_pc == 0x5100139Cu;
+                // The three instructions after the three `bl 0x510194C0` sites: the
+                // helper's return value is in r0, and a negative one makes the loop
+                // `blt 0x510013F4` straight out, abandoning the rest of the batch.
+                const bool result = arm_pc == 0x510013F0u || arm_pc == 0x51001410u || arm_pc == 0x5100149Cu;
+                // 0x510194E4 is the helper's `pop {r4-r7, r15}`: a start whose
+                // helper never reaches it is a start that never returned.
+                const bool ret = arm_pc == 0x510194E4u;
+                if (batch || slot || result || ret || arm_pc == 0x510194C0u) {
                     const ArmCore* log_arm = dynamic_cast<const ArmCore*>(core);
-                    ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", ++module_starts,
-                                 log_arm != nullptr ? log_arm->r[0] : 0u, i);
+                    const u32 r9 = log_arm != nullptr ? log_arm->r[9] : 0u;
+                    const u32 r10 = log_arm != nullptr ? log_arm->r[10] : 0u;
+                    static u32 module_starts = 0;
+                    static u32 module_slots = 0;
+                    static u32 module_batches = 0;
+                    static u32 module_returns = 0;
+                    if (batch) {
+                        ++module_batches;
+                        ZLB_LOG_INFO("machine",
+                                     "module batch #%u records=0x%08X uids=0x%08X count=%u core=%d",
+                                     module_batches, log_arm != nullptr ? log_arm->r[0] : 0u,
+                                     log_arm != nullptr ? log_arm->r[1] : 0u,
+                                     log_arm != nullptr ? log_arm->r[2] : 0u, i);
+                    } else if (slot) {
+                        const u32 uid = arm_pc == 0x51001326u ? r9 : r10;
+                        ++module_slots;
+                        ZLB_LOG_INFO("machine", "module slot #%u uid=0x%08X next=0x%08X at 0x%08X core=%d",
+                                     module_slots, uid, log_arm != nullptr ? log_arm->r[5] : 0u, arm_pc, i);
+                    } else if (ret) {
+                        ++module_returns;
+                        ZLB_LOG_INFO("machine", "module return #%u core=%d (uids=0x%08X)", module_returns, i,
+                                     log_arm != nullptr ? log_arm->r[5] : 0u);
+                    } else if (result) {
+                        ZLB_LOG_INFO("machine", "module result 0x%08X at 0x%08X core=%d (uids=0x%08X)",
+                                     log_arm != nullptr ? log_arm->r[0] : 0u, arm_pc, i,
+                                     log_arm != nullptr ? log_arm->r[5] : 0u);
+                    } else {
+                        ++module_starts;
+                        ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
+                                     log_arm != nullptr ? log_arm->r[0] : 0u, i);
+                    }
                 }
             }
             if (satisfy_arm_boot_pc(static_cast<u32>(i), arm_pc)) {
