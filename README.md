@@ -12,6 +12,11 @@ ARM Cortex-A9        -> kernel_boot_loader -> kernel (os0)
 Ernie (RL78 syscon)  -> питание/сброс/RTC/SC-канал/eMMC-хост
 ```
 
+![Белый логотип PlayStation на экране загрузки](screenshots/boot-logo.png)
+
+*Холодная загрузка прошивки 1.04: гостевой белый логотип PlayStation (панель Display, F7).
+Framebuffer 960×544, RGBA8888, 10 753 чтения eMMC, 0 записей.*
+
 Текущее состояние (подробности, адреса и метрики — `docs/STATUS.md`):
 
 * CMeP first_loader проходит **всю** свою цепочку проверок (заголовок ENP, SHA-256,
@@ -70,9 +75,11 @@ Ernie (RL78 syscon)  -> питание/сброс/RTC/SC-канал/eMMC-хос�
 
 Последняя полная проверка macOS: **617 тестов, 0 отказов**. Настоящие os0 kernel
 modules загружены; native SDL3 показывает белый PlayStation logo на чёрном фоне.
-Скриншот (image omitted from source delivery) и
+Скриншот — [screenshots/boot-logo.png](screenshots/boot-logo.png);
 [проверка native producer/IRQ/presentation](build/goal-native-iftu-arm-integrated-evidence.md)
-сохранены. Полная загрузка ядра, LiveArea и SGX rendering ещё не подтверждены;
+сохранена. Тот же холодный прогон воспроизведён на Windows (MSVC Release x64):
+**617/0**, framebuffer 960×544 RGBA8888, 10 753 чтения eMMC, 0 записей.
+Полная загрузка ядра, LiveArea и SGX rendering ещё не подтверждены;
 IFTU timing/rearm/status используют явно ограниченную модель.
 
 ## Что внутри
