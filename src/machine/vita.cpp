@@ -1167,6 +1167,37 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // Trace the guest's DMA interrupt handler: from its entry (0x438790)
+                    // to its tail (0x43879C), collecting the distinct code addresses and
+                    // the argument the kernel passes in r0.
+                    static bool isr_trace = false;
+                    static u32 isr_seen[200];
+                    static u32 isr_count = 0;
+                    static u32 isr_logged = 0;
+                    if (arm_pc == 0x00438790u && !isr_trace) {
+                        isr_trace = true;
+                        isr_count = 0;
+                        const ArmCore* ia = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine", "module: DMA ISR entry r0=0x%08X r1=0x%08X core=%d",
+                                     ia != nullptr ? ia->r[0] : 0u, ia != nullptr ? ia->r[1] : 0u, i);
+                    } else if (isr_trace && arm_pc == 0x0043879Cu) {
+                        isr_trace = false;
+                    } else if (isr_trace && isr_count < 200u) {
+                        bool known = false;
+                        for (u32 k = 0; k < isr_count; ++k) {
+                            if (isr_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            isr_seen[isr_count++] = arm_pc;
+                            if (isr_logged < 200u) {
+                                ++isr_logged;
+                                ZLB_LOG_INFO("machine", "module: ISR pc #%u 0x%08X", isr_logged, arm_pc);
+                            }
+                        }
+                    }
                     // The DMA library registered handler 0x438791 for the channel IRQs
                     // (0x70..0x7F). Whether the guest actually takes the interrupt the
                     // model pulses is what the completion experiment turns on.
@@ -1186,8 +1217,11 @@ void Vita::run_slice() {
                         const ArmCore* ic = dynamic_cast<const ArmCore*>(core);
                         if (ic != nullptr) {
                             ZLB_LOG_INFO("machine",
-                                         "module: RegisterIntrHandler #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X core=%d",
-                                         intr_logged, ic->r[0], ic->r[1], ic->r[2], ic->r[3], ic->r[14], i);
+                                         "module: RegisterIntrHandler #%u irq=0x%02X name=0x%08X r2=0x%08X handler=0x%08X "
+                                         "arg=[sp]=0x%08X [sp+4]=0x%08X lr=0x%08X core=%d",
+                                         intr_logged, ic->r[0], ic->r[1], ic->r[2], ic->r[3],
+                                         arm_bus_->read32(static_cast<u32>(ic->r[13])),
+                                         arm_bus_->read32(static_cast<u32>(ic->r[13]) + 4u), ic->r[14], i);
                         }
                     }
                     // 0x4ADD88 is where the library's syscall trampoline (0x43AD28) lands in
