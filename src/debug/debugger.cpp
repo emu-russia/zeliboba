@@ -1163,6 +1163,21 @@ bool Debugger::execute(const std::string& line) {
         emit(cmd_keyring(args));
         return true;
     }
+    if (command == "sc") {
+        // What the guest asks the syscon. The model keeps a ring of the last 32
+        // dispatched commands but had no way to print it, so "the kernel sits
+        // idle - what is it polling?" could not be answered from the debugger.
+        const auto& recent = vita_.ernie().recent_commands();
+        emit(format("SC commands served: %llu (last %zu, oldest first)",
+                    static_cast<unsigned long long>(vita_.ernie().commands_served()),
+                    recent.size()));
+        for (const auto& entry : recent) {
+            const char* name = zlb::ernie::sc_command_name(entry.first);
+            emit(format("  0x%04X %-20s reply %u byte(s)", entry.first,
+                        name[0] != '\0' ? name : "(unknown)", entry.second));
+        }
+        return true;
+    }
     if (command == "bootkeys") {
         // Which resident first-loader build is fitted and which signed block its
         // RSA check expects (see machine/bootkeys.cpp).  Useful when a differently

@@ -70,6 +70,13 @@ bool parse_spi_request(const std::vector<u8>& packet, u16& command, std::vector<
                        std::string& error);
 /// The response code the 1.04 boot chain accepts for a data reply.
 constexpr u16 kSpiResponseOk = 0x0004;
+
+/// Name of an SC command from the USS-1001 command table ("get_status",
+/// "nvs_read", ...), or an empty string when the number is not in it.  The table
+/// lives inside the syscon model; this is the public way for a tool (the
+/// debugger's `sc` command) to name what the guest asked for without including
+/// the model's private header.
+const char* sc_command_name(u32 number);
 }  // namespace ernie
 
 /// The syscon side of the board.
@@ -111,6 +118,15 @@ public:
 
     bool busy() const { return busy_; }
     u64 commands_served() const { return commands_served_; }
+
+    /// The last few SC commands that were dispatched, oldest first, as
+    /// {command number, reply byte count}.  The model has always collected this
+    /// ring (and serialises it) but nothing could read it back, so "what is the
+    /// guest actually asking the syscon while the boot sits idle" was
+    /// unanswerable; the debugger's `sc` command now prints it with the
+    /// USS-1001 command names.  Defined in hw/syscon/ernie.cpp (the ring lives in
+    /// the private implementation).
+    const std::vector<std::pair<u32, u32>>& recent_commands() const;
 
     // ------------------------------------------------------------------
     // Peripherals
