@@ -1288,26 +1288,36 @@ void Vita::run_slice() {
                             // words and, if one points at a name string, the string itself.
                             u32 words[4] = {0, 0, 0, 0};
                             std::string text;
-                            for (u32 k = 0; k < 4u; ++k) {
-                                const arm::MmResult r =
-                                    kb->mmu.translate(kb->r[0] + k * 4u, false, false, kb->mode());
-                                if (r.ok) words[k] = arm_bus_->read32(r.phys_addr);
-                            }
-                            for (u32 k = 0; k < 4u; ++k) {
-                                const u32 candidate = words[k];
-                                if (candidate < 0x1000u || candidate > 0x0FFFFFFFu) continue;
-                                const arm::MmResult r =
-                                    kb->mmu.translate(candidate, false, false, kb->mode());
-                                if (!r.ok) continue;
-                                char buf[48] = {};
-                                for (u32 c = 0; c < sizeof(buf) - 1u; ++c) {
-                                    const char ch = static_cast<char>(arm_bus_->read32(r.phys_addr + c) & 0xFFu);
+                            // Try every register as a pointer: the loader's lookup takes
+                            // the library name (or a record holding it) in one of r0..r3,
+                            // and this fires at the moment it is live.
+                            auto read_string_at = [&](u32 va, char* buf, size_t cap) -> bool {
+                                if (va < 0x1000u || va > 0x0FFFFFFFu) return false;
+                                const arm::MmResult r = kb->mmu.translate(va, false, false, kb->mode());
+                                if (!r.ok) return false;
+                                size_t c = 0;
+                                for (; c + 1u < cap; ++c) {
+                                    const char ch =
+                                        static_cast<char>(arm_bus_->read32(r.phys_addr + c) & 0xFFu);
                                     if (ch < 32 || ch > 126) break;
                                     buf[c] = ch;
                                 }
-                                if (buf[0] != '\0') {
-                                    text = buf;
-                                    break;
+                                buf[c] = '\0';
+                                return c >= 4u;
+                            };
+                            for (u32 k = 0; k < 4u; ++k) {
+                                const arm::MmResult r =
+                                    kb->mmu.translate(kb->r[k], false, false, kb->mode());
+                                if (r.ok) words[k] = arm_bus_->read32(r.phys_addr);
+                            }
+                            char buf[48];
+                            for (u32 k = 0; k < 4u && text.empty(); ++k) {
+                                if (read_string_at(kb->r[k], buf, sizeof(buf))) text = buf;
+                            }
+                            for (u32 w = 0; w < 4u && text.empty(); ++w) {
+                                const u32 candidate = words[w];
+                                for (u32 delta = 0; delta <= 0x40u && text.empty(); delta += 4u) {
+                                    if (read_string_at(candidate + delta, buf, sizeof(buf))) text = buf;
                                 }
                             }
                             ZLB_LOG_INFO("machine",
