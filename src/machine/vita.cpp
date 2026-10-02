@@ -81,6 +81,7 @@ u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
 std::map<u32, u32> g_hist_arm_map;
 std::map<u32, u32> g_hist_cmep_map;
 std::map<u32, u32> g_hist_cmep_fine;
+std::map<u32, u32> g_hist_module;
 bool g_hist_on = false;
 u32 g_hist_tick = 0;
 
@@ -964,6 +965,19 @@ void dump_pc_histogram_now(const char* when) {
             ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
                          rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
         }
+        if (which == 1 && !g_hist_module.empty()) {
+            std::vector<std::pair<u32, u32>> mod(g_hist_module.begin(), g_hist_module.end());
+            std::sort(mod.begin(), mod.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            u64 total = 0;
+            for (const auto& r : mod) total += r.second;
+            ZLB_LOG_INFO("machine", "kprx_auth_sm range total samples: %llu (16-byte buckets)",
+                         static_cast<unsigned long long>(total));
+            for (size_t k = 0; k < mod.size() && k < 12u; ++k) {
+                ZLB_LOG_INFO("machine", "   module pc 0x%05X..0x%05X  %u samples",
+                             mod[k].first << 4, ((mod[k].first + 1u) << 4) - 1u, mod[k].second);
+            }
+        }
         if (which == 1 && !g_hist_cmep_fine.empty()) {
             std::vector<std::pair<u32, u32>> fine(g_hist_cmep_fine.begin(), g_hist_cmep_fine.end());
             std::sort(fine.begin(), fine.end(),
@@ -1267,6 +1281,12 @@ void Vita::run_slice() {
                     const u32 cp = cmep_->get_pc();
                     ++g_hist_cmep_map[cp >> 12];
                     ++g_hist_cmep_fine[cp >> 8];
+                    // The staged secure module kprx_auth_sm lives at 0x80B000..0x80E000
+                    // (entry 0x80B000, one segment). Recording that range separately
+                    // shows whether the module's body ever runs and how far it gets.
+                    if (cp >= 0x80A000u && cp < 0x810000u) {
+                        ++g_hist_module[cp >> 4];
+                    }
                 }
             }
             // The core records undefined opcodes in last_undefined_instruction, but
