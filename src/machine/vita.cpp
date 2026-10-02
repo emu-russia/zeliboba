@@ -1100,6 +1100,48 @@ void Vita::run_slice() {
                         ZLB_LOG_INFO("machine", "module: core %d idle entry #%u from%s", i, idle_logged,
                                      path.c_str());
                     }
+                    // The kernel thread switcher restores a thread's context here; the
+                    // pointer (r1) names the thread's control block, which is how the
+                    // parked module-start thread can be found and its saved pc read.
+                    static u32 restore_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x000EC848u && restore_logged < 12u) {
+                        ++restore_logged;
+                        const ArmCore* ctx_arm = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 context restore #%u from=0x%08X ptr=0x%08X sp=0x%08X lr=0x%08X",
+                                     restore_logged, ctx_arm != nullptr ? ctx_arm->r[4] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[1] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
+                    }
+                    // The park site itself: 0x4A93F0 is the call into the kernel thread
+                    // switcher (0x4A3D94 -> 0xEC8AC) with r4 = TPIDRPRW, the current
+                    // thread structure, and [r4+12]/[r4+16] as the wait arguments.
+                    // Logging r4 names the object the abandoned thread waits on.
+                    static u32 park_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A93F0u && park_logged < 12u) {
+                        ++park_logged;
+                        const ArmCore* park_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 tcb = park_arm != nullptr ? park_arm->r[4] : 0u;
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 park #%u TCB=0x%08X sp=0x%08X obj=0x%08X aux=0x%08X",
+                                     park_logged, tcb, park_arm != nullptr ? park_arm->r[13] : 0u,
+                                     park_arm != nullptr ? park_arm->r[0] : 0u,
+                                     park_arm != nullptr ? park_arm->r[1] : 0u);
+                    }
+                    // What the waiting thread asked for: 0x4A9384 is the entry of the
+                    // kernel wait function; r0/r1 are its arguments and LR names the
+                    // caller, which is the operation the module-start thread blocks on.
+                    static u32 waitcall_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A9384u && waitcall_logged < 6u) {
+                        ++waitcall_logged;
+                        const ArmCore* wc = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 wait call #%u r0=0x%08X r1=0x%08X lr=0x%08X sp=0x%08X",
+                                     waitcall_logged, wc != nullptr ? wc->r[0] : 0u,
+                                     wc != nullptr ? wc->r[1] : 0u, wc != nullptr ? wc->r[14] : 0u,
+                                     wc != nullptr ? wc->r[13] : 0u);
+                    }
                     // Coarse whereabouts of core 0 after the module phase began: every
                     // 200k executions the pc is logged, which shows whether the
                     // abandoned thread stays in one loop or moves through the kernel.
