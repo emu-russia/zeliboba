@@ -80,6 +80,7 @@ u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
 /// after the module phase, which the module-error experiment showed is not the barrier.
 std::map<u32, u32> g_hist_arm_map;
 std::map<u32, u32> g_hist_cmep_map;
+std::map<u32, u32> g_hist_cmep_fine;
 bool g_hist_on = false;
 u32 g_hist_tick = 0;
 
@@ -963,6 +964,16 @@ void dump_pc_histogram_now(const char* when) {
             ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
                          rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
         }
+        if (which == 1 && !g_hist_cmep_fine.empty()) {
+            std::vector<std::pair<u32, u32>> fine(g_hist_cmep_fine.begin(), g_hist_cmep_fine.end());
+            std::sort(fine.begin(), fine.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            ZLB_LOG_INFO("machine", "PC histogram CMeP fine %s (256-byte buckets):", when);
+            for (size_t k = 0; k < fine.size() && k < 15u; ++k) {
+                ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                             fine[k].first << 8, ((fine[k].first + 1u) << 8) - 1u, fine[k].second);
+            }
+        }
     }
 }
 }  // namespace
@@ -1253,7 +1264,9 @@ void Vita::run_slice() {
             if (g_hist_on && (++g_hist_tick & 0xFFFu) == 0u) {
                 ++g_hist_arm_map[arm_pc >> 12];
                 if (cmep_ != nullptr) {
-                    ++g_hist_cmep_map[cmep_->get_pc() >> 12];
+                    const u32 cp = cmep_->get_pc();
+                    ++g_hist_cmep_map[cp >> 12];
+                    ++g_hist_cmep_fine[cp >> 8];
                 }
             }
             // The core records undefined opcodes in last_undefined_instruction, but
