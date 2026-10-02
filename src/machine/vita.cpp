@@ -1079,11 +1079,14 @@ void Vita::run_slice() {
                 static u32 idle_ring[kArmCoreCount][8] = {};
                 static u32 idle_ring_at[kArmCoreCount] = {};
                 static u32 idle_logged = 0;
+                // Only interesting once the module phase has begun: the early kernel
+                // init uses the same wfe wait loop, and it must not eat the budget.
+                static bool any_module_start = false;
                 if (i < static_cast<int>(kArmCoreCount)) {
                     const u32* ring = idle_ring[i];
                     const u32 next = idle_ring_at[i]++;
                     idle_ring[i][next & 7u] = arm_pc;
-                    if (arm_pc == 0x47969Cu && i == 0 && idle_logged < 40u &&
+                    if (arm_pc == 0x47969Cu && i == 0 && any_module_start && idle_logged < 40u &&
                         ring[(next + 7u) & 7u] != 0x47969Cu) {
                         ++idle_logged;
                         std::string path;
@@ -1092,6 +1095,30 @@ void Vita::run_slice() {
                         }
                         ZLB_LOG_INFO("machine", "module: core %d idle entry #%u from%s", i, idle_logged,
                                      path.c_str());
+                    }
+                    // Coarse whereabouts of core 0 after the module phase began: every
+                    // 200k executions the pc is logged, which shows whether the
+                    // abandoned thread stays in one loop or moves through the kernel.
+                    static u64 where_tick = 0;
+                    static u32 where_logged = 0;
+                    if (any_module_start && i == 0 && (++where_tick % 2000000ull) == 0ull &&
+                        where_logged < 60u) {
+                        ++where_logged;
+                        ZLB_LOG_INFO("machine", "module: core 0 pc sample %u: 0x%08X", where_logged, arm_pc);
+                    }
+                    // 0x47AE92 is the body of the kernel's wfe wait loop
+                    // (while [r4+4] > 0).  r4 is the object being waited on, so naming
+                    // it (and the counter's value) says *what* the parked thread waits
+                    // for; the two halves at +4/+6 are the same pair NSKBL's spinlock
+                    // 0x51015874 uses.
+                    static u32 wait_logged = 0;
+                    if (arm_pc == 0x47AE92u && i == 0 && any_module_start && wait_logged < 400u) {
+                        ++wait_logged;
+                        const ArmCore* wait_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 obj = wait_arm != nullptr ? wait_arm->r[4] : 0u;
+                        const u32 ctr = wait_arm != nullptr ? wait_arm->r[6] : 0u;
+                        ZLB_LOG_INFO("machine", "module: core 0 wfe-wait #%u object=0x%08X (+4=0x%08X)",
+                                     wait_logged, obj, ctr);
                     }
                 }
                 static u32 nskbl_last[kArmCoreCount] = {0, 0, 0, 0};
@@ -1150,6 +1177,7 @@ void Vita::run_slice() {
                                      log_arm != nullptr ? log_arm->r[5] : 0u);
                     } else {
                         ++module_starts;
+                        any_module_start = true;
                         ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
                                      log_arm != nullptr ? log_arm->r[0] : 0u, i);
                     }
