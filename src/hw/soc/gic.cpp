@@ -435,7 +435,9 @@ bool GicDistributor::tick_pulses(u64 ticks) {
         if (left <= ticks) {
             pulse_left_[index] = 0;
             const u32 id = index < max_irq_ ? static_cast<u32>(index) : (index - max_irq_) % 32u;
-            const unsigned core = index < max_irq_ ? 0u : 1u + (index - max_irq_) / 32u;
+            const unsigned core = index < max_irq_
+                                      ? 0u
+                                      : 1u + static_cast<unsigned>((index - max_irq_) / 32u);
             set_level(id, false, core);
         } else {
             pulse_left_[index] = static_cast<u32>(left - ticks);

@@ -686,6 +686,11 @@ private:
     bool built_ = false;
     bool kernel_started_ = false;
     bool kernel_running_ = false;
+    /// Set once any core has been observed executing inside the NSKBL window
+    /// (VA 0x51000000).  The debug-only `stage nskbl` entry used to be the only
+    /// thing that moved `boot_.stage` off `arm-kernel-boot-loader`, so a normal
+    /// boot reported the boot loader for the whole run even after os0 had started.
+    bool nskbl_seen_ = false;
 
     /// Shared boot SRAM: the ARM boot ROM stages the second loader here and the
     /// CMeP reads it. Both buses alias the same host buffer at 0x1F000000.

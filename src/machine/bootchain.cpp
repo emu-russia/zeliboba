@@ -4884,6 +4884,46 @@ void Vita::poll_boot_chain() {
         }
     }
 
+    // Publish the real boot stage for a *normal* boot.  Only the debug entry
+    // points `stage nskbl` / `stage kernel` used to assign NskblEntry/KernelEntry,
+    // so a cold boot from the first loader reported `arm-kernel-boot-loader` for
+    // the rest of the run - long after NSKBL had loaded every os0 module and the
+    // kernel was executing.  Sample the cluster's PCs instead: NSKBL lives at
+    // VA 0x51000000 and the non-secure kernel below VA 0x00800000.  The Secure
+    // Monitor's relocated handlers (VA 0x003BE1C8) also live low, but they run
+    // before NSKBL, so `nskbl_seen_` gates the kernel transition.
+    if (!kernel_running_) {
+        for (int i = 0; i < kArmCoreCount; ++i) {
+            const Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
+            if (!core) continue;
+            const u32 pc = core->get_pc();
+            if (pc >= 0x51000000u && pc < 0x51060000u) {
+                if (!nskbl_seen_) {
+                    nskbl_seen_ = true;
+                    // If a core is executing NSKBL, the state machine is behind
+                    // regardless of which earlier stage it last recorded.
+                    if (boot_.stage != BootStage::NskblEntry &&
+                        boot_.stage != BootStage::KernelEntry &&
+                        boot_.stage != BootStage::KernelRunning &&
+                        boot_.stage != BootStage::Failed) {
+                        boot_.stage = BootStage::NskblEntry;
+                        boot_.detail = "ARM in the non-secure world on NSKBL";
+                        add_milestone("NSKBL entered at 0x51000000 (non-secure world)");
+                    }
+                }
+            } else if (nskbl_seen_ && pc >= 0x00010000u && pc < 0x00800000u) {
+                // NSKBL handed control to the os0 kernel: it now runs from the low
+                // VA window, and NSKBL itself has already been left behind.
+                kernel_started_ = true;
+                boot_.stage = BootStage::KernelEntry;
+                boot_.arm_entry = pc;
+                boot_.detail = "os0 kernel executing below VA 0x00800000";
+                add_milestone("kernel entered from NSKBL at 0x" + hex(pc, 8));
+                break;
+            }
+        }
+    }
+
     if (kernel_started_ && !kernel_running_ && arm_ && arm_->instructions > 0) {
         kernel_running_ = true;
         boot_.stage = BootStage::KernelRunning;

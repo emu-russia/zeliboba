@@ -274,9 +274,18 @@ struct MachineStepResult {
 
 void Debugger::step(int count) {
     stop_requested_ = false;
+    // `step` advances one core per architecture.  For the ARM cluster that core is
+    // the *selected* one (`core arm3`): Kermit's four cores run different code, so
+    // resolving Arch::Arm through `Vita::core()` returned arm0 unconditionally, and
+    // `core arm3` + `step` silently stepped the parked arm0 instead - the history
+    // ring was recorded from arm0 too, so it came back empty.
+    auto step_core = [this](Arch arch) -> Cpu* {
+        if (arch == Arch::Arm) return vita_.arm_core(arm_core_index_);
+        return vita_.core(arch);
+    };
     for (int i = 0; i < count && !stop_requested_; ++i) {
         for (Arch arch : {Arch::MeP, Arch::Arm, Arch::Rl78}) {
-            Cpu* cpu = vita_.core(arch);
+            Cpu* cpu = step_core(arch);
             if (!cpu || cpu->halted) continue;
             if (breakpoints_.count(arch) && breakpoints_[arch].count(cpu->get_pc())) {
                 last_stop_.stopped = true;
@@ -293,7 +302,7 @@ void Debugger::step(int count) {
         for (Bus* bus : buses) trace_from = std::max(trace_from, bus->trace.total());
 
         for (Arch arch : {Arch::MeP, Arch::Rl78, Arch::Arm}) {
-            Cpu* cpu = vita_.core(arch);
+            Cpu* cpu = step_core(arch);
             if (!cpu || cpu->halted) continue;
             if (history_enabled_) {
                 auto& ring = history_[arch];

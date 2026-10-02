@@ -76,6 +76,13 @@ public:
     /// Advance time based devices (timers, DMA) by `cycles` CPU cycles.
     void tick(u64 cycles);
 
+    /// Total CPU cycles the block has been ticked with since reset.  This is the
+    /// machine's own monotonic clock: `run_slice`/`step` tick exactly once per
+    /// machine step, so unlike a per-core `cycles` read it keeps advancing while
+    /// a core is parked in WFE (which is why `boot` used to freeze its
+    /// "emulated time" for the rest of the run once arm0 went to sleep).
+    u64 total_cycles() const;
+
     /// Connect the syscon, so the ARM can post SC commands to Ernie.
     void set_syscon(ErnieBlock* ernie) { ernie_ = ernie; }
 

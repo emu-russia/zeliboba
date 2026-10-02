@@ -110,7 +110,8 @@ namespace {
     X(u32, kbl_entry_)                     \
     X(bool, built_)                        \
     X(bool, kernel_started_)               \
-    X(bool, kernel_running_)
+    X(bool, kernel_running_)               \
+    X(bool, nskbl_seen_)
 
 void write_boot_status(StateWriter& writer, const BootStatus& status) {
     writer.put_u32(static_cast<u32>(status.stage));

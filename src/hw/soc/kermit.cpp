@@ -860,6 +860,8 @@ KermitBlock::~KermitBlock() = default;
 
 void KermitBlock::install() { impl_->installed = true; }
 
+u64 KermitBlock::total_cycles() const { return impl_->total_cycles; }
+
 void KermitBlock::reset() {
     Impl& d = *impl_;
     d.cycle_accumulator = 0;

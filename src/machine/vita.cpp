@@ -694,6 +694,7 @@ void Vita::reset(bool cold) {
     boot_.stage = BootStage::ArmBootRom;
     kernel_started_ = false;
     kernel_running_ = false;
+    nskbl_seen_ = false;
     milestones_.clear();
     events_.clear();
 
@@ -780,6 +781,16 @@ u64 Vita::total_instructions() const {
 }
 
 double Vita::emulated_seconds() const {
+    // The machine's clock comes from the Kermit block, which is ticked exactly
+    // once per machine step/slice with the CPU cycles that step represents.  The
+    // old implementation read arm0's `cycles`, which stops the moment arm0 parks
+    // in WFE: `boot` then reported the same "emulated time" for the rest of the
+    // run (and `run_for` could never reach its target).  Fall back to the core
+    // only for a machine whose Kermit block has not been ticked yet.
+    if (kermit_) {
+        const u64 cycles = kermit_->total_cycles();
+        if (cycles != 0u) return static_cast<double>(cycles) / kArmClockHz;
+    }
     if (!arm_) return 0.0;
     return static_cast<double>(arm_->cycles) / kArmClockHz;
 }
