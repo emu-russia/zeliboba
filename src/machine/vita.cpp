@@ -1328,6 +1328,21 @@ void Vita::run_slice() {
                     }
                 }
             }
+            // The registry filler is a block copy whose store is
+            // "strd r4, r5, [r3], #8" at 0x51011D00. Probe its entry and the next
+            // instruction: r3 must advance by exactly 8 (a post-increment bug of 4
+            // would shift every copied record by one word - exactly the observed
+            // off-by-one in the module UIDs).
+            if (arm_pc == 0x51011D00u || arm_pc == 0x51011D04u) {
+                static u32 strd_logged = 0;
+                if (strd_logged < 24u) {
+                    ++strd_logged;
+                    if (const ArmCore* sd = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "strd probe 0x%08X: r1=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r2=0x%08X",
+                                     arm_pc, sd->r[1], sd->r[3], sd->r[4], sd->r[5], sd->r[2]);
+                    }
+                }
+            }
             // Secure World question: does anything ever hand the ARM over to its
             // TrustZone side? Count instructions per mode and report the first time
             // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
