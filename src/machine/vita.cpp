@@ -1114,6 +1114,35 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // The kernel routine that ends up parking the thread is 0x4AE710
+                    // (six arguments). Its arguments and its caller name the operation
+                    // the module initialisation is blocked on, which is the one thing
+                    // left unidentified.
+                    static u32 enter_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004AE710u && enter_logged < 8u) {
+                        ++enter_logged;
+                        const ArmCore* en = dynamic_cast<const ArmCore*>(core);
+                        if (en != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: park entry #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X "
+                                         "s52=0x%08X s56=0x%08X lr=0x%08X",
+                                         enter_logged, en->r[0], en->r[1], en->r[2], en->r[3],
+                                         arm_bus_->read32(static_cast<u32>(en->r[13]) + 52u),
+                                         arm_bus_->read32(static_cast<u32>(en->r[13]) + 56u), en->r[14]);
+                        }
+                    }
+                    // The wait descriptor at VA 0x0030FA80 (=[TCB+0x0C]) carries two code
+                    // pointers - 0x0048E55C and 0x0049F5D8 - which is where a completion
+                    // would land. Whether they ever execute after the park decides
+                    // between "the wake never comes" and "the wake ran but did not
+                    // resume the thread".
+                    static u32 callback_logged = 0;
+                    if (starts_seen >= 22u && callback_logged < 24u &&
+                        (arm_pc == 0x0048E55Cu || arm_pc == 0x0049F5D8u)) {
+                        ++callback_logged;
+                        ZLB_LOG_INFO("machine", "module: wait callback 0x%08X ran at t=%.6f core=%d",
+                                     arm_pc, emulated_seconds(), i);
+                    }
                     // The abandoned thread's stack is 0x7D000..0x80000 (TCB+0xDC/+0xE0).
                     // Any execution with SP inside it means that thread is running, so a
                     // coarse timeline of such samples answers "did it ever come back".
