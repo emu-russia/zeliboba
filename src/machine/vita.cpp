@@ -1071,6 +1071,23 @@ void Vita::run_slice() {
                 return value != nullptr && value[0] != '\0' && value[0] != '0';
             }();
             if (module_log) {
+                // The start loop runs inside NSKBL; when a core's pc leaves the NSKBL
+                // window the interesting thing is *where it last was*, because that is
+                // the point the module-start thread was abandoned at (round 5: the
+                // 22nd start never returns and the remaining seven modules never run).
+                static u32 nskbl_last[kArmCoreCount] = {0, 0, 0, 0};
+                if (i < static_cast<int>(kArmCoreCount)) {
+                    const bool in_nskbl = arm_pc >= 0x51000000u && arm_pc < 0x51100000u;
+                    static bool was_in_nskbl[kArmCoreCount] = {false, false, false, false};
+                    if (in_nskbl) {
+                        nskbl_last[i] = arm_pc;
+                        was_in_nskbl[i] = true;
+                    } else if (was_in_nskbl[i]) {
+                        was_in_nskbl[i] = false;
+                        ZLB_LOG_INFO("machine", "module: core %d left NSKBL at 0x%08X -> 0x%08X", i,
+                                     nskbl_last[i], arm_pc);
+                    }
+                }
                 // 0x510012F4 is the batch entry (r0=records, r1=UID array, r2=count);
                 // 0x51001326 / 0x51001368 / 0x5100139C follow the three UID loads in
                 // it - the UID is in r9 at the first and in r10 at the other two;
