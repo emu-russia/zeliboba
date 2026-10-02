@@ -61,6 +61,24 @@ public:
     DmaWindow(std::string name, zlb::u32 base, zlb::u32 size, std::function<void(zlb::u32)> raise)
         : RegisterBlock(std::move(name), base, size), raise_(std::move(raise)) {}
 
+    void tick(zlb::u64 ticks) override {
+        if (!busy_) return;
+        if (ticks >= budget_) {
+            budget_ = 0;
+        } else {
+            budget_ -= static_cast<zlb::u32>(ticks);
+        }
+        if (budget_ == 0u) {
+            busy_ = false;
+            RegisterBlock::write(base() + 0x024u, 4u, 0u);
+            RegisterBlock::write(base() + 0x028u, 4u, 3u);
+            ZLB_LOG_INFO("machine", "module: DMA engine finished after the transfer budget -> pulse irq 0x%X", irq_);
+            if (raise_) raise_(irq_);
+        }
+    }
+
+    void set_budget(zlb::u32 ticks) { budget_ticks_ = ticks ? ticks : 1u; }
+
     void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
         RegisterBlock::write(address, size, value);
         if (enabled_ && address - base() == 0x020u && value != 0) {
@@ -72,11 +90,12 @@ public:
             // polling (start #22 then hangs again, 22 starts / 21 results), so the
             // engine has to complete unprompted. What is still not modelled is the
             // transfer itself: the bytes never move.
-            RegisterBlock::write(base() + 0x024u, 4u, 0u);
-            RegisterBlock::write(base() + 0x028u, 4u, 3u);
-            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> +0x24=0 +0x28=3, pulse irq 0x%X",
-                         static_cast<unsigned>(value), irq_);
-            raise_(irq_);
+            RegisterBlock::write(base() + 0x024u, 4u, 1u);
+            RegisterBlock::write(base() + 0x028u, 4u, 0u);
+            busy_ = true;
+            budget_ = budget_ticks_;
+            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> busy for %u ticks",
+                         static_cast<unsigned>(value), budget_ticks_);
         }
     }
 
@@ -87,6 +106,9 @@ private:
     std::function<void(zlb::u32)> raise_;
     zlb::u32 irq_ = 0x7Cu;
     bool enabled_ = false;
+    bool busy_ = false;
+    zlb::u32 budget_ = 0;
+    zlb::u32 budget_ticks_ = 1000u;
 };
 
 }  // namespace
@@ -117,7 +139,8 @@ constexpr u32 kScuPowerStatus = 0x08;
 
 /// The device names KermitBlock::tick advances; must match install().
 bool needs_tick(const std::string& name) {
-    return name == "Kermit.GIC" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.Sdif0" ||
+    return name == "Kermit.GIC" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.DmaWin" ||
+           name == "Kermit.Sdif0" ||
            name == "Kermit.Sdif1" || name == "Kermit.Sdif2" || name == "Kermit.DMA" || name == "Kermit.Display" ||
            name == "Kermit.DSI0" || name == "Kermit.EmcTop" || name == "Kermit.LT5" || name == "Kermit.WT7" || name == "Kermit.Spi0";
 }
@@ -906,6 +929,9 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
         dma_win->set_enabled(true);
         if (const char* irq_env = std::getenv("ZLB_DMA_IRQ")) {
             dma_win->set_irq(static_cast<u32>(std::strtoul(irq_env, nullptr, 0)));
+        }
+        if (const char* budget_env = std::getenv("ZLB_DMA_TICKS")) {
+            dma_win->set_budget(static_cast<u32>(std::strtoul(budget_env, nullptr, 0)));
         }
         dma_win->define(0x010, "CTRL_010");
         dma_win->define(0x014, "CALLBACK_014");
