@@ -1013,6 +1013,12 @@ void Vita::run_slice() {
         if (hist_on && (++slice_no % 250000u) == 0u) {
             char when[48];
             std::snprintf(when, sizeof(when), "at slice %llu", static_cast<unsigned long long>(slice_no));
+            if (MePCore* mcp = dynamic_cast<MePCore*>(cmep_.get())) {
+                ZLB_LOG_INFO("machine", "CMeP IRQ counters %s: seen=%llu taken=%llu last=%d",
+                             when, static_cast<unsigned long long>(mcp->irq_sources_seen),
+                             static_cast<unsigned long long>(mcp->irq_sources_taken),
+                             mcp->irq_last_source);
+            }
             dump_pc_histogram_now(when);
         }
     }
