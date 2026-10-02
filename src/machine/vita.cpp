@@ -1114,6 +1114,47 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // Trace the enqueue itself: from its call site (0x5BE956) until it
+                    // returns (0x5BE95A). That shows how the DMA library reaches the kernel
+                    // to submit an operation, and where the transfer should be started.
+                    static bool enq_trace = false;
+                    static u32 enq_seen[220];
+                    static u32 enq_count = 0;
+                    static u32 enq_logged2 = 0;
+                    if (starts_seen >= 22u && i == 0) {
+                        if (arm_pc == 0x005BE956u) {
+                            enq_trace = true;
+                            enq_count = 0;
+                        } else if (enq_trace && arm_pc == 0x005BE95Au) {
+                            enq_trace = false;
+                        } else if (enq_trace && enq_count < 220u) {
+                            bool known = false;
+                            for (u32 k = 0; k < enq_count; ++k) {
+                                if (enq_seen[k] == arm_pc) {
+                                    known = true;
+                                    break;
+                                }
+                            }
+                            if (!known) {
+                                enq_seen[enq_count++] = arm_pc;
+                                if (enq_logged2 < 220u) {
+                                    ++enq_logged2;
+                                    ZLB_LOG_INFO("machine", "module: enqueue pc #%u 0x%08X", enq_logged2, arm_pc);
+                                }
+                            }
+                        }
+                    }
+                    // The sibling entry 0x4ADD9C shares 0x4AD714 but passes flag 1. Probing
+                    // both shows which service each of the module's DMA calls reaches.
+                    static u32 sys2_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004ADD9Cu && sys2_logged < 16u) {
+                        ++sys2_logged;
+                        const ArmCore* sc2 = dynamic_cast<const ArmCore*>(core);
+                        if (sc2 != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: syscall 0x4ADD9C #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X",
+                                         sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
+                        }
+                    }
                     // 0x4ADD88 is where the library's syscall trampoline (0x43AD28) lands in
                     // the kernel. Its arguments name the service the DMA library asks for -
                     // and therefore what the parked thread is really waiting on.
