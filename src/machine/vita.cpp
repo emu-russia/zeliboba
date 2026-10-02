@@ -1071,10 +1071,29 @@ void Vita::run_slice() {
                 return value != nullptr && value[0] != '\0' && value[0] != '0';
             }();
             if (module_log) {
-                // The start loop runs inside NSKBL; when a core's pc leaves the NSKBL
-                // window the interesting thing is *where it last was*, because that is
-                // the point the module-start thread was abandoned at (round 5: the
-                // 22nd start never returns and the remaining seven modules never run).
+                // Where a core goes idle is where its current thread was parked.  The
+                // module-start thread is abandoned once (round 5/6: 22 starts, 21
+                // returns, and 12M further slices start nothing), so dumping the last
+                // few pcs of every core when it enters the kernel idle loop names the
+                // parking path - the missing piece for "what is the thread waiting on".
+                static u32 idle_ring[kArmCoreCount][8] = {};
+                static u32 idle_ring_at[kArmCoreCount] = {};
+                static u32 idle_logged = 0;
+                if (i < static_cast<int>(kArmCoreCount)) {
+                    const u32* ring = idle_ring[i];
+                    const u32 next = idle_ring_at[i]++;
+                    idle_ring[i][next & 7u] = arm_pc;
+                    if (arm_pc == 0x47969Cu && i == 0 && idle_logged < 40u &&
+                        ring[(next + 7u) & 7u] != 0x47969Cu) {
+                        ++idle_logged;
+                        std::string path;
+                        for (u32 k = 0; k < 8u; ++k) {
+                            path += format(" %08X", ring[(next + 1u + k) & 7u]);
+                        }
+                        ZLB_LOG_INFO("machine", "module: core %d idle entry #%u from%s", i, idle_logged,
+                                     path.c_str());
+                    }
+                }
                 static u32 nskbl_last[kArmCoreCount] = {0, 0, 0, 0};
                 if (i < static_cast<int>(kArmCoreCount)) {
                     const bool in_nskbl = arm_pc >= 0x51000000u && arm_pc < 0x51100000u;
