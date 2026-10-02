@@ -331,6 +331,23 @@ void Vita::build_cores() {
             // 0x800C2E is the command dispatcher: it loads 0x806FD8 + $3*4 and jumps
             // through it, so $3 is the command id. Logging it shows which commands the
             // secure kernel processes and whether the 3->4->5->8 cycle repeats one.
+            // kprx_auth_sm.self is staged from SLB2 into DRAM at 0x40000500 and the
+            // secure kernel copies it into its own SRAM at 0x0080B000 (verified: the
+            // byte writes there match the decrypted module exactly). This probe says
+            // whether the secure core ever *executes* it, i.e. whether the module's
+            // entry is reached.
+            if (pc >= 0x0080B000u && pc < 0x00810000u) {
+                static u64 module_hits = 0;
+                static u32 module_last = 0;
+                static u32 module_logged = 0;
+                ++module_hits;
+                if (module_logged < 8u && (module_hits <= 4u || (module_hits % 2000000u) == 0u)) {
+                    ++module_logged;
+                    ZLB_LOG_INFO("machine", "secure: kprx_auth_sm hit=%llu pc=0x%08X last=0x%08X",
+                                 static_cast<unsigned long long>(module_hits), pc, module_last);
+                }
+                module_last = pc;
+            }
             // 0x800BFA is the step machine's entry; its arg4 selects the step
             // (1..8, >8 goes to the error path). Logging the entry shows whether the
             // caller repeats the same step, which is what the 3->4->5->8 cycle looks
