@@ -1114,6 +1114,19 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // 0x4399CA is the import wrapper the display module reaches before the
+                    // syscall trampoline (0x43AD28) and the kernel. Its r0 names the import
+                    // slot and its LR names the module's call site, which is what identifies
+                    // the service the module is blocked on.
+                    static u32 imp_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004399CAu && imp_logged < 24u) {
+                        ++imp_logged;
+                        const ArmCore* im = dynamic_cast<const ArmCore*>(core);
+                        if (im != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: import wrapper #%u r0=0x%08X r1=0x%08X r2=0x%08X lr=0x%08X",
+                                         imp_logged, im->r[0], im->r[1], im->r[2], im->r[14]);
+                        }
+                    }
                     // The kernel routine that ends up parking the thread is 0x4AE710
                     // (six arguments). Its arguments and its caller name the operation
                     // the module initialisation is blocked on, which is the one thing
