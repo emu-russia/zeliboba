@@ -18,10 +18,42 @@
 namespace zlb {
 
 namespace {
-/// Ring of the most recent ARM PCs, used to show the path that produced a
-/// module-start failure (see the MODULEMGR_NO_LIB dump below).
-u32 g_arm_trace_ring[512];
-u32 g_arm_trace_pos = 0;
+/// Per-core rings of the most recent ARM PCs, used to show the path that produced a
+/// module-start failure (see the MODULEMGR_NO_LIB dump below). They are per core
+/// because the four cores interleave - a single ring made the path look scrambled
+/// (a delay loop from core 2 appeared between core 0's instructions).
+/// Deduplicated set of the NSKBL code addresses executed since the current module
+/// start began. A ring was not enough: the loader's cache-flush loop at 0x510143xx
+/// fills it and evicts the history that matters. Reset on each module start and
+/// dumped when the start fails.
+constexpr unsigned kPcSetSlots = 4096;
+u32 g_pc_set[kPcSetSlots];
+unsigned char g_pc_set_used[kPcSetSlots];
+u32 g_pc_set_count = 0;
+
+void pc_set_reset() {
+    std::memset(g_pc_set_used, 0, sizeof(g_pc_set_used));
+    g_pc_set_count = 0;
+}
+
+void pc_set_add(u32 pc) {
+    u32 slot = (pc * 2654435761u) & (kPcSetSlots - 1u);
+    for (unsigned probe = 0; probe < kPcSetSlots; ++probe) {
+        const u32 index = (slot + probe) & (kPcSetSlots - 1u);
+        if (g_pc_set_used[index] == 0u) {
+            g_pc_set_used[index] = 1u;
+            g_pc_set[index] = pc;
+            ++g_pc_set_count;
+            return;
+        }
+        if (g_pc_set[index] == pc) return;
+    }
+}
+
+constexpr unsigned kArmTraceCores = 4;
+constexpr unsigned kArmTraceSize = 512;
+u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
+u32 g_arm_trace_pos[kArmTraceCores] = {0, 0, 0, 0};
 }  // namespace
 
 namespace {
@@ -1143,7 +1175,10 @@ void Vita::run_slice() {
             // MODULEMGR_NO_LIB error the ring is dumped, deduplicated, so the path
             // that produced the failure is visible (the loader's own code, not the
             // ordinary resolution pass the persistent probes keep catching).
-            g_arm_trace_ring[(g_arm_trace_pos++) & 511u] = arm_pc;
+            if (i < kArmTraceCores) {
+                g_arm_trace_ring[i][(g_arm_trace_pos[i]++) & (kArmTraceSize - 1u)] = arm_pc;
+            }
+            if (arm_pc >= 0x51000000u && arm_pc < 0x51100000u) pc_set_add(arm_pc);
             // Secure World question: does anything ever hand the ARM over to its
             // TrustZone side? Count instructions per mode and report the first time
             // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
@@ -1687,9 +1722,12 @@ void Vita::run_slice() {
                             // code that produced the error is identifiable.
                             static u32 dumped[64];
                             u32 dumped_count = 0;
-                            for (u32 back = 0; back < 512u && dumped_count < 64u; ++back) {
+                            const unsigned trace_core = i < kArmTraceCores ? i : 0u;
+                            for (u32 back = 0; back < kArmTraceSize && dumped_count < 64u; ++back) {
                                 const u32 pc_value =
-                                    g_arm_trace_ring[(g_arm_trace_pos - 1u - back) & 511u];
+                                    g_arm_trace_ring[trace_core]
+                                                    [(g_arm_trace_pos[trace_core] - 1u - back) &
+                                                     (kArmTraceSize - 1u)];
                                 bool known = false;
                                 for (u32 k = 0; k < dumped_count; ++k) {
                                     if (dumped[k] == pc_value) { known = true; break; }
@@ -1699,11 +1737,20 @@ void Vita::run_slice() {
                             for (u32 k = 0; k < dumped_count; ++k) {
                                 ZLB_LOG_INFO("machine", "module fail path [%u] 0x%08X", k, dumped[k]);
                             }
+                            // Every NSKBL address executed during this start, so the
+                            // resolution path is visible even when a flush loop runs.
+                            ZLB_LOG_INFO("machine", "module fail set: %u NSKBL addresses", g_pc_set_count);
+                            for (u32 k = 0; k < kPcSetSlots; ++k) {
+                                if (g_pc_set_used[k] != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail addr 0x%08X", g_pc_set[k]);
+                                }
+                            }
                         }
                     } else {
                         ++module_starts;
                         any_module_start = true;
                         starts_seen = module_starts;
+                        pc_set_reset();
                         ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
                                      log_arm != nullptr ? log_arm->r[0] : 0u, i);
                     }
