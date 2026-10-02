@@ -1275,8 +1275,12 @@ void Vita::run_slice() {
             if (arm_pc == 0x5100B82Cu) {
                 static u32 tbl_logged = 0;
                 if (tbl_logged < 30u) {
-                    ++tbl_logged;
                     if (ArmCore* tb = dynamic_cast<ArmCore*>(core)) {
+                    // The routine table walks use classes 0..8; sdif.skprx's UID
+                    // 0x200F3 yields class (0x200F3 >> 1) & 0x7FFF = 0x10079, so only
+                    // report the large-class lookups.
+                    if (tb->r[1] < 0x40u) return;
+                    ++tbl_logged;
                         const u32 base = tb->r[0];
                         u32 count = 0, count2 = 0;
                         if (const arm::MmResult r1 = tb->mmu.translate(base + 0x20u, false, false, tb->mode()); r1.ok) {
