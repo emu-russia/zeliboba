@@ -91,6 +91,22 @@ bool MePCore::ControlBus::busy() const { return running && !force_expired; }
 
 u32 MePCore::ControlBus::read(unsigned address) const {
     if (address >= regs.size()) return 0;
+    // The secure module kprx_auth_sm configures control registers 0x410..0x415 and
+    // then polls 0x412 for completion. Logging that window shows the whole protocol:
+    // who writes what and what is read back.
+    {
+        static const bool cb_log = [] {
+            const char* v = std::getenv("ZLB_CB_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (cb_log && address >= 0x410u && address < 0x420u) {
+            static u32 n = 0;
+            if (n < 60u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "cb read  0x%03X -> 0x%X", address, regs[address]);
+            }
+        }
+    }
     if (address == 1) return (irq_levels & ~regs[3]) | (irq_edges & regs[3]);
     u32 value = regs[address];
     if (address == kCbTimerStatus) {
@@ -106,6 +122,19 @@ u32 MePCore::ControlBus::read(unsigned address) const {
 
 void MePCore::ControlBus::write(unsigned address, u32 value) {
     if (address >= regs.size()) return;
+    {
+        static const bool cb_log = [] {
+            const char* v = std::getenv("ZLB_CB_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (cb_log && address >= 0x410u && address < 0x420u) {
+            static u32 n = 0;
+            if (n < 80u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "cb write 0x%03X = 0x%X", address, value);
+            }
+        }
+    }
     if (address == 0) {
         // IVR.ICN and ILV describe the last vector fetch; only IML is writable.
         regs[0] = (regs[0] & ~0xF00u) | (value & 0xF00u);
