@@ -899,7 +899,13 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
         }
         dma_win->define(0x010, "CTRL_010");
         dma_win->define(0x014, "CALLBACK_014");
-        dma_win->define(0x020, "FIELD_020");
+        dma_win->define(0x020, "DOORBELL");
+        // The completion routine 0x438400 reads these two and leaves at 0x438432
+        // when ([+0x28] & 3) == 0: they are the engine's transfer-finished status,
+        // which the guest never writes. They must be defined or RegisterBlock::write
+        // drops the hardware's update.
+        dma_win->define(0x024, "STATUS_024");
+        dma_win->define(0x028, "STATUS_028");
         dma_win->define(0x02C, "MASK_02C", 0x07FFFFFF);
         dma_win->define(0x030, "CTRL_030");
         dma_win->define(0x03C, "CALLBACK_03C");
