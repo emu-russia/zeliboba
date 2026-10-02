@@ -965,6 +965,17 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
         dma_win->define(0x23C, "DESC_23C");
         d.bus.add_device(std::move(dma_win));
     }
+    // 0xE04E0000: the companion window of the DMA/secure engine. The kernel's device
+    // table maps it to physical 0x2802B000, and the engine driver (module code at
+    // 0x3BE5xx) writes +0x400 = 0x200000FF and +0x404 = 0xFFFFFFFF there. The window
+    // was unmapped, so both writes vanished. Storage only, like Kermit.DmaWin: the
+    // engine's semantics are not recovered.
+    {
+        auto eng_win = std::make_unique<kermit::RegisterBlock>("Kermit.EngWin", 0xE04E0000u, 0x1000u);
+        eng_win->define(0x400, "CFG_400");
+        eng_win->define(0x404, "CFG_404");
+        d.bus.add_device(std::move(eng_win));
+    }
     // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
     // was missing, so the guest's programming fell into unmapped space - measured
     // with ZLB_WTRAP, the kernel writes +0x00/+0x04/+0x08/+0x0C = 0 and +0x14 = 3
