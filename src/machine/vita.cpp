@@ -75,6 +75,14 @@ void pc_set_add(u32 pc) {
 constexpr unsigned kArmTraceCores = 4;
 constexpr unsigned kArmTraceSize = 512;
 u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
+/// PC histogram (bucketed by 4 KiB) for ARM and CMeP, sampled every 4096th ARM
+/// instruction, to show where the machine actually spends its time - in particular
+/// after the module phase, which the module-error experiment showed is not the barrier.
+std::map<u32, u32> g_hist_arm_map;
+std::map<u32, u32> g_hist_cmep_map;
+bool g_hist_on = false;
+u32 g_hist_tick = 0;
+
 constexpr unsigned kUidRingSize = 64;
 u32 g_uid_ring_site[kUidRingSize];
 u32 g_uid_ring_value[kUidRingSize];
@@ -941,6 +949,24 @@ double Vita::emulated_seconds() const {
     return static_cast<double>(arm_->cycles) / kArmClockHz;
 }
 
+namespace {
+void dump_pc_histogram_now(const char* when) {
+    for (int which = 0; which < 2; ++which) {
+        std::map<u32, u32>& map = which == 0 ? g_hist_arm_map : g_hist_cmep_map;
+        if (map.empty()) continue;
+        std::vector<std::pair<u32, u32>> rows(map.begin(), map.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        ZLB_LOG_INFO("machine", "PC histogram %s %s (top buckets, 4 KiB each):",
+                     which == 0 ? "ARM" : "CMeP", when);
+        for (size_t k = 0; k < rows.size() && k < 12u; ++k) {
+            ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                         rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
+        }
+    }
+}
+}  // namespace
+
 void Vita::run_slice() {
     const auto no_abort = []() { return false; };
 
@@ -952,6 +978,19 @@ void Vita::run_slice() {
         cmep_->run(budget_.cmep, no_abort);
     }
 
+    {
+        static const bool hist_on = [] {
+            const char* v = std::getenv("ZLB_PC_HIST");
+            return v != nullptr && v[0] != '0';
+        }();
+        g_hist_on = hist_on;
+        static u64 slice_no = 0;
+        if (hist_on && (++slice_no % 250000u) == 0u) {
+            char when[48];
+            std::snprintf(when, sizeof(when), "at slice %llu", static_cast<unsigned long long>(slice_no));
+            dump_pc_histogram_now(when);
+        }
+    }
     // The four Kermit cores are stepped *one instruction at a time*, round robin.
     // Giving each core a whole 32-instruction budget before switching (as this
     // did) breaks kernel_boot_loader's barrier at 0x4003B384: the core released
@@ -1210,6 +1249,12 @@ void Vita::run_slice() {
             // ordinary resolution pass the persistent probes keep catching).
             if (i < kArmTraceCores) {
                 g_arm_trace_ring[i][(g_arm_trace_pos[i]++) & (kArmTraceSize - 1u)] = arm_pc;
+            }
+            if (g_hist_on && (++g_hist_tick & 0xFFFu) == 0u) {
+                ++g_hist_arm_map[arm_pc >> 12];
+                if (cmep_ != nullptr) {
+                    ++g_hist_cmep_map[cmep_->get_pc() >> 12];
+                }
             }
             // The core records undefined opcodes in last_undefined_instruction, but
             // nothing in src/machine or src/debug ever looks at it - a guest hitting an
@@ -2113,9 +2158,27 @@ void Vita::run_for(double seconds) {
     const double target = seconds;
     int64_t guard = 0;
     const int64_t guard_limit = 2000000;
+    if (const char* hist = std::getenv("ZLB_PC_HIST"); hist != nullptr && hist[0] != '0') {
+        g_hist_on = true;
+    }
+    dump_pc_histogram_now("at end of run");
     while (emulated_seconds() < target && guard++ < guard_limit) {
         if (stage() == BootStage::Failed) break;
         run_slice();
+    }
+    if (const char* hist = std::getenv("ZLB_PC_HIST"); hist != nullptr && hist[0] != '0') {
+        for (int which = 0; which < 2; ++which) {
+            std::map<u32, u32>& map = which == 0 ? g_hist_arm_map : g_hist_cmep_map;
+            std::vector<std::pair<u32, u32>> rows(map.begin(), map.end());
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            ZLB_LOG_INFO("machine", "PC histogram %s (top buckets, 4 KiB each):",
+                         which == 0 ? "ARM" : "CMeP");
+            for (size_t k = 0; k < rows.size() && k < 15u; ++k) {
+                ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                             rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
+            }
+        }
     }
 }
 
