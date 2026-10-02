@@ -18,6 +18,13 @@
 namespace zlb {
 
 namespace {
+/// Ring of the most recent ARM PCs, used to show the path that produced a
+/// module-start failure (see the MODULEMGR_NO_LIB dump below).
+u32 g_arm_trace_ring[512];
+u32 g_arm_trace_pos = 0;
+}  // namespace
+
+namespace {
 /// The Vita's Cortex-A9 runs at 333 MHz; used to convert cycles into wall time.
 constexpr double kArmClockHz = 333.0e6;
 }  // namespace
@@ -1132,6 +1139,11 @@ void Vita::run_slice() {
             }
             const u32 arm_pc = core->get_pc();
             arm_cov_mark(arm_pc);
+            // Ring of the most recent ARM PCs. When a module start returns the
+            // MODULEMGR_NO_LIB error the ring is dumped, deduplicated, so the path
+            // that produced the failure is visible (the loader's own code, not the
+            // ordinary resolution pass the persistent probes keep catching).
+            g_arm_trace_ring[(g_arm_trace_pos++) & 511u] = arm_pc;
             // Secure World question: does anything ever hand the ARM over to its
             // TrustZone side? Count instructions per mode and report the first time
             // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
@@ -1667,9 +1679,27 @@ void Vita::run_slice() {
                         ZLB_LOG_INFO("machine", "module return #%u core=%d (uids=0x%08X)", module_returns, i,
                                      log_arm != nullptr ? log_arm->r[5] : 0u);
                     } else if (result) {
+                        const u32 result_value = log_arm != nullptr ? log_arm->r[0] : 0u;
                         ZLB_LOG_INFO("machine", "module result 0x%08X at 0x%08X core=%d (uids=0x%08X)",
-                                     log_arm != nullptr ? log_arm->r[0] : 0u, arm_pc, i,
-                                     log_arm != nullptr ? log_arm->r[5] : 0u);
+                                     result_value, arm_pc, i, log_arm != nullptr ? log_arm->r[5] : 0u);
+                        if ((result_value & 0x80000000u) != 0u) {
+                            // Dump the recent PC path (deduplicated, newest first) so the
+                            // code that produced the error is identifiable.
+                            static u32 dumped[64];
+                            u32 dumped_count = 0;
+                            for (u32 back = 0; back < 512u && dumped_count < 64u; ++back) {
+                                const u32 pc_value =
+                                    g_arm_trace_ring[(g_arm_trace_pos - 1u - back) & 511u];
+                                bool known = false;
+                                for (u32 k = 0; k < dumped_count; ++k) {
+                                    if (dumped[k] == pc_value) { known = true; break; }
+                                }
+                                if (!known) dumped[dumped_count++] = pc_value;
+                            }
+                            for (u32 k = 0; k < dumped_count; ++k) {
+                                ZLB_LOG_INFO("machine", "module fail path [%u] 0x%08X", k, dumped[k]);
+                            }
+                        }
                     } else {
                         ++module_starts;
                         any_module_start = true;
