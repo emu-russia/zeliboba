@@ -56,6 +56,24 @@ namespace {
 // with ZLB_DMA_IRQ=<n> it asserts interrupt <n> (a pulse) on the doorbell.  The
 // DMA library registered handlers 0x70..0x7F, one per channel, so 0x7D is the
 // natural default for the channel-13 operation the display module submits.
+/// A window that stores whatever the guest writes, learning the register layout
+/// from the accesses themselves. It is used for the windows the kernel's device
+/// table declares but whose semantics are not recovered: a plain RegisterBlock
+/// drops writes to offsets it was not told about, which is how 89 writes vanished
+/// during a single boot before this existed. Save states are keyed by offset, so a
+/// register defined at run time round-trips correctly.
+class StorageWindow : public zlb::kermit::RegisterBlock {
+public:
+    StorageWindow(std::string name, zlb::u32 base, zlb::u32 size)
+        : RegisterBlock(std::move(name), base, size) {}
+
+    void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
+        const zlb::u32 offset = (address - base()) & ~3u;
+        if (!is_defined(offset)) define(offset, "W_" + std::to_string(offset));
+        RegisterBlock::write(address, size, value);
+    }
+};
+
 class DmaWindow : public zlb::kermit::RegisterBlock {
 public:
     DmaWindow(std::string name, zlb::u32 base, zlb::u32 size, std::function<void(zlb::u32)> raise)
@@ -989,61 +1007,90 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
         u32 base;
         u32 size;
     };
+    // Every window the kernel's device table (PA 0x40621500: 128 {base,size} pairs)
+    // declares that the model did not already cover. Before this, a boot wrote 89
+    // times into addresses that belonged to no device at all.
     static const ExtraWindow extra_windows[] = {
-        {"Kermit.Engine0400", 0xE0400000u, 0x1000u}, {"Kermit.Engine300", 0xE3000000u, 0x1000u},
-        {"Kermit.Engine301", 0xE3010000u, 0x1000u},  {"Kermit.Engine500", 0xE5000000u, 0x1000u},
-        {"Kermit.Engine501", 0xE5010000u, 0x1000u},  {"Kermit.EngineBE0", 0xE20BE000u, 0x1000u},
-        {"Kermit.Engine50C", 0xE50C0000u, 0x1000u},  {"Kermit.TimerB1", 0xE20B1000u, 0x1000u},
-        {"Kermit.TimerBC", 0xE20BC000u, 0x1000u},    {"Kermit.TimerBD", 0xE20BD000u, 0x1000u},
-        {"Kermit.Reg010", 0xE0100000u, 0x1000u},
+        // The kernel's table lists the whole 0xE20B timer bank; Kermit.TimerB covers
+        // 0xE20B7000, so these two banks cover the rest.
+        // The kernel's table lists the timer bank block by block (0x1000 each). They
+        // are added individually rather than as two big banks so the overlap check
+        // below can skip just the blocks the model already implements (LT5, WT7, PT,
+        // TimerB) instead of dropping the whole bank with them.
+        {"Kermit.Tmr0", 0xE20B0000u, 0x1000u}, {"Kermit.Tmr1", 0xE20B1000u, 0x1000u},
+        {"Kermit.Tmr2", 0xE20B2000u, 0x1000u}, {"Kermit.Tmr3", 0xE20B3000u, 0x1000u},
+        {"Kermit.Tmr4", 0xE20B4000u, 0x1000u}, {"Kermit.Tmr5", 0xE20B5000u, 0x1000u},
+        {"Kermit.Tmr6", 0xE20B6000u, 0x1000u}, {"Kermit.Tmr8", 0xE20B8000u, 0x1000u},
+        {"Kermit.Tmr9", 0xE20B9000u, 0x1000u}, {"Kermit.TmrA", 0xE20BA000u, 0x1000u},
+        {"Kermit.TmrB", 0xE20BB000u, 0x1000u}, {"Kermit.TmrC", 0xE20BC000u, 0x1000u},
+        {"Kermit.TmrD", 0xE20BD000u, 0x1000u}, {"Kermit.TmrE", 0xE20BE000u, 0x1000u},
+        {"Kermit.TmrF", 0xE20BF000u, 0x1000u},
+        {"Kermit.Dev20C", 0xE20C0000u, 0x10000u},
+        {"Kermit.Dev300", 0xE3000000u, 0x10000u},
+        {"Kermit.Dev301", 0xE3010000u, 0x10000u},
+        {"Kermit.Dev302", 0xE3020000u, 0x10000u},
+        {"Kermit.Dev303", 0xE3030000u, 0x10000u},
+        {"Kermit.Dev305", 0xE3050000u, 0x10000u},
+        {"Kermit.Dev306", 0xE3060000u, 0x10000u},
+        {"Kermit.Dev3101", 0xE3101000u, 0x1000u},
+        {"Kermit.Dev3102", 0xE3102000u, 0x1000u},
+        {"Kermit.Dev3103", 0xE3103000u, 0x1000u},
+        {"Kermit.Dev3104", 0xE3104000u, 0x1000u},
+        {"Kermit.Dev3105", 0xE3105000u, 0x1000u},
+        {"Kermit.Dev3106", 0xE3106000u, 0x1000u},
+        {"Kermit.Dev3108", 0xE3108000u, 0x1000u},
+        {"Kermit.Dev3109", 0xE3109000u, 0x1000u},
+        {"Kermit.Dev310A", 0xE310A000u, 0x1000u},
+        {"Kermit.Dev310B", 0xE310B000u, 0x1000u},
+        {"Kermit.Dev310C", 0xE310C000u, 0x1000u},
+        {"Kermit.Dev310D", 0xE310D000u, 0x1000u},
+        {"Kermit.Dev310E", 0xE310E000u, 0x1000u},
+        {"Kermit.Dev310F", 0xE310F000u, 0x1000u},
+        {"Kermit.Dev311", 0xE3110000u, 0x10000u},
+        {"Kermit.Dev320", 0xE3200000u, 0x6000u},
+        {"Kermit.Dev330", 0xE3300000u, 0x1000u},
+        {"Kermit.Dev331", 0xE3310000u, 0x10000u},
+        {"Kermit.Dev402", 0xE4020000u, 0x1000u},
+        {"Kermit.Dev40B", 0xE40B0000u, 0x1000u},
+        {"Kermit.Dev40C", 0xE40C0000u, 0x10000u},
+        {"Kermit.Dev40D", 0xE40D0000u, 0x10000u},
+        {"Kermit.Dev40E", 0xE40E0000u, 0x1000u},
+        {"Kermit.Dev40F", 0xE40F0000u, 0x10000u},
+        {"Kermit.Dev500", 0xE5000000u, 0x10000u},
+        {"Kermit.Dev501", 0xE5010000u, 0x10000u},
+        {"Kermit.Dev5020", 0xE5020000u, 0x1000u},
+        {"Kermit.Dev5021", 0xE5021000u, 0x1000u},
+        {"Kermit.Dev5022", 0xE5022000u, 0x1000u},
+        {"Kermit.Dev5030", 0xE5030000u, 0x1000u},
+        {"Kermit.Dev5031", 0xE5031000u, 0x1000u},
+        {"Kermit.Dev5032", 0xE5032000u, 0x1000u},
+        {"Kermit.Dev504", 0xE5040000u, 0x1000u},
+        {"Kermit.Dev505", 0xE5050000u, 0x10000u},
+        {"Kermit.Dev506", 0xE5060000u, 0x10000u},
+        {"Kermit.Dev5070", 0xE5070000u, 0x1000u},
+        {"Kermit.Dev5071", 0xE5071000u, 0x1000u},
+        {"Kermit.Dev50C", 0xE50C0000u, 0x10000u},
+        {"Kermit.Dev50D", 0xE50D0000u, 0x10000u},
+        {"Kermit.Dev580", 0xE5800000u, 0x10000u},
+        {"Kermit.Dev581", 0xE5810000u, 0x10000u},
+        {"Kermit.Dev8400", 0xE8400000u, 0x4000u},
+        {"Kermit.Dev8401", 0xE8404000u, 0x4000u},
+        {"Kermit.Dev8402", 0xE8408000u, 0x4000u},
+        {"Kermit.Dev8403", 0xE840C000u, 0x4000u},
+        {"Kermit.Dev8410", 0xE8410000u, 0x4000u},
+        {"Kermit.Dev8411", 0xE8414000u, 0x4000u},
+        {"Kermit.Dev040", 0xE0400000u, 0x1000u},
+        {"Kermit.Dev010", 0xE0100000u, 0x1000u},
     };
+    // Several of the kernel's windows already have a real device in the model
+    // (kIftu0Base 0xE5020000 with its three planes, kDsi0Base 0xE5050000, the CMeP
+    // blocks, the timers, Kermit.PerCore). Adding a storage window over one of those
+    // shadows it - the first attempt did exactly that and broke the IFTU tests - so
+    // this runs at the very end of install() and skips anything already claimed.
     for (const ExtraWindow& w : extra_windows) {
-        auto window = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
-        window->define(0x000, "W_000");
-        window->define(0x004, "W_004");
-        window->define(0x008, "W_008");
-        window->define(0x00C, "W_00C");
-        window->define(0x010, "W_010");
-        window->define(0x014, "W_014");
-        window->define(0x038, "W_038");
-        window->define(0x03C, "W_03C");
-        window->define(0x040, "W_040");
-        window->define(0x044, "W_044");
-        window->define(0x048, "W_048");
-        window->define(0x100, "W_100");
-        window->define(0x104, "W_104");
-        window->define(0x800, "W_800");
-        window->define(0x804, "W_804");
-        window->define(0x904, "W_904");
-        window->define(0x90C, "W_90C");
-        window->define(0x914, "W_914");
-        window->define(0x91C, "W_91C");
-        window->define(0x924, "W_924");
-        window->define(0x92C, "W_92C");
-        window->define(0x934, "W_934");
-        window->define(0x93C, "W_93C");
-        d.bus.add_device(std::move(window));
-    }
-
-    // The guest programs timer channels all over 0xE20B0000..0xE20BFFFF (it wrote
-    // 0xE20B1000, 0xE20B2000, 0xE20B3000, 0xE20B4000, 0xE20B5000, 0xE20B8000 and the
-    // 0xE20BC000/0xE20BD000 pair, each at +0x000..+0x01C). Kermit.TimerB covers
-    // 0xE20B7000, so two banks cover the remainder; every 0x20-byte block's first
-    // eight words are defined, which is what the guest touches.
-    for (const ExtraWindow& w : {ExtraWindow{"Kermit.TimerBankLo", 0xE20B0000u, 0x7000u},
-                                 ExtraWindow{"Kermit.TimerBankHi", 0xE20B8000u, 0x8000u}}) {
-        auto bank = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
-        for (u32 block = 0; block < w.size; block += 0x20u) {
-            bank->define(block + 0x000u, "T_000");
-            bank->define(block + 0x004u, "T_004");
-            bank->define(block + 0x008u, "T_008");
-            bank->define(block + 0x00Cu, "T_00C");
-            bank->define(block + 0x010u, "T_010");
-            bank->define(block + 0x014u, "T_014");
-            bank->define(block + 0x018u, "T_018");
-            bank->define(block + 0x01Cu, "T_01C");
-        }
-        d.bus.add_device(std::move(bank));
+        if (d.bus.find_device(w.base) != nullptr) continue;
+        if (d.bus.find_device(w.base + w.size - 1u) != nullptr) continue;
+        d.bus.add_device(std::make_unique<StorageWindow>(w.name, w.base, w.size));
     }
 
     // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
