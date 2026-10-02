@@ -1132,6 +1132,39 @@ void Vita::run_slice() {
             }
             const u32 arm_pc = core->get_pc();
             arm_cov_mark(arm_pc);
+            // Secure World question: does anything ever hand the ARM over to its
+            // TrustZone side? Count instructions per mode and report the first time
+            // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
+            // mode only runs if some code issued SMC.
+            if (const ArmCore* mode_core = dynamic_cast<const ArmCore*>(core)) {
+                static u64 mode_counts[32] = {};
+                static u32 modes_logged = 0;
+                const u32 mode_now = mode_core->mode() & 0x1Fu;
+                if (mode_now < 32u) {
+                    ++mode_counts[mode_now];
+                    if (mode_counts[mode_now] == 1u && modes_logged < 12u) {
+                        ++modes_logged;
+                        ZLB_LOG_INFO("machine", "arm: first instruction in mode 0x%02X (pc=0x%08X core=%d)",
+                                     mode_now, arm_pc, i);
+                    }
+                }
+                // Periodic per-mode census: shows whether the Secure World keeps
+                // being entered after the early boot, and how often.
+                static u64 mode_total = 0;
+                static u32 mode_reports = 0;
+                if (++mode_total % 200000000ull == 0ull && mode_reports < 8u) {
+                    ++mode_reports;
+                    ZLB_LOG_INFO("machine",
+                                 "arm modes: SVC=%llu IRQ=%llu FIQ=%llu SYS=%llu MON=%llu USR=%llu (total=%llu)",
+                                 static_cast<unsigned long long>(mode_counts[0x13]),
+                                 static_cast<unsigned long long>(mode_counts[0x12]),
+                                 static_cast<unsigned long long>(mode_counts[0x11]),
+                                 static_cast<unsigned long long>(mode_counts[0x1F]),
+                                 static_cast<unsigned long long>(mode_counts[0x16]),
+                                 static_cast<unsigned long long>(mode_counts[0x10]),
+                                 static_cast<unsigned long long>(mode_total));
+                }
+            }
             // Diagnostic (ZLB_MODULE_LOG=1): NSKBL's native module-start loop.  The
             // remaining boot gap is that only 22 of the 28 modules the bootconfig
             // lists are ever started (docs/STATUS.md), so this logs both sides of the
