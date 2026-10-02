@@ -331,6 +331,20 @@ void Vita::build_cores() {
             // 0x800C2E is the command dispatcher: it loads 0x806FD8 + $3*4 and jumps
             // through it, so $3 is the command id. Logging it shows which commands the
             // secure kernel processes and whether the 3->4->5->8 cycle repeats one.
+            // 0x800BFA is the step machine's entry; its arg4 selects the step
+            // (1..8, >8 goes to the error path). Logging the entry shows whether the
+            // caller repeats the same step, which is what the 3->4->5->8 cycle looks
+            // like from the outside.
+            if (pc == 0x800BFAu) {
+                static u32 step_logged = 0;
+                if (step_logged < 40u) {
+                    ++step_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: step entry arg3=0x%X arg4=0x%X r1=0x%X r2=0x%X lp=0x%08X",
+                                     st->r[3], st->r[4], st->r[1], st->r[2], st->lp);
+                    }
+                }
+            }
             if (pc == 0x800C2Eu) {
                 static u32 cmd_logged = 0;
                 if (cmd_logged < 40u) {
@@ -453,6 +467,19 @@ void Vita::wire_bridges() {
     // Smsched registers the reverse direction on GIC interrupts 200..203.
     cmep_block_->set_mailbox_irq_callbacks(
         [this](unsigned channel, bool asserted) {
+            // The secure kernel's step machine polls software flags that its
+            // interrupt handlers are supposed to set; a write trap on those flags
+            // shows nothing but the reset ever writes them. This log says whether
+            // the mailbox even raises the line that leads to those handlers.
+            static u32 irq_logged = 0;
+            if (asserted && irq_logged < 40u) {
+                ++irq_logged;
+                if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+                    ZLB_LOG_INFO("machine", "secure: mailbox irq to CMeP channel=%u isr=0x%08X imr=0x%08X psw=0x%X",
+                                 channel, mep->interrupt_flag_register(), mep->interrupt_mask_register(),
+                                 mep->psw);
+                }
+            }
             if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
                 mep->set_irq_level(8u + channel, asserted);
             }

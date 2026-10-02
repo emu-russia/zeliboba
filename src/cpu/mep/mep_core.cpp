@@ -730,6 +730,9 @@ StepResult MePCore::step() {
     return out;
 }
 
+u32 MePCore::interrupt_flag_register() const { return cbus.read(1); }
+u32 MePCore::interrupt_mask_register() const { return cbus.read(2); }
+
 void MePCore::set_irq_level(unsigned source, bool asserted) {
     cbus.set_irq_level(source, asserted);
     refresh_irq_line();
