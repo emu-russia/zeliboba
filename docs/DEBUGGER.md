@@ -179,6 +179,24 @@ determinism` в `verify.ps1` и тесты `state_*` в `zlb_tests`.
 | `ZLB_WTRAP=<lo>-<hi>` | печатает каждую **запись** в диапазон: регион, смещение, размер, значение, `pc` гостя, ядро |
 | `ZLB_RTRAP=<lo>-<hi>` | то же для **чтений** — так восстанавливаются параметрические блоки (`[rtrap] arm_bootrom +0x001C4 r4 = 0x0 pc=4002028C core=ARM Cortex-A9`) |
 
+### WSL: переменные надо передавать через `WSLENV`
+
+Эмулятор — Windows-бинарник, и WSL **не** передаёт ему своё окружение: строка
+`ZLB_ARM_PC_LOG=pc.log ./build/bin/zeliboba.exe …`, запущенная из Linux-шелла,
+не увидит переменную, и диагностика будет молча бездействовать (выглядит как
+«фича не работает»). Запускайте через `./run-wsl.sh` — он сам собирает все
+`ZLB_*` и публикует их в `WSLENV`:
+
+```bash
+ZLB_ARM_TRACE_RANGE=0x4F9D00-0x4F9E00 ZLB_ARM_TRACE_LIMIT=200 \
+    ./run-wsl.sh -q -ex "loadstate scratch/s600k.state" -ex "runm 20" -ex "quit"
+```
+
+`run-wsl.sh` кладёт в `WSLENV` только имена переменных: относительные пути
+(`ZLB_ARM_PC_LOG=scratch/pc.log`) резолвятся от текущего каталога (корень
+`zeliboba/`). Бинарник выбирается `ZLB_BIN` (`zeliboba` по умолчанию,
+`zeliboba_ui` для SDL3, `zlb_tests` для самотестов).
+
 ## Примеры
 
 ```

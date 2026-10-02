@@ -16,3 +16,6 @@ third_party/SDL3-devel-VC.zip
 
 # Visual Studio per-user project settings (*.vcxproj.user)
 *.vcxproj.user
+
+# local scratch: save states, screenshots, coverage bitmaps
+scratch/

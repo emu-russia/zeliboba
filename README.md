@@ -130,6 +130,36 @@ msbuild zeliboba.slnx -p:Configuration=Release -p:Platform=x64 -m
 подхватываются автоматически, а вывод идёт в тот же `build/bin`, что и у
 CMake-сборки. Подробности — `msvc/README.md`.
 
+### WSL (Windows-сборка из Linux-шелла)
+
+Рабочая копия часто открыта в WSL, а исполняемый файл — Windows. Сборка идёт
+тем же решением VS2026, а запускать надо через `run-wsl.sh`:
+
+```bash
+cd zeliboba
+"/mnt/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe" \
+    zeliboba.slnx -p:Configuration=Release -p:Platform=x64 -m
+./build/bin/zlb_tests.exe                 # тесты тоже Windows-бинарник, но exe запускается прямо из WSL
+./run-wsl.sh --info                       # консольный отладчик
+./run-wsl.sh --cli -ex "boot" -ex "runm 300000" -ex "quit"
+ZLB_BIN=zeliboba_ui ./run-wsl.sh --screenshot out.bmp --screenshot-tab panel
+```
+
+**Важно про переменные окружения.** WSL по умолчанию **не** передаёт своё
+окружение Windows-процессу: `ZLB_ARM_PC_LOG=... ./build/bin/zeliboba.exe ...`
+не увидит переменную, и диагностика из `docs/DEBUGGER.md` будет молча
+бездействовать. Передавать нужно через `WSLENV` — это и делает `run-wsl.sh`
+(он сам собирает все `ZLB_*` и добавляет их в `WSLENV`):
+
+```bash
+ZLB_ARM_TRACE_RING=0x4F9DBC ZLB_ARM_TRACE_RING_SIZE=128 \
+    ./run-wsl.sh --cli -ex "loadstate scratch/s600k.state" -ex "runm 300" -ex "quit"
+```
+
+Пути внутри эмулятора — Windows; `savestate`/`loadstate` резолвятся от
+`ZLB_WORKSPACE_DIR` (по умолчанию — каталог **над** `zeliboba/`), поэтому
+`savestate scratch/x.state` кладёт файл в `<workspace>/scratch/x.state`.
+
 ### macOS (Apple Silicon и Intel)
 
 Нужны инструменты командной строки Apple (`xcode-select --install`), CMake и
@@ -208,6 +238,36 @@ MMIO-устройств, четыре ARM-ядра, CMeP, Ernie/RL78, keyring и
 но не сам образ (загрузка с образом другого размера отвергается). Формат описан
 в [docs/SAVE_STATE.md](docs/SAVE_STATE.md), команды — в
 [docs/DEBUGGER.md](docs/DEBUGGER.md).
+
+### Быстрый цикл: сейв на логотипе PlayStation
+
+Холодная загрузка 1.04 до гостевого логотипа занимает ~2.5 минуты, поэтому
+каждую попытку начинают не с нуля, а с сохранённой точки. Раскладка сейвов
+(каталог `scratch/` рядом с `zeliboba/`) — `s200k`, `s400k`, `s600k`, `s1000k`
+(`runm N` — N машинных слайсов по 256 инструкций на ядро); состояние на `s400k`
+и позже уже показывает логотип и содержит загруженные os0-модули:
+
+```bash
+# один раз: пройти загрузку и сохранить точки
+./run-wsl.sh --cli -q -ex "boot" -ex "runm 200000" -ex "savestate scratch/s200k.state" \
+    -ex "runm 200000" -ex "savestate scratch/s400k.state" \
+    -ex "runm 200000" -ex "savestate scratch/s600k.state" \
+    -ex "runm 400000" -ex "savestate scratch/s1000k.state" -ex "quit"
+
+# затем: продолжить с логотипа за миллисекунды
+./run-wsl.sh --cli -q -ex "loadstate scratch/s400k.state" -ex "runm 100000" \
+    -ex "boot" -ex "core" -ex "emmc info" -ex "quit"
+```
+
+Сейв привязан к сборке и к размеру `build/emmc.img`: после правки формата
+состояния старый файл отвергается (это и есть защита от несовпадения), поэтому
+точки надо перегенерировать. `build/emmc.img` собирается заново командой
+
+```bash
+./build/bin/emmc_rebuild.exe --firmware ../Vita_104_Firmware/Out --out build/emmc.img --verify
+```
+
+и совпадает с исходным деревом побайтово (992 файла, 0 расхождений).
 
 ## Отладчик
 
