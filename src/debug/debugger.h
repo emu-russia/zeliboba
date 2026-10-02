@@ -169,6 +169,7 @@ private:
     /// command away.  `mep` selects the CMeP map instead of the ARM one.
     std::string cmd_cov(const std::vector<std::string>& args, bool mep);
     std::string cmd_keyring(const std::vector<std::string>& args);
+    std::string cmd_nid(const std::vector<std::string>& args);
     std::string cmd_image(const std::vector<std::string>& args);
     std::string cmd_log(const std::vector<std::string>& args);
 

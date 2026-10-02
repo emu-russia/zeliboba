@@ -5,10 +5,13 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
 #include "common/log.h"
+#include "debug/nid_table.h"
 #include "common/util.h"
 #include "cpu/arm/arm_core.h"
 #include "cpu/arm/arm_disasm.h"
@@ -1178,6 +1181,10 @@ bool Debugger::execute(const std::string& line) {
         }
         return true;
     }
+    if (command == "nid") {
+        emit(cmd_nid(args));
+        return true;
+    }
     if (command == "bootkeys") {
         // Which resident first-loader build is fitted and which signed block its
         // RSA check expects (see machine/bootkeys.cpp).  Useful when a differently
@@ -1568,6 +1575,57 @@ std::string Debugger::cmd_faults(const std::vector<std::string>& args) {
     return out;
 }
 
+std::string Debugger::cmd_nid(const std::vector<std::string>& args) {
+    std::string out;
+    if (args.empty()) {
+        out += format("NID database: %zu entries\n", zlb::debug::nid_entry_count());
+        out += "usage: nid <0xNID>   name an import\n";
+        out += "       nid <text>    search function names\n";
+        return out;
+    }
+    const std::string& term = args.front();
+    bool hex = term.size() > 2 && (term[0] == '0') && (term[1] == 'x' || term[1] == 'X');
+    if (!hex) {
+        hex = !term.empty();
+        for (char c : term) {
+            if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                hex = false;
+                break;
+            }
+        }
+    }
+    if (hex) {
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(term.c_str(), &end, 0);
+        if (end != nullptr && *end == '\0') {
+            const std::uint32_t nid = static_cast<std::uint32_t>(value);
+            const std::vector<const zlb::debug::NidEntry*> matches = zlb::debug::nid_lookup(nid);
+            if (matches.empty()) {
+                out += format("0x%08X: no entry in the NID database\n", nid);
+            } else {
+                for (const auto* entry : matches) {
+                    out += format("0x%08X %s::%s  (%s)\n", entry->nid, entry->library, entry->function,
+                                  entry->module);
+                }
+            }
+            return out;
+        }
+    }
+    const std::vector<const zlb::debug::NidEntry*> matches = zlb::debug::nid_search(term);
+    if (matches.empty()) {
+        out += format("no function name contains \"%s\"\n", term.c_str());
+        return out;
+    }
+    out += format("%zu match(es) for \"%s\":\n", matches.size(), term.c_str());
+    const std::size_t limit = matches.size() < 32u ? matches.size() : 32u;
+    for (std::size_t index = 0; index < limit; ++index) {
+        const auto* entry = matches[index];
+        out += format("  0x%08X %s::%s  (%s)\n", entry->nid, entry->library, entry->function, entry->module);
+    }
+    if (matches.size() > limit) out += format("  ... and %zu more\n", matches.size() - limit);
+    return out;
+}
+
 std::string Debugger::cmd_keyring(const std::vector<std::string>& args) {
     (void)args;
     std::string out;
@@ -1622,7 +1680,7 @@ std::vector<std::string> Debugger::complete(const std::string& prefix) const {
         "step", "run", "runm", "until", "reset", "core", "bp", "bpc", "bpl", "watch", "watchc",
         "wpl", "regs", "reg", "dis", "mem", "poke", "save", "trace", "devices", "map", "devget",
         "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "faults", "stage", "keyring",
-        "bootkeys", "info", "load",
+        "bootkeys", "nid", "info", "load",
         "log", "help", "quit"};
     std::vector<std::string> out;
     for (const auto& command : commands) {
