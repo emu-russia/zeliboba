@@ -1359,6 +1359,39 @@ void Vita::run_slice() {
                     }
                 }
             }
+            // Experiment: when a module start returns a negative result, the loader's
+            // loop at 0x510013F0 does "cmp r0,#0; bge continue" and otherwise stops.
+            // With ZLB_IGNORE_MODULE_ERR=1 the negative result is replaced by 0 so the
+            // loop keeps going - this shows whether the first failure is the only
+            // obstacle or merely the first one.
+            if (arm_pc == 0x510013F0u) {
+                static const bool ignore_err = [] {
+                    const char* v = std::getenv("ZLB_IGNORE_MODULE_ERR");
+                    return v != nullptr && v[0] != '0';
+                }();
+                if (ignore_err) {
+                    if (ArmCore* ic = dynamic_cast<ArmCore*>(core)) {
+                        if ((ic->r[0] & 0x80000000u) != 0u) {
+                            ZLB_LOG_INFO("machine", "module error 0x%08X ignored at 0x%08X",
+                                         ic->r[0], arm_pc);
+                            ic->r[0] = 0u;
+                        }
+                    }
+                }
+            }
+            // All calls to the validator 0x510049F4, with the object it is handed (r0)
+            // and the UID (r1), to see whether every caller passes the same kind of
+            // object or whether some pass a different one.
+            if (arm_pc == 0x510049F4u) {
+                static u32 all_logged = 0;
+                if (all_logged < 40u) {
+                    ++all_logged;
+                    if (const ArmCore* av = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "validator any: obj=0x%08X uid=0x%08X lr=0x%08X",
+                                     av->r[0], av->r[1], av->r[14]);
+                    }
+                }
+            }
             // 0x510049F4 is the UID validator: r0 = the table it is handed, r1 = the
             // UID to validate. Log only the UIDs that matter here - 0x200F3 (ss_mgr)
             // and 0x200F9 (sdif) - so the table each lookup uses is identifiable.
