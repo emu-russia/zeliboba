@@ -549,6 +549,11 @@ u16 Bus::read16(u32 address) {
     u64 out = 0;
     Device* device = nullptr;
     slow_read(address, 2, out, device, false);
+    // Every other accessor reports the slow path - read8/32/64 and all four writes.
+    // read16 was the one that did not, so a 16-bit MMIO read was invisible to
+    // ZLB_RTRAP: the guest's `ldrh` of the per-core window at 0xE3320000 never
+    // appeared in the trace, and it looked as if the kernel only ever wrote there.
+    if (read_trap_enabled()) note_read_trap(address, 2, out);
     return static_cast<u16>(out);
 }
 

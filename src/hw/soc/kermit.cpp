@@ -809,6 +809,23 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     // E8000000 remains opaque peripheral glue. E20B6000 is now established
     // as native ThreadMgr LT5, not an empty/drop-write descriptor window.
     d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE8000", 0xE8000000, 0x1000));
+    // 0xE3320000: the per-core control window the non-secure kernel (NSKBL at
+    // 0x51003328, then the kernel's context code at 0x000EC39C) writes.  The
+    // kernel's own TTBR1 maps all of 0xE0000000-0xE7FFFFFF as 1 MiB sections, so
+    // VA == PA here.  Measured with ZLB_WTRAP over a cold boot: for every core it
+    // programs +0x100 = 1 and then +0x000 = 0x87, i.e. 0xE3320000 + 0x1000 * core
+    // with a two-register sequence - 214 writes, and (with the 16-bit read trap
+    // fixed) not one read.  The meaning of the value is not recovered, so the block
+    // only keeps and names the four observed slots instead of dropping the writes,
+    // the way Kermit.UnkE8000 keeps the other opaque window.
+    {
+        auto per_core = std::make_unique<kermit::RegisterBlock>("Kermit.PerCore", 0xE3320000u, 0x4000u);
+        for (u32 core = 0; core < 4u; ++core) {
+            per_core->define(core * 0x1000u, format("CORE%u_00", core));
+            per_core->define(core * 0x1000u + 0x100u, format("CORE%u_100", core));
+        }
+        d.bus.add_device(std::move(per_core));
+    }
     auto lt5 = std::make_unique<kermit::VitaSystemTimer>("Kermit.LT5", kermit::kLt5Base, true, kermit::kIrqLt5);
     auto wt7 = std::make_unique<kermit::VitaSystemTimer>("Kermit.WT7", kermit::kWt7Base, false, kermit::kIrqWt7);
     lt5->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
