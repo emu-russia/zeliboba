@@ -1343,6 +1343,33 @@ void Vita::run_slice() {
                     }
                 }
             }
+            // 0x510049F4 is the UID validator: r0 = the table it is handed, r1 = the
+            // UID to validate. Log only the UIDs that matter here - 0x200F3 (ss_mgr)
+            // and 0x200F9 (sdif) - so the table each lookup uses is identifiable.
+            if (arm_pc == 0x510049F4u) {
+                static u32 val_logged = 0;
+                if (val_logged < 24u) {
+                    if (const ArmCore* vc = dynamic_cast<const ArmCore*>(core)) {
+                        const u32 uid = vc->r[1];
+                        if (uid == 0x200F3u || uid == 0x200F9u || uid == 0x200EDu) {
+                            ++val_logged;
+                            // r2 points at the out word. The kernel's low VAs map to
+                            // PA = VA + 0x40300000 (verified: VA 0x60C0 -> PA 0x403060C0),
+                            // so the value left by the *previous* validation can be read
+                            // from RAM directly - no MMU involvement (see the round-49
+                            // lesson about probes perturbing the machine).
+                            u32 out_word = 0xDEADBEEFu;
+                            const u32 out_pa = vc->r[2] + 0x40300000u;
+                            if (out_pa >= 0x40000000u && out_pa < 0x44000000u) {
+                                out_word = arm_bus_->read32(out_pa);
+                            }
+                            ZLB_LOG_INFO("machine",
+                                         "validator call: uid=0x%08X table=0x%08X lr=0x%08X prev_out=0x%08X",
+                                         uid, vc->r[0], vc->r[14], out_word);
+                        }
+                    }
+                }
+            }
             // Secure World question: does anything ever hand the ARM over to its
             // TrustZone side? Count instructions per mode and report the first time
             // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
