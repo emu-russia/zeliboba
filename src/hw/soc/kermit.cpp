@@ -832,6 +832,47 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     wt7->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.bus.add_device(std::move(lt5));
     d.bus.add_device(std::move(wt7));
+    // 0xE0410000: the DMA window the guest actually drives.  The kernel's own
+    // device table (PA 0x40102E58) maps it to physical 0x2802A000, and the DMA
+    // library's kick code (0x4381B6..0x438262) writes its descriptor here:
+    // +0x10/+0x14 and +0x30/+0x3C carry callbacks, +0x10C/+0x100 a control word,
+    // and +0x200..+0x23C the descriptor proper (op pointer 0xFA01F0, buffer
+    // 0x7D00F9, size 0x100, code pointers 0x43C000/0x5C1C54).  The window was
+    // unmapped, so every one of those writes vanished and the single read at
+    // +0x3C came back as 0xFFFFFFFF.  Modelled as storage with the observed
+    // offsets: the engine's semantics - and the interrupt that would set the
+    // completion event flag ksceKernelDmaOpSync waits on - are not recovered, so
+    // this only stops the guest's descriptor from disappearing.  The separate
+    // Kermit.DMA block stays at 0xE2060000, where the KBL's console table and
+    // docs/HARDWARE.md place it.
+    {
+        auto dma_win = std::make_unique<kermit::RegisterBlock>("Kermit.DmaWin", 0xE0410000u, 0x1000u);
+        dma_win->define(0x010, "CTRL_010");
+        dma_win->define(0x014, "CALLBACK_014");
+        dma_win->define(0x020, "FIELD_020");
+        dma_win->define(0x02C, "MASK_02C", 0x07FFFFFF);
+        dma_win->define(0x030, "CTRL_030");
+        dma_win->define(0x03C, "CALLBACK_03C");
+        dma_win->define(0x100, "CTRL_100");
+        dma_win->define(0x104, "FIELD_104");
+        dma_win->define(0x200, "DESC_200");
+        dma_win->define(0x204, "DESC_204");
+        dma_win->define(0x208, "DESC_208");
+        dma_win->define(0x20C, "DESC_20C");
+        dma_win->define(0x210, "DESC_210");
+        dma_win->define(0x214, "DESC_214");
+        dma_win->define(0x218, "DESC_218");
+        dma_win->define(0x21C, "DESC_21C");
+        dma_win->define(0x220, "DESC_220");
+        dma_win->define(0x224, "DESC_224");
+        dma_win->define(0x228, "DESC_228");
+        dma_win->define(0x22C, "DESC_22C");
+        dma_win->define(0x230, "DESC_230");
+        dma_win->define(0x234, "DESC_234");
+        dma_win->define(0x238, "DESC_238");
+        dma_win->define(0x23C, "DESC_23C");
+        d.bus.add_device(std::move(dma_win));
+    }
     // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
     // was missing, so the guest's programming fell into unmapped space - measured
     // with ZLB_WTRAP, the kernel writes +0x00/+0x04/+0x08/+0x0C = 0 and +0x14 = 3
