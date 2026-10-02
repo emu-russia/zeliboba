@@ -672,6 +672,24 @@ std::string MePCore::mark_undefined(const std::string& what, u32 address) {
 }
 
 StepResult MePCore::step() {
+    // The secure kernel keeps its state in a global written through 0x801d54
+    // ("sw $1,-32748($gp)"). The idle loop waits for the value 9. Trace every call to
+    // that setter with its value and return address: this shows whether 9 is ever set
+    // and, if so, from where.
+    {
+        static const bool st_log = [] {
+            const char* v = std::getenv("ZLB_STATE_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (st_log && (pc & ~1u) == 0x801D54u) {
+            static u32 n = 0;
+            if (n < 80u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "state set: value=%u (0x%X) lr=0x%X pc=0x%X",
+                             r[1], r[1], lp, pc);
+            }
+        }
+    }
     StepResult out;
     const u32 address = pc;
     out.address = address;
