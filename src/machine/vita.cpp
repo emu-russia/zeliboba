@@ -1082,11 +1082,15 @@ void Vita::run_slice() {
                 // Only interesting once the module phase has begun: the early kernel
                 // init uses the same wfe wait loop, and it must not eat the budget.
                 static bool any_module_start = false;
+                // The interesting window is *after* the last start (UID 0x200ED, the
+                // 22nd); the earlier counters were exhausted long before it, so the
+                // aftermath went unlogged.  This mirrors the count in the loop below.
+                static u32 starts_seen = 0;
                 if (i < static_cast<int>(kArmCoreCount)) {
                     const u32* ring = idle_ring[i];
                     const u32 next = idle_ring_at[i]++;
                     idle_ring[i][next & 7u] = arm_pc;
-                    if (arm_pc == 0x47969Cu && i == 0 && any_module_start && idle_logged < 40u &&
+                    if (arm_pc == 0x47969Cu && i == 0 && starts_seen >= 22u && idle_logged < 40u &&
                         ring[(next + 7u) & 7u] != 0x47969Cu) {
                         ++idle_logged;
                         std::string path;
@@ -1112,7 +1116,7 @@ void Vita::run_slice() {
                     // for; the two halves at +4/+6 are the same pair NSKBL's spinlock
                     // 0x51015874 uses.
                     static u32 wait_logged = 0;
-                    if (arm_pc == 0x47AE92u && i == 0 && any_module_start && wait_logged < 400u) {
+                    if (arm_pc == 0x47AE92u && i == 0 && starts_seen >= 22u && wait_logged < 400u) {
                         ++wait_logged;
                         const ArmCore* wait_arm = dynamic_cast<const ArmCore*>(core);
                         const u32 obj = wait_arm != nullptr ? wait_arm->r[4] : 0u;
@@ -1178,6 +1182,7 @@ void Vita::run_slice() {
                     } else {
                         ++module_starts;
                         any_module_start = true;
+                        starts_seen = module_starts;
                         ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
                                      log_arm != nullptr ? log_arm->r[0] : 0u, i);
                     }
