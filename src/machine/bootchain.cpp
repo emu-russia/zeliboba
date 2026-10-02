@@ -7,6 +7,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "cpu/arm/arm_core.h"
+#include "cpu/mep/mep_core.h"
 #include "cpu/factory.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
@@ -86,10 +87,6 @@ void ensure_instance_arena(ArmCore* arm, Bus* bus) {
     ensure_arena_section(arm, bus, kInstanceArenaVa);
 }
 
-/// How long the CMeP may keep running after the secure kernel's "done" jump while
-/// its second loader finishes the ARM boot context (see poll_boot_chain).
-constexpr u64 kCmepFinishBudget = 2000000;
-
 /// Read the whole SLB2 container: the eMMC boot partition first (that is where
 /// the hardware looks at power-on), then the two "bls" copies in the user area
 /// that a reconstructed image carries as well.
@@ -145,6 +142,11 @@ bool Vita::stage_in_dram(u32 address, const std::vector<u8>& bytes) {
 }
 
 bool Vita::arm_boot_rom_stage_second_loader() {
+    secure_module_sources_ = {};
+    secure_modules_staged_ = false;
+    context_auth_sm_pa_ = context_auth_sm_size_ = 0;
+    kprx_auth_sm_pa_ = kprx_auth_sm_size_ = 0;
+    prog_rvk_pa_ = prog_rvk_size_ = 0;
     if (!emmc_) return false;
 
     std::vector<u8> container;
@@ -222,19 +224,15 @@ bool Vita::arm_boot_rom_stage_second_loader() {
     second_loader_pa_ = board::kSecondLoaderStagingDram;
     cmep_block_->set_arm_to_cmep_command(second_loader_pa_ | 1u);
 
-    // The second loader also stages the two kernel modules the secure/non-secure
-    // boot loaders hand to the kernel (wiki: "the kprx_auth_sm.self and
-    // prog_rvk.srvk read from the eMMC SLB2 partition are both loaded into DRAM");
-    // their paddrs/sizes go into SceKblParam (0x90/0x98).
-    if (const Slb2Entry* kprx = find_entry(*slb2, "kprx_auth_sm.self"); kprx && !kprx->data.empty()) {
-        stage_in_dram(board::kKprxAuthSmStaging, kprx->data);
-        kprx_auth_sm_pa_ = board::kKprxAuthSmStaging;
-        kprx_auth_sm_size_ = static_cast<u32>(kprx->data.size());
-    }
-    if (const Slb2Entry* rvk = find_entry(*slb2, "prog_rvk.srvk"); rvk && !rvk->data.empty()) {
-        stage_in_dram(board::kProgRvkStaging, rvk->data);
-        prog_rvk_pa_ = board::kProgRvkStaging;
-        prog_rvk_size_ = static_cast<u32>(rvk->data.size());
+    // Retain the original files, but do not place them in the second loader's
+    // working DRAM yet: its earlier IdStorage path fills this region with
+    // 0xF5FFF5FF. The model's secure-kernel handoff below stands in for the final
+    // named-file reads performed by the firmware's 0x4181C routine.
+    const char* module_names[] = {"context_auth_sm.self", "kprx_auth_sm.self", "prog_rvk.srvk"};
+    for (size_t i = 0; i < secure_module_sources_.size(); ++i) {
+        if (const Slb2Entry* entry = find_entry(*slb2, module_names[i])) {
+            secure_module_sources_[i] = *entry;
+        }
     }
 
     add_milestone("ARM boot ROM staged " + second->name + " at 0x" + hex(second_loader_pa_, 8) + " (" +
@@ -242,6 +240,31 @@ bool Vita::arm_boot_rom_stage_second_loader() {
     boot_.detail = "second loader staged in DRAM";
     ZLB_LOG_INFO("machine", "mailbox 0xE0000010 <- 0x%08X (image present)", second_loader_pa_ | 1u);
     return true;
+}
+
+void Vita::stage_secure_modules() {
+    context_auth_sm_pa_ = context_auth_sm_size_ = 0;
+    kprx_auth_sm_pa_ = kprx_auth_sm_size_ = 0;
+    prog_rvk_pa_ = prog_rvk_size_ = 0;
+    const std::array<u32*, 3> addresses = {&context_auth_sm_pa_, &kprx_auth_sm_pa_, &prog_rvk_pa_};
+    const std::array<u32*, 3> sizes = {&context_auth_sm_size_, &kprx_auth_sm_size_, &prog_rvk_size_};
+    u32 module_pa = board::kSecureModuleStagingBase;
+    for (size_t i = 0; i < secure_module_sources_.size(); ++i) {
+        const Slb2Entry& entry = secure_module_sources_[i];
+        if (entry.name.empty()) continue;
+        const u64 allocation = (static_cast<u64>(entry.size) + 0x1FFu) & ~0x1FFull;
+        if (entry.data.size() != entry.size ||
+            allocation > board::kSecureModuleStagingEnd - module_pa) {
+            ZLB_LOG_WARN("boot", "cannot stage %s: size 0x%X, available DRAM 0x%X", entry.name.c_str(),
+                         entry.size, board::kSecureModuleStagingEnd - module_pa);
+            continue;
+        }
+        if (!stage_in_dram(module_pa, entry.data)) continue;
+        *addresses[i] = module_pa;
+        *sizes[i] = entry.size;
+        module_pa += static_cast<u32>(allocation);
+    }
+    secure_modules_staged_ = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +284,9 @@ bool Vita::load_second_loader_direct() {
     }
     second_loader_entry_ = board::kSecondLoaderStaging;
     cmep_->reset(second_loader_entry_);
+    if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+        mep->set_boot_vector_base(board::kSecondLoaderStaging);
+    }
     cmep_->halted = false;
     boot_.stage = BootStage::CmepSecondLoader;
     boot_.detail = "second loader loaded directly (bypassing the first loader crypto chain)";
@@ -288,7 +314,39 @@ bool Vita::load_cmep_secure_kernel() {
         ZLB_LOG_ERROR("machine", "could not map the secure kernel at 0x%08X", board::kCmepSecureKernelBase);
         return false;
     }
+    // Model the board's secure-kernel SRAM remap at the same handoff as the
+    // vector remap below; the actual register selecting it is unknown. The
+    // guest calls its own cache helpers through the uncached 0x400B0/0x400CE
+    // addresses, whose bytes are present at image offsets 0xB0/0xCE in private
+    // SRAM. Retain the first-loader region's owned storage for the next reset,
+    // but expose the same live SRAM through both CMeP windows during this stage.
+    // Rebuild the bus fast path too: it caches each RAM page's host pointer.
+    auto* low_sram = cmep_bus_->region_at(board::kCmepRamBase, board::kCmepRamSize);
+    if (!low_sram) {
+        ZLB_LOG_ERROR("machine", "CMeP low SRAM window missing at secure-kernel handoff");
+        return false;
+    }
+    low_sram->external = cmep_priv_.data();
+    cmep_bus_->rebuild_map();
+    // Board peer-selection boundary, alongside the already-modeled SRAM and
+    // vector remap. The first/second loaders have finished; their optional
+    // development JIG must no longer assert the Ernie response-ready input.
+    // Real SPI response signaling is also required by the second loader and
+    // remains independent of this phase boundary.
+    // The actual hardware selector is unknown. Reset restores legacy phase.
+    cmep_block_->enter_native_gpio_phase();
+    // Development stand-in for the second loader's final file reads. This
+    // boundary follows its DRAM scratch use; staging during the ARM boot ROM
+    // model instead leaves the auth files overwritten before the ARM reads them.
+    stage_secure_modules();
     cmep_->reset(board::kCmepSecureKernelBase);
+    // Vita's EVM=0 vector bank is remapped from 0x40000 to private SRAM for
+    // secure_kernel (wiki Cmep/Reset and Secure_Kernel/Main, plus its CFG setup
+    // and native vector table). The missing ROM/board register that performs
+    // that remap is modelled at this handoff; CPU IRQ selection stays generic.
+    if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+        mep->set_boot_vector_base(board::kCmepSecureKernelBase);
+    }
     cmep_->halted = false;
     secure_kernel_active_ = true;
     secure_kernel_size_ = static_cast<u32>(data->size());
@@ -1580,19 +1638,17 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // fall through to the instruction itself
     }
 
-    // Substitution (round 93): the SceUID registration at 0x4002BD00 walks a
-    // per-class table through the global 0x400B291C
+    // Development fallback for the MemBlock descriptor free pools referenced
+    // through global 0x400B291C. The allocator accepts type indices 0..8:
     //   0x4002BFAC  movwls r2, #0x291c / movtls r2, #0x400b ; r2 = 0x400B291C
     //   0x4002BFB8  ldrls  r2, [r2]                        ; table base
     //   0x4002BFBC  addls.w sb, r2, r3, lsl #2             ; r3 = class*5
     //   0x4002BFC2  blx    0x4003A28C                      ; lock(&table[class])
-    // and that global is *never* written: a write trap over the whole run sees only
-    // the BSS zero-fill (pc 0x400211E0) at 0x400B291C, so the table base stays 0,
-    // the lock call gets a NULL pointer and the KBL spins in the second spinlock
-    // (pc 0x4003A2B8, R0 = 0, LR = 0x4002BFC7).  The model creates it: an 8-entry,
-    // 0x14-byte-per-entry table in a writable page it allocates for itself, stored
-    // into the global before the registration loop runs.  ZLB_NO_SUBSTITUTION=1
-    // disables it.
+    // FW1.04 initializes its nine-record table at 0x4002C38C, stores the pointer
+    // at 0x4002C3BE, then populates the free pools through 0x4002C440. Older
+    // incomplete boot paths left the slot zero and locked NULL at 0x4003A28C.
+    // The fallback supplies empty records only when the native table is absent;
+    // it does not manufacture free descriptors. ZLB_NO_SUBSTITUTION=1 disables it.
     constexpr u32 kClassTableGlobal = 0x400B291Cu;
     constexpr u32 kSystemInitPc = 0x4002BB32u;   // `str r1,[r5]` in the manager builder
 
@@ -1659,13 +1715,8 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
-    // Round 110: with the memory walls behind it the KBL now runs the *whole* manager
-    // builder and zeroes this field itself (`str r1,[r4,#0x1C]` at 0x4002ADB8, where
-    // r4 = 0x400B2900 and +0x1C = the very slot our substitution fills), so the two
-    // writes race and the registration loop ends up locking a NULL pointer
-    // (pc 0x4003A28C, R0 = 0, LR = 0x4002BFC7).  The substitution can therefore be
-    // switched off with ZLB_KBL_CLASS_TABLE=0 to see whether the loader builds the
-    // table on its own now.
+    // Keep the legacy early fallback available for incomplete initialization.
+    // ZLB_KBL_CLASS_TABLE=0 disables both its allocation and later restoration.
     static const bool supply_class_table = [] {
         const char* value = std::getenv("ZLB_KBL_CLASS_TABLE");
         return value == nullptr || value[0] != '0';
@@ -1679,22 +1730,10 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the instruction still has to run
     }
 
-    // Round 111: the loader's own class-descriptor loop overwrites the slot *after*
-    // the substitution above ran.  The trace
-    //     ZLB_KBL_TRACE_PC=0x4002ADB8  ->  from pc=0x4002ADB6 lr=0x4002B153,
-    //                                      r4 = 0x14000/0x14020/0x14040/0x14060,
-    //                                      r1 = 0
-    //     ZLB_KBL_TRACE_PC=0x4002B14E  ->  r0 = the same 0x140xx, r1 = 0 (from the
-    //                                      caller's *stack local* [r4+0x10])
-    // shows four class descriptors (VA 0x14000 + n*0x20, i.e. PA 0x400B2900 + n*0x20)
-    // whose +0x1C table pointer the loader sets to 0 because the local that should
-    // carry the table pointer is zero.  Supply the table again right before the
-    // registration loop reads the pointer, so the loop does not lock NULL:
-    //     0x4002BFB8  ldrls r2,[r2]        ; r2 = [0x400B291C]
-    //     0x4002BFBC  addls.w sb, r2, r3, lsl #2
-    //     0x4002BFC2  blx 0x4003A28C       ; lock(&table[class])
-    // `supply_kbl_class_table` is a no-op when the field is already non-zero, so this
-    // only stands in where the loader left nothing.  ZLB_KBL_CLASS_TABLE=0 disables it.
+    // Restore an earlier fallback only if the pointer slot is still zero when
+    // MemBlock allocation reads it. Genuine FW1.04 has populated a native table
+    // by this point; replacing it with the empty fallback loses class8's object
+    // and makes the NameHeap backing allocation return NULL.
     constexpr u32 kClassTableReadPc = 0x4002BFB8u;
     if (supply_blocks && supply_class_table && pc == kClassTableReadPc) {
         if (core < static_cast<u32>(kArmCoreCount)) {
@@ -1704,12 +1743,17 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 // 0x51C0 can return garbage and the allocator inside
                 // supply_kbl_class_table then probes its way into the *low* window
                 // (measured: it once "supplied" a table at VA 0x0004705F and the
-                // registration loop faulted).  Only the very first supply allocates.
+                // allocator faulted). Preserve any current nonzero guest pointer.
+                u32 global_pa = 0;
+                std::string read_fault;
+                const bool vacant = arm->translate(kClassTableGlobal, false, false,
+                                                   global_pa, read_fault) &&
+                                    arm_bus_->read32(global_pa) == 0u;
                 bool done = false;
-                if (class_table_va_ != 0u) {
+                if (vacant && class_table_va_ != 0u) {
                     // Write the *table address* into the *pointer slot* - translating
                     // the table's own VA here would overwrite the table's first word
-                    // with its own address and the registration loop would then spin
+                    // with its own address and the allocator would then spin
                     // on a lock value of 0x400B0000 (measured, round 111).
                     u32 pa = 0;
                     std::string fault;
@@ -1725,31 +1769,22 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                         }
                     }
                 }
-                if (!done) supply_kbl_class_table(core);
+                if (vacant && !done) supply_kbl_class_table(core);
             }
         }
         return false;    // the load still has to run
     }
 
-    // Substitution (round 94, extended round 163): restore the ARM exception vectors
-    // at the mapping the KBL installed.  The KBL points VBAR at VA 0x16100 and maps
-    // that VA onto its own DRAM page (`vpa 0x16100` = PA 0x40000100), where its copy
-    // is incomplete (two `ldr pc,[pc,#0x18]` words followed by data), so every
-    // exception entry falls into zeros and the core ends up hopping through the whole
-    // vector page.  The model stages the real 0xC0-byte table from the KBL's ELF
-    // segment (vaddr 0) the first time the core enters the vector window, at the
-    // physical address the core's own tables resolve.
+    // Preserve the FW 1.04 runtime vector page. SKBL builds eight exception
+    // stubs and a separate monitor table at PA 0x40000100; its SMC entry is at
+    // +0x48 and its installed handler pointer at +0x68. The raw ELF vectors have
+    // no monitor table. Copying those over the runtime page destroys the genuine
+    // SMC path once Monitor correctly uses the Secure translation bank.
     //
-    // Round 163: staging the ELF table is not enough for the TrustZone monitor.  SKBL
-    // *builds* the two tables at runtime, with the MMU off, straight into the physical
-    // page PA 0x40000100: the exception stubs at +0x00 and their handlers at +0x20
-    // (measured: {0x4002826C, 0x400288C4, ...}) and the monitor stubs at +0x40..+0x5F
-    // with the SMC handler pointer (MVBAR+0x28 -> 0x4002831C) at +0x68.  NSKBL, however,
-    // clears SCTLR at 0x51000138 and therefore runs with the MMU *off*: its first
-    // `smc` (0x510002E4, r12 = 0x103) fetches the monitor vector physically from
-    // MVBAR = 0x16140, which in the model is the low boot page - the staged ELF table
-    // has zeros there, so the core executed the zero page and derailed.  Mirror the
-    // page SKBL built into the page the MMU-off fetch actually reads.
+    // The existing development fallback may still need to mirror the runtime
+    // page when VA 0x16100 resolves elsewhere (including an MMU-off debug entry).
+    // Use raw ELF exception vectors only when neither physical page has a valid
+    // runtime monitor table.
     if (supply_blocks && pc >= 0x16100u && pc < 0x16200u) {
         if (core < static_cast<u32>(kArmCoreCount)) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
@@ -1761,7 +1796,42 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                 std::string fault;
                 const bool mapped = arm->translate(0x00016100u, false, false, pa, fault);
                 if (!mapped) pa = 0x40000100u;
-                if (!kbl_vectors_restored_ && !kbl_vectors_.empty()) {
+                const auto valid_runtime_table = [&](u32 base) {
+                    for (u32 i = 0; i < 8u; ++i) {
+                        if (arm_bus_->read32(base + i * 4u) != 0xE59FF018u) return false;
+                    }
+                    const u32 smc_handler = arm_bus_->read32(base + 0x68u);
+                    if (arm_bus_->read32(base + 0x48u) != 0xE59FF018u ||
+                        smc_handler == 0u) return false;
+                    // IntrMgr replaces the KBL's identity-mapped handler with
+                    // its relocated virtual address. Validate that address in
+                    // the executing Monitor's Secure translation bank before
+                    // checking RAM; treating it as a PA rejects the live table.
+                    u32 handler_pa = smc_handler & ~1u;
+                    if (arm_bus_->is_ram(handler_pa, 4u)) return true;
+                    std::string handler_fault;
+                    return arm->translate(smc_handler & ~1u, false, true,
+                                          handler_pa, handler_fault) &&
+                           arm_bus_->is_ram(handler_pa, 4u);
+                };
+                const u32 runtime_page = 0x40000100u;
+                const bool have_runtime = valid_runtime_table(runtime_page);
+                if (valid_runtime_table(pa)) {
+                    // The guest has already installed this page; keep its
+                    // handler registrations and all adjacent boot-context data.
+                    kbl_vectors_restored_ = true;
+                } else if (have_runtime && pa != runtime_page && kbl_vector_mirrors_ < 8u) {
+                    for (u32 i = 0; i < 0x100u; ++i) {
+                        arm_bus_->write8(pa + i, arm_bus_->read8(runtime_page + i));
+                    }
+                    kbl_vectors_restored_ = true;
+                    ++kbl_vector_mirrors_;
+                    ZLB_LOG_INFO("machine",
+                                 "SKBL runtime vector page mirrored to PA 0x%08X "
+                                 "(VA 0x16100 mapping) (development substitution)", pa);
+                    add_milestone("SKBL runtime vector page mirrored to PA 0x" + hex(pa, 8) +
+                                  " (development substitution)");
+                } else if (!have_runtime && !kbl_vectors_restored_ && !kbl_vectors_.empty()) {
                     for (size_t i = 0; i < kbl_vectors_.size(); ++i) {
                         arm_bus_->write8(pa + static_cast<u32>(i), kbl_vectors_[i]);
                     }
@@ -1773,26 +1843,6 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
                                  kbl_vectors_.size());
                     add_milestone("ARM exception vectors restored at PA 0x" + hex(pa, 8) +
                                   " (development substitution)");
-                }
-                // SKBL's runtime page, when it exists and lives somewhere else.
-                const u32 runtime_page = 0x40000100u;
-                if (pa != runtime_page && arm_bus_->read32(runtime_page) != 0u &&
-                    kbl_vector_mirrors_ < 8u) {
-                    bool copied = false;
-                    for (u32 i = 0; i < 0x100u; ++i) {
-                        const u8 byte = arm_bus_->read8(runtime_page + i);
-                        if (byte != 0u) copied = true;
-                        arm_bus_->write8(pa + i, byte);
-                    }
-                    if (copied) {
-                        ++kbl_vector_mirrors_;
-                        ZLB_LOG_INFO("machine",
-                                     "SKBL vector page mirrored to PA 0x%08X (MMU-off monitor "
-                                     "fetch at MVBAR 0x16140) (development substitution)",
-                                     pa);
-                        add_milestone("SKBL vector page mirrored to PA 0x" + hex(pa, 8) +
-                                      " (development substitution)");
-                    }
                 }
             }
         }
@@ -2349,51 +2399,10 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         }
     }
 
-    // Substitution (round 184): NSKBL's boot-mode gate 0x51010F14 reads the byte at
-    // boot_config[0x33] and treats 0xFF as "the boot configuration is valid"; anything
-    // else sends it down the path that prints ".Safe Mode : [ YES ]" (docs/NSKBL.md
-    // 8.26-8.27).  Nothing in the model ever fills that byte - the whole structure at
-    // VA 0x47C0 is zeroed by NSKBL's own initialiser and no CPU store or DMA to it
-    // exists - so the machine sits in the first-boot/safe path forever.  A console that
-    // booted before has this marker persisted, so stamping it stands in for "the boot
-    // configuration is valid" and is on by default (ZLB_NSKBL_BOOTCFG=0 disables it).
-    // Measured effect: the mode gate 0x51010F14 returns 0 instead of 1, the safe-mode
-    // print (0x5100100E/0x51001022) no longer runs, and ~600 more bytes of NSKBL (the
-    // class installer 0x51007E88-0x51007EF8 and the stage tail 0x51001042-0x51001054)
-    // execute.
-    static const bool bootcfg_marker = [] {
-        const char* value = std::getenv("ZLB_NSKBL_BOOTCFG");
-        if (value != nullptr && value[0] == '0') return false;
-        return substitutions_enabled_static();
-    }();
-    if (bootcfg_marker && pc == 0x51010F20u) {
-        // boot-config VA 0x47C0 lives in NSKBL's low window: PA = VA + 0x40300000.
-        static bool stamped = false;
-        const u32 bootcfg_pa = 0x403047C0u;
-        if (!stamped) {
-            arm_bus_->write8(bootcfg_pa + 0x33u, 0xFFu);
-            // Round 261: the first external load is gated on bit 0 of the boot config's
-            // +0x6C field.  The dispatcher 0x51018F6C calls 0x51010F00 for the object call
-            // 0x10005 ("open path"), and that helper is literally
-            //     r3 = [obj+0x3C] (boot config) ; r0 = [r3+0x6C] ; r0 &= 1 ; bx lr
-            // A zero result sends the dispatcher to its failure exit 0x51019116, which is
-            // why NSKBL's open of os0:psp2bootconfig.skprx returns 0x803FF007.  Bit 0 means
-            // "storage loading enabled" for the boot configuration the model supplies.
-            const u32 gate_pa = bootcfg_pa + 0x6Cu;
-            // Bit 0 gates the dispatcher's first check (0x51010F00) and the firmware sets
-            // it itself (pc 0x5101587C writes 1 there), so supplying it matches the
-            // guest's own intent.  Bit 2 gates the second check (0x51010EEC,
-            // `ubfx r0, r0, #2, #1`), but setting it did not change the run and the guest
-            // never writes it - so the model does not fabricate it.
-            arm_bus_->write32(gate_pa, arm_bus_->read32(gate_pa) | 1u);
-            stamped = true;
-            ZLB_LOG_INFO("machine",
-                         "boot-config marker written (PA 0x%08X = 0xFF; PA 0x%08X |= 1; development "
-                         "substitution)",
-                         bootcfg_pa + 0x33u, gate_pa);
-            add_milestone("NSKBL boot-config marker stamped (development substitution)");
-        }
-    }
+    // Boot-mode bytes now come from the modeled Ernie NVS at the original
+    // board handoff. The retired bootcfg marker overwrote copied +33 and ORed
+    // +6C bit0, falsely selecting external boot. With bit0 clear, the genuine
+    // dispatcher takes its ordinary alternate path and still opens os0.
 
     // Substitution (round 236): remember the section NSKBL replaces with a page table, so
     // that the window's content can be measured with and without it (docs/NSKBL.md 8.69).
@@ -2830,8 +2839,13 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     // `arm1 from pc=0x4003B3D0 sp=0x3F10`).  On hardware the stage before the KBL
     // gives each core its own stack through the ARM boot context, which the model
     // does not have (docs/STATUS.md 3.1).  The trampoline 0x4003A140 is
-    // `mov sp,r2; bx r1`, so biasing r2 per core gives each secondary its own 4 KiB
-    // page inside the same low window.  Measured effect: NSKBL goes 0xA4 -> 0xA7
+    // `mov sp,r2; bx r1`, so biasing the measured shared top 0x4000 per core
+    // gives each secondary its own 4 KiB page inside the same low window.
+    // Preserve native allocated stack tops: the caller at 0x400207B0..40020806
+    // allocates 0x4000 bytes, stores base+size in the per-core record +0x1BC,
+    // and loads that exact top into r2. Adding a bias there runs past the
+    // allocation and corrupts saved returns (observed in the cold boot).
+    // Measured effect of the original shared-stack fallback: NSKBL goes 0xA4 -> 0xA7
     // (all four cores pass "other cores start" and the MMU/VBAR step and run at
     // 0x80000000), where without it the secondaries die in the barrier.
     // ZLB_KBL_CORE_STACK=<hex> overrides the step, 0 disables it,
@@ -2843,16 +2857,19 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     }();
     if (core_stack_step != 0u && pc == 0x4003A140u && core > 0u) {
         if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
-            const u32 biased = static_cast<u32>(arm->r[2]) + core * core_stack_step;
-            arm->set_register("r2", biased);
-            if (core_stack_biases_ < 4u) {
-                ++core_stack_biases_;
-                ZLB_LOG_INFO("machine",
-                             "per-core stage stack: arm%u 0x%08X -> 0x%08X (development "
-                             "substitution; ZLB_KBL_CORE_STACK=%X)",
-                             core, static_cast<u32>(arm->r[2]), biased, core_stack_step);
-                add_milestone("per-core ARM stage stack for arm" + std::to_string(core) +
-                              " (development substitution)");
+            const u32 original_top = arm->r[2];
+            if (original_top == 0x4000u) {
+                const u32 biased = original_top + core * core_stack_step;
+                arm->set_register("r2", biased);
+                if (core_stack_biases_ < 4u) {
+                    ++core_stack_biases_;
+                    ZLB_LOG_INFO("machine",
+                                 "per-core stage stack: arm%u 0x%08X -> 0x%08X (development "
+                                 "substitution; ZLB_KBL_CORE_STACK=%X)",
+                                 core, original_top, biased, core_stack_step);
+                    add_milestone("per-core ARM stage stack for arm" + std::to_string(core) +
+                                  " (development substitution)");
+                }
             }
         }
     }
@@ -3198,19 +3215,16 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
         return false;    // the allocator still runs its own code
     }
 
-    // Substitution (round 134): the SceSysmem heap lookup 0x4002C4D8 walks the
-    // object manager for `(type=0x0001000B, uid=r0)` and, on a miss, prints
-    // "sceKernelAllocHeapMemory failed(NULL)" (kprintf of the .rodata string
-    // 0x4005A9A4).  The heap object 0x5900 is created (round 130) but its SceUID is
-    // never allocated (empty registry 0x5A40), so every lookup sees uid == 0 and
-    // fails.  Stand in: when the uid is 0, return the created heap object directly
-    // so the allocator has a heap to carve out of.  ZLB_NO_SUBSTITUTION=1 disables
-    // it; ZLB_KBL_HEAP_LOOKUP=0 disables just this substitution.
+    // Historical opt-in allocation substitution. 0x4002C4D8 takes a byte count,
+    // supplies internal heap UID 0x1000B, and calls the real heap allocator; it is
+    // not a UID lookup entry. The native heap now exists and must perform these
+    // allocations itself. ZLB_KBL_HEAP_LOOKUP=1 retains the old zero-page return
+    // experiment for comparisons; it stays disabled during an ordinary boot.
     static const bool heap_lookup_fix = [] {
         const char* off = std::getenv("ZLB_NO_SUBSTITUTION");
         if (off != nullptr && off[0] != '0') return false;
         const char* on = std::getenv("ZLB_KBL_HEAP_LOOKUP");
-        return on == nullptr || on[0] != '0';
+        return on != nullptr && on[0] != '0';
     }();
     if (heap_lookup_fix && pc == 0x4002C4D8u) {
         if (core < static_cast<u32>(kArmCoreCount)) {
@@ -3396,13 +3410,50 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
             if (ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get())) {
                 u64 heap = 0;
                 if (arm->get_register("r0", heap)) {
-                    // Round 135: route a garbage heap pointer (measured 0x4B656353 =
-                    // the first word of the string "SceKernel…" read little-endian, a
-                    // never-initialised [pool] word) to the real created heap 0x5900,
-                    // and zero its cookie so the 0x40034A16 comparison against the
-                    // (still zero) global cookie 0x400B2974 passes.
                     const u32 hv = static_cast<u32>(heap);
-                    if (hv >= 0x10000u) {
+                    // Native FW1.04 also creates dlmalloc heaps above VA 0x10000:
+                    // its internal heap at VA 0x70008 has a fully initialized
+                    // header and the same nonzero cookie as [0x400B2974]. Preserve
+                    // those heaps. The older fallback below is only for pointers
+                    // that fail this native-state check, such as the measured
+                    // ASCII word 0x4B656353 ("SceK") from an uninitialized pool.
+                    // Check the whole header through the current MMU, including
+                    // page boundaries, so matching MMIO/unmapped words cannot
+                    // qualify as a heap. +0x1D8 is the last header field used by
+                    // the guest allocator/heap initializer.
+                    auto valid_native_heap = [&] {
+                        constexpr u32 kHeaderBytes = 0x1DCu;
+                        auto plain_ram = [&](u32 pa, u32 bytes) {
+                            if (!arm_bus_->is_ram(pa, bytes)) return false;
+                            const u64 end = static_cast<u64>(pa) + bytes;
+                            for (const auto& device : arm_bus_->devices()) {
+                                const u64 device_end = static_cast<u64>(device->base()) + device->size();
+                                if (static_cast<u64>(pa) < device_end && device->base() < end) return false;
+                            }
+                            return true;
+                        };
+                        if (hv > 0xFFFFFFFFu - kHeaderBytes) return false;
+                        u32 cookie_pa = 0, field_pa = 0;
+                        std::string fault;
+                        if (!arm->translate(kCookieVa, false, false, cookie_pa, fault) ||
+                            !plain_ram(cookie_pa, 4u)) return false;
+                        const u32 cookie = arm_bus_->read32(cookie_pa);
+                        if (cookie == 0u ||
+                            !arm->translate(hv + 0x24u, false, false, field_pa, fault) ||
+                            !plain_ram(field_pa, 4u) ||
+                            arm_bus_->read32(field_pa) != cookie) return false;
+                        for (u32 offset = 0; offset < kHeaderBytes;) {
+                            const u32 va = hv + offset;
+                            const u32 chunk = std::min(kHeaderBytes - offset,
+                                                      0x1000u - (va & 0xFFFu));
+                            u32 pa = 0;
+                            if (!arm->translate(va, false, false, pa, fault) ||
+                                !plain_ram(pa, chunk)) return false;
+                            offset += chunk;
+                        }
+                        return true;
+                    };
+                    if (hv >= 0x10000u && !valid_native_heap()) {
                         arm->set_register("r0", 0x00005900u);
                         heap = 0x00005900ull;
                         u32 field_pa = 0;
@@ -3590,12 +3641,11 @@ bool Vita::satisfy_arm_boot_pc(u32 core, u32 pc) {
     return true;
 }
 
-// Substitution body (round 93): create the per-class table the SceUID registration
-// walks (global 0x400B291C), because nothing in the loader ever writes that global
-// - see the note at the call site.  The table is 8 entries of 0x14 bytes
-// ({lock, count, head, next, spare}) and lives in a page the model allocates for
-// itself out of the partition's region, walking down from the tail until a page
-// accepts writes.
+// Create a fallback MemBlock descriptor pool table only while global 0x400B291C
+// is zero. FW1.04's native table has nine 0x14-byte records with fields
+// {lock, free_count, low_water_count, head, tail}. Empty fallback records supply
+// no objects; native initialization remains responsible for populating them.
+// The fallback lives in a writable page near the partition region's tail.
 bool Vita::supply_kbl_class_table(u32 core) {
     if (core >= static_cast<u32>(kArmCoreCount)) return false;
     ArmCore* arm = dynamic_cast<ArmCore*>(arm_cores_[core].get());
@@ -3636,7 +3686,8 @@ bool Vita::supply_kbl_class_table(u32 core) {
         return false;
     }
 
-    constexpr u32 kTableBytes = 8u * 0x14u;
+    constexpr u32 kTableEntries = 9u;
+    constexpr u32 kTableBytes = kTableEntries * 0x14u;
     u32& cursor = partition_block_next_[1];
     if (cursor == 0u || cursor > region_size) cursor = region_size - 0x1000u;
     while (cursor >= 0x1000u) {
@@ -3651,12 +3702,12 @@ bool Vita::supply_kbl_class_table(u32 core) {
         if (writable) {
             if (!write_va(kClassTableGlobalVa, table)) return false;
             cursor = cursor > 0x1000u ? cursor - 0x1000u : 0u;
-            class_table_va_ = table;    // remember it: the loader zeroes the slot later
+            class_table_va_ = table;    // remember it in case the slot becomes zero
             ++class_tables_supplied_;
             ZLB_LOG_INFO("machine",
                          "class table supplied at VA 0x%08X (global 0x%08X, %u entries) "
                          "(development substitution)",
-                         table, kClassTableGlobalVa, 8u);
+                         table, kClassTableGlobalVa, kTableEntries);
             add_milestone("KBL class table created at VA 0x" + hex(table, 8) +
                           " (development substitution)");
             return true;
@@ -4032,12 +4083,12 @@ bool Vita::supply_kbl_instance_block(u32 core, u32& out_block) {
     return true;
 }
 
-// Substitution body: put free blocks of the requested class into the calling
+// Legacy opt-in substitution: put raw blocks of the requested class into the calling
 // core's page-cache slot of the KBL's own partition.  The partition record, its
 // cache table and the region it describes are all addressed through the core's
 // active page tables, because the loader rebuilds them while it boots (docs/KBL.md
 // round 57), and every field offset here was read out of the allocator itself
-// (round 95): +0x08 magic 0x4080502B, +0x18 size, +0x1C base, +0x9C cache table,
+// (round 95): +0x08 magic 0x4080502B, +0x18 base, +0x1C size, +0x9C cache table,
 // cache slot = table + core*0x20.
 bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
     // The page cache is only consulted for 0x1000 (see the note at the call site);
@@ -4058,6 +4109,11 @@ bool Vita::supply_kbl_partition_block(u32 core, u32 pool_va, u32 size) {
             partition_blocks_per_class_ = static_cast<u32>(count);
         }
     }
+    // Genuine cache misses enter the guest's own buddy allocator. Its return is
+    // a metadata descriptor address, not the body of a RAM page. The historical
+    // raw-page substitution below does not satisfy that contract and must not
+    // run by default.
+    if (partition_blocks_per_class_ == 0u) return false;
     // The slot holds {u16 target, u16 count, u32 head, u32 extra0, u32 extra1} and
     // the pop path only reads head / extra0 / extra1, so at most three blocks can
     // be handed out from one seeding.
@@ -4275,7 +4331,22 @@ bool Vita::build_kbl_param() {
     put_field8(0x03, (board::kKblParamSize >> 8) & 0xFF);
     put_field32(0x04, 0x01040000);                               // current firmware version (1.04)
     put_field32(0x08, 0x01040000);                               // minimum firmware version (SMI leaf)
-    // 0x20 QA flags: none.  0x30 boot flags: no Ernie NVS overrides.
+    // The genuine 1.04 second-loader builder copies NVS4A0 into +30,
+    // cached NVS481/483 into +31/+33, and its cold initializer supplies +32=0
+    // (41D2C..41D32, 41CB0, 42174, 42188). Zero-filled +30 falsely selects
+    // update mode in Sysmem; fresh modeled NVS yields FF FF 00 FF instead.
+    // Read the existing board state, without issuing another SC transaction.
+    const auto nvs_boot_byte = [&](u16 offset) -> u8 {
+        std::vector<u8> data;
+        if (ernie_ && ernie_->read_nvs(offset, 1, data) && data.size() == 1)
+            return data[0];
+        return 0xFF; // unavailable board NVS uses the existing unprovisioned profile
+    };
+    put_field8(0x30, nvs_boot_byte(0x04A0));
+    put_field8(0x31, nvs_boot_byte(0x0481));
+    put_field8(0x32, 0);
+    put_field8(0x33, nvs_boot_byte(0x0483));
+    // 0x20 QA flags: none.
     // 0x40 DIP switches (0x20 bytes): no CP board (zeroes), then the release-mode
     // values the wiki lists (sdk 0, shell 0, debug 0x00080002, system 0x20000000).
     put_field32(0x50, 0x00000000);                               // SDK (SCE) flags
@@ -4288,7 +4359,8 @@ bool Vita::build_kbl_param() {
     // 0x70 OpenPsId: no per-console id in the dumps, left zero.
     put_field32(0x80, board::kCmepSecureKernelBase);             // secure_kernel.enp paddr
     put_field32(0x84, secure_kernel_size_);
-    // 0x88 context_auth_sm.self: not present in the 1.04 SLB2.
+    put_field32(0x88, context_auth_sm_pa_);                      // optional context_auth_sm.self
+    put_field32(0x8C, context_auth_sm_size_);
     put_field32(0x90, kprx_auth_sm_pa_);                         // kprx_auth_sm.self paddr
     put_field32(0x94, kprx_auth_sm_size_);
     put_field32(0x98, prog_rvk_pa_);                             // prog_rvk.srvk paddr
@@ -4393,6 +4465,8 @@ bool Vita::start_arm_kernel_boot_loader() {
     // as PA 0..0x3FFF, so the mirror has to run last or it overwrites the record it
     // was meant to publish (the old order built it first and mirrored after, which
     // wiped it - docs/KBL.md 7.1.32).
+    // A direct debug-stage entry skips the second-loader handoff.
+    if (!secure_modules_staged_) stage_secure_modules();
     build_kbl_param();
 
     // The wiki's boot sequence: the CMeP's 32 KiB scratch buffer (SPAD32K) is
@@ -4552,7 +4626,9 @@ bool Vita::start_nskbl() {
     // the record overwrites the record the ARM is about to read (docs/KBL.md 7.1.32).
     const bool have_record = arm_bus_->read32(board::kKblParamBase) != 0;
     mirror_cmep_scratch_to_arm();
-    if (!substitutions_enabled_static() || !have_record) build_kbl_param();
+    const bool direct_module_handoff = !secure_modules_staged_;
+    if (direct_module_handoff) stage_secure_modules();
+    if (!substitutions_enabled_static() || !have_record || direct_module_handoff) build_kbl_param();
 
     const u32 compressed = arm_bus_->read32(kNskblCompressedPa);
     if (compressed != 0x4C5A5241u) {   // "ARZL"
@@ -4645,29 +4721,6 @@ bool Vita::cmep_pc_hook(u32 pc) {
         return value != nullptr && value[0] != '0';
     }();
     if (disabled) return false;
-    // The secure kernel's success path ends by jumping back into the 0x40000 window
-    // (it re-enters its caller with "done"), which on hardware is the point where
-    // it has told the syscon to reset the ARM at 0x00000000 (wiki, step 4).  Our
-    // model has no SC path for that message yet, so the jump is turned into the
-    // syscon release directly.  The test is "the secure kernel is the current
-    // image" rather than the boot stage: by the time the first instruction at
-    // 0x40000 runs, poll_boot_chain() has already relabelled the stage from the PC.
-    if (secure_kernel_active_ && pc >= board::kSecondLoaderStaging && pc < board::kFirstLoaderBase) {
-        secure_kernel_done_ = true;
-        // Round 152 experiment: do NOT swallow the jump but let the second loader
-        // run its post-secure-kernel continuation - that is where 0x408EC ->
-        // 0x41B4A would build SceKblParam for real instead of the substitution.
-        // Measured with ZLB_CMEP_HANDOFF_RUN=1: the CMeP reaches the cold branch
-        // 0x40858 (it never got there before) and runs ~14.8M instructions, but
-        // within 60k slices it does not reach the builder and it never signals
-        // the ARM release, so the run ends with the ARM still parked.  Off by
-        // default; kept as the starting point for the next round.
-        static const bool run_through = [] {
-            const char* value = std::getenv("ZLB_CMEP_HANDOFF_RUN");
-            return value != nullptr && value[0] != '0';
-        }();
-        return !run_through;
-    }
     if (boot_.stage == BootStage::CmepSecondLoader && pc == board::kFirstLoaderServiceEntry) {
         cmep_service_pending_ = true;
         return true;
@@ -4695,6 +4748,9 @@ bool Vita::enter_stage(BootStage stage) {
     switch (stage) {
         case BootStage::CmepFirstLoader:
             cmep_->reset(config_.first_loader_base);
+            if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+                mep->set_boot_vector_base(board::kSecondLoaderStaging);
+            }
             cmep_->prepare_reset_context(board::kCmepStackTop, 0x00040000, 0, 0);
             cmep_->halted = false;
             boot_.stage = stage;
@@ -4784,7 +4840,8 @@ void Vita::poll_boot_chain() {
 
     // Once the first loader hands control to the staged image, the CMeP runs the
     // second loader out of its own RAM window below the first loader.
-    if (cmep_pc < config_.first_loader_base && cmep_pc >= 0x00040000) {
+    if (!secure_kernel_active_ && !boot_.arm_released &&
+        cmep_pc < config_.first_loader_base && cmep_pc >= 0x00040000) {
         if (boot_.stage != BootStage::CmepSecondLoader) {
             boot_.stage = BootStage::CmepSecondLoader;
             boot_.detail = "CMeP second loader executing at 0x" + hex(cmep_pc, 5);
@@ -4804,100 +4861,27 @@ void Vita::poll_boot_chain() {
         boot_.cmep_status = cmep_block_ ? cmep_block_->cmep_status() : 0;
     }
 
-    // The secure kernel's success path re-enters the 0x40000 window (see
-    // Vita::cmep_pc_hook): that jump goes back into the *second loader*, whose
-    // remaining work is what fills the ARM boot context (the second loader copies
-    // 1 KiB from DRAM to scratch+0x100, image 0x40A86, and clears the scratch
-    // header - which is also what our traces saw at SPAD+0x100).  On hardware the
-    // syscon releases the ARM only after the CMeP is done, so the model keeps the
-    // CMeP running for a bounded budget first: halting it at the jump lost the
-    // context and left kernel_boot_loader without its objects.
-    if (secure_kernel_done_) {
-        secure_kernel_done_ = false;
-        secure_kernel_active_ = false;
-        if (substitutions_enabled_static()) {
-            cmep_finish_pending_ = true;
-            cmep_finish_steps_ = 0;
-            ZLB_LOG_INFO("boot",
-                         "secure kernel finished (jump back to 0x40000): letting the second loader finish "
-                         "before the ARM is released");
-            add_milestone("secure kernel finished -> second loader continues (ARM boot context)");
-        } else {
-            cmep_->halted = true;
-            if (ernie_) ernie_->release_soc();
-            cmep_context_done_ = true;   // no CMeP continuation is modelled (round 92)
-            ZLB_LOG_INFO("boot",
-                         "secure kernel finished (jump back to 0x40000): substituting the syscon handshake, "
-                         "releasing the ARM");
-            add_milestone("CMeP secure kernel finished -> syscon SoC release (development substitution)");
-        }
-    }
-
-    // Bounded continuation: the second loader's post-processing runs, then the ARM
-    // is released (either because the CMeP stops by itself or when the budget ends).
-    if (cmep_finish_pending_ && !boot_.arm_released) {
-        ++cmep_finish_steps_;
-        const bool stopped = cmep_ == nullptr || cmep_->halted;
-        if (stopped || cmep_finish_steps_ >= kCmepFinishBudget) {
-            cmep_finish_pending_ = false;
-            if (cmep_) cmep_->halted = true;
-            if (ernie_) ernie_->release_soc();
-            cmep_context_done_ = true;   // the ARM may start now (round 92)
-            ZLB_LOG_INFO("boot",
-                         "second loader finished after the secure kernel (%s, %llu steps): releasing the ARM",
-                         stopped ? "it stopped by itself" : "budget reached",
-                         static_cast<unsigned long long>(cmep_finish_steps_));
-            add_milestone("CMeP second-loader post-processing done -> syscon SoC release");
-        }
-    }
-
-    // The secure kernel starts by waiting for the CMeP->ARM status word to be
-    // consumed: its loop at 0x008003C0 is
-    //     $3 = 0xE0000000; erepeat; lw $2,($3); $2 &= 0xFFFF; beqz $2, <continue>
-    // so somebody on the ARM side has to read it back as zero before it goes on.
-    // That "somebody" is the ARM's boot ROM, which our model stands in for.
-    if (boot_.stage == BootStage::CmepSecureKernel && boot_.cmep_status != 0u) {
+    // The ARM boot-ROM stand-in consumes only the second loader's residual
+    // status (9). The secure kernel then publishes 0x101 at 0x800408 and waits
+    // for a shared-buffer PA followed by a doorbell. That exchange belongs to
+    // the native ARM SceSblSmsched module, not to the boot ROM. Answering it with
+    // 1 supplied PA zero; forcing the CMeP state to 9 requested shutdown and
+    // destroyed the secure kernel before the ARM scheduler could use it.
+    if (secure_kernel_active_ && !boot_.arm_released && cmep_block_) {
         const u32 status = static_cast<u32>(boot_.cmep_status);
-        cmep_block_->set_cmep_status(0);
-        boot_.cmep_status = 0;
-        // The secure kernel's start-up is a handshake: it clears the ARM->CMeP
-        // register (writes 0xFFFFFFFF to 0xE0000010 at 0x8003FA), posts a status
-        // (0x101 at 0x800408) and then parses the answer; the check at 0x800430 is
-        //     bnei $8, 0x1, <post 0x802F and idle>
-        // so the answer has to be 1 for it to continue.  The ARM's boot ROM is
-        // what answers on hardware.
-        cmep_block_->set_arm_to_cmep_command(1);
-        // The CMeP's handshake is interrupt driven: after posting 0x102 the secure
-        // kernel waits for its own handler 0x80099E (reached from the dispatch
-        // table at 0x800B8A) to set the state variable at `$gp - 32748` to 9
-        // (`bnei $0,0x9,<idle>` at 0x800462).  The MeP core does not model
-        // interrupt delivery yet, so the ARM's reply is turned into that event
-        // directly; the address comes from the firmware's own $gp, which the
-        // machine reads from the core.
-        u64 gp = 0;
-        if (cmep_->get_register("gp", gp) && gp != 0u) {
-            cmep_bus_->write32(static_cast<u32>(gp) - 32748u, 9u);
+        if (status == 9u) {
+            cmep_block_->set_cmep_status(0);
+            boot_.cmep_status = 0;
+            add_milestone("ARM boot ROM acknowledged the second-loader status 0x009");
+        } else if ((status & 0xFFFFu) == 0x101u && !cmep_context_done_) {
+            // The missing reset/ROM path is still modelled here. Preserve the
+            // pending status and the live CMeP so genuine Smsched can ACK it,
+            // submit its allocated shared buffer, and complete initialization.
+            if (ernie_) ernie_->release_soc();
+            cmep_context_done_ = true;
+            ZLB_LOG_INFO("boot", "CMeP published 0x101: releasing ARM for the native scheduler handshake");
+            add_milestone("CMeP ready for native scheduler -> syscon SoC release (development substitution)");
         }
-        // ... and wake the core: the wait loop is
-        //     0x80045E  bsr 0x801D5A          ; read the state
-        //     0x800462  bnei $0, 0x9, 0x800488
-        //     0x800488  sleep                 ; wait for the reply
-        //     0x80048A  bra 0x80045E
-        // so the secure kernel is *asleep* when the answer arrives.  Without the
-        // wake the state variable is set but never read again, the secure kernel
-        // never reaches the code that builds the ARM boot context (the structure
-        // with the 0x61CE6649 signature at DRAM+0xA0 which the second loader then
-        // copies into the scratchpad), and kernel_boot_loader finds an empty
-        // context.  This stands in for the CMeP interrupt the mailbox raises.
-        if (cmep_->halted) {
-            cmep_->halted = false;
-            ZLB_LOG_INFO("boot", "woke the CMeP for the handshake reply (MeP interrupt not modelled)");
-            add_milestone("CMeP woken for the handshake reply (development substitution)");
-        }
-        ZLB_LOG_INFO("boot",
-                     "ARM boot ROM consumed the CMeP status 0x%X and answered 0xE0000010 <- 1 (handshake)",
-                     status);
-        add_milestone("ARM boot ROM answered the CMeP handshake (status 0x" + hex(status, 3) + ")");
     }
 
     if (kernel_started_ && !kernel_running_ && arm_ && arm_->instructions > 0) {
@@ -4949,26 +4933,30 @@ std::vector<std::string> Vita::plan_boot() {
     plan.push_back("dumped first loader is loaded straight into the 0x5C000 window, and second_loader is");
     plan.push_back("fed through the first loader's *own documented* boot mode 'A' (0x41, bit0 = image");
     plan.push_back("comes from ARM via mailbox 0xE0000010) rather than by the ROM reading eMMC; step 3");
-    plan.push_back("currently stops inside the per-console SCE chain; `stage kbl` jumps straight to");
-    plan.push_back("step 5, and TrustZone (NS/SCR/MVBAR/secure banked state) is not modelled yet, so");
-    plan.push_back("only the non-secure half of KBL can work.");
+    plan.push_back("still needs per-console SCE services and the missing boot ROM handoff stand-in.");
+    plan.push_back("TrustZone Monitor entry, SCR/MVBAR and separate Secure/Nonsecure MMU banks are");
+    plan.push_back("modelled; `stage kbl` remains a direct debugging entry that skips earlier stages.");
     plan.push_back("");
     plan.push_back("model (round 40): the second loader's own end - an absolute `jmp 0x5FF00`");
     plan.push_back("with $1..$5 loaded with Bigmac/mailbox addresses - is intercepted by a MeP");
     plan.push_back("pc hook, and the ROM routine behind it is substituted by a restart of the");
     plan.push_back("CMeP into secure_kernel.enp at its link address 0x800000 (step 3 -> 4).");
-    plan.push_back("The ARM side of the mailbox handshake (0xE0000000 consumed, 0xE0000010");
-    plan.push_back("answered) is modelled by the ARM boot ROM stand-in.  The secure kernel");
-    plan.push_back("then posts 0x9/0x101/0x802F and idles: the reply its parser at 0x8018B2");
-    plan.push_back("expects is not reproduced yet, which is where step 4 stops.");
+    plan.push_back("The ROM stand-in acknowledges the second-loader status 0x9 and releases");
+    plan.push_back("the ARM cluster when the live secure kernel publishes 0x101. Native ARM");
+    plan.push_back("SceSblSmsched acknowledges 0x101, supplies its shared-buffer PA and receives");
+    plan.push_back("0x102. ARM/CMeP mailbox endpoints implement outgoing set and incoming ACK.");
+    plan.push_back("Later mailbox commands require native interrupt delivery; no shutdown state");
+    plan.push_back("or scheduler completion is supplied by the ROM stand-in.");
+    plan.push_back("Vita's EVM=0 vector bank remaps from 0x40000 to 0x800000 at the secure-kernel");
+    plan.push_back("handoff (missing ROM/register stand-in); CFG selection and vectors stay native.");
     plan.push_back("");
     plan.push_back("model (NSKBL): step 5's second half - the ARZL decode of the non-secure kernel");
-    plan.push_back("boot loader - runs in `stage nskbl`.  The decoder and the ARM filter are the");
-    plan.push_back("KBL's *own* routines (0x4003C330 and 0x4003CB40, called from the KBL itself at");
-    plan.push_back("0x40020588), so only the call is modelled: the model sets up the AAPCS");
-    plan.push_back("registers and a scratch stack on arm0 and runs them.  NSKBL starts at");
-    plan.push_back("0x51000000 in the non-secure world and reaches its checkpoint 0xA1; the next");
-    plan.push_back("wall is its first `smc` into the (not modelled) TrustZone monitor.");
+    plan.push_back("boot loader - runs during normal boot. The decoder and ARM filter are the");
+    plan.push_back("KBL's own routines (0x4003C330 and 0x4003CB40). `stage nskbl` calls those");
+    plan.push_back("routines directly with an AAPCS scratch context as a separate debug path.");
+    plan.push_back("NSKBL starts at 0x51000000 in Nonsecure state. The live checkpoint, core");
+    plan.push_back("registers and boot events above establish the reached state; kernel-loaded");
+    plan.push_back("flags from a direct `stage kernel` do not establish a normal os0 boot.");
     return plan;
 }
 

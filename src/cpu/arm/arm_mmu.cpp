@@ -19,6 +19,7 @@ u32 fsr_for(arm::MmFaultKind kind, bool write, u32 domain, bool second_level) {
         case arm::MmFaultKind::Background: status = 0x00u; break;
         case arm::MmFaultKind::Domain: status = 0x09u | ((domain & 0xFu) << 4); break;
         case arm::MmFaultKind::Permission: status = second_level ? 0x0Fu : 0x0Du; break;
+        case arm::MmFaultKind::AccessFlag: status = second_level ? 0x06u : 0x03u; break;
         case arm::MmFaultKind::Section: status = 0x05u; break;
         default: status = 0x07u; break;  // page translation fault
     }
@@ -35,77 +36,27 @@ bool domain_manager(u32 dacr, u32 domain) {
     return ((dacr >> static_cast<int>(domain * 2)) & 3u) == 3u;  // 3 = manager
 }
 
-/// AP/APX check. Returns true when the access is allowed.
-///
-/// Short-descriptor format uses two different encodings and they are easy to
-/// conflate:
-///   * first level (sections): AP[1:0] in bits [11:10] plus APX in bit 15.
-///     APX is an *override to no user access*, not an AP[2] read-only bit, so
-///     AP[1:0] = 0b11 with APX = 0 is "read/write for everyone" (ARM ARM B3-13).
-///   * second level (pages): a real 3-bit AP[2:0] where AP[2] = read-only.
-bool check_ap(u32 ap, u32 apx, u32 mode, bool write, bool page_table_format) {
+/// All short descriptors use the same AP[2:0] permissions (ARM ARM B3.7.1,
+/// table B3-8). Section AP[2] is descriptor bit 15; page AP[2] is bit 9.
+bool check_ap(u32 ap, u32 mode, bool write) {
     const bool privileged = (mode & arm::kModeMask) != arm::kModeUser;
-
-    if (page_table_format) {
-        // AP[2] (bit 2) = read-only for privileged modes.
-        const u32 ap2 = (ap >> 2) & 1u;
-        const u32 ap10 = ap & 3u;
-        if (write && ap2 != 0) return false;   // read-only for everyone
-        if ((ap10 & 1u) == 0) return privileged;  // 0b00 / 0b10: no user access
-        if ((ap10 & 2u) != 0) return true;     // 0b_11: full access
-        return privileged || !write;           // 0b_01: user read-only
-    }
-
-    const u32 ap01 = ap & 3u;
-    const u32 apx2 = apx & 1u;
-    if (apx2 != 0) {
-        // APX set: privileged permissions from AP[1:0], no user access at all.
-        return (ap01 >= 2u) ? (privileged && !write) : privileged;
-    }
-    switch (ap01) {
-        case 0: return privileged;              // privileged RW, user none
-        case 1: return privileged || !write;    // privileged RW, user RO
-        case 2: return privileged && !write;    // privileged RO, user none
-        default: return true;                   // read/write for everyone
-    }
-}
-
-/// Large page AP check: the second level AP field selects one of four subpage
-/// permission sets (ARM ARM B3.7.3, table B3-16).
-bool check_large_ap(u32 ap, u32 subpage, u32 mode, bool write) {
-    const bool privileged = (mode & arm::kModeMask) != arm::kModeUser;
-    switch (ap & 3u) {
-        case 0u: return subpage == 0u && privileged;
-        case 1u:
-            if (subpage == 0u) return false;
-            if (subpage == 1u) return privileged;
-            return !write;  // subpages 2,3: user read-only
-        case 2u: return privileged || !write || (subpage >= 2u);
-        default: return !write;  // read-only for everyone
+    switch (ap & 7u) {
+        case 0u: return false;
+        case 1u: return privileged;
+        case 2u: return privileged || !write;
+        case 3u: return true;
+        case 5u: return privileged && !write;
+        case 6u: case 7u: return !write;
+        default: return false; // 0b100 is reserved; do not grant access.
     }
 }
 
 /// Classify a TEX/C/B combination into Normal / Device / Strongly-ordered.
-void classify_memory(u32 tex_cb, u32 tex, arm::MmResult& result) {
-    const u32 main = tex_cb & 7u;  // TEX[0],C,B
-    const u32 tex_high = (tex >> 1) & 3u;
-    if (tex_high != 0u) {
-        if (tex_high == 1u) {
-            result.strongly_ordered = true;
-            return;
-        }
-        result.normal = true;
-        return;
-    }
-    switch (main) {
-        case 0: result.strongly_ordered = true; break;
-        case 1: result.device = true; break;  // shared device
-        case 2: result.device = true; break;  // non-shared device (TEX=0b010)
-        case 3: result.normal = true; break;  // write-back, no write allocate
-        case 6: result.device = true; break;  // TEX=0b001, C=1,B=0
-        case 7: result.normal = true; break;  // write-back, write allocate
-        default: result.normal = true; break;
-    }
+void classify_memory(u32 tex, u32 c, u32 b, arm::MmResult& result) {
+    if (tex == 0u && c == 0u && b == 0u) result.strongly_ordered = true;
+    else if ((tex == 0u && c == 0u && b == 1u) ||
+             (tex == 2u && c == 0u && b == 0u)) result.device = true;
+    else result.normal = true;
 }
 
 }  // namespace
@@ -116,6 +67,7 @@ const char* arm::fault_name(arm::MmFaultKind kind) {
         case arm::MmFaultKind::Background: return "translation fault (no TTBR entry)";
         case arm::MmFaultKind::Domain: return "domain fault";
         case arm::MmFaultKind::Permission: return "permission fault";
+        case arm::MmFaultKind::AccessFlag: return "access flag fault";
         case arm::MmFaultKind::Section: return "section translation fault";
         default: return "page translation fault";
     }
@@ -213,7 +165,7 @@ u32 ArmMmu::select_ttbr(u32 va, int& ttbr_num) const {
 /// The wrapper keeps the hot translation path free of bookkeeping branches other
 /// than the ones the debugger actually needs.
 arm::MmResult ArmMmu::translate(u32 va, bool write, bool fetch, u32 mode) {
-    const arm::MmResult result = translate_walk(va, write, fetch, mode);
+    const arm::MmResult result = translate_walk<false>(va, write, fetch, mode);
     if (!result.ok) {
         // Faults are rare, so the rich record is built only here; a successful
         // translation is not recorded at all unless the debugger asked for it
@@ -238,9 +190,31 @@ arm::MmResult ArmMmu::translate(u32 va, bool write, bool fetch, u32 mode) {
     return result;
 }
 
+arm::MmResult ArmMmu::inspect_translation(u32 va, bool fetch, u32 mode) const {
+    ArmMmu snapshot = *this;
+    return snapshot.translate_walk<true>(va, false, fetch, mode);
+}
+
+template <bool Inspect>
 arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     arm::MmResult result;
     if (record_walks) last_walk = WalkRecord{};
+
+    const auto read_descriptor = [&](u32 address) -> u32 {
+        if constexpr (!Inspect) {
+            return read_table(address);
+        } else {
+            address &= ~3u;
+            const MemRegion* region = bus_->region_at(address, 4);
+            if (!region) return 0u;
+            for (u32 byte = 0; byte < 4; ++byte) {
+                if (bus_->find_device(address + byte)) return 0u;
+            }
+            const u8* bytes = region->bytes() + (address - region->base);
+            return static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8) |
+                   (static_cast<u32>(bytes[2]) << 16) | (static_cast<u32>(bytes[3]) << 24);
+        }
+    };
 
     if (!enabled()) {
         result.ok = true;
@@ -257,7 +231,7 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
 
     const u32 l1_index = (va >> 20) & 0xFFFu;
     const u32 l1_addr = ttbr | (l1_index << 2);
-    const u32 l1 = read_table(l1_addr);
+    const u32 l1 = read_descriptor(l1_addr);
     last_walk.l1_addr = l1_addr;
     last_walk.l1_desc = l1;
 
@@ -275,16 +249,17 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
         const u32 ns = (l1 >> 19) & 1u;
         const u32 domain = (l1 >> 5) & 0xFu;
         last_walk.domain = domain;
-        const u32 ap = (l1 >> 10) & 3u;
-        const u32 apx = (l1 >> 15) & 1u;
+        const u32 ap = ((l1 >> 10) & 3u) | (((l1 >> 15) & 1u) << 2);
         const u32 tex = (l1 >> 12) & 7u;
         const u32 c = (l1 >> 3) & 1u;
         const u32 b = (l1 >> 2) & 1u;
         const u32 xn = (l1 >> 4) & 1u;
 
         if (domain_fault(dacr, domain)) {
-            ZLB_LOG_DBG("mmu", "domain fault: VA=0x%08X dacr=0x%08X domain=%u l1=0x%08X", va, dacr, domain,
-                          l1);
+            if constexpr (!Inspect) {
+                ZLB_LOG_DBG("mmu", "domain fault: VA=0x%08X dacr=0x%08X domain=%u l1=0x%08X", va, dacr, domain,
+                            l1);
+            }
             result.fault = arm::MmFaultKind::Domain;
             result.fsr_full = fsr_for(arm::MmFaultKind::Domain, write, domain, false);
             result.fsr_status = result.fsr_full;
@@ -292,7 +267,13 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
         }
 
         const bool manager = domain_manager(dacr, domain);
-        if (!manager && !check_ap(ap, apx, mode, write, false)) {
+        if (!manager && (sctlr & (1u << 29)) != 0u && (ap & 1u) == 0u) {
+            result.fault = arm::MmFaultKind::AccessFlag;
+            result.fsr_full = fsr_for(arm::MmFaultKind::AccessFlag, write, domain, false);
+            result.fsr_status = result.fsr_full;
+            return result;
+        }
+        if (!manager && !check_ap(ap, mode, write)) {
             result.fault = arm::MmFaultKind::Permission;
             result.fsr_full = fsr_for(arm::MmFaultKind::Permission, write, domain, false);
             result.fsr_status = result.fsr_full;
@@ -319,20 +300,11 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
             phys = (l1 & 0xFFF00000u) | (va & 0x000FFFFFu);
         }
 
-        // First level TEX[0],C,B / TEX[2:1] encoding (ARM ARM B3.7, table B3-13).
-        const u32 tex_cb = ((tex & 1u) << 3) | (c << 2) | (b << 1);
-        classify_memory(tex_cb, tex, result);
-
-        // Access-flag update is deliberately not performed. For a first-level
-        // section descriptor bits [8:5] hold the *domain*, so the reference
-        // core's `l1 |= 1 << 8` writes into the domain field and silently
-        // changes the permission model of the whole 1 MiB region (that is what
-        // this MMU was doing before). The access flag is an advisory hint that
-        // software uses for page reclamation, and this model never reclaims, so
-        // not setting it cannot change a translation result.
+        classify_memory(tex, c, b, result);
 
         result.ok = true;
         result.phys_addr = phys;
+        result.supersection = supersection;
         return result;
     }
 
@@ -340,7 +312,7 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     const u32 l2_base = l1 & 0xFFFFFC00u;
     const u32 l2_index = (va >> 12) & 0xFFu;
     const u32 l2_addr = l2_base | (l2_index << 2);
-    u32 l2 = read_table(l2_addr);
+    u32 l2 = read_descriptor(l2_addr);
     // Development substitution (round 236, docs/NSKBL.md 8.69): keep a section that the
     // guest replaced with this page table serving the pages the table leaves unmapped.
     // The synthesized descriptor is the small-page equivalent of the section's
@@ -383,7 +355,6 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     const bool manager2 = domain_manager(dacr, domain2);
 
     const bool large = t2 == 1u;
-    const u32 subpage = large ? ((va >> 14) & 3u) : 0u;
 
     u32 ap_field;
     u32 tex;
@@ -393,9 +364,10 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     u32 phys;
 
     if (large) {
-        // Large page: 64 KiB, 4 x 16 KiB subpages.
-        ap_field = (l2 >> 4) & 3u;
-        tex = (l2 >> 6) & 7u;
+        // ARMv7 large pages have one AP field for all 64 KiB (ARM ARM B3.5.1,
+        // figure B3-5), not ARMv5's four subpage permission fields.
+        ap_field = ((l2 >> 4) & 3u) | (((l2 >> 9) & 1u) << 2);
+        tex = (l2 >> 12) & 7u;
         c = (l2 >> 3) & 1u;
         b = (l2 >> 2) & 1u;
         xn = (l2 >> 15) & 1u;
@@ -419,12 +391,22 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
         phys = (l2 & 0xFFFFF000u) | (va & 0x00000FFFu);
     }
 
-    const bool allowed = large ? check_large_ap(ap_field, subpage, mode, write)
-                               : check_ap(ap_field, 0u, mode, write, true);
+    // Cortex-A9 uses software management of AF: when AFE is set, AP[0]
+    // must already be 1. With AF set, the shared AP table also implements
+    // the simplified AP[2:1] permissions model.
+    if (!manager2 && (sctlr & (1u << 29)) != 0u && (ap_field & 1u) == 0u) {
+        result.fault = arm::MmFaultKind::AccessFlag;
+        result.fsr_full = fsr_for(arm::MmFaultKind::AccessFlag, write, domain2, true);
+        result.fsr_status = result.fsr_full;
+        return result;
+    }
+    const bool allowed = check_ap(ap_field, mode, write);
     if (!manager2 && !allowed) {
-        ZLB_LOG_DBG("mmu", "permission fault (page): VA=0x%08X %s%s mode=0x%02X l2=0x%08X ap_field=0x%X",
-                    va, write ? "write" : "read", fetch ? "/fetch" : "", mode & arm::kModeMask, l2,
-                    ap_field);
+        if constexpr (!Inspect) {
+            ZLB_LOG_DBG("mmu", "permission fault (page): VA=0x%08X %s%s mode=0x%02X l2=0x%08X ap_field=0x%X",
+                        va, write ? "write" : "read", fetch ? "/fetch" : "", mode & arm::kModeMask, l2,
+                        ap_field);
+        }
         result.fault = arm::MmFaultKind::Permission;
         result.fsr_full = fsr_for(arm::MmFaultKind::Permission, write, domain2, true);
         result.fsr_status = result.fsr_full;
@@ -432,18 +414,16 @@ arm::MmResult ArmMmu::translate_walk(u32 va, bool write, bool fetch, u32 mode) {
     }
 
     if (fetch && !manager2 && xn != 0) {
-        ZLB_LOG_DBG("mmu", "execute-never (page): VA=0x%08X l2=0x%08X", va, l2);
+        if constexpr (!Inspect) {
+            ZLB_LOG_DBG("mmu", "execute-never (page): VA=0x%08X l2=0x%08X", va, l2);
+        }
         result.fault = arm::MmFaultKind::Permission;
         result.fsr_full = fsr_for(arm::MmFaultKind::Permission, write, domain2, true) | (1u << 3);
         result.fsr_status = result.fsr_full;
         return result;
     }
 
-    const u32 tex_cb = ((tex & 1u) << 3) | (c << 2) | (b << 1);
-    classify_memory(tex_cb, tex, result);
-
-    // Access flag: bit [10] for a small page descriptor, not bit [8] (bits
-    // [8:6] are TEX). Not updated for the same reason as above.
+    classify_memory(tex, c, b, result);
 
     result.ok = true;
     result.phys_addr = phys;
@@ -492,8 +472,8 @@ void ArmMmu::describe_extended(std::vector<std::string>& lines) const {
     lines.push_back(format("CP15 walks=%llu  faults=%llu  PAR=0x%08X (%s 0x%08X)",
                            static_cast<unsigned long long>(walks),
                            static_cast<unsigned long long>(total_faults), par,
-                           (par & 1u) ? "last VA->PA =" : "last V2P faulted, status",
-                           (par & 1u) ? (par & 0xFFFFF000u) : (par >> 1)));
+                           (par & 1u) ? "last V2P faulted, status" : "last VA->PA =",
+                           (par & 1u) ? (par >> 1) : (par & 0xFFFFF000u)));
     if (last_walk.va != 0 || last_walk.ttbr_num >= 0) {
         lines.push_back(format("last walk: VA=0x%08X pc=0x%08X %s%s -> TTBR%d base=0x%08X "
                                "L1[0x%08X]=0x%08X%s%s",

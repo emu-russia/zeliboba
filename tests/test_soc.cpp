@@ -10,6 +10,7 @@
 
 #include "bus/bus.h"
 #include "common/log.h"
+#include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc.h"
 #include "hw/soc/soc_internal.h"
@@ -18,6 +19,24 @@
 using namespace zlb;
 
 namespace {
+
+// Observe the controller's real CPU input calls without executing a handler.
+class InterruptInputs final : public Cpu {
+public:
+    explicit InterruptInputs(Bus& bus) : Cpu(bus) {}
+    Arch arch() const override { return Arch::Arm; }
+    const char* core_name() const override { return "GIC test receiver"; }
+    void reset() override { irq = fiq = false; }
+    StepResult step() override { return {}; }
+    std::string disassemble(u32, unsigned& length) override { length = 0; return {}; }
+    void registers(std::vector<RegValue>&) const override {}
+    void set_irq(int line, bool asserted) override {
+        if (line == static_cast<int>(IrqLine::Irq)) irq = asserted;
+        if (line == static_cast<int>(IrqLine::FiQ)) fiq = asserted;
+    }
+    bool irq = false;
+    bool fiq = false;
+};
 
 /// One scratch machine per test: the bus, the eMMC image and the block.
 struct Fixture {
@@ -44,11 +63,15 @@ struct Fixture {
 
     u32 gic(u32 offset) const { return kermit::kScuBase + kermit::kGicDistOffset + offset; }
     u32 icc(u32 offset) const { return kermit::kScuBase + kermit::kIccOffset + offset; }
+    void access(unsigned core, bool nonsecure = false) {
+        bus.context.core_id = core;
+        bus.context.nonsecure = nonsecure;
+    }
 
     /// Enable an interrupt line through the distributor's set-enable register.
     void enable_irq(u32 id) {
         bus.write32(gic(0x100 + (id / 32) * 4), 1u << (id % 32));
-        bus.write32(gic(0x400 + id / 4), 0xA0A0A0A0u);
+        bus.write32(gic(0x400 + (id / 4u) * 4u), 0xA0A0A0A0u);
     }
 
     /// Power the interrupt controller up the way a driver would.
@@ -111,6 +134,9 @@ ZLB_TEST(kermit_gic_acknowledge_and_eoi) {
     const u32 spi = static_cast<u32>(kermit::Irq::Emmc);
     fx.gic_start();
     fx.enable_irq(spi);
+    // This test exercises a single edge event, independent of pulse duration.
+    const u32 config_word = fx.gic(0xC00) + (spi / 16u) * 4u;
+    fx.bus.write32(config_word, fx.bus.read32(config_word) | (2u << ((spi % 16u) * 2u)));
 
     ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 0u);
     fx.kermit.pulse_irq(spi, 64);
@@ -140,17 +166,21 @@ ZLB_TEST(kermit_gic_level_and_edge_triggering) {
     // A level sensitive line is pending while it is asserted. Once the interrupt
     // is acknowledged (active) it stays hidden until the EOI, and dropping the
     // line clears it.
-    const u32 config_word = fx.gic(0xC20) + ((spi - 32) / 16) * 4;
-    const u32 config_shift = ((spi - 32) % 16) * 2;
+    const u32 config_word = fx.gic(0xC00) + (spi / 16) * 4;
+    const u32 config_shift = (spi % 16) * 2;
     fx.bus.write32(config_word, fx.bus.read32(config_word) & ~(3u << config_shift));
     fx.kermit.raise_irq(spi, true);
     ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 1u);
     ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)) & 0x3FF, spi);
-    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 0u);
+    // An asserted level can be active and pending simultaneously, but it
+    // cannot be acknowledged again until EOI.
+    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 1u);
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
     // Re-asserting a line that is already sampled high must not latch a new
     // interrupt while the first one is still active.
     fx.kermit.raise_irq(spi, true);
-    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 0u);
+    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 1u);
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
     fx.kermit.raise_irq(spi, false);
     fx.bus.write32(fx.icc(0x010), spi);
     ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 0u);
@@ -164,16 +194,85 @@ ZLB_TEST(kermit_gic_level_and_edge_triggering) {
     fx.kermit.raise_irq(spi, false);
 }
 
+ZLB_TEST(kermit_gic_reset_mailbox_poll_ack_before_interrupt_enable) {
+    Fixture fx("build/soc_test_gic_mailbox_poll.img");
+    Bus cmep_bus;
+    SceKeys keys;
+    CmepBlock cmep(cmep_bus, keys);
+    cmep.install();
+    cmep.install_arm_mailbox(fx.bus);
+    cmep.set_mailbox_irq_callbacks({}, [&](unsigned channel, bool asserted) {
+        fx.kermit.raise_irq(200u + channel, asserted);
+    });
+    InterruptInputs cpu3(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu3, 3);
+
+    // A9 reset configuration: SGIs fixed edge, PPIs fixed per-CPU, and
+    // shared interrupts level-sensitive with their handling-model bit set.
+    for (unsigned core : {0u, 3u}) {
+        fx.access(core);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC00)), 0xAAAAAAAAu);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC04)), 0x7DC00000u);
+        fx.bus.write32(fx.gic(0xC00), 0u);
+        fx.bus.write32(fx.gic(0xC04), 0xFFFFFFFFu);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC00)), 0xAAAAAAAAu);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC04)), 0x7DC00000u);
+    }
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC30)), 0x55555555u);
+
+    // Native boot polls and acknowledges these responses before enabling
+    // IRQ200. Dropping the mailbox level must remove each pending request.
+    for (u32 status : {0x101u, 0x102u, 1u, 1u}) {
+        cmep_bus.write32(cmep::kMailboxBase, status);
+        ZLB_EXPECT_EQ(fx.bus.read32(cmep::kMailboxBase), status);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x218)) & 0x100u, 0x100u);
+        fx.bus.write32(cmep::kMailboxBase, status);
+        ZLB_EXPECT_EQ(fx.bus.read32(cmep::kMailboxBase), 0u);
+        ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x218)) & 0x100u, 0u);
+    }
+    fx.bus.write32(fx.gic(0), 1u);
+    fx.bus.write8(fx.gic(0x4C8), 0x40u);
+    fx.bus.write8(fx.gic(0x8C8), 8u);
+    fx.bus.write32(fx.gic(0x118), 0x100u);
+    fx.bus.write32(fx.icc(4), 0xF8u);
+    fx.bus.write32(fx.icc(0), 9u);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0xC)), 1023u);
+
+    // A later native notification still reaches ARM3, remains observable
+    // after IAR, and disappears when the receiver acknowledges its status.
+    cmep_bus.write32(cmep::kMailboxBase, 0x10000u);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0xC)), 200u);
+    ZLB_EXPECT_EQ(fx.bus.read32(cmep::kMailboxBase), 0x10000u);
+    fx.bus.write32(cmep::kMailboxBase, 0x10000u);
+    fx.bus.write32(fx.icc(0x10), 200u);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0xC)), 1023u);
+
+    // Explicitly selecting edge sensitivity retains an event after the
+    // peripheral drops its level. The reset correction does not suppress it.
+    fx.bus.write32(fx.gic(0xC30), fx.bus.read32(fx.gic(0xC30)) | (2u << 16));
+    cmep_bus.write32(cmep::kMailboxBase, 1u);
+    fx.bus.write32(cmep::kMailboxBase, 1u);
+    ZLB_EXPECT_EQ(fx.bus.read32(cmep::kMailboxBase), 0u);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0xC)), 200u);
+    fx.bus.write32(fx.icc(0x10), 200u);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    fx.kermit.reset();
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC30)), 0x55555555u);
+}
+
 ZLB_TEST(kermit_gic_priority_masks_low_priority_lines) {
     Fixture fx("build/soc_test_gic3.img");
     const u32 spi = static_cast<u32>(kermit::Irq::Emmc);
     fx.gic_start();
     fx.enable_irq(spi);
     // A priority mask below the interrupt's priority must hide it. The
-    // distributor's priority registers are byte addressable; the model feeds
-    // every interrupt in the word from the same value.
-    const u32 priority_word = fx.gic(0x400) + spi / 4;
-    fx.bus.write32(priority_word, 0x000000F0u);
+    // distributor's priority registers have one byte per interrupt.
+    const u32 priority_word = fx.gic(0x400) + (spi / 4u) * 4u;
+    fx.bus.write8(priority_word + (spi % 4u), 0xF0);
     fx.bus.write32(fx.icc(0x004), 0x80);  // mask every priority >= 0x80
     fx.kermit.pulse_irq(spi, 64);
     ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
@@ -184,6 +283,320 @@ ZLB_TEST(kermit_gic_priority_masks_low_priority_lines) {
     fx.kermit.pulse_irq(spi, 64);
     ZLB_EXPECT_TRUE(kermit_irq_line(fx.bus));
     ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)) & 0x3FF, spi);
+}
+
+ZLB_TEST(kermit_gic_native_mailbox_register_layout) {
+    Fixture fx("build/soc_test_gic_mailbox.img");
+    // Vita's SCU/GIC private region ends where the separate PL310 starts.
+    ZLB_EXPECT_EQ(fx.gic(0), 0x1A001000u);
+    ZLB_EXPECT_EQ(fx.icc(0), 0x1A000100u);
+    ZLB_EXPECT_TRUE(fx.bus.find_device(0x1A002000) == nullptr);
+    const u32 typer = fx.bus.read32(fx.gic(0x004));
+    ZLB_EXPECT_EQ(((typer & 31u) + 1u) * 32u, 256u);
+    ZLB_EXPECT_EQ(((typer >> 5) & 7u) + 1u, 4u);
+
+    // Smsched's four native mailbox sources occupy bank six, bytes 200..203,
+    // and fields 8..11 of the twelfth configuration word.
+    fx.bus.write32(fx.gic(0x118), 0x00000F00);
+    fx.bus.write32(fx.gic(0x4C8), 0x40302010);
+    fx.bus.write32(fx.gic(0x8C8), 0x01010101);
+    fx.bus.write32(fx.gic(0xC30), 0);
+    // Byte stores must preserve neighboring priority and target fields.
+    fx.bus.write8(fx.gic(0x4CB), 0x08);
+    fx.bus.write8(fx.gic(0x8CB), 0);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x4C8)), 0x08302010u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x8C8)), 0x00010101u);
+    for (u32 id = 200; id < 204; ++id) fx.kermit.raise_irq(id, true);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x218)) & 0xF00u, 0xF00u);
+    // Reset-held controllers record the pending sources without raising IRQ.
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    fx.gic_start();
+    ZLB_EXPECT_TRUE(kermit_irq_line(fx.bus));
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 200u);
+    fx.kermit.raise_irq(200, false);
+    fx.bus.write32(fx.icc(0x010), 200);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 201u);
+    fx.kermit.raise_irq(201, false);
+    fx.bus.write32(fx.icc(0x010), 201);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 202u);
+    fx.kermit.raise_irq(202, false);
+    fx.bus.write32(fx.icc(0x010), 202);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+
+    // Source 203 was pending throughout; routing its byte to CPU0 makes it
+    // visible. A level still asserted at EOI must become pending again.
+    fx.bus.write8(fx.gic(0x8CB), 1);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 203u);
+    fx.bus.write32(fx.icc(0x010), 203);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 203u);
+    fx.kermit.raise_irq(203, false);
+    fx.bus.write32(fx.icc(0x010), 203);
+    ZLB_EXPECT_TRUE(!kermit_irq_line(fx.bus));
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+}
+
+ZLB_TEST(kermit_gic_highest_implemented_source) {
+    Fixture fx("build/soc_test_gic_limit.img");
+    fx.gic_start();
+    fx.bus.write32(fx.gic(0x11C), 0x80000000);
+    fx.bus.write8(fx.gic(0x4FF), 0x20);
+    fx.bus.write8(fx.gic(0x8FF), 1);
+    fx.kermit.raise_irq(255, true);
+    fx.kermit.raise_irq(256, true);
+    ZLB_EXPECT_EQ(fx.kermit.pending_irq_count(), 1u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 255u);
+    fx.kermit.raise_irq(255, false);
+    fx.bus.write32(fx.icc(0x010), 255);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+}
+
+ZLB_TEST(kermit_gic_secure_mailbox_survives_nonsecure_init) {
+    Fixture fx("build/soc_test_gic_secure_mailbox.img");
+    InterruptInputs cpu0(fx.bus), cpu3(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu0, 0);
+    fx.access(3);
+    // Genuine 1.04 KBL/Smsched setup: bank6's only Secure sources are 200..203,
+    // their target is ARM3, and its Secure CPU interface enables FIQ.
+    fx.bus.write32(fx.gic(0x098), 0xFFFFF0FF);
+    fx.bus.write32(fx.gic(0x118), 0xF00);
+    fx.bus.write32(fx.gic(0x4C8), 0x40404040);
+    fx.bus.write32(fx.gic(0x8C8), 0x08080808);
+    fx.bus.write32(fx.gic(0xC30), 0);
+    fx.bus.write32(fx.gic(0x000), 1);
+    fx.bus.write32(fx.icc(0x004), 0xF8);
+    fx.bus.write32(fx.icc(0x000), 9);
+
+    // NSKBL's NS controller initialization must affect only Group1.
+    fx.access(3, true);
+    fx.bus.write32(fx.icc(0x000), 0);
+    fx.bus.write32(fx.gic(0x000), 0);
+    fx.bus.write32(fx.gic(0x198), 0xFFFFFFFF);
+    fx.bus.write32(fx.icc(0x000), 1);
+    fx.bus.write32(fx.gic(0x000), 1);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0)), 1u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0)), 1u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x098)), 0u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x118)) & 0xF00u, 0u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x4C8)), 0u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x8C8)), 0u);
+    fx.bus.write32(fx.gic(0x098), 0xFFFFFFFF);
+    fx.bus.write8(fx.gic(0x4C8), 0x10);
+    fx.bus.write8(fx.gic(0x8C8), 1);
+    fx.bus.write32(fx.gic(0xC30), 0xFFFFFFFF);
+    fx.kermit.raise_irq(200, true);
+    // Attaching ARM3 after the assertion applies the already pending FIQ.
+    kermit_set_cpu(fx.bus, &cpu3, 3);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    ZLB_EXPECT_FALSE(cpu0.irq);
+    ZLB_EXPECT_FALSE(cpu0.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x218)) & 0x100u, 0u);
+
+    fx.access(3);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0)), 0xBu);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0)), 3u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x098)), 0xFFFFF0FFu);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x118)) & 0xF00u, 0xF00u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x4C8)), 0x40404040u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x8C8)), 0x08080808u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0xC30)) & 0x00AA0000u, 0u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 200u);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x318)) & 0x100u, 0x100u);
+    // An NS EOI cannot complete a Secure handler's active interrupt.
+    fx.access(3, true);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x014)), 0u);
+    fx.bus.write32(fx.icc(0x010), 200);
+    fx.access(3);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x318)) & 0x100u, 0x100u);
+    fx.bus.write32(fx.icc(0x010), 200);
+    ZLB_EXPECT_TRUE(cpu3.fiq);  // level still asserted
+    fx.kermit.raise_irq(200, false);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+
+    // NS priority writes to a Group1 neighbor use the NS priority range while
+    // retaining the adjacent Secure mailbox fields.
+    fx.access(3, true);
+    fx.bus.write8(fx.gic(0x4CC), 0x10);
+    fx.bus.write8(fx.gic(0x8CC), 8);
+    fx.bus.write32(fx.gic(0x118), 1u << 12);
+    fx.kermit.raise_irq(204, true);
+    ZLB_EXPECT_TRUE(cpu3.irq);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    fx.access(3);
+    ZLB_EXPECT_EQ(fx.bus.read8(fx.gic(0x4CC)), 0x88u);
+    // Secure IAR with AckCtl=0 reports that the winner is Nonsecure.
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1022u);
+    fx.access(3, true);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 204u);
+    fx.kermit.raise_irq(204, false);
+    fx.bus.write32(fx.icc(0x010), 204);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+}
+
+ZLB_TEST(kermit_gic_core_target_bank_and_fiq_reset) {
+    Fixture fx("build/soc_test_gic_core_target.img");
+    InterruptInputs cpu0(fx.bus), cpu3(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu0, 0);
+    kermit_set_cpu(fx.bus, &cpu3, 3);
+    fx.gic_start();
+    fx.bus.write32(fx.gic(0x118), 1u << 8);
+    fx.bus.write8(fx.gic(0x4C8), 0x40);
+    fx.bus.write8(fx.gic(0x8C8), 8);
+    fx.kermit.raise_irq(200, true);
+    ZLB_EXPECT_FALSE(cpu0.irq);
+    ZLB_EXPECT_FALSE(cpu3.fiq);  // ARM3's own CPU-interface bank is disabled
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    fx.access(3);
+    fx.bus.write32(fx.icc(0x004), 0xF8);
+    fx.bus.write32(fx.icc(0x000), 9);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    // FIQEn changes the input pin without consuming the pending interrupt.
+    fx.bus.write32(fx.icc(0x000), 1);
+    ZLB_EXPECT_TRUE(cpu3.irq);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    fx.bus.write32(fx.icc(0x000), 9);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    fx.access(0);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0)), 1u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    auto* gic = static_cast<kermit::Gic*>(fx.bus.find_device(fx.icc(0)));
+    u64 value = 0;
+    ZLB_EXPECT_TRUE(gic->peek_register("CPU3.ICCICR", value));
+    ZLB_EXPECT_EQ(value, 9u);
+    ZLB_EXPECT_TRUE(gic->peek_register("CPU3.FIQ", value));
+    ZLB_EXPECT_EQ(value, 1u);
+    fx.kermit.reset();
+    ZLB_EXPECT_FALSE(cpu0.irq);
+    ZLB_EXPECT_FALSE(cpu0.fiq);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    fx.access(3);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0)), 0u);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x098)), 0u);
+}
+
+ZLB_TEST(kermit_gic_group1_irq_priority_and_ack_mask) {
+    Fixture fx("build/soc_test_gic_group1.img");
+    InterruptInputs cpu1(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu1, 1);
+    fx.access(1);
+    fx.bus.write32(fx.gic(0), 3);
+    fx.bus.write32(fx.gic(0x098), 1u << 8);
+    fx.bus.write32(fx.gic(0x118), 1u << 8);
+    fx.bus.write8(fx.gic(0x4C8), 0x88);
+    fx.bus.write8(fx.gic(0x8C8), 2);
+    fx.bus.write32(fx.icc(0x004), 0x88);
+    fx.bus.write32(fx.icc(0), 0xF);  // both groups + AckCtl + FIQEn
+    fx.kermit.raise_irq(200, true);
+    ZLB_EXPECT_FALSE(cpu1.irq);  // equality with PMR masks both signal and IAR
+    ZLB_EXPECT_FALSE(cpu1.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    fx.bus.write32(fx.icc(0x004), 0x90);
+    ZLB_EXPECT_TRUE(cpu1.irq);  // Group1 always uses IRQ, even with FIQEn
+    ZLB_EXPECT_FALSE(cpu1.fiq);
+    fx.access(1, true);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x004)), 0x20u);
+    fx.bus.write32(fx.icc(0), 0);
+    ZLB_EXPECT_FALSE(cpu1.irq);
+    fx.bus.write32(fx.icc(0), 1);
+    ZLB_EXPECT_TRUE(cpu1.irq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 200u);
+    fx.kermit.raise_irq(200, false);
+    fx.bus.write32(fx.icc(0x010), 200);
+    ZLB_EXPECT_FALSE(cpu1.irq);
+}
+
+ZLB_TEST(kermit_gic_sgi_target_source_and_private_banks) {
+    Fixture fx("build/soc_test_gic_sgi.img");
+    InterruptInputs cpu0(fx.bus), cpu2(fx.bus), cpu3(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu0, 0);
+    kermit_set_cpu(fx.bus, &cpu2, 2);
+    kermit_set_cpu(fx.bus, &cpu3, 3);
+    fx.gic_start();
+    for (unsigned core : {2u, 3u}) {
+        fx.access(core);
+        fx.bus.write32(fx.icc(0x004), 0xF8);
+        fx.bus.write32(fx.icc(0), 1);
+    }
+    fx.access(2);
+    fx.bus.write32(fx.gic(0xF00), (8u << 16) | 5u);
+    ZLB_EXPECT_FALSE(cpu0.irq);
+    ZLB_EXPECT_FALSE(cpu2.irq);
+    ZLB_EXPECT_TRUE(cpu3.irq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    fx.access(3);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x200)) & (1u << 5), 1u << 5);
+    const u32 token = fx.bus.read32(fx.icc(0x00C));
+    ZLB_EXPECT_EQ(token, 5u | (2u << 10));
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    fx.bus.write32(fx.icc(0x010), token);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    // Self filter targets the executing CPU, not the controller's first CPU.
+    fx.access(2);
+    fx.bus.write32(fx.gic(0xF00), (2u << 24) | 5u);
+    ZLB_EXPECT_TRUE(cpu2.irq);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    const u32 self = fx.bus.read32(fx.icc(0x00C));
+    ZLB_EXPECT_EQ(self, 5u | (2u << 10));
+    fx.bus.write32(fx.icc(0x010), self);
+    // NS cannot generate Secure SGI5. It can generate Group1 SGI6 into ARM3's
+    // separately banked group register once that receiver is configured.
+    fx.access(2, true);
+    fx.bus.write32(fx.gic(0xF00), (8u << 16) | 5u);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+    fx.access(3);
+    fx.bus.write32(fx.gic(0x080), 1u << 6);
+    fx.bus.write32(fx.gic(0), 3);
+    fx.bus.write32(fx.icc(0), 3);
+    fx.access(2);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.gic(0x080)), 0u);
+    fx.access(2, true);
+    fx.bus.write32(fx.gic(0xF00), (8u << 16) | 6u);
+    ZLB_EXPECT_TRUE(cpu3.irq);
+    fx.access(3, true);
+    const u32 nonsecure = fx.bus.read32(fx.icc(0x00C));
+    ZLB_EXPECT_EQ(nonsecure, 6u | (2u << 10));
+    fx.bus.write32(fx.icc(0x010), nonsecure);
+    ZLB_EXPECT_FALSE(cpu3.irq);
+}
+
+ZLB_TEST(kermit_gic_fiq_preemption_and_running_priority) {
+    Fixture fx("build/soc_test_gic_preemption.img");
+    InterruptInputs cpu3(fx.bus);
+    kermit_set_cpu(fx.bus, &cpu3, 3);
+    fx.access(3);
+    fx.bus.write32(fx.gic(0), 1);
+    fx.bus.write32(fx.gic(0x118), 0x700);
+    fx.bus.write32(fx.gic(0x4C8), 0xA0205040);
+    fx.bus.write32(fx.gic(0x8C8), 0x01080808);
+    fx.bus.write32(fx.icc(0x004), 0xF8);
+    fx.bus.write32(fx.icc(0), 9);
+    fx.kermit.raise_irq(200, true);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 200u);
+    fx.kermit.raise_irq(200, false);  // handler acknowledges the peripheral
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x014)), 0x40u);
+    fx.kermit.raise_irq(201, true);  // lower priority cannot preempt
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 1023u);
+    fx.kermit.raise_irq(202, true);  // higher priority can preempt
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 202u);
+    fx.kermit.raise_irq(202, false);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x014)), 0x20u);
+    fx.bus.write32(fx.icc(0x010), 202);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x014)), 0x40u);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
+    fx.bus.write32(fx.icc(0x010), 200);
+    ZLB_EXPECT_TRUE(cpu3.fiq);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x00C)), 201u);
+    fx.kermit.raise_irq(201, false);
+    fx.bus.write32(fx.icc(0x010), 201);
+    ZLB_EXPECT_EQ(fx.bus.read32(fx.icc(0x014)), 0xFFu);
+    ZLB_EXPECT_FALSE(cpu3.fiq);
 }
 
 ZLB_TEST(kermit_global_timer_counts_microseconds) {
@@ -292,11 +705,7 @@ ZLB_TEST(kermit_uart_captures_output_and_raises_rx_irq) {
     ZLB_EXPECT_TRUE(!fx.kermit.uart_has_output());
 
     // Receive: inject a byte and check the interrupt and the data register.
-    // The UART line is level sensitive, so configure it that way (the reset
-    // default is edge triggered for every interrupt).
-    const u32 config_word = fx.gic(0xC20) + ((spi - 32) / 16) * 4;
-    const u32 config_shift = ((spi - 32) % 16) * 2;
-    fx.bus.write32(config_word, fx.bus.read32(config_word) & ~(3u << config_shift));
+    // The UART line uses the shared interrupt's reset level sensitivity.
     fx.bus.write32(kermit::kUartBase + 0x04, 0x01);
     fx.kermit.uart_write("xy");
     std::fprintf(stderr, "  uart test: pending=%u line=%d iir=0x%02X lsr=0x%02X\n", fx.kermit.pending_irq_count(),
@@ -380,6 +789,33 @@ ZLB_TEST(kermit_display_framebuffer_and_flip) {
     // Powering the display down hides the buffer again.
     fx.bus.write32(kermit::kDisplayBase + 0x00, 0);
     ZLB_EXPECT_TRUE(fx.kermit.framebuffer(width, height, stride) == nullptr);
+}
+
+ZLB_TEST(kermit_display_padded_pitch_preserves_explicit_pixel_format) {
+    Fixture fx("build/soc_test_display_padded.img");
+    constexpr u32 base = kermit::kDisplayBase;
+    fx.bus.write32(base + 0x08, kermit::kDramBase + 0x10000);
+    fx.bus.write32(base + 0x14, (272u << 16) | 480u);
+
+    int width = 0, height = 0, stride = 0, bpp = -1;
+    ZLB_EXPECT_TRUE(fx.kermit.framebuffer(width, height, stride, &bpp) == nullptr);
+    ZLB_EXPECT_EQ(bpp, 0);
+
+    // Legal padded pixel pitches must not be mistaken for a different format.
+    fx.bus.write32(base + 0x18, 0);  // RGB565; 1024-pixel pitch
+    fx.bus.write32(base + 0x10, 1024 * 2);
+    fx.bus.write32(base + 0x00, 1);
+    ZLB_EXPECT_TRUE(fx.kermit.framebuffer(width, height, stride, &bpp) != nullptr);
+    ZLB_EXPECT_EQ(width, 480);
+    ZLB_EXPECT_EQ(height, 272);
+    ZLB_EXPECT_EQ(stride, 2048);
+    ZLB_EXPECT_EQ(bpp, 2);
+
+    fx.bus.write32(base + 0x18, 1);  // RGBA8888; 640-pixel pitch
+    fx.bus.write32(base + 0x10, 640 * 4);
+    ZLB_EXPECT_TRUE(fx.kermit.framebuffer(width, height, stride, &bpp) != nullptr);
+    ZLB_EXPECT_EQ(stride, 2560);
+    ZLB_EXPECT_EQ(bpp, 4);
 }
 
 ZLB_TEST(kermit_sdif_programs_a_block_read) {
@@ -608,4 +1044,193 @@ ZLB_TEST(sdif_buffer_port_pops_a_word_per_word_access) {
     // Transfer Complete is reported a few clocks after the last byte.
     f.kermit.tick(20000);
     ZLB_EXPECT_TRUE((f.bus.read32(0xE0B00030) & 0x2u) != 0u);
+}
+
+ZLB_TEST(sdif_status_acknowledgements_preserve_unselected_normal_bits) {
+    constexpr u32 base = kermit::kSdif0Base;
+    kermit::Sdif sdif("sdif-status", base, 0x1000, nullptr, 0);
+    sdif.reset();
+
+    // Command Complete and Transfer Complete may be pending together. Each
+    // access width must acknowledge only the bits written as one.
+    for (unsigned size : {1u, 2u, 4u}) {
+        sdif.poke(0x30, 0x0003u);
+        sdif.write(base + 0x30, size, 0u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 2), 0x0003u);
+        sdif.write(base + 0x30, size, 0x0001u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 2), 0x0002u);
+        sdif.write(base + 0x30, size, 0x0001u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 2), 0x0002u);
+    }
+
+    // A byte write to the high normal-status byte preserves the low byte.
+    sdif.poke(0x30, 0x0103u);
+    sdif.write(base + 0x31, 1, 0x01u);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 2), 0x0003u);
+}
+
+ZLB_TEST(sdif_error_status_acknowledgements_preserve_normal_status) {
+    Fixture f("sdif-error-status.img");
+    constexpr u32 base = kermit::kSdif0Base;
+    auto* sdif = static_cast<kermit::Sdif*>(f.bus.find_device(base));
+    ZLB_EXPECT_TRUE(sdif != nullptr);
+    if (sdif == nullptr) return;
+    f.bus.write16(base + 0x36, 0x0001u); // enable Command Timeout status
+
+    auto raise_error = [&] {
+        // An out-of-range card read reports Command Timeout in the error half.
+        f.bus.write32(base + 0x04, 0x00010200u);
+        f.bus.write32(base + 0x08, 0xFFFFFFFFu);
+        f.bus.write16(base + 0x0C, 0x0010u);
+        f.bus.write16(base + 0x0E, 0x113Au);
+        f.kermit.tick(20000);
+        ZLB_EXPECT_EQ(f.bus.read16(base + 0x32), 0x0001u);
+        f.bus.write8(base + 0x2F, 0x04u); // cancel the failed read's data phase
+        sdif->poke(0x30, 0x0003u);
+    };
+
+    for (unsigned size : {1u, 2u}) {
+        raise_error();
+        sdif->write(base + 0x32, size, 0u);
+        ZLB_EXPECT_EQ(f.bus.read32(base + 0x30), 0x00018003u);
+        sdif->write(base + 0x32, size, 0x01u);
+        ZLB_EXPECT_EQ(f.bus.read32(base + 0x30), 0x00000003u);
+    }
+
+    raise_error();
+    f.bus.write8(base + 0x33, 0x01u);
+    ZLB_EXPECT_EQ(f.bus.read32(base + 0x30), 0x00018003u);
+    // A combined word acknowledgement selects bits independently in each half.
+    f.bus.write32(base + 0x30, 0x00010001u);
+    ZLB_EXPECT_EQ(f.bus.read32(base + 0x30), 0x00000002u);
+}
+
+ZLB_TEST(sdif_absent_probe_response_times_out_and_next_command_completes) {
+    constexpr u32 base = kermit::kSdif0Base;
+    kermit::Sdif sdif("sdif-probe-timeout", base, 0x1000, nullptr, 0);
+    sdif.reset();
+    bool irq = false;
+    sdif.set_irq_callback([&](u32 id, bool level) {
+        ZLB_EXPECT_EQ(id, static_cast<u32>(kermit::Irq::Emmc));
+        irq = level;
+    });
+    sdif.write(base + 0x36, 2, 0x0001u); // Command Timeout status enabled
+
+    for (u16 command : {u16(0x081Au), u16(0x0502u)}) {
+        // SD SEND_IF_COND with rejected VHS=0 and SDIO IO_SEND_OP_COND receive
+        // no response from the eMMC. Neither may report Command Complete or
+        // fabricate a response; the host must still finish with an error.
+        sdif.write(base + 0x08, 4, command == 0x081Au ? 0xAAu : 0u);
+        sdif.write(base + 0x0C, 2, 0u);
+        sdif.write(base + 0x0E, 2, command);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x10, 4), 0u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x24, 4) & 0x3u, 0x1u);
+        sdif.tick(63);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+        ZLB_EXPECT_TRUE((sdif.read(base + 0x24, 4) & 1u) != 0u);
+        sdif.tick(1);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x32, 2), 0x0001u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00018000u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x24, 4) & 0x3u, 0u);
+        ZLB_EXPECT_FALSE(irq); // status enable does not imply signal enable
+
+        // Error signal enable is the upper half of the paired word at 0x38.
+        // Enabling a latched source asserts the line even with no normal source.
+        sdif.write(base + 0x3A, 2, 0x0001u);
+        ZLB_EXPECT_TRUE(irq);
+        ZLB_EXPECT_TRUE(sdif.irq_line());
+        sdif.write(base + 0x30, 2, 0x8000u); // summary is read-only
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00018000u);
+        sdif.write(base + 0x32, 2, 0u);
+        ZLB_EXPECT_TRUE(irq);
+        sdif.write(base + 0x32, 2, 0x0001u); // acknowledge the error itself
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+        ZLB_EXPECT_FALSE(irq);
+        ZLB_EXPECT_FALSE(sdif.irq_line());
+
+        sdif.write(base + 0x0E, 2, 0u); // CMD0 still completes normally
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00000001u);
+        sdif.tick(64);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00000001u);
+        ZLB_EXPECT_FALSE(irq);
+        sdif.write(base + 0x30, 2, 0x0001u);
+        sdif.write(base + 0x3A, 2, 0u);
+    }
+}
+
+ZLB_TEST(sdif_response_timeout_is_independent_of_data_timeout_control) {
+    constexpr u32 base = kermit::kSdif0Base;
+    kermit::Sdif sdif("sdif-response-clock", base, 0x1000, nullptr, 0);
+    sdif.reset();
+    sdif.write(base + 0x36, 2, 1u);
+
+    // TIMEOUT_CONTROL governs the DAT circuit. The model approximates the
+    // separate 64-SDCLK command-response window with 64 PERIPHCLK ticks.
+    for (u8 data_timeout : {u8(0), u8(0x0E)}) {
+        sdif.write(base + 0x2E, 1, data_timeout);
+        sdif.write(base + 0x0E, 2, 0x0502u);
+        sdif.tick(63);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x32, 2), 0u);
+        sdif.tick(1);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x32, 2), 1u);
+        sdif.write(base + 0x32, 2, 1u);
+    }
+}
+
+ZLB_TEST(sdif_masked_error_status_does_not_latch_or_resurrect_a_timeout) {
+    constexpr u32 base = kermit::kSdif0Base;
+    kermit::Sdif sdif("sdif-masked-timeout", base, 0x1000, nullptr, 0);
+    sdif.reset();
+    sdif.write(base + 0x3A, 2, 1u); // signal enabled, status source still masked
+    sdif.write(base + 0x0E, 2, 0x0502u);
+    sdif.tick(64);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x24, 4) & 1u, 0u);
+    ZLB_EXPECT_FALSE(sdif.irq_line());
+    sdif.write(base + 0x36, 2, 1u);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+
+    sdif.write(base + 0x0E, 2, 0x0502u);
+    sdif.tick(64);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00018000u);
+    ZLB_EXPECT_TRUE(sdif.irq_line());
+    sdif.write(base + 0x36, 2, 0u); // masking clears the latched source
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+    ZLB_EXPECT_FALSE(sdif.irq_line());
+    sdif.write(base + 0x36, 2, 1u);
+    ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0u);
+}
+
+ZLB_TEST(sdif_reset_cancels_pending_response_timeout_before_next_command) {
+    constexpr u32 base = kermit::kSdif0Base;
+    for (u8 reset : {u8(0), u8(1), u8(2)}) {
+        kermit::Sdif sdif("sdif-reset-timeout", base, 0x1000, nullptr, 0);
+        sdif.reset();
+        sdif.write(base + 0x36, 2, 1u);
+        sdif.write(base + 0x3A, 2, 1u);
+        sdif.write(base + 0x0E, 2, 0x0502u);
+        sdif.tick(32);
+        ZLB_EXPECT_TRUE((sdif.read(base + 0x24, 4) & 1u) != 0u);
+
+        // Exercise both the machine reset and the host/command reset registers.
+        if (reset == 0u) sdif.reset();
+        else sdif.write(base + 0x2F, 1, reset);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x2F, 1), 0u);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x24, 4) & 0x3u, 0u);
+        sdif.write(base + 0x36, 2, 1u);
+        sdif.write(base + 0x3A, 2, 1u);
+        sdif.write(base + 0x0E, 2, 0u); // next CMD0 is a different request
+        sdif.tick(64);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00000001u);
+        ZLB_EXPECT_FALSE(sdif.irq_line());
+        sdif.write(base + 0x30, 2, 1u);
+
+        // A later missing response must still time out; reset cancels only the
+        // abandoned deadline rather than disabling the host's error path.
+        sdif.write(base + 0x0E, 2, 0x0502u);
+        sdif.tick(64);
+        ZLB_EXPECT_EQ(sdif.read(base + 0x30, 4), 0x00018000u);
+        ZLB_EXPECT_TRUE(sdif.irq_line());
+    }
 }

@@ -980,6 +980,36 @@ void neon_transfer(DState& s, u32 instr) {
 /// Advanced SIMD data processing. The 3-same-length group is named from the
 /// (U, size, opc1, opc2) fields; anything else is reported by class.
 void neon_data_processing(DState& s, u32 instr) {
+    // The reached Syscon fill idiom uses the modified-immediate I8 form.
+    if ((instr & 0xFEB80FB0u) == 0xF2800E10u) {
+        const u32 d = ((instr >> 22) & 1u) * 16u + ((instr >> 12) & 15u);
+        const bool quad = (instr & 0x40u) != 0u;
+        const u32 imm8 = ((instr >> 17) & 0x80u) | ((instr >> 12) & 0x70u) | (instr & 15u);
+        s.s("vmov.i8 "); s.c(quad ? 'q' : 'd'); s.u(quad ? d / 2u : d);
+        s.s(", "); s.imm(imm8);
+        return;
+    }
+    if ((instr & 0xFFB00000u) == 0xF4000000u) {
+        const u32 type = (instr >> 8) & 15u;
+        const int regs = type == 7u ? 1 : type == 10u ? 2 : type == 6u ? 3 : type == 2u ? 4 : 0;
+        if (regs != 0) {
+            const u32 d = ((instr >> 22) & 1u) * 16u + ((instr >> 12) & 15u);
+            const u32 align = (instr >> 4) & 3u;
+            const int n = static_cast<int>((instr >> 16) & 15u);
+            const int m = static_cast<int>(instr & 15u);
+            s.s("vst1."); s.u(8u << ((instr >> 6) & 3u)); s.s(" {");
+            for (int reg = 0; reg < regs; ++reg) {
+                if (reg != 0) s.s(", ");
+                s.c('d'); s.u(d + static_cast<u32>(reg));
+            }
+            s.s("}, ["); s.reg(n);
+            if (align != 0u) { s.c(':'); s.u(32u << align); }
+            s.c(']');
+            if (m == 13) s.c('!');
+            else if (m != 15) { s.s(", "); s.reg(m); }
+            return;
+        }
+    }
     const u32 opc1 = (instr >> 8) & 0xFu;
     const bool opc2 = (instr & 0x10u) != 0u;
     const u32 size = (instr >> 20) & 3u;
@@ -991,7 +1021,7 @@ void neon_data_processing(DState& s, u32 instr) {
     const char* name = nullptr;
     if (opc1 == 0x1u && opc2 && !u_bit) {
         name = size == 0u ? "vand" : (size == 1u ? "vbic" : (size == 2u ? "vorr" : "vorn"));
-    } else if (opc1 == 0x3u && opc2 && !u_bit) {
+    } else if (opc1 == 0x1u && opc2 && u_bit) {
         name = size == 0u ? "veor" : (size == 1u ? "vbsl" : (size == 2u ? "vbit" : "vbif"));
     }
     if (name != nullptr) {
@@ -1411,9 +1441,8 @@ void arm_unconditional(DState& s, u32 addr, u32 instr) {
     s.s(tmp);
 }
 
-void arm_decode(DState& s, u32 addr, unsigned& length) {
+void arm_decode(DState& s, u32 addr, u32 instr, unsigned& length) {
     length = 4;
-    const u32 instr = fetch_word(s, addr);
     s.insn = instr;
     const u32 cond = instr >> 28;
     s.cond = cond;
@@ -2405,6 +2434,14 @@ void t32_misc(DState& s, u32 addr, u32 instr) {
 
 void thumb32(DState& s, u32 addr, u32 instr) {
     const u32 hw1 = (instr >> 16) & 0xFFFFu;
+    if ((hw1 & 0xEF00u) == 0xEF00u) {
+        neon_data_processing(s, 0xF2000000u | (instr & 0x00FFFFFFu) | ((instr & 0x10000000u) >> 4));
+        return;
+    }
+    if ((hw1 & 0xFF10u) == 0xF900u) {
+        neon_data_processing(s, 0xF4000000u | (instr & 0x00FFFFFFu));
+        return;
+    }
     const u32 t1 = (hw1 >> 11) & 3u;
     const u32 top = (hw1 >> 4) & 0x7Fu;
 
@@ -2450,7 +2487,7 @@ std::string arm_disassemble(Bus& bus, u32 address, bool thumb, unsigned& length)
     length = thumb ? 2u : 4u;
 
     if (thumb) thumb_decode(s, address, length);
-    else arm_decode(s, address, length);
+    else arm_decode(s, address, fetch_word(s, address), length);
 
     if (s.buf.empty()) {
         char tmp[16];
@@ -2460,6 +2497,34 @@ std::string arm_disassemble(Bus& bus, u32 address, bool thumb, unsigned& length)
     }
     if (length != 2u && length != 4u) length = thumb ? 2u : 4u;
     s.bus = nullptr;
+    return s.buf;
+}
+
+std::string arm_disassemble_bytes(const u8* bytes, u32 address, bool thumb, unsigned& length) {
+    DState s;
+    s.thumb = thumb;
+    s.address = address;
+    const u32 hw1 = static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8);
+    if (thumb) {
+        if ((hw1 & 0xF800u) >= 0xE800u) {
+            const u32 hw2 = static_cast<u32>(bytes[2]) | (static_cast<u32>(bytes[3]) << 8);
+            s.insn = (hw1 << 16) | hw2;
+            length = 4;
+            thumb32(s, address, s.insn);
+        } else {
+            s.insn = hw1;
+            length = 2;
+            thumb16(s, address, hw1);
+        }
+    } else {
+        const u32 instr = hw1 | (static_cast<u32>(bytes[2]) << 16) | (static_cast<u32>(bytes[3]) << 24);
+        arm_decode(s, address, instr, length);
+    }
+    if (s.buf.empty()) {
+        char tmp[32];
+        std::snprintf(tmp, sizeof(tmp), ".word 0x%08X", s.insn);
+        s.buf = tmp;
+    }
     return s.buf;
 }
 

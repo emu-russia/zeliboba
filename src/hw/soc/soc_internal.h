@@ -72,10 +72,6 @@ constexpr u32 kPrivateTimerOffset = 0x0600; // private timer + watchdog
 constexpr u32 kPrivateTimerSize = 0x0100;
 constexpr u32 kGicDistOffset = 0x1000;      // interrupt distributor
 constexpr u32 kGicDistSize = 0x1000;
-// The TRM also documents a 4 KiB "CPU interface" page at 0x2000 (the generic
-// GIC architecture's own offset) in addition to the 0x0100 page. The firmware
-// uses one of the two; both are mapped, one as an alias of the other.
-constexpr u32 kIccAliasOffset = 0x2000;
 
 /// Addresses used by the C# reference models (VitaDevices.cs DeviceSetup) and
 /// therefore also by the ARM sandbox in this workspace.
@@ -129,6 +125,32 @@ constexpr u32 kSpi1Base = 0xE0A10000;
 constexpr u32 kSpi2Base = 0xE0A20000;
 constexpr u32 kSpiSize = 0x10000;
 
+/// Firmware 1.04 Lowio 0x81003024 maps two 4 KiB I2C controller windows
+/// (mapping calls 0x8100307A/30CA) and registers IRQs 142/143 at 0x8100317A/31A6.
+constexpr u32 kI2c0Base = 0xE0500000;
+constexpr u32 kI2c1Base = 0xE0510000;
+constexpr u32 kI2cSize = 0x1000;
+constexpr u32 kIrqI2c0 = 142;
+constexpr u32 kIrqI2c1 = 143;
+
+/// Genuine 1.04 SceDriverTzs maps this 4 KiB "SceEmcTop" resource at
+/// linked 0x810019D0..19DE and registers calibration IRQ34 at 0x81001A18.
+/// Only its observed command/mode protocol is modeled; IRQ34 is not generated.
+constexpr u32 kEmcTopBase = 0xE8200000;
+constexpr u32 kEmcTopSize = 0x1000;
+constexpr u32 kIrqEmcCalibration = 34;
+
+/// Reached FW1.04 timers: ThreadMgr LT5 and Secure IntrMgr WT7/usleep.
+/// Native mapping/handler registration establishes these physical IRQ IDs.
+constexpr u32 kLt5Base = 0xE20B6000;
+constexpr u32 kWt7Base = 0xE20BE000;
+constexpr u32 kVitaTimerSize = 0x1000;
+constexpr u32 kIrqLt5 = 141;
+constexpr u32 kIrqWt7 = 135;
+/// WT7 source0 is SysClock. Its actual board input is not captured; 222 MHz
+/// is an explicit modeled input, giving 1 MHz with native divider221+1.
+constexpr u32 kVitaTimerSysClockHz = 222000000;
+
 /// DMA controller. ASSUMPTION: no register-level evidence was recovered from
 /// dmacmgr.elf, so this is a fresh window in the free part of the ARM
 /// peripheral space (0xE2000000-0xE20A0000 in the C# map).
@@ -143,12 +165,27 @@ constexpr u32 kDisplaySize = 0x1000;
 constexpr int kPanelWidth = 960;
 constexpr int kPanelHeight = 544;
 
+/// Native head-0 IFTU A/B planes and shared control. The lowio.elf 1.04
+/// table at linked VA 0x81009498 supplies these physical windows.
+constexpr u32 kIftu0Base = 0xE5020000;
+constexpr u32 kIftu0Size = 0x3000;
+
+/// Firmware 1.04 Lowio 0x81003EA4 maps head0 at E5050000/1000 and
+/// registers IRQ213. Display stores refresh-rate float 0x426FC29E,
+/// approximately 60000/1001 Hz. See docs/FIRMWARE_DISPLAY_104.md.
+constexpr u32 kDsi0Base = 0xE5050000;
+constexpr u32 kDsi0Size = 0x1000;
+constexpr u32 kIrqDsi0 = 213;
+
 /// IRQ ids of the private peripheral interrupts (PPI). TRM 4.2.3: the private
 /// timer raises ID 29, and 4.3: the global timer comparator raises ID 27.
 constexpr u32 kIrqPpiGlobalTimer = 27;
 constexpr u32 kIrqPpiPrivateTimer = 29;
 constexpr u32 kIrqPpiWatchdog = 30;
-constexpr u32 kGicMaxIrq = 128;
+/// Native IntrMgr has a 0x100 interrupt-number limit; Smsched registers
+/// mailbox sources 200..203. Keep all eight 32-source register banks.
+constexpr u32 kGicMaxIrq = 256;
+constexpr unsigned kGicCoreCount = 4;
 
 }  // namespace zlb::kermit
 
@@ -162,11 +199,11 @@ namespace zlb {
 class KermitBlock;
 class Cpu;
 
-/// Connect the Cortex-A9 core so that GIC interrupts reach Cpu::set_irq(line 0).
+/// Connect one Cortex-A9 core so GIC IRQ and FIQ reach its two input lines.
 /// The block must have been installed on the bus first (KermitBlock::install);
 /// this looks the interrupt controller up by name, so it works without touching
 /// a private member of KermitBlock (hw/soc.h cannot be modified).
-void kermit_set_cpu(Bus& bus, Cpu* cpu);
+void kermit_set_cpu(Bus& bus, Cpu* cpu, unsigned core = 0);
 /// Round 343: tell the controller that the stages before the ARM are staged by the
 /// machine as substitutions which reproduce their checkpoints but not their register
 /// programming, so the enables they would have left in place are assumed present.
@@ -274,6 +311,7 @@ public:
 
     u64 read_word(u32 offset, u64 stored) override;
     void write_word(u32 offset, u64 value) override;
+    void write(u32 address, unsigned size, u64 value) override;
 
     // State the distributor/CPU side of the model needs.
     bool enabled() const { return (peek(0x000) & 1) != 0; }
@@ -287,6 +325,9 @@ public:
     void set_sources(std::function<u32()> highest_pending_source);
     void set_ack_handler(std::function<u32()> handler);
     void set_eoi_handler(std::function<void(u32)> handler);
+    void set_running_priority_source(std::function<u32()> source) { running_priority_ = std::move(source); }
+    void set_nonsecure_access(bool value) { nonsecure_access_ = value; }
+    bool nonsecure_access() const { return nonsecure_access_; }
 
     std::string summary() const override;
 
@@ -294,6 +335,8 @@ private:
     std::function<u32()> highest_pending_;
     std::function<u32()> acknowledge_;
     std::function<void(u32)> eoi_;
+    std::function<u32()> running_priority_;
+    bool nonsecure_access_ = false;
 };
 
 /// The Cortex-A9 interrupt distributor (TRM 3.3, page 3-51).
@@ -309,21 +352,26 @@ public:
     /// Rebuild the enable/pending/active status registers from the model state.
     void sync_status_registers();
 
-    void set_level(u32 id, bool level);
-    void pulse(u32 id, u64 ticks);
-    void clear_pending(u32 id);
+    void set_level(u32 id, bool level, unsigned core = 0);
+    void pulse(u32 id, u64 ticks, unsigned core = 0);
+    void clear_pending(u32 id, unsigned core = 0);
 
-    bool enabled(u32 id) const;
-    bool pending(u32 id) const;
-    bool active(u32 id) const;
-    u16 priority(u32 id) const;
-    u8 targets(u32 id) const;
-    bool edge_triggered(u32 id) const;
+    bool enabled(u32 id, unsigned core = 0) const;
+    bool pending(u32 id, unsigned core = 0) const;
+    bool active(u32 id, unsigned core = 0) const;
+    u16 priority(u32 id, unsigned core = 0) const;
+    u8 targets(u32 id, unsigned core = 0) const;
+    bool edge_triggered(u32 id, unsigned core = 0) const;
+    bool group1(u32 id, unsigned core = 0) const;
+    void set_access_context(unsigned core, bool nonsecure) {
+        access_core_ = core < kGicCoreCount ? core : 0;
+        nonsecure_access_ = nonsecure;
+    }
     /// True when the distributor would signal an interrupt for this CPU.
     bool line_asserted(u32 core, u8 priority_mask) const;
     /// Highest priority pending interrupt id for `core`, or 1023.
     u32 highest_pending(u32 core, u8 priority_mask) const;
-    u32 acknowledge(u32 core);
+    u32 acknowledge(u32 core, u8 priority_mask = 0xFF);
     void end_of_interrupt(u32 core, u32 id);
     u32 pending_count() const;
     void set_default_priority(u32 id, u8 value);
@@ -341,7 +389,12 @@ public:
     void describe(std::vector<std::string>& lines) const override;
 
 private:
+    size_t state_index(u32 id, unsigned core) const;
+    u32 visible_word(u32 word, const std::vector<bool>& bits) const;
     u32 max_irq_;
+    unsigned access_core_ = 0;
+    bool nonsecure_access_ = false;
+    std::vector<bool> group1_;
     std::vector<bool> enabled_;
     std::vector<bool> pending_;
     std::vector<bool> active_;
@@ -352,13 +405,14 @@ private:
     bool secure_world_left_enabled_ = false;
     std::vector<u8> targets_;
     std::vector<u32> pulse_left_;
+    std::array<std::array<u8, 16>, kGicCoreCount> sgi_sources_{};
 };
 
 /// The GIC as one debugger-visible device. It covers the whole MPCore private
 /// region so that the per-core interface pages are routed to it (the SCU, the
 /// timers and the distributor are separate, smaller devices in the same
-/// region, and the bus prefers the smallest match). Only CPU0's interface is
-/// modelled.
+/// region, and the bus prefers the smallest match). The physical CPU-interface
+/// address selects the executing core's bank through BusContext.
 class Gic : public Device {
 public:
     Gic(u32 region_base, u32 region_size, u32 distrib_base, u32 distrib_size, u32 cpuif_base, u32 cpuif_size,
@@ -377,13 +431,13 @@ public:
     void describe(std::vector<std::string>& lines) const override;
 
     GicDistributor& distributor() { return *distributor_; }
-    GicCpuInterface& cpu_interface() { return *cpu_interface_; }
+    GicCpuInterface& cpu_interface(unsigned core = 0) { return *cpu_interfaces_[core]; }
 
     /// Set when the CPU's IRQ input should change.
     void set_line_callback(std::function<void(bool)> callback) { line_callback_ = std::move(callback); }
-    /// Connect a core: the IRQ line is asserted/deasserted through
-    /// Cpu::set_irq(IrqLine::Irq) and the current state is applied immediately.
-    void set_cpu(Cpu* cpu);
+    /// Connect a core and apply its current IRQ and FIQ levels immediately.
+    void set_cpu(Cpu* cpu, unsigned core = 0);
+    void set_access_context(const BusContext* context) { access_context_ = context; }
 
     /// Round 343: forward the machine's "the secure world left the controller
     /// enabled" policy to the distributor and use it for the CPU interface too.
@@ -392,16 +446,22 @@ public:
         distributor_->set_secure_world_left_enabled(value);
     }
     bool line() const { return line_; }
+    bool fiq_line(unsigned core = 0) const { return fiq_lines_[core]; }
     /// Re-evaluate the IRQ line and notify the CPU when it changed.
     void refresh_line();
 
 private:
+    u32 highest_pending(unsigned core, bool acknowledge_view = false) const;
+    u8 running_priority(unsigned core) const;
     std::unique_ptr<GicDistributor> distributor_;
-    std::unique_ptr<GicCpuInterface> cpu_interface_;
+    std::array<std::unique_ptr<GicCpuInterface>, kGicCoreCount> cpu_interfaces_;
     std::unique_ptr<Device> cpu_interface_alias_;
-    std::vector<u32> active_;  ///< stack of acknowledged-but-not-EOI'd ids
+    std::array<std::vector<u32>, kGicCoreCount> active_;
     std::function<void(bool)> line_callback_;
-    Cpu* cpu_ = nullptr;
+    std::array<Cpu*, kGicCoreCount> cpus_{};
+    std::array<bool, kGicCoreCount> irq_lines_{};
+    std::array<bool, kGicCoreCount> fiq_lines_{};
+    const BusContext* access_context_ = nullptr;
     bool line_ = false;
     bool secure_world_left_enabled_ = false;
 };
@@ -409,6 +469,47 @@ private:
 // ---------------------------------------------------------------------------
 // Timers
 // ---------------------------------------------------------------------------
+
+/// Bounded Vita LT5/WT7 comparison timers; distinct from the A9 MPCore timers.
+/// Only reached configuration profiles are accepted. Unrecovered overflow,
+/// capture and auto-reload interrupt modes do not generate events.
+class VitaSystemTimer : public Device {
+public:
+    VitaSystemTimer(std::string name, u32 base, bool longrange, u32 irq_id);
+    u64 read(u32 address, unsigned size) override;
+    void write(u32 address, unsigned size, u64 value) override;
+    void reset() override;
+    void tick(u64 periph_ticks) override;
+    void set_irq_callback(std::function<void(u32, bool)> callback) { irq_ = std::move(callback); }
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+    bool peek_register(const std::string& name, u64& out) const override;
+    bool poke_register(const std::string& name, u64 value) override;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+private:
+    u32 counter_offset() const { return longrange_ ? 0 : 4; }
+    u32 deadline_offset() const { return longrange_ ? 8 : 0; }
+    u32 config_offset() const { return longrange_ ? 0x1C : 8; }
+    u32 status_offset() const { return longrange_ ? 0x18 : 0x14; }
+    bool known_offset(u32 offset) const;
+    bool supported_config(u32 config) const;
+    bool running() const;
+    u64 counter() const;
+    u64 deadline() const;
+    void refresh_irq();
+
+    bool longrange_;
+    u32 irq_id_;
+    std::array<u32, 8> registers_{};
+    u64 fractional_ = 0;
+    u64 comparisons_ = 0;
+    u64 unsupported_configs_ = 0;
+    bool armed_ = false;
+    bool unsupported_ = false;
+    bool irq_state_ = false;
+    std::function<void(u32, bool)> irq_;
+};
 
 /// The Cortex-A9 global timer (TRM 4.4, page 4-71). 64 bit up counter clocked
 /// by PERIPHCLK with a banked comparator.
@@ -648,10 +749,9 @@ private:
     /// PERIPHCLK ticks left before Transfer Complete is reported after the last
     /// data byte was consumed.
     u32 transfer_complete_in_ = 0;
-    /// Set when a command was deliberately left unanswered (CMD5 on an eMMC, CMD8
-    /// without the check pattern).  Such a command must not raise an error interrupt:
-    /// reporting it as a command failure put error-status bit 0 into the request
-    /// status and NSKBL read that as 0x80320002 (docs/NSKBL.md round 403).
+    /// The card does not return a response (CMD5 on an eMMC, rejected SD CMD8).
+    /// Hold Command Inhibit until the delayed response deadline reports Command
+    /// Timeout; never fabricate a successful response for these probes.
     bool command_no_response_ = false;
     /// PERIPHCLK ticks left before a *failed* command reports its error interrupt
     /// status.  On hardware the error (e.g. a command timeout) arrives after the
@@ -702,14 +802,15 @@ private:
 ///   0x28  SPI_RXFIFO_STATUS   number of bytes available to read
 ///   0x2C  SPI_TXFIFO_STATUS   number of bytes still pending in the TX FIFO
 ///
-/// The transfer itself is delegated to an attached slave: when software sets
-/// the start bit the accumulated transmit bytes are clocked out and the slave's
-/// answer is queued into the receive FIFO. The block is byte oriented on the
-/// outside (0x28 counts bytes, FIFO accesses are 16 bit words, low byte first)
-/// because that is how both drivers count the reply.
+/// Framed modes delegate prequeued bytes to an attached slave at start. The
+/// native OLED port2 / CTL30001 subset instead arms before TX and synchronously
+/// consumes each subsequent low16 word. Its unconnected input is explicitly
+/// modeled as pulled high (FFFF per clocked word), not as a valid panel ID.
+/// Queue counts inherit the existing byte-oriented model (word accesses pop
+/// two low-byte-first bytes); nonzero OLED count units/rate/capacity are unknown.
 class Spi : public RegisterBlock {
 public:
-    /// The slave side: consume the transmitted bytes, produce the answer.
+    /// The framed slave side: consume prequeued bytes at start, produce a reply.
     using Transfer = std::function<std::vector<u8>(const std::vector<u8>&)>;
 
     Spi(std::string name, u32 base, u32 size, u32 port);
@@ -720,6 +821,15 @@ public:
     void reset() override;
     u64 read_word(u32 offset, u64 stored) override;
     void write_word(u32 offset, u64 value) override;
+    void tick(u64 ticks) override;
+
+    /// SPI0 board wire, independent of service-result contents or CPU phase.
+    /// No pin4 peer is asserted before a real valid framed transaction.
+    void set_syscon_ready_callback(std::function<void(bool)> callback);
+    void set_syscon_gpio(bool edge_qualified, bool driven_request_high);
+    void reset_syscon_ready_wire();
+    bool syscon_ready_asserted() const { return syscon_ready_asserted_; }
+    u64 syscon_ready_edges() const { return syscon_ready_edges_; }
 
     void set_irq_callback(std::function<void(u32, bool)> callback) { irq_callback_ = std::move(callback); }
     bool irq_line() const { return irq_line_; }
@@ -749,11 +859,14 @@ public:
 
 private:
     void start_transfer();
+    void consume_oled_words();
     void update_irq();
+    void cancel_syscon_ready();
+    void drive_syscon_ready(bool asserted);
 
     u32 port_;
-    std::vector<u8> tx_;      ///< bytes handed to the slave so far
-    std::deque<u8> rx_;       ///< bytes the slave returned
+    std::vector<u8> tx_;      ///< queued low-byte-first words, awaiting clocks
+    std::deque<u8> rx_;       ///< captured input bytes, retained across stop
     u32 ctl_ = 0;
     u32 int_ctl_ = 0;
     u32 dma_ctl_ = 0;
@@ -761,6 +874,15 @@ private:
     u32 reg20_ = 0;
     u32 int_status_ = 0;
     bool busy_ = false;
+    bool oled_stream_armed_ = false;
+    bool syscon_peer_active_ = false;
+    bool syscon_gpio_qualified_ = false;
+    bool syscon_request_high_ = false;
+    bool syscon_valid_generation_ = false;
+    bool syscon_ready_scheduled_ = false;
+    bool syscon_ready_asserted_ = false;
+    u64 syscon_ready_edges_ = 0;
+    std::function<void(bool)> syscon_ready_callback_;
     bool irq_line_ = false;
     Transfer slave_;
     std::function<void(u32, bool)> irq_callback_;
@@ -857,7 +979,8 @@ public:
     void describe(std::vector<std::string>& lines) const override;
 
     /// Currently selected buffer, or nullptr when the display is powered down.
-    const u8* framebuffer(int& width, int& height, int& stride) const;
+    const u8* framebuffer(int& width, int& height, int& stride,
+                          int* bytes_per_pixel = nullptr) const;
     u64 frame_counter() const { return frame_counter_; }
     /// Called after every completed frame (used by tests and the debugger).
     void set_frame_callback(std::function<void()> callback) { frame_callback_ = std::move(callback); }
@@ -904,6 +1027,152 @@ private:
     u64 writes_ = 0;
     std::map<u32, std::string> names_;
     std::function<void()> frame_callback_;
+};
+
+/// Native IFTU0 register storage and direct scanout of a selected guest buffer.
+/// This implements the recovered format-0x10 layout and explicit bank selects.
+/// The observed ordinary mode has one bank turnover per native +180 rearm,
+/// driven by the board's DSI0 frame boundary. Raw +40 encoding and blending
+/// remain unrecovered; completion is an explicitly modeled internal IRQ latch.
+class IftuController : public RegisterBlock {
+public:
+    IftuController(std::string name, u32 base, u32 size, Bus& bus);
+
+    void write(u32 address, unsigned size, u64 value) override;
+    void write_word(u32 offset, u64 value) override;
+    void reset() override;
+    void frame_boundary(u64 frames);
+    void set_irq_callback(std::function<void(u32, bool)> callback);
+    bool poke_register(const std::string& name, u64 value) override;
+    const u8* framebuffer(int& width, int& height, int& stride,
+                          int* bytes_per_pixel = nullptr) const;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+private:
+    struct Scanout {
+        const u8* pixels = nullptr;
+        u32 address = 0;
+        int width = 0;
+        int height = 0;
+        int stride = 0;
+        unsigned plane = 0;
+        unsigned bank = 0;
+    };
+
+    bool selected_scanout(unsigned plane, Scanout& out) const;
+    bool active_scanout(Scanout& out) const;
+    bool ordinary_profile(unsigned plane) const;
+    void update_irq(unsigned plane);
+    Bus& bus_;
+    std::array<u32, 2> active_bank_{};
+    std::array<bool, 2> armed_{};
+    std::array<bool, 2> pending_{};
+    std::array<bool, 2> irq_{};
+    std::array<u64, 2> turnovers_{};
+    std::function<void(u32, bool)> irq_callback_;
+};
+
+/// Recovered DSI0 progressive VIC0 timing and vblank interrupt subset.
+/// PHY/packet execution, shutdown completion and scanline semantics are
+/// unsupported; unknown registers retain writes without producing readiness.
+/// A board callback publishes physical frame boundaries independently of the
+/// DSI interrupt mask; the callback never invokes a guest function.
+class DsiController : public Device {
+public:
+    DsiController();
+
+    u64 read(u32 address, unsigned size) override;
+    void write(u32 address, unsigned size, u64 value) override;
+    void reset() override;
+    /// Kermit supplies elapsed microseconds, not ARM cycles.
+    void tick(u64 microseconds) override;
+
+    const char* register_name(u32 address) const override;
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+    bool peek_register(const std::string& name, u64& out) const override;
+    bool poke_register(const std::string& name, u64 value) override;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+    void set_irq_callback(std::function<void(u32, bool)> callback);
+    void set_frame_callback(std::function<void(u64)> callback) { frame_callback_ = std::move(callback); }
+    u64 frame_counter() const { return frames_; }
+
+private:
+    bool supported_running() const;
+    void update_irq();
+    std::array<u32, kDsi0Size / 4> registers_{};
+    u64 phase_ = 0;
+    u64 frames_ = 0;
+    bool irq_ = false;
+    std::function<void(u32, bool)> irq_callback_;
+    std::function<void(u64)> frame_callback_;
+};
+
+/// Native Lowio I2C idle/reset subset. Transfer commands remain busy until
+/// reset; no slave data, completion status or interrupt is fabricated. The
+/// IRQ-control word is opaque because its individual masks are not recovered.
+class I2cController : public Device {
+public:
+    I2cController(std::string name, u32 base, unsigned port);
+
+    u64 read(u32 address, unsigned size) override;
+    void write(u32 address, unsigned size, u64 value) override;
+    void reset() override;
+    const char* register_name(u32 address) const override;
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+    bool peek_register(const std::string& name, u64& out) const override;
+    bool poke_register(const std::string& name, u64 value) override;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+private:
+    void submit_command();
+    std::array<u32, 0x30 / 4> registers_{};
+    unsigned port_;
+    u64 tx_writes_ = 0;
+    u64 bus_resets_ = 0;
+    bool unsupported_ = false;
+};
+
+/// SceEmcTop initialization subset recovered from genuine SceDriverTzs.
+/// Accepted commands and mode requests complete after one PERIPHCLK tick
+/// (explicit emulator latency). Unknown operations stay busy until control0.
+/// Calibration events, electrical timings and DRAM access gating are unmodeled.
+class EmcTopController : public Device {
+public:
+    EmcTopController();
+
+    u64 read(u32 address, unsigned size) override;
+    void write(u32 address, unsigned size, u64 value) override;
+    void reset() override;
+    void tick(u64 peripheral_ticks) override;
+    const char* register_name(u32 address) const override;
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+    bool peek_register(const std::string& name, u64& out) const override;
+    bool poke_register(const std::string& name, u64 value) override;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+private:
+    u32 control_status() const;
+    void submit_control();
+    void reject_control();
+    std::array<u32, 0x248 / 4> registers_{};
+    u32 modifier_ = 0;
+    u32 last_payload_ = 0;
+    u32 last_control_ = 0;
+    u64 command_count_ = 0;
+    u64 completion_count_ = 0;
+    u64 rejected_count_ = 0;
+    u64 control_resets_ = 0;
+    bool busy_ = false;
+    bool command_pending_ = false;
+    bool mode_request_ = false;
+    bool mode_acknowledged_ = false;
+    bool mode_pending_ = false;
+    bool unsupported_ = false;
 };
 
 // ---------------------------------------------------------------------------

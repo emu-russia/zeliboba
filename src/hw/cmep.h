@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -142,8 +143,22 @@ public:
     std::string summary() const;
     void describe(std::vector<std::string>& lines) const;
 
+    /// Board handoff after the legacy loaders: retire any development JIG
+    /// peer until reset. Real SPI response-ready signaling also serves the
+    /// second loader. The physical peer-selection control is not recovered.
+    void enter_native_gpio_phase();
+
     /// Access to the devices for the debugger's device list.
     std::vector<Device*> devices() const;
+
+    /// Attach the ARM mailbox port, with sender-set / receiver-ack semantics.
+    /// The CMeP devices must already be installed in their bus.
+    void install_arm_mailbox(Bus& arm_bus);
+
+    /// Level interrupts for the four shared mailbox channels in each direction.
+    /// Callbacks receive the channel index and its current asserted state.
+    using MailboxIrqCallback = std::function<void(unsigned, bool)>;
+    void set_mailbox_irq_callbacks(MailboxIrqCallback to_cmep, MailboxIrqCallback to_arm);
 
     /// Point the CMeP's SC register window (0xE3100000) at the *shared* SC block -
     /// the same registers the ARM polls and Ernie serves. Without this the CMeP had

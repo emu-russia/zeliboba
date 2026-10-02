@@ -43,8 +43,15 @@ first_loader по шагам, с листингами и измерениями)
    кладёт её в DRAM по физическому адресу `0x407C0000` — **не** в общую SRAM
    `0x1F000000`, потому что вторая стадия строит там `SceKblParam`;
 3. пишет в mailbox `0xE0000010` значение `PA | 1` (бит 0 = «образ готов»);
-4. кладёт `kprx_auth_sm.self` и `prog_rvk.srvk` в окно CMeP SRAM (`0x00800500`,
-   `0x00809B00`) — их адреса вторая стадия записывает в `SceKblParam`;
+4. сохраняет исходные SCE-байты auth-модулей из SLB2. Модель размещает их в общей
+   DRAM только при переходе second_loader → secure_kernel, после использования
+   этой области как IdStorage scratch: optional `context_auth_sm.self`, затем
+   `kprx_auth_sm.self` и `prog_rvk.srvk`, с выравниванием 512 байт в пределах
+   `0x40000500..0x40020000`. Для имеющейся 1.04 это `kprx_auth_sm` по
+   `0x40000500` (размер `0x88F8`) и RVK по `0x40008F00` (`0x6C0`). Отсутствующая
+   запись не занимает место; модельный `SceKblParam` содержит фактические PA/размеры.
+   Это стенд-ин финальных чтений второй стадии, а не загрузка auth-файлов поверх
+   приватной SRAM secure_kernel;
 5. при `config_.provision_keys` подкладывает в CMeP синтетическую таблицу ключей
    `0xE0066000` и переподписывает staged-образ (`machine/bootkeys.cpp`,
    `tools/make_boot_keys.py`), чтобы RSA-проверка первого загрузчика выполнялась
@@ -204,22 +211,67 @@ build\bin\zeliboba.exe -q -ex "boot" -ex "runm 300000" -ex "boot" -ex "gpo" -ex 
 
 `secure_kernel.enp` слинкован на `0x800000` (его первые слова — векторная таблица
 абсолютных прыжков `jmp 0x800100`, `jmp 0x80028C`, …), это приватное окно CMeP
-`CMeP.Private` (2 МиБ). Порядок подтверждён прогоном:
+`CMeP.Private` (2 МиБ). Ниже порядок проверенного полного прогона с 579 проходящими
+тестами (`build/goal-native-emc-syscon-full.log`):
 
 1. стартовые проверки keyring/sysctl/версии;
-2. чтение статуса ARM→CMeP и рукопожатие: CMeP публикует `0x9`, `0x101`, `0x102`,
-   `0x106`, а ARM отвечает записью `1` в `0xE0000010` (на железе это делает ARM
-   boot ROM; в модели — стенд-ин);
-3. успешный путь заканчивается прыжком назад в окно `0x40000` («done»), то есть
-   возвратом во вторую стадию, которая доводит ARM-контекст; после этого syscon
-   отпускает ARM.
+2. стенд-ин ARM boot ROM подтверждает оставшийся статус второй стадии `0x9`;
+3. CMeP публикует `0x101`, модель отпускает ARM для запуска настоящего
+   SceSblSmsched. Статус остаётся pending: гость подтверждает его записью `0x101`,
+   затем пишет свой shared-buffer PA `0x401402C0` и отдельно doorbell `1`;
+4. CMeP получает `0x401402C1`, сохраняет PA и публикует `0x102`, который
+   подтверждает настоящий ARM scheduler. MeP засыпает на `0x800488` (PC `0x80048A`),
+   state `3`. ARM посылает команду `0x80A01` для RVK.
+5. Source 8 пробуждает MeP; настоящий вектор `0x800050` и обработчик
+   `0x800A42` принимают и подтверждают команду. Bigmac исполняет DMA,
+   AES-256-CBC `0x238A`, AES-128-CBC `0x218A` и native SHA-256 `0x2093`.
+   Plain-section copy `0x2080`, HMAC-SHA256 `0x20B3` и AES-128-CTR `0x21A1`
+   также реализованы. Настоящая RSA-проверка и оба section HMAC проходят;
+   RVK callback возвращает `0`, гость публикует 21 запись по `0x809410`.
+   CTR plaintext совпадает с независимой распаковкой, counter обновляется
+   на 42 блока. Прежний отказ `0x800F0627` устранён.
+6. Независимый `0x80901` регистрирует `{PA 0x40140200, length 0x80}` и
+   возвращает настоящий статус `1`. SceSblSmsched запускается со start `0`,
+   выставляет `0x5190A0 = 1` и регистрирует SMC `0x12D..0x13C`.
+7. GIC доставляет mailbox Group0 как Secure FIQ на ARM3. Исправлен reset SPI
+   по Cortex-A9 (`ICDICFR = 0x55555555`, level-sensitive), поэтому polling ACK
+   не оставляет stale pending и прежний Smsched panic исчез. Настоящий SGI4
+   доставляет completion в NSKBL и подтверждается EOI token `0xC04`.
+   Public retail prefix в slot `0x509` (`0xE0062120`) устраняет прежний отказ
+   platform/RVK policy `0x800F0B31`; это моделируемый input, не console dump.
+   Payload CTR и streamed HMAC `0x24B3/0x2CB3/0x28B3` проверены:
+   payload return `0`, outer launch `1`, настоящий entry `0x80B000` исполнен.
+   Plaintext и final digest совпадают с независимой ELF/metadata проверкой.
+8. Native kprx startup использует SWI0 для dispatcher registration. Доставка
+   SWI теперь исправлена: vector `0x800014`, return `1`, IRQ9 callback `0x80E55E`.
+   Модуль остаётся в настоящем work loop `0x80E84A`. DRAM-size slot `0x513`
+   теперь согласован с board 512 MiB. First os0 services `0x10001/0x20001/0x30001`
+   возвращают `0`, section plaintext — валидный zlib stream `0x2DD` bytes.
+   Исправленный unaligned Thumb32 addressing позволяет настоящему inflater
+   вернуть `0x658`, затем `0x318`; оба outputs точно совпадают с ELF load/relocation
+   segments. Все segment loads и native relocation возвращают `0`.
+   Stop/exit notification `0x10000` завершено. Затем cleanup вызывает low-SRAM
+   helper `0x400CE`: его настоящий код есть в префиксе secure_kernel по `0x8000CE`.
+   Низкое окно теперь alias-ит private SRAM на board handoff, helper возвращает
+   `0` на `0x80020E`. Native Bigmac zero-fill `0x000C` очищает module arena,
+   не меняя kernel. Native restart публикует `0x102` и засыпает на `0x80048A`.
+   Затем гость загружает все 28 bootconfig list modules и запускает все 14
+   core modules плюс Stdio и Lowio. Native threads работают; следующая граница
+   — Secure hardware polling (§7);
+   native display contract — `FIRMWARE_DISPLAY_104.md`.
 
-В измеренном прогоне secure kernel исполняет ~117 тыс. инструкций.
+За этот полный прогон CMeP исполняет ~38 млн инструкций и завершает cleanup.
+Mailbox-прерывания, SWI и реальный RETI работают;
+подробности ControlBus, masks/priorities и vector remap — `HARDWARE.md` §1.2.2.
+Оба mailbox endpoint реализуют set исходящих битов и clear подтверждённых
+входящих битов; последовательность PA, затем `1` сохраняет адрес.
 
-*Модель:* доставки прерываний в MeP нет, поэтому ответ ARM превращается в событие
-`state = 9` по адресу `$gp - 32748`, а спящее ядро будится снятием `halted`. Само
-`release_soc()` по «done»-прыжку — тоже подстановка (SC-пути для этого сообщения
-нет).
+*Модель:* отсутствующий reset/ROM/SC-путь отпускает ARM через `release_soc()`
+после `0x101`. Контекст перед KBL по-прежнему дополняется моделью.
+Старое принудительное `state = 9` удалено: это запрос завершения и очистки памяти
+secure kernel. Его эпилог ошибочно читал `0x102` из переключённого стека как адрес
+возврата; выполнение unmapped памяти до `0x40002` было ошибочно названо «done».
+Прогон больше не использует этот признак успеха или автоматические ответы `1`.
 
 ## 6. ARM kernel_boot_loader
 
@@ -235,19 +287,25 @@ build\bin\zeliboba.exe -q -ex "boot" -ex "runm 300000" -ex "boot" -ex "gpo" -ex 
 * сам распаковывает NSKBL своими `sceArlzDecode` (`0x4003C330`) и
   `sceArlzArmFilter` (`0x4003CB40`), поток `0x50000004` → `0x51000000`;
 * рапортует чекпойнты `0x88`, `0x89` и уходит в Non-Secure через `0x40021AE0`
-  (`SCR.NS = 1`), после чего ядро стартует в небезопасном мире;
+  (`SCR.NS = 1`), после чего NSKBL стартует в небезопасном мире;
 * **читает** `SceKblParam` (PA `0x1F000100`): `0x400376E4` копирует 128 байт в
   `0x400B2DC8` → `0x40300100`, плюс поле `+0xC4` читает развилка `0x4002028C`.
-  В обычном прогоне запись при этом **нулевая**: вторая стадия успевает только
-  обнулить её (`0x41B38`), до сборщика (`0x41B4A`) дело не доходит, а C++-сборщик
-  при включённых подстановках не вызывается. То есть KBL доходит до Non-Secure
-  с пустой записью — она нужна не для этого перехода (трап `ZLB_RTRAP=0x100-0x1D0`,
-  покрытие: `0x41B4A` не исполнялась; значения `magic 0xCBAC03AA`, sleep `0x60`,
-  wakeup `0xFF14` появляются только когда сборщик вызван).
+  В текущем обычном прогоне C++-модель строит ненулевую запись после зеркалирования
+  scratchpad: magic `0xCBAC03AA`, DRAM `0x40000000+0x20000000`, реальные адреса
+  и размеры auth-файлов (§2), sleep `0x60`, wakeup `0xFF14`. Это модель параметров
+  предшествующей стадии, не доказательство исполнения гостевого сборщика `0x41B4A`.
+
+Исторический замер с `ZLB_RTRAP=0x100-0x1D0` обнаруживал нулевую запись:
+second_loader исполнял очистку `0x41B38`, но не `0x41B4A`, а C++-сборщик тогда
+не вызывался при включённых подстановках. Вывод той серии о проходе KBL с пустым
+параметром относится к старому состоянию модели; текущий порядок построения
+и зеркалирования исправлен (`docs/STATUS.md` §4).
 
 *Модель:* карта памяти, которую KBL наследует от предыдущей ступени (низкое окно
-ARM, страница векторов `PA 0x16100`), и пред-наполненный раздел памяти KBL —
-подстановки (`docs/STATUS.md` §4).
+ARM, начальная страница векторов `PA 0x16100`), и отдельные fallback-хелперы —
+подстановки (`docs/STATUS.md` §4). Созданные гостем Monitor-векторы, валидные
+dlmalloc heaps и ненулевая native-таблица MemBlock сохраняются. Старый page-cache
+stand-in и heap-lookup shortcut теперь opt-in, по умолчанию выключены.
 
 ## 7. NSKBL
 
@@ -255,20 +313,59 @@ NSKBL стартует на VA `0x51000000` и печатает свой бан�
 (`Starting PSP2 Kernel Boot Loader (Non-secure)`). Подтверждённые чекпойнты
 (писатель GPO `0x51010F98`): `0xA1` `0x510008DC` — pre-init, `0xA2` `0x5100094C`,
 `0xA3` `0x51000C18`, `0xA4` `0x51000C22`, `0xA5` `0x510003CA`, `0xA6` `0x510004CA`;
-текущий — **`0xA9`** `0x51000CF6` («kernel pre-init done, before first external
-load»).
+достигнут **`0xA9`** `0x51000CF6` («kernel pre-init done, before first external
+load»). GPIO остаётся `0xA9`; дальнейшие native module starts описаны ниже.
 
 Что уже работает: NSKBL поднимает eMMC повторно, читает том `os0` (`lba=0`,
-`lba=65536`, `lba=65568`, по 32 сектора), разбирает FAT16 и **находит**
-`os0:psp2bootconfig.skprx`. Данные файла при этом не читаются ни разу: запрос
-драйвера уходит в устройство хранения, чья структура (`VA 0x240`) в цепочке
-загрузки никем не заполняется, поэтому ожидание получает пустой список завершений
-и строится код `0x80320011`. Это текущая стена (`docs/NSKBL.md` §7).
+`lba=65536`, `lba=65568`, затем данные с `lba=72800`), разбирает FAT16 и читает
+`os0:psp2bootconfig.skprx` через настоящий объект драйвера `0x5117CB00` и SDIF ADMA.
+Полный прогон даёт 10753 sector reads, 0 writes; клон eMMC остаётся чистым.
+Auth-команды `0x10001/0x20001/0x30001` завершаются transport `1`, service `0`.
+Расшифрованный поток по VA/PA `0x5113C000` содержит `0x2DD` байт валидного zlib:
+независимая распаковка даёт `0x658` байт и побайтово совпадает с первым PT_LOAD
+`psp2bootconfig.elf`. Native ARM decoder теперь выдаёт точные load и relocation
+segments; relocation, linking 12 imports и первый module callback проходят.
+Прежние list-load errors `0x803FF007` исправлены: A32 word load больше не
+портит `/kd/` при unaligned path copy. Оба списка возвращают `0`, все 28 modules
+получают положительные UID и проходят native relocation. NEON initializer
+ThreadMgr также исполняется после исправления D/Q register decode.
+Все 14 core-module starts, Stdio, Lowio, Syscon, OLED, Display и SblSsSmComm успешны.
+Exact reset7/idle I2C model
+устраняет прежний Lowio wait на `0xE050001C`. Architectural TPIDR registers
+сохраняют native per-core context pointers и security banks; threads работают.
+Syscon VMOV/VST1 padding block также исправлен. LT5/WT7 считают elapsed time;
+настоящий IRQ135 handler освобождает delay wait. Все шесть SceEmcTop commands
+завершены, SMC117 возвращает `0`; CDRAM имеет независимый RAM backing.
+GPIO248/sub4 теперь выполняет receive/ACK/stop. RFE Thumb return исправлен;
+OLED A1 сохраняет SP и выдаёт точные18 bytes, отвергает моделируемый high input
+и устанавливает ready2. Display WaitReady/script/head возвращают0, DSI0 включён.
+Syscon checksum SIMD исправлен. Boot flags раннего modeled handoff теперь
+согласованы с NVS: FF FF 00 FF, product4; поздний external marker удалён.
+Native allocated per-core stacks сохранены, fallback только для shared top4000.
+Все четыре Display predicates0; producer005B7048/gzip1FE000/SetFrameBuf0 и
+vblank wait0 исполняются. Гостевой logo buffer PA1C000000 побайтово совпадает
+с embedded asset. Deferred IFTU bank1 публикуется на следующем DSI frame;
+physical IRQ204 вызывает настоящий Lowio handler, zero ACK, +180 rearm и replay
+в старый bank0. Прогон: `runm 1000000`, `build/goal-native-iftu-arm-full.log`,
+suite **617 / 0**; breakpoints: `build/goal-arm-native-syscon-oled-iftu-arm.log/.json`.
+Белый PlayStation logo на чёрном фоне подтверждён в
+native SDL screenshot (image omitted from source delivery).
+Timing/rearm/status — ограниченная модель; подробности и пределы проверки в
+[integrated evidence](../build/goal-native-iftu-arm-integrated-evidence.md).
+
+Историческое наблюдение пустой структуры по VA `0x240`, отсутствия чтений файла
+и результата `0x80320011` относится к ранним неполным путям инициализации
+(`docs/NSKBL.md` §7); текущий native driver/completion путь это препятствие прошёл.
 
 ## 8. Ядро
 
-«Ядро загружено» = ARM исполняет код модулей ядра в DRAM. Пока не достигнуто:
-стадия `--stage kernel` грузит модуль ядра напрямую (`bootimage.elf` →
+ARM теперь исполняет настоящий код os0 kernel modules в DRAM: все 14 core
+starts возвращают `0`, затем Stdio, Lowio, Syscon, OLED, Display и SblSsSmComm;
+native threads работают.
+Обычный cold path создаёт настоящий logo buffer, публикует его через IFTU и
+показывает PlayStation logo в native SDL (§7). Полная загрузка ядра и LiveArea
+ещё не наблюдались. Прежний interrupt context divergence исправлен.
+Стадия `--stage kernel` грузит модуль ядра напрямую (`bootimage.elf` →
 `0x81000000`) — это отладочный путь, позволяющий работать с ядром, не доводя
 предыдущие ступени.
 
@@ -278,16 +375,17 @@ load»).
 |---|---|---|
 | `0x00000000..0x0003FFFF` | ARM | низкое окно, алиас power scratchpad (256 КиБ) |
 | `0x00040000..0x0005FFFF` | ARM | зеркало CMeP SRAM `0x00800000` («MeP boot») |
-| `0x00040000..0x0005FFFF` | CMeP | RAM CMeP: окно first_loader и staging second_loader (128 КиБ) |
+| `0x00040000..0x0005FFFF` | CMeP | Boot backing first_loader и staging second_loader (128 КиБ); после secure-kernel handoff alias private SRAM `0x800000`, model boundary с неизвестным selecting register |
 | `0x00060000` | CMeP | вершина стека (`$0` при сбросе) |
 | `0x00800000..0x009FFFFF` | CMeP | приватная RAM CMeP: secure kernel и Secure Modules (2 МиБ) |
-| `0x00800500`, `0x00809B00` | ARM+CMeP | `kprx_auth_sm.self`, `prog_rvk.srvk` |
+| `0x40000500`, `0x40008F00` | ARM и CMeP | исходные `kprx_auth_sm.self` и `prog_rvk.srvk` для имеющейся 1.04; общий staging-пул `0x40000500..0x40020000`, §2 |
 | `0x1F000000..0x1F03FFFF` | ARM и CMeP | общая загрузочная SRAM (256 КиБ); `SceKblParam` — по `0x1F000100` |
 | `0x1C000000..0x1C1FFFFF` | ARM | Scratchpad SRAM (2 МиБ) |
 | `0x1D000000` | ARM | аппаратный «/dev/null» (4 КиБ) |
 | `0x40000000..0x5FFFFFFF` | ARM и CMeP | DRAM, видимая обеим сторонам (KBL линкуется на `0x40020000`) |
 | `0x80000000..0x83FFFFFF` | ARM | окно основной DRAM (64 МиБ) |
-| `0x1E000000` | ARM | MPCore: SCU, GIC, GT, PT |
+| `0x1A000000..0x1A001FFF` | ARM | native MPCore: SCU, GIC (CPU interface `+0x100`, distributor `+0x1000`), GT, PT |
+| `0x1A002000` | ARM | native PL310 L2 controller |
 
 ## 10. Что подтверждено, а что модель
 
@@ -305,7 +403,12 @@ reset-пролог Ernie, содержимое SLB2 1.04, формат FAT16 р�
 области; адресация периферии Kermit там, где её не удалось подтвердить реверсом
 модулей прошивки; начальные значения батареи/RTC syscon; ключ разработчика в
 таблице `0xE0066000` и переподпись образа (реальная таблица в дампы не попала);
-запись digest-таблицы `+0x1A0`; отсутствие прерываний MeP; карта памяти, которую
-KBL наследует от предыдущей ступени; структура устройства хранения NSKBL
-(её в модели нет — это и есть текущая стена). Полный список подстановок —
+запись digest-таблицы `+0x1A0`; handoff-стейджинг auth-файлов и построение
+`SceKblParam`; карта памяти, которую KBL наследует от предыдущей ступени;
+stage-boundary remap EVM=0 vectors (`0x40000` → `0x800000`, реальный управляющий
+регистр ещё неизвестен); board-профиль public identity slot `0x509` и DRAM-size
+slot `0x513`. MeP IRQ/SWI и native ARM mailbox completion теперь исполняют код
+гостя; старые fake `state=9`, auto-reply `1` и «done» по `0x40002` удалены.
+Текущие нерешённые пути — native ARM decompression error и low-SRAM helper alias
+при cleanup, а не отсутствие структуры хранения NSKBL. Полный список подстановок —
 `docs/STATUS.md` §4.

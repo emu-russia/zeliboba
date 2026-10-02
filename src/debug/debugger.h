@@ -115,6 +115,7 @@ public:
 
     struct DisassemblyLine {
         u32 address = 0;
+        unsigned length = 0;
         std::string text;
         bool is_pc = false;
         bool has_breakpoint = false;

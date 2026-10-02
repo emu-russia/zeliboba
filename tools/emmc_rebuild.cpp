@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
         if (root.empty()) {
             // Default to the workspace layout next to the emulator checkout.
             for (const char* candidate : {"../Vita_104_Firmware/Out", "../../Vita_104_Firmware/Out",
-                                          "C:/Work/PSVita/Vita_104_Firmware/Out"}) {
+                                          "../Vita_104_Firmware/Out"}) {
                 if (std::filesystem::is_directory(candidate)) {
                     root = candidate;
                     break;

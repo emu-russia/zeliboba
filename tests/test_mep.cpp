@@ -1417,17 +1417,20 @@ ZLB_TEST(mep_reti_uses_epc_or_npc) {
     // NMI latch) is set; both have bit 0 masked off.
     Fixture f;
     f.cpu.epc = (kCode + 0x30u) | 1u;
+    f.cpu.psw = 0x1BAu;          // HIE, SIE, IEP and UMP; IEC/UMC clear
     f.word(kCode, 0x7012u);        // reti
     f.run(1);
     ZLB_EXPECT_EQ(f.cpu.pc, kCode + 0x30u);
+    ZLB_EXPECT_EQ(f.cpu.psw, 0x1BFu);
 
     Fixture g;
     g.cpu.npc = (kCode + 0x40u) | 1u;
-    g.cpu.psw = 1u << 9;
+    g.cpu.psw = (1u << 9) | 0x105u;
     g.word(kCode, 0x7012u);        // reti
     g.run(1);
     ZLB_EXPECT_EQ(g.cpu.pc, kCode + 0x40u);
     ZLB_EXPECT_EQ(g.cpu.psw & (1u << 9), 0u);
+    ZLB_EXPECT_EQ(g.cpu.psw, 0x105u); // NMI return leaves IEC and UMC unchanged.
 }
 
 ZLB_TEST(mep_sleep_sets_the_halt_flag) {
@@ -1454,6 +1457,154 @@ ZLB_TEST(mep_swi_sets_the_exception_cause_bit) {
     ZLB_EXPECT_EQ(f.cpu.exc, (1u << 4) | (1u << 6));
 }
 
+ZLB_TEST(mep_swi_enters_native_vector_and_returns_after_acknowledgement) {
+    for (const unsigned index : {0u, 2u}) {
+        Fixture f;
+        f.bus.add_ram("secure_swi_vectors", 0x1000, 0x800000, "native SWI handler");
+        f.cpu.set_boot_vector_base(0x800000);
+        const u32 sip = 1u << (4u + index);
+        f.cpu.psw = 0x105u | sip; // IEC/HIE, user mode, corresponding SIE.
+        f.cpu.exc = 0x89u;        // Unenabled SIP3 and an old exception code.
+        f.word(kCode, 0x7006u | (index << 4));
+        f.word(kCode + 2, 0x6204u); // add $2,1: syscall continuation.
+        // Native kernel vector and SIP-clear sequence at 0x800014/0x800390.
+        f.word(0x800014, 0x8003DBD8u); // jmp 0x80037A
+        f.word(0x80037A, 0x704Bu);     // ldc $0,$exc
+        f.word(0x80037C, index == 0 ? 0x5CEFu : 0x5CBFu); // mov $12,~SIP
+        f.word(0x80037E, 0x10C1u);     // and $0,$12
+        f.word(0x800380, 0x7049u);     // stc $0,$exc
+        f.word(0x800382, 0x7012u);     // reti
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+        ZLB_EXPECT_EQ(f.cpu.exc, 0x89u | sip);
+        const StepResult entry = f.cpu.step();
+        ZLB_EXPECT_TRUE(entry.was_branch);
+        ZLB_EXPECT_TRUE(entry.text == "software interrupt");
+        ZLB_EXPECT_EQ(f.cpu.pc, 0x800014u);
+        ZLB_EXPECT_EQ(f.cpu.epc, kCode + 2u);
+        ZLB_EXPECT_EQ(f.cpu.psw, 0x10Au | sip); // IEC/UMC saved in IEP/UMP.
+        ZLB_EXPECT_EQ(f.cpu.exc, 0x85u | sip);  // SIP remains for native ACK.
+        ZLB_EXPECT_EQ(f.cpu.r[2], 0u);         // Continuation has not executed.
+        f.run(6);                            // Vector jump, clear SIP, RETI.
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+        ZLB_EXPECT_EQ(f.cpu.exc, 0x85u);
+        ZLB_EXPECT_EQ(f.cpu.psw, 0x10Fu | sip);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.r[2], 1u);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);
+    }
+}
+
+ZLB_TEST(mep_swi_pending_delivery_waits_for_iec_sie_and_nmi_masks) {
+    // A request remains pending through masked instructions. STC PSW enables
+    // it before the very next instruction, with that instruction as EPC.
+    const u32 variants[][2] = {{0x10u, 0u}, {1u, 0u}, {0x211u, 0u}, {0x11u, 2u}};
+    for (const auto& variant : variants) {
+        Fixture f;
+        f.cpu.set_boot_vector_base(0x800000);
+        f.cpu.psw = variant[0];
+        const u32 sip = 1u << (4u + variant[1]);
+        f.cpu.r[1] = 1u | sip;
+        f.word(kCode, 0x7006u | (variant[1] << 4));
+        f.word(kCode + 2, 0x6204u); // add $2,1 while request is masked.
+        f.word(kCode + 4, 0x7109u); // stc $1,$psw
+        f.word(kCode + 6, 0x6304u); // add $3,1 must wait for handler.
+        f.run(3);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 6u);
+        ZLB_EXPECT_EQ(f.cpu.r[2], 1u);
+        ZLB_EXPECT_EQ(f.cpu.exc & sip, sip);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, 0x800014u);
+        ZLB_EXPECT_EQ(f.cpu.epc, kCode + 6u);
+        ZLB_EXPECT_EQ(f.cpu.r[3], 0u);
+    }
+    // STC EXC, like SWI, can request software delivery. EVA selects the RAM
+    // exception bank, independently of IVA/IVM and the board's ROM remap.
+    for (const u32 cfg : {0x10u, 0x00400018u, 0x00800010u, 0x00C00018u}) {
+        Fixture f;
+        f.cpu.cfg = cfg;
+        f.cpu.set_boot_vector_base(0x40000);
+        f.cpu.psw = 0x81u;
+        f.cpu.r[1] = 0x80u;
+        f.word(kCode, 0x7149u); // stc $1,$exc, request SIP3
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, (cfg & 0x00800000u) ? 0x800014u : 0x200014u);
+        ZLB_EXPECT_EQ(f.cpu.epc, kCode + 2u);
+        ZLB_EXPECT_EQ(f.cpu.exc, 0x85u);
+    }
+}
+
+ZLB_TEST(mep_swi_has_priority_over_pending_hardware_irq) {
+    Fixture f;
+    f.bus.add_ram("swi_irq_vectors", 0x100, 0, "interrupt handlers");
+    f.cpu.psw = 0x111u;
+    f.cpu.cbus.write(2, 0x100u);
+    f.cpu.cbus.write(5, 0xFu);
+    f.cpu.cbus.write(0, 0x600u);
+    f.word(kCode, 0x7006u);
+    f.word(kCode + 2, 0x6204u);
+    f.word(0x14, 0x704Bu); // ldc $0,$exc
+    f.word(0x16, 0x5CEFu); // mov $12,-17
+    f.word(0x18, 0x10C1u); // and $0,$12
+    f.word(0x1A, 0x7049u); // stc $0,$exc
+    f.word(0x1C, 0x7012u); // reti
+    f.word(0x50, 0x7012u); // hardware IRQ reti
+    f.run(1);
+    f.cpu.set_irq_level(8, true);
+    f.run(1);
+    ZLB_EXPECT_EQ(f.cpu.pc, 0x14u);
+    ZLB_EXPECT_EQ(f.cpu.exc, 0x115u); // SIP0, HIP and SWI code5.
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0), 0x600u); // INTC not acknowledged yet.
+    f.run(5);
+    ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+    f.run(1);
+    ZLB_EXPECT_EQ(f.cpu.pc, 0x50u);
+    ZLB_EXPECT_EQ(f.cpu.exc, 0x100u); // Native SWI ACK retained hardware request.
+    ZLB_EXPECT_EQ(f.cpu.epc, kCode + 2u);
+    ZLB_EXPECT_EQ(f.cpu.r[2], 0u);
+    f.cpu.set_irq_level(8, false);
+    f.run(2); // IRQ RETI, then continuation.
+    ZLB_EXPECT_EQ(f.cpu.r[2], 1u);
+}
+
+ZLB_TEST(mep_swi_preserves_valid_repeat_context_across_native_return) {
+    // SWI is in the first loop slot, safely before the prohibited final two.
+    for (const bool endless : {false, true}) {
+        Fixture f;
+        f.bus.add_ram("repeat_swi_vectors", 0x100, 0, "SWI handler");
+        f.cpu.psw = 0x11u;
+        f.cpu.r[1] = 2u;
+        f.word(kCode, endless ? 0x0005E019u : 0x0005E109u);
+        f.word(kCode + 4, 0x7006u);
+        f.word(kCode + 6, 0x6204u);
+        f.word(kCode + 8, 0x6304u);
+        f.word(kCode + 10, 0x6404u); // RPE
+        f.word(kCode + 12, 0x6504u); // trailing slot
+        f.word(0x14, 0x704Bu);
+        f.word(0x16, 0x5CEFu);
+        f.word(0x18, 0x10C1u);
+        f.word(0x1A, 0x7049u);
+        f.word(0x1C, 0x7012u);
+        f.run(1); // REPEAT/EREPEAT setup.
+        for (unsigned iteration = 0; iteration < 3u; ++iteration) {
+            const u32 rpb = f.cpu.rpb, rpe = f.cpu.rpe, rpc = f.cpu.rpc;
+            f.run(2); // SWI instruction then exception entry.
+            ZLB_EXPECT_EQ(f.cpu.pc, 0x14u);
+            ZLB_EXPECT_EQ(f.cpu.epc, kCode + 6u);
+            ZLB_EXPECT_EQ(f.cpu.rpb, rpb);
+            ZLB_EXPECT_EQ(f.cpu.rpe, rpe);
+            ZLB_EXPECT_EQ(f.cpu.rpc, rpc);
+            f.run(5); // ACK/RETI.
+            ZLB_EXPECT_EQ(f.cpu.pc, kCode + 6u);
+            f.run(4); // Remaining loop body and trailing slot.
+        }
+        for (unsigned reg = 2; reg <= 5; ++reg) ZLB_EXPECT_EQ(f.cpu.r[reg], 3u);
+        ZLB_EXPECT_EQ(f.cpu.pc, endless ? kCode + 4u : kCode + 14u);
+    }
+}
+
 ZLB_TEST(mep_dret_dbreak_and_sync_instructions) {
     // MAJ_7 sub 3 (`dret`, `dbreak`) and sub 1 (`syncm`, `synccp`).  The core
     // has no debug exception unit, so only the depc jump of dret is visible.
@@ -1478,33 +1629,244 @@ ZLB_TEST(mep_dret_dbreak_and_sync_instructions) {
     ZLB_EXPECT_EQ(g.cpu.pc, kCode + 2u);
 }
 
-ZLB_TEST(mep_control_bus_byte_transfers) {
-    // MAJ_15 sub 4: stcb/ldcb transfer one byte; the address is a 16 bit
-    // immediate or the low half of $rm.
+ZLB_TEST(mep_control_bus_word_transfers) {
+    // STCB/LDCB transfer a 32-bit word at a 16-bit control-bus address
+    // (Toshiba MEPUM03015-E11 p6), in both immediate and register forms.
     Fixture f;
-    f.cpu.r[1] = 0x1234u;
+    f.cpu.r[1] = 0x89ABCDEFu;
     f.word(kCode, 0x0300F104u);    // stcb $1,0x300
     f.run(1);
-    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x300), 0x34u);
-    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x301), 0x00u);   // byte sized store
-    f.cpu.cbus.write(0x300, 0xAB);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x300), 0x89ABCDEFu);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x301), 0x00u); // Separate word address.
+    f.cpu.cbus.write(0x300, 0xFEDCBA98u);
     f.word(kCode, 0x0300F214u);    // ldcb $2,0x300
     f.cpu.pc = kCode;
     f.run(1);
-    ZLB_EXPECT_EQ(f.cpu.r[2], 0xABu);
+    ZLB_EXPECT_EQ(f.cpu.r[2], 0xFEDCBA98u);
 
-    f.cpu.r[1] = 0x5678u;
+    f.cpu.r[1] = 0x76543210u;
     f.cpu.r[2] = 0x00010300u;      // only the low 16 bits are the address
     f.word(kCode, 0x712Cu);        // stcb $1,($2)
     f.cpu.pc = kCode;
     f.run(1);
-    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x300), 0x78u);
-    f.cpu.cbus.write(0x300, 0x5A);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0x300), 0x76543210u);
+    f.cpu.cbus.write(0x300, 0xABCDEF01u);
     f.cpu.r[3] = 0x00010300u;
     f.word(kCode, 0x723Du);        // ldcb $2,($3)
     f.cpu.pc = kCode;
     f.run(1);
-    ZLB_EXPECT_EQ(f.cpu.r[2], 0x5Au);
+    ZLB_EXPECT_EQ(f.cpu.r[2], 0xABCDEF01u);
+}
+
+ZLB_TEST(mep_intc_firmware_setup_and_vector_metadata) {
+    Fixture f;
+    // Secure kernel 0x8002C0 configures priority F for mailbox source 8,
+    // enables its bit 0x100, and masks priorities <=6. Byte-sized control
+    // transfers previously erased that enable bit and the priority fields.
+    const u32 setup[][3] = {
+        {0x0003F104u, 0u, 3u},         // stcb $1,3: level-triggered inputs
+        {0x0004F104u, 0x07777777u, 4u},
+        {0x0005F104u, 0x0000777Fu, 5u},
+        {0x0000F104u, 0x600u, 0u},
+        {0x0002F104u, 0x100u, 2u},
+    };
+    for (const auto& entry : setup) {
+        f.cpu.r[1] = entry[1];
+        f.bus.write32(kCode, entry[0]); // STCB remains 32 bits when address is zero.
+        f.cpu.pc = kCode;
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.cbus.read(entry[2]), entry[1]);
+    }
+    f.cpu.psw = 0x101u;
+    f.cpu.set_irq_level(8, true);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(1), 0x100u);
+    ZLB_EXPECT_EQ(f.cpu.exc & 0x100u, 0x100u);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.pc, 0x50u);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0), 0xF640u); // ILV=15, IML=6, ICN=8.
+    f.cpu.cbus.write(0, 0xFFFFFFFFu);
+    ZLB_EXPECT_EQ(f.cpu.cbus.read(0), 0xFF40u); // Only IML is writable.
+}
+
+ZLB_TEST(mep_intc_levels_edges_priorities_and_masks) {
+    MePCore::ControlBus cb;
+    cb.reset();
+    cb.write(2, 0xE0000000u); // Enable channels 29..31, including high bits.
+    cb.write(7, 0x77700000u); // All three at priority 7.
+    cb.write(0, 0x600u);
+    cb.set_irq_level(30, true);
+    cb.set_irq_level(31, true);
+    ZLB_EXPECT_EQ(cb.pending_irq(), 31); // Equal priority favors larger channel.
+    cb.write(1, 0);
+    ZLB_EXPECT_EQ(cb.read(1), 0xC0000000u); // A software clear cannot clear levels.
+    cb.set_irq_level(31, false);
+    ZLB_EXPECT_EQ(cb.pending_irq(), 30);
+    cb.write(0, 0x700u);
+    ZLB_EXPECT_EQ(cb.pending_irq(), -1); // Equal to IML is masked.
+    cb.write(0, 0x600u);
+    cb.write(3, 0x20000000u); // Channel 29 is edge-triggered.
+    cb.set_irq_level(29, true);
+    cb.set_irq_level(29, false);
+    ZLB_EXPECT_EQ(cb.read(1), 0x60000000u); // Edge remains latched after deassertion.
+    cb.write(1, 0xFFFFFFFFu);
+    ZLB_EXPECT_EQ(cb.read(1), 0x60000000u); // Writing one preserves the edge.
+    cb.write(1, ~0x20000000u);
+    ZLB_EXPECT_EQ(cb.read(1), 0x40000000u);
+    cb.set_irq_level(30, false);
+    ZLB_EXPECT_EQ(cb.pending_irq(), -1);
+    cb.write(7, 0);
+    cb.set_irq_level(31, true);
+    ZLB_EXPECT_EQ(cb.pending_irq(), -1); // Priority zero is disabled.
+}
+
+ZLB_TEST(mep_mailbox_irq_wakes_sleep_and_returns_to_next_instruction) {
+    Fixture f;
+    f.bus.add_ram("secure_vectors", 0x1000, 0x800000, "test secure vectors");
+    f.cpu.set_boot_vector_base(0x800000);
+    f.cpu.cbus.write(2, 0x100u);
+    f.cpu.cbus.write(5, 0xFu);
+    f.cpu.cbus.write(0, 0x600u);
+    f.cpu.psw = 0x115u; // IEC=HIE=1, user mode; SIE0 must be retained.
+    f.cpu.exc = 0x61u; // SIP1/2 pending but disabled; SIE0 is enabled above.
+    f.word(kCode, 0x7062u);     // sleep, like the secure kernel idle loop.
+    f.word(kCode + 2, 0x6204u); // add $2,1: interrupted continuation.
+    f.word(0x800050, 0x8003DAE8u); // Genuine kernel vector: jmp 0x80035C.
+    f.word(0x80035C, 0x0012F314u); // ldcb $3,0x12: stand-in handler work.
+    f.word(0x800360, 0x7012u);     // reti
+    f.cpu.cbus.write(0x12, 0x80A01u); // Actual RVK command, retained in 32 bits.
+    f.run(1);
+    ZLB_EXPECT_TRUE(f.cpu.halted);
+    ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+    f.cpu.set_irq_level(8, true);
+    ZLB_EXPECT_FALSE(f.cpu.halted);
+    ZLB_EXPECT_EQ(f.cpu.psw & 0x800u, 0u);
+    const auto entry = f.cpu.step();
+    ZLB_EXPECT_TRUE(entry.was_branch);
+    ZLB_EXPECT_EQ(f.cpu.pc, 0x800050u);
+    ZLB_EXPECT_EQ(f.cpu.epc, kCode + 2u);
+    ZLB_EXPECT_EQ(f.cpu.psw, 0x11Au); // IEP/UMP saved; IEC/UMC cleared.
+    ZLB_EXPECT_EQ(f.cpu.exc, 0x160u); // HIP set, hardware exception cause zero.
+    f.run(2);                       // Vector jump and handler instruction.
+    ZLB_EXPECT_EQ(f.cpu.r[3], 0x80A01u);
+    ZLB_EXPECT_EQ(f.cpu.pc, 0x800360u);
+    f.cpu.set_irq_level(8, false);    // Hardware ACK deasserts the level.
+    ZLB_EXPECT_EQ(f.cpu.exc, 0x60u);
+    f.run(1);                       // RETI restores IEC and UMC.
+    ZLB_EXPECT_EQ(f.cpu.pc, kCode + 2u);
+    ZLB_EXPECT_EQ(f.cpu.psw, 0x11Fu);
+    f.run(1);
+    ZLB_EXPECT_EQ(f.cpu.r[2], 1u);
+    ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);
+}
+
+ZLB_TEST(mep_irq_masking_wakes_without_entering_handler) {
+    for (const u32 masked_psw : {0u, 1u, 0x100u, 0x301u}) {
+        Fixture f;
+        f.cpu.cbus.write(2, 0x100u);
+        f.cpu.cbus.write(5, 0xFu);
+        f.cpu.psw = masked_psw;
+        f.word(kCode, 0x7062u);      // sleep
+        f.word(kCode + 2, 0x6404u);  // add $4,1
+        f.run(1);
+        f.cpu.set_irq_level(8, true);
+        ZLB_EXPECT_FALSE(f.cpu.halted); // INTC request wakes despite IEC/HIE/NMI.
+        ZLB_EXPECT_EQ(f.cpu.exc & 0x100u, 0x100u);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);
+        ZLB_EXPECT_EQ(f.cpu.r[4], 1u);
+        ZLB_EXPECT_EQ(f.cpu.epc, 0u);
+    }
+    Fixture f;
+    f.cpu.cbus.write(5, 0xFu);
+    f.word(kCode, 0x7062u);
+    f.run(1);
+    f.cpu.set_irq_level(8, true);
+    ZLB_EXPECT_TRUE(f.cpu.halted); // IER=0 prevents even the wake signal.
+    ZLB_EXPECT_EQ(f.cpu.exc & 0x100u, 0u);
+    Fixture g;
+    g.cpu.cbus.write(2, 0x100u);
+    g.cpu.cbus.write(5, 0xFu);
+    g.cpu.halt("debugger stop");
+    g.cpu.set_irq_level(8, true);
+    ZLB_EXPECT_TRUE(g.cpu.halted);
+    ZLB_EXPECT_TRUE(g.cpu.halt_reason == "debugger stop");
+}
+
+ZLB_TEST(mep_irq_vector_selection_uses_cfg_and_board_boot_bank) {
+    // Architecture Table 42. The board remap applies only to EVM=0.
+    const u32 variants[][2] = {
+        {0u, 0x30u},
+        {0x00C00000u, 0x30u},
+        {0x10u, 0x200030u},
+        {0x00800010u, 0x200000u},
+        {0x00400010u, 0x800000u},
+        {0x00C00010u, 0x800030u},
+    };
+    for (const auto& variant : variants) {
+        for (const bool separate : {false, true}) {
+            for (const u32 boot_bank : {0u, 0x40000u, 0x800000u}) {
+                Fixture f;
+                f.cpu.cfg = variant[0] | (separate ? 8u : 0u);
+                f.cpu.set_boot_vector_base(boot_bank);
+                f.cpu.psw = 0x101u;
+                f.cpu.cbus.write(2, 0x100u);
+                f.cpu.cbus.write(5, 0xFu);
+                f.cpu.set_irq_level(8, true);
+                f.cpu.step();
+                const u32 expected = variant[1] + (separate ? 0x20u : 0u) +
+                    ((variant[0] & 0x10u) == 0 ? boot_bank : 0u);
+                ZLB_EXPECT_EQ(f.cpu.pc, expected);
+            }
+        }
+    }
+}
+
+ZLB_TEST(mep_irq_preserves_repeat_context_and_defers_trailing_slot) {
+    // Architecture 7.12: interrupting the trailing slot while another
+    // iteration remains is prohibited. IRQ entry follows its branch-back.
+    for (const bool endless : {false, true}) {
+        Fixture f;
+        f.bus.add_ram("vectors", 0x100, 0, "test interrupt vectors");
+        f.cpu.psw = 0x101u;
+        f.cpu.cbus.write(2, 0x100u);
+        f.cpu.cbus.write(5, 0xFu);
+        f.cpu.r[1] = 2u;
+        f.word(kCode, endless ? 0x0003E019u : 0x0003E109u);
+        f.word(kCode + 4, 0x6204u); // add $2,1
+        f.word(kCode + 6, 0x6304u); // add $3,1: RPE
+        f.word(kCode + 8, 0x6404u); // add $4,1: trailing slot
+        f.word(0x50, 0x7012u);      // reti
+        f.run(3);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 8u);
+        ZLB_EXPECT_EQ(f.cpu.rpe, (kCode + 6u) | (endless ? 1u : 0u));
+        f.cpu.set_irq_level(8, true);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);
+        ZLB_EXPECT_EQ(f.cpu.r[4], 1u);
+        f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, 0x50u);
+        ZLB_EXPECT_EQ(f.cpu.epc, kCode + 4u);
+        f.cpu.set_irq_level(8, false);
+        // Run the actual context-restore register order from 0x80252E..536,
+        // after a handler has cleared RPB. EREPEAT must retain RPE.ELR.
+        const u32 saved_rpb = f.cpu.rpb, saved_rpe = f.cpu.rpe, saved_rpc = f.cpu.rpc;
+        f.cpu.r[1] = 0;
+        f.word(0x50, 0x7148u); f.run(1); // stc $1,$rpb
+        f.cpu.r[1] = saved_rpc;
+        f.word(0x52, 0x7168u); f.run(1); // stc $1,$rpc
+        f.cpu.r[1] = saved_rpe;
+        f.word(0x54, 0x7158u); f.run(1); // stc $1,$rpe
+        f.cpu.r[1] = saved_rpb;
+        f.word(0x56, 0x7148u); f.run(1); // stc $1,$rpb
+        f.word(0x58, 0x0000u); f.run(1);
+        f.word(0x5A, 0x7012u); f.run(1);
+        ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);
+        f.run(6);
+        ZLB_EXPECT_EQ(f.cpu.r[2], 3u);
+        ZLB_EXPECT_EQ(f.cpu.r[3], 3u);
+        ZLB_EXPECT_EQ(f.cpu.r[4], 3u);
+        ZLB_EXPECT_EQ(f.cpu.pc, endless ? kCode + 4u : kCode + 0xAu);
+    }
 }
 
 ZLB_TEST(mep_bit_memory_operations) {

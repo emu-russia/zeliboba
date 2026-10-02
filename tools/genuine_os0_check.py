@@ -7,8 +7,8 @@ SELF/ELF; the extracted tree holds a decrypted module starting with "SCE\\0".
 import glob
 import struct
 
-GENUINE = r"C:\Work\PSVita\Vita_104_Firmware\Out\PUP_dec\os0.bin"
-TREE = r"C:\Work\PSVita\Vita_104_Firmware\Out\fs\os0\psp2bootconfig.skprx"
+GENUINE = r"..\Vita_104_Firmware\Out\PUP_dec\os0.bin"
+TREE = r"..\Vita_104_Firmware\Out\fs\os0\psp2bootconfig.skprx"
 
 
 def head(path, count=16):

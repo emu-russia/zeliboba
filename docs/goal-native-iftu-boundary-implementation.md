@@ -1,0 +1,57 @@
+# Native IFTU frame-boundary integration — 2026-10-01
+
+Sources are frozen after an isolated build and 16 unique focused test cases with zero failures. Parent's all-target build succeeds and the complete integrated suite passes 617/0 (`goal-native-iftu-arm-build.log`, `goal-native-iftu-arm-tests.log`). The fresh Mac SDL capture now visibly shows the guest's white PlayStation logo; details below distinguish this positive result from preserved pre-turnover evidence.
+
+## Fresh integrated native and SDL result
+
+The fresh native graphics capture `goal-arm-native-syscon-oled-iftu-arm.log/.json` observes IRQ204 entering the actual Lowio handler at `005AD99C` after IFTU A current-bank readback becomes2 (bank1). Native ACK clears the internal completion level, the real `+180` store rearms, guest software pending `80000000` clears, and native replay at `005AD9DC` fills old bank0 with the same PA. Both banks now contain the guest buffer at PA `1C000000`, while the stored manual selector remains0 and hardware current is1. The real first vblank wait returns zero.
+
+Graphics independently verifies `goal-arm-native-syscon-oled-iftu-arm-guest-framebuffer.rgba`, 2,088,960 bytes, SHA256 `80c43bdc43d6fcc7f1419960726e6dc3e6be906ae0faac2cdf060204717a6979`, against the supplied logo bytes produced by the native gzip path.
+
+`goal-native-iftu-arm-macos-ui.png` was converted from the actual SDL BMP with `sips` and inspected with `view_image`: the guest panel visibly contains a white PlayStation logo centered on black. Its header reports framebuffer960x544, stride3840, 4bpp RGBA8888. The fresh UI process PID16540 exits zero after108.528 seconds, with Metal/vsync and a48kHz stereoS16 audio stream. The captured console reports10753 reads/zero writes. Existing UI PID20100 remains present and untouched; the source image's size/mtime is unchanged.
+
+The run uses a fresh APFS clone `goal-native-iftu-arm-macos-ui.img`, all inherited `ZLB_*` variables removed, `--no-rebuild --run0`, `runm1000000`, and panel screenshot after2 SDL frames. BMP, PNG, log and JSON are retained under that prefix. No rendering asset, guest predicate, software pending token, handler entry or service result was inserted by the host. This establishes the actual guest logo milestone; it does not establish a later shell boot or erase the explicit controller-model limits below.
+
+The separate ordinary `goal-native-iftu-arm-full.log` is consistent with this presentation: line3409 exports A bank1 at PA `1C000000`, 960x544, pitch3840; line3410 records DSI0 progressive VIC0, 23 frames, status0, mask2 and IRQ213 low. Register dumps from line4021 show current-bank bit1 set while the stored manual selector remains0. Both A descriptor banks contain PA `1C000000`, format10, width `3C0`, height `220`, blank0 and padding0. Both planes retain run1; B's descriptors remain blank. The attached image is writable but clean (`dirty: no`, line3349) and has10753 reads/zero writes (line3350).
+
+No undefined-instruction, panic or logged runtime ARM/secure-fault message appears in this full log. This is not a claim of zero fault counters: ARM0's accumulated CP15 `faults` is8 at line3495, while ARM1/2/3 are0 at lines3618/3741/3864. All four current DFSR/DFAR/IFSR/IFAR values are0. The debugger appends a generic translation-fault description even to the zero DFSR value; that label is not an observed abort event. The ordinary final stop is native WFE on ARM0/1/2 and the running GetSystemTimeLow read on ARM3, with CMeP sleeping at `80048A`. WFE watchdog ticks, counter patches and cluster wakeups are0; actual interrupt wakeups are867. There is no later-shell claim.
+
+## Reached native evidence
+
+The preceding cold-stack binary genuinely reaches Display's producer at VA `005B7048`, gzip return `005B70B0` with R0 `001FE000` into VA `10000000`, and SetFrameBuf return `005B70E2` with R0 zero. The graphics agent independently verifies the resulting guest-RAM pixels against the supplied asset. Native SetInput writes IFTU A bank1 at PA `1C000000`, format `10`, 960x544, row padding zero, blank zero; active bank remains zero, whose address is zero and blank is one. Software record `+1E0/+1E4/+1E8/+1EC` is `{0,1,80000000,1}`. DSI generates actual modeled frame boundaries and native vblank IRQs, but the preceding IFTU model had no completion event or bank turnover.
+
+Evidence is retained in `goal-arm-native-syscon-oled-cold-stack.log/.json` and `goal-native-cold-stack-graphics-evidence.md`. The independent Mac SDL run `goal-native-cold-stack-macos-ui.log/.json/.bmp/.png` exits zero after 109.130 seconds, using Metal/vsync and a 48 kHz stereo S16 audio stream. The viewed panel is still the host `no framebuffer yet` placeholder; it contains no PlayStation logo. Original UI PID20100 remains present, the source image's size/mtime is unchanged, and the captured console reports 10753 reads/zero writes. This is preserved negative pre-turnover evidence, not a screenshot from the new model.
+
+Native Lowio Enable programs ordinary mode pair binary01, run `+50=1`, setup `+58=108`, flag `+180=1`, then explicit initial select zero. Deferred SetInput reads plane `+4` bit1, prepares the opposite bank and stores an old-bank token in guest software. The hardware receives no separate commit write. Handler linked `8100599C` reads raw `+40`, writes zero ACK, reads again, rewrites cached flag to `+180`, then replays its descriptor into the old bank. It never branches on the sampled raw status. Shared mode A→B changes alpha-enable bit0, not a commit bit. Detailed unchanged instructions and primary sources are linked in `goal-native-iftu-599-contract-review.md` and `goal-firmware104-iftu-deferred-turnover.md`.
+
+Hardware-tested primary references: [vita-libbaremetal IFTU source](https://github.com/xerpi/vita-libbaremetal/blob/master/libbaremetal/src/iftu.c) and [IFTU header](https://github.com/xerpi/vita-libbaremetal/blob/master/libbaremetal/include/iftu.h). These corroborate manual mode00 selects and descriptor layout; they do not establish the ordinary01 timing or raw completion encoding.
+
+## Implemented boundary and explicit choices
+
+`DsiController` publishes a batch count when its existing supported VIC0 timing crosses actual frame boundaries. This callback is independent of IRQ213's mask and retains the existing rational phase, batch arithmetic and reset behavior. Kermit's board connection sends those boundaries to IFTU and routes IFTU's physical IRQ204/205 to the existing GIC. There is no second display timer, read-driven clock or guest function invocation.
+
+IFTU accepts only the reached automatic subset: bus control exactly1; the plane's mode pair01; run exactly1; setup exactly108; flag exactly1; a recognized stored 0/1 select. Only a full native word write `+180=1` arms one future boundary. That boundary changes the hardware active bank and `+4` bit1 before latching IRQ204/205. An elapsed batch with multiple frames consumes that one arm once. ACK and rearm stores never flip immediately, so the native handler can finish old-bank replay before its newly armed later frame.
+
+**One armed frame per flag write is a model choice.** Firmware does not distinguish continuous alternation from rearmed transfer. At Enable, the arm may precede final bus/mode programming, so its qualification occurs at the later boundary. This can produce timing while both banks are blank or invalid: descriptor content, RAM validity, addresses, alpha bit and guest software pending are never event gates. Only frontend scanout validates format and the complete guest-RAM span. No descriptor-generation or last-D4 heuristic was added; D4 is merely the final native writer store, not an established commit register.
+
+Raw `+40` encoding is unrecovered and stays zero. An explicit internal latch drives the physical IRQ until the actual full-word zero ACK. Nonzero and byte/halfword ACK writes cannot clear it. Diagnostics state the unknown encoding and expose active/requested bank, arm, pending, level and turnover count. Full-word `+180=1` can rearm, while partial lanes only retain register storage and cannot submit a frame. This exact-access restriction is a bounded native-profile choice, not a claim of complete hardware lane semantics.
+
+Shared manual selectors retain guest-written values independently of the active bank; automatic movement does not pretend the guest wrote a selector. Manual00 keeps explicit selection. Unsupported10/11 produce no automatic events. Current-bank bit1 is hardware-owned even through partial or cross-word accesses; other opaque state bits retain their existing storage behavior. An invalid manual selector does not invent a new active index and remains invalid for frontend export.
+
+Known bus/plane stops cancel the future arm and pending output. Losing an already qualified mode/setup cancels its arm; restoring a qualifier alone does not resurrect it. These cancellation rules are explicit model policy. IRQ completion otherwise remains latched until the native zero ACK. Reset clears requested/active state, arm, latch, count and physical IRQ while retaining board callback wiring. Named debugger writes use the same full-word path as guest writes.
+
+No production code reads guest pending words, overwrites either descriptor, supplies asset pixels, invokes the IRQ handler, unlocks Display waits or returns guest service success. Blending, special modes, physical status encoding and full display-controller timing remain unsupported.
+
+## Focused validation
+
+Reproducible isolated command is in `goal-native-iftu-boundary-isolated/build-command.txt`; it recompiles only the owned peripheral/test translation units and links the current frozen core archive. It does not rebuild the shared tree. `build.log` contains only the preexisting unused `kGicDeviceName` warning. Correct filter syntax is a positional substring.
+
+- `test_iftu.log`: 8 cases, zero failures.
+- `test_dsi.log`: 9 cases, zero failures; this filter also includes one IFTU case whose name contains `dsi`.
+- Combined: 16 unique cases, including six new cases. The integrated suite increased from611 to617 and passed with zero failures.
+
+Coverage includes actual cold blank-bank/deferred-buffer sequence, exact first physical frame, bank/readback/frontend coherence, stored manual select, physical GIC IAR204/205 and zero-ACK deassertion, multiple-frame coalescing, plane independence, empty-descriptor timing, ACK/rearm lane restrictions, named debugger writes, stop/reset/mode cancellation, manual00 and unsupported modes, separate DSI masking and reset phase.
+
+The native-handler regression embeds only276 unchanged supplied Lowio code bytes at linked `810058DC..810059EF` (descriptor writer and handler), SHA256 `a6b196d03dc1df2ce6b06b3dd993f815acfc040288c982022ea9c1777760e21a`. It requires no firmware files. It consumes a real board/GIC IRQ204, executes those actual handler/writer instructions for old bank0 and1, verifies guest-cleared pending and guest-written old-bank replay, retains SP and handler return, then observes a later rearmed boundary. Only imported synchronization wrappers are local no-op fixture returns. This verifies isolated handler/device sequencing; the separate integrated native capture above now observes the actual OS route and old-bank replay during the genuine guest boot.
+
+Changed files are only `src/hw/soc/{iftu.cpp,dsi.cpp,kermit.cpp,soc_internal.h}` and `tests/{test_iftu.cpp,test_dsi.cpp}`. No machine, CPU, firmware, original image or rendering asset was changed by this integration.

@@ -454,7 +454,7 @@ bool UiApp::init_machine(int argc, char** argv) {
     // bounded amount of emulated work, then write the BMP and exit.
     if (screenshot_requested_) {
         if (frame_limit_ <= 0) frame_limit_ = 2;
-        if (step_limit_ <= 0) step_limit_ = 200000;
+        if (step_limit_ < 0) step_limit_ = 200000;
     }
 
     // The UI console is the frontend's log, so the console gets its own sink.
@@ -1149,8 +1149,8 @@ void UiApp::step_over() {
     paused_ = true;
     Cpu* cpu = debugger_.active_core();
     if (!cpu) return;
-    unsigned length = 0;
-    cpu->disassemble(cpu->get_pc(), length);
+    const auto lines = debugger_.disassemble(cpu->get_pc(), 1);
+    unsigned length = lines.empty() ? 0u : lines.front().length;
     if (length == 0) length = 4;
     const u32 start = cpu->get_pc();
     const u32 fall_through = start + length;
@@ -1328,7 +1328,7 @@ void UiApp::draw_help_line(const UiRect& area) {
         "trace: up/down scroll  wheel scroll  newest access at the bottom  ` console",
         "devices: up/down select device  PgUp/PgDn registers  values read live from the device",
         "boot: 1 first  2 second  3 kbl  4 kernel  (click the buttons or press 1..4)",
-        "panel: emulated display output; RGB565/RGBA8888 detected from stride",
+        "panel: emulated display output; RGB565/RGBA8888 from display format",
     };
     const std::string text = help[static_cast<int>(tab_)];
     canvas_.fill(UiRect{area.x + 1, area.bottom() - 15, area.w - 2, 14}, ui_theme::kPanelAlt);
@@ -1396,7 +1396,8 @@ void UiApp::draw_display_panel(const UiRect& area) {
     int width = 0;
     int height = 0;
     int stride = 0;
-    const u8* pixels = vita_.kermit().framebuffer(width, height, stride);
+    int bpp = 0;
+    const u8* pixels = vita_.kermit().framebuffer(width, height, stride, &bpp);
 
     display_.frames = vita_.kermit().frame_counter();
     display_.width = width;
@@ -1406,7 +1407,6 @@ void UiApp::draw_display_panel(const UiRect& area) {
     const UiRect view{area.x + 4, area.y + 16, area.w - 8, area.h - 34};
 
     if (pixels && width > 0 && height > 0 && stride > 0) {
-        const int bpp = stride / width;
         display_.bytes_per_pixel = bpp;
         display_.present = true;
         blit_display(view, pixels, width, height, stride, bpp);
@@ -1426,11 +1426,8 @@ void UiApp::draw_display_panel(const UiRect& area) {
     static const char* lines[] = {
         "no framebuffer yet",
         "",
-        "the kernel has not reached the display driver, so the Kermit display",
-        "controller (0xE2100000, 960x544 panel) has not been programmed.",
-        "",
-        "the panel appears here as soon as the kernel publishes a buffer;",
-        "RGB565 and RGBA8888 are both supported.",
+        "the guest has not submitted a supported display buffer.",
+        "open the Devices tab to inspect display state.",
     };
     const int count = static_cast<int>(sizeof(lines) / sizeof(lines[0]));
     int y = view.y + std::max(4, view.h / 2 - (count * kLineHeight) / 2);

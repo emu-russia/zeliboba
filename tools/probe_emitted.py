@@ -1,6 +1,6 @@
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-enc = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
+enc = open(r'..\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
 print('enc[0x2C0:0x2E0] =', enc[0x2C0:0x2E0].hex(' '))
 target = bytes.fromhex('9520c36f0da66bc18d1adc02eb34ec1d')
 src = enc[0x2C0:0x2C0 + 16]

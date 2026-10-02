@@ -12,6 +12,25 @@
 //               bit 0 is set (0x5C57A `lw $7,($10)` / 0x5C580 `beqz`), then
 //               takes bits 2+ as a 4-byte aligned PA (`mov $12,-4; and $7,$12`,
 //               0x5C586) and copies 64 bytes from it to 0x40000 (0x5C58C).
+//   Each CPU sets bits in its outgoing words and clears acknowledged bits in
+//               its incoming words. FW1.04 secure_kernel clears the incoming
+//               command with -1 at 0x8003FC and 0x80042E. Native ARM Smsched
+//               acknowledges status 101/102 by writing those values to +0,
+//               and submits the shared-buffer PA then a separate 1 to +0x10
+//               at 0x0051E3C2/0x0051E3C4. These accesses match xyzz/f00d
+//               smsched.c set_kernel_enp:
+//               https://github.com/xyzz/f00d/blob/master/smsched.c
+//               Sender writes must accumulate PA and doorbell; ACK writes must
+//               clear only the requested bits. Host set_* helpers use poke.
+//   0xE0000040..0x5C are W1C aliases of the eight words at +0..+0x1C.
+//               CMeP clears its outgoing auxiliary words through +0x44/48/4C
+//               at 0x8005FE..0x80061E and 0x8023F8..0x802416. ARM clears its
+//               outgoing auxiliary words through +0x54/58/5C in smsched.c
+//               smsched_load_task. These aliases clear from either endpoint.
+//   Pending words drive level interrupts. Command channel 0 uses bit 0 as its
+//               doorbell, so submitting a PA alone does not interrupt CMeP.
+//               ARM status notifications include high-half-only values such
+//               as 0x10000 (0x8009CE), so any pending status bit asserts ARM.
 //   0xE0000020/0x24  CMeP -> debugger (two 32-bit words, written at 0x5E54C
 //               and 0x5E556 from the live value of 0xE005003C).
 //   0xE0000028/0x2C  debugger -> CMeP.  mailbox_debug_sc reads both (0x5E58C,
@@ -27,7 +46,7 @@
 //               boot-mode bit 0 is set (loop at 0x5C164..0x5C178).
 //   0xE0064060  read three times (0x5C2BC, 0x5C416, 0x5C808); img_proc_5C798
 //               uses the low 16 bits as an "eMMC key index select" mask.
-//   0xE20A0000  GPIO output register (written with 8 at 0x5E4FA).
+//   0xE20A0000  GPIO direction register (written with 8 at 0x5E4FA).
 //   0xE20A0004  GPIO state/handshake.  mailbox_debug_sc waits for bit 4 to
 //               become *set* (0x5E4FC + 0x5E502) and, after signalling on
 //               0xE20A0008, waits for it to become *clear* (0x5E560/0x5E566).
@@ -39,9 +58,11 @@
 //               0xE31020A4 and wait for it to clear (0x5C246..0x5C28C and
 //               0x5C3BC..0x5C3E6).
 #include <cstring>
+#include <utility>
 
 #include "common/log.h"
 #include "hw/cmep/cmep_internal.h"
+#include "hw/soc.h"
 #include "hw/syscon.h"
 #include "loader/loader.h"
 
@@ -62,6 +83,9 @@ MailboxDevice::MailboxDevice(Bus& bus, CmepBlock& owner)
     define(0xE0000014, "MailboxArmToCmep.Func0", 0);
     define(0xE0000018, "MailboxArmToCmep.Func1", 0);
     define(0xE000001C, "MailboxArmToCmep.Func2", 0);
+    for (u32 offset = 0; offset < 0x20u; offset += 4u) {
+        define(kCmepToArm + 0x40u + offset, "Mailbox.Clear", 0);
+    }
     define(kCmepToDebugger, "MailboxCmepToDebugger", 0);
     define(0xE0000024, "MailboxCmepToDebugger+0x4", 0);
     define(kDebuggerToCmep, "MailboxDebuggerToCmep", 0xFFFFFFFF);
@@ -70,16 +94,99 @@ MailboxDevice::MailboxDevice(Bus& bus, CmepBlock& owner)
     define(0xE0000064, "MailboxDebuggerToCmep2+0x4", 0xFFFFFFFF);
 }
 
+void MailboxDevice::set_irq_callbacks(CmepBlock::MailboxIrqCallback to_cmep,
+                                     CmepBlock::MailboxIrqCallback to_arm) {
+    to_cmep_irq_ = std::move(to_cmep);
+    to_arm_irq_ = std::move(to_arm);
+    refresh_irqs(true);
+}
+
+void MailboxDevice::refresh_irqs(bool force) {
+    for (unsigned channel = 0; channel < 4u; ++channel) {
+        const u32 command = static_cast<u32>(peek(kArmToCmep + channel * 4u));
+        const bool to_cmep = channel == 0u ? (command & 1u) != 0u : command != 0u;
+        const bool to_arm = peek(kCmepToArm + channel * 4u) != 0u;
+        if (force || to_cmep_levels_[channel] != to_cmep) {
+            to_cmep_levels_[channel] = to_cmep;
+            if (to_cmep_irq_) to_cmep_irq_(channel, to_cmep);
+        }
+        if (force || to_arm_levels_[channel] != to_arm) {
+            to_arm_levels_[channel] = to_arm;
+            if (to_arm_irq_) to_arm_irq_(channel, to_arm);
+        }
+    }
+}
+
+void MailboxDevice::reset() {
+    RegisterFile::reset();
+    debug_posts_ = 0;
+    debug_acks_ = 0;
+    refresh_irqs();
+}
+
+void MailboxDevice::set_arm_to_cmep(u32 value) {
+    poke(kArmToCmep, value);
+    refresh_irqs();
+}
+
+void MailboxDevice::set_cmep_to_arm(u32 value) {
+    poke(kCmepToArm, value);
+    refresh_irqs();
+}
+
 u64 MailboxDevice::read(u32 address, unsigned size) {
+    if (address >= kCmepToArm && size <= 8u &&
+        static_cast<u64>(address) + size <= static_cast<u64>(kArmToCmep) + 0x10u) {
+        u64 value = 0;
+        for (unsigned i = 0; i < size; ++i) {
+            const u32 byte_address = address + i;
+            const unsigned shift = (byte_address & 3u) * 8u;
+            const u64 byte = (peek(byte_address & ~3u) >> shift) & 0xFFu;
+            value |= byte << (i * 8u);
+        }
+        return value;
+    }
     return RegisterFile::read(address, size);
 }
 
-void MailboxDevice::write(u32 address, unsigned size, u64 value) {
-    if (address == kCmepToArm) {
-        // 0x5C5F0 (1 = success) and 0x5C616 (2 = the failure path).
-        RegisterFile::write(address, size, value);
-        return;
+bool MailboxDevice::write_data_mailbox(u32 address, unsigned size, u64 value, bool arm_port) {
+    if (address < kCmepToArm || size > 8u ||
+        static_cast<u64>(address) + size > static_cast<u64>(kArmToCmep) + 0x10u) {
+        return false;
     }
+    for (unsigned i = 0; i < size; ++i) {
+        const u32 byte_address = address + i;
+        const u32 word_address = byte_address & ~3u;
+        const unsigned shift = (byte_address & 3u) * 8u;
+        const u32 mask = static_cast<u32>((value >> (i * 8u)) & 0xFFu) << shift;
+        const bool outgoing = (word_address < kArmToCmep) != arm_port;
+        set_bits(word_address, mask, outgoing);
+    }
+    refresh_irqs();
+    return true;
+}
+
+bool MailboxDevice::write_clear_alias(u32 address, unsigned size, u64 value) {
+    constexpr u32 begin = kCmepToArm + 0x40u;
+    constexpr u32 end = begin + 0x20u;
+    if (address < begin || size > 8u || static_cast<u64>(address) + size > end) return false;
+    for (unsigned i = 0; i < size; ++i) {
+        const u32 byte_address = address - 0x40u + i;
+        const unsigned shift = (byte_address & 3u) * 8u;
+        const u32 mask = static_cast<u32>((value >> (i * 8u)) & 0xFFu) << shift;
+        set_bits(byte_address & ~3u, mask, false);
+    }
+    refresh_irqs();
+    return true;
+}
+
+void MailboxDevice::write_arm(u32 address, unsigned size, u64 value) {
+    if (!write_data_mailbox(address, size, value, true)) write(address, size, value);
+}
+
+void MailboxDevice::write(u32 address, unsigned size, u64 value) {
+    if (write_clear_alias(address, size, value)) return;
+    if (write_data_mailbox(address, size, value, false)) return;
     if (address == kDebuggerToCmep || address == 0xE000002C || address == kDebuggerToCmep2 ||
         address == 0xE0000064) {
         if (static_cast<u32>(value) == 0xFFFFFFFFu) ++debug_acks_;
@@ -397,6 +504,19 @@ void CmepFlagsDevice::write(u32 address, unsigned size, u64 value) {
 // StrapDevice
 // ---------------------------------------------------------------------------
 
+namespace {
+constexpr u32 kConsoleIdentityBase = 0xE0062120u;
+constexpr u32 kConsoleIdentitySlotSize = 32u;
+constexpr u32 kDramCapacityBase = 0xE0062260u;
+
+bool public_platform_slot(u32 address, unsigned size) {
+    if (size > sizeof(u64)) return false;
+    const u64 end = static_cast<u64>(address) + size;
+    return (address >= kConsoleIdentityBase && end <= kConsoleIdentityBase + 32u) ||
+           (address >= kDramCapacityBase && end <= kDramCapacityBase + 32u);
+}
+}
+
 StrapDevice::StrapDevice(Bus& bus, CmepBlock& owner)
     : RegisterFile("CMeP.Strap", cmep::kStrapBase, 0x10000), bus_(bus), owner_(owner) {
     for (u32 i = 0; i < kStrapSize; i += 4) {
@@ -405,6 +525,31 @@ StrapDevice::StrapDevice(Bus& bus, CmepBlock& owner)
     }
     define(kScState, "MMIO_E0064060 (eMMC key index select)", 0);
     define(kScState + 4, "MMIO_E0064064", 0);
+    // FW1.04 0x805774 reads slot 0x509 via 0x80571A: E0058000 + (509<<5)
+    // = E0062120. Its first 16 bytes are the console identity used by native
+    // 0x804B58 to classify the board; an all-zero product is rightly rejected.
+    // Supply the public PCH-1001 prefix for the existing USS-1001 retail model:
+    // 00 00 00 01 01 04 00 10. This is modeled platform input, not a dumped
+    // console identity or a console key. The unique remainder is unavailable
+    // and stays zero. Public prefix evidence: https://github.com/Freakler/vita-ConsoleID
+    for (u32 word = 0; word < kConsoleIdentitySlotSize / 4u; ++word) {
+        const char* kind = word < 2u ? "modeled public PCH-1001 prefix" :
+                           (word < 4u ? "unique identity unavailable" : "slot padding");
+        const u32 value = word == 0u ? 0x01000000u : (word == 1u ? 0x10000401u : 0u);
+        define(kConsoleIdentityBase + word * 4u,
+               format("Console identity slot 0x509 word %u (%s)", word, kind), value);
+    }
+    // Native FW1.04 kprx 0x80E59E..0x80E5D8 reads slot 0x513's first four
+    // bytes as a little-endian DRAM aperture size, then validates mailbox
+    // buffers against [0x40000000, 0x40000000+size) with carry accounting.
+    // This is the existing modeled board capacity, shared with Vita's DRAM
+    // aliases and SceKblParam+0x64, not dumped per-console configuration.
+    for (u32 word = 0; word < 8u; ++word) {
+        define(kDramCapacityBase + word * 4u,
+               word == 0u ? "DRAM capacity slot 0x513 (modeled board byte size)" :
+                            "DRAM capacity slot 0x513 (unavailable padding)",
+               word == 0u ? kermit::kScuSize : 0u);
+    }
     // 0xE00621C0..0xE00621DF: the eight words the CMeP secure kernel reads in its
     // start-up check (0x800FA4 reads 0xE00621C0, C4, C8, CC, D0, D4, D8, DC, keeps
     // the last one and demands 0x01040000 - i.e. "system software 01.04.0000" -
@@ -416,10 +561,33 @@ StrapDevice::StrapDevice(Bus& bus, CmepBlock& owner)
 }
 
 u64 StrapDevice::read(u32 address, unsigned size) {
+    if (public_platform_slot(address, size)) {
+        // Identity copies use words and the native capacity validator uses
+        // bytes. Both must see the same explicitly modeled platform input.
+        u64 value = 0;
+        for (unsigned i = 0; i < size; ++i) {
+            const u32 byte_address = address + i;
+            const u64 byte = (peek(byte_address & ~3u) >> ((byte_address & 3u) * 8u)) & 0xFFu;
+            value |= byte << (i * 8u);
+        }
+        return value;
+    }
     return RegisterFile::read(address, size);
 }
 
 void StrapDevice::write(u32 address, unsigned size, u64 value) {
+    if (public_platform_slot(address, size)) {
+        // Keep explicit overrides verbatim. Malformed/unknown products must
+        // remain visible to the native classifier and aperture validator.
+        for (unsigned i = 0; i < size; ++i) {
+            const u32 byte_address = address + i;
+            const unsigned shift = (byte_address & 3u) * 8u;
+            const u64 byte = (value >> (i * 8u)) & 0xFFu;
+            poke(byte_address & ~3u, (peek(byte_address & ~3u) & ~(0xFFull << shift)) |
+                                      (byte << shift));
+        }
+        return;
+    }
     RegisterFile::write(address, size, value);
 }
 
@@ -434,8 +602,13 @@ void StrapDevice::set_bit0(bool set) {
 }
 
 std::string StrapDevice::summary() const {
-    return format("strap=0x%08X mode='%c' sc_state=0x%08X", static_cast<u32>(peek(kStrap)),
-                  bit0() ? 'A' : '!', static_cast<u32>(peek(kScState)));
+    const u32 product_word = static_cast<u32>(peek(kConsoleIdentityBase + 4u));
+    const u32 product = ((product_word & 0xFFu) << 8u) | ((product_word >> 8u) & 0xFFu);
+    return format("strap=0x%08X mode='%c' sc_state=0x%08X console_product=0x%04X "
+                  "identity=modeled public platform (not a console dump) dram_capacity=0x%08X",
+                  static_cast<u32>(peek(kStrap)), bit0() ? 'A' : '!',
+                  static_cast<u32>(peek(kScState)), product,
+                  static_cast<u32>(peek(kDramCapacityBase)));
 }
 
 // ---------------------------------------------------------------------------
@@ -469,48 +642,210 @@ std::string EmmcCryptoDevice::summary() const {
 // GpioDevice
 // ---------------------------------------------------------------------------
 
-GpioDevice::GpioDevice() : RegisterFile("CMeP.GPIO", cmep::kGpioBase, 0x100) {
-    define(kData, "GPIO data", 0);
-    define(kState, "GPIO state/handshake (bit4 = debugger alive)", 0x10);
-    define(kSet, "GPIO set", 0);
-    define(kClear, "GPIO clear", 0);
-    define(0xE20A0010, "GPIO direction", 0);
+// Supplied FW1.04 Lowio PortRead810027A6..27B0 reads output+34 when
+// direction+00 selects output, otherwise input+04. Checkpoints use SET08 /
+// CLEAR0C. The reached Syscon driver sets pin4 mode3 at+14=300, unmasks gate0
+// at+1C=0, and registers GPIO248/sub4. Other gates were undefined in the old
+// shim, not observed unmasked. Primary hardware-tested register encoding:
+// https://github.com/xerpi/vita-libbaremetal/blob/master/libbaremetal/src/gpio.c
+// https://github.com/xerpi/vita-libbaremetal/blob/master/libbaremetal/include/gpio.h
+//
+// Bounded model: only physical input4 falling/mode3 generates edges. Reset
+// masks all gates; pin levels have no fabricated pull-up/ready source. Pending
+// edges fan out into all five status latches even while masked; this retention
+// and fanout are explicit model choices, not captured electrical reset facts.
+// Each parent248+gate is separately mask-gated, so the reached setup raises248
+// only. Unsupported mode/slave work never receives a completion here.
+GpioDevice::GpioDevice() : Device("CMeP.GPIO", cmep::kGpioBase, 0x1000) {
+    const std::pair<u32, const char*> names[] = {
+        {0x00, "DIRECTION"}, {0x04, "INPUT"}, {0x08, "SET"}, {0x0C, "CLEAR"},
+        {0x10, "OPAQUE_10"}, {0x14, "MODE_0_15"}, {0x18, "MODE_16_31"},
+        {0x1C, "MASK0"}, {0x20, "MASK1"}, {0x24, "MASK2"}, {0x28, "MASK3"}, {0x2C, "MASK4"},
+        {0x34, "OUTPUT"}, {0x38, "STATUS0"}, {0x3C, "STATUS1"}, {0x40, "STATUS2"},
+        {0x44, "STATUS3"}, {0x48, "STATUS4"},
+    };
+    for (const auto& name : names) register_name_entry(base_ + name.first, name.second);
+    reset();
+}
+
+bool GpioDevice::known_offset(u32 offset) const {
+    return (offset & 3u) == 0 && offset <= 0x48 && offset != 0x30;
+}
+
+u32 GpioDevice::raw_input() const {
+    return external_input_ | (legacy_jig_enabled_ && jig_asserted_ ? 0x10u : 0u);
+}
+
+u32 GpioDevice::sampled_input() const {
+    return (output_latch() & direction()) | (raw_input() & ~direction());
+}
+
+u32 GpioDevice::word_value(u32 offset) const {
+    return offset == 4 ? sampled_input() : registers_[offset / 4];
+}
+
+void GpioDevice::refresh_irqs() {
+    for (unsigned gate = 0; gate < kGateCount; ++gate) {
+        const u32 pending = registers_[(0x38 + gate * 4) / 4];
+        const u32 mask = registers_[(0x1C + gate * 4) / 4];
+        const bool level = (pending & ~mask) != 0;
+        if (level == irq_states_[gate]) continue;
+        irq_states_[gate] = level;
+        if (irq_) irq_(kParentIrqBase + gate, level);
+    }
+}
+
+void GpioDevice::set_irq_callback(std::function<void(u32, bool)> callback) {
+    irq_ = std::move(callback);
+    if (irq_) {
+        for (unsigned gate = 0; gate < kGateCount; ++gate) irq_(kParentIrqBase + gate, irq_states_[gate]);
+    }
+}
+
+void GpioDevice::set_output_callback(std::function<void(u32, u32)> callback) {
+    output_callback_ = std::move(callback);
+    if (output_callback_) output_callback_(direction(), output_latch());
+}
+
+void GpioDevice::input_changed(u32 before) {
+    const u32 falling = before & ~raw_input() & ~direction();
+    if ((falling & 0x10u) == 0) return;
+    const unsigned pin4_mode = (registers_[0x14 / 4] >> 8) & 3u;
+    if (pin4_mode == 3) {
+        ++falling_edges_;
+        // Masking affects delivery, not physical edge capture. All-gate fanout
+        // is an explicit model choice; all-masked reset bounds unused parents.
+        for (unsigned gate = 0; gate < kGateCount; ++gate) registers_[(0x38 + gate * 4) / 4] |= 0x10u;
+    } else {
+        // Retain readable mode snapshots, but never invent unmodeled level,
+        // rising, capture or other-pin events to satisfy a guest wait.
+        ++unsupported_edges_;
+    }
+    refresh_irqs();
+}
+
+void GpioDevice::set_external_input(u32 mask, u32 levels) {
+    const u32 before = raw_input();
+    external_input_ = (external_input_ & ~mask) | (levels & mask);
+    input_changed(before);
+}
+
+bool GpioDevice::set_legacy_jig_enabled(bool enabled) {
+    if (enabled && native_phase_) return false;
+    const u32 before = raw_input();
+    legacy_jig_enabled_ = enabled;
+    jig_asserted_ = enabled;
+    input_changed(before);
+    return true;
+}
+
+void GpioDevice::enter_native_phase() {
+    native_phase_ = true;
+    set_legacy_jig_enabled(false);
+    if (output_callback_) output_callback_(direction(), output_latch());
 }
 
 void GpioDevice::reset() {
-    RegisterFile::reset();
-    handshakes_ = 0;
-    // The debugger/JIG line is presented as asserted after power-on.
-    poke(kState, 0x10);
+    registers_.fill(0);
+    for (unsigned gate = 0; gate < kGateCount; ++gate) registers_[(0x1C + gate * 4) / 4] = 0xFFFFFFFF;
+    external_input_ = 0;
+    handshakes_ = falling_edges_ = unsupported_edges_ = 0;
+    legacy_jig_enabled_ = jig_asserted_ = native_phase_ = false;
+    refresh_irqs(); // deassert live parents; retain installed board callbacks
+    if (board_reset_) board_reset_(); // modes are reset before wire disconnect; no reset edge
+    if (output_callback_) output_callback_(direction(), output_latch());
 }
 
 u64 GpioDevice::read(u32 address, unsigned size) {
-    if (address == kState) {
-        const u64 value = peek(kState);
-        // 0x5E4FC expects bit 4 set, 0x5E560 expects it clear.  Modelling the
-        // external agent as "releases the line on the first read" satisfies
-        // both loops without an external debugger attached.
-        if ((value & 0x10u) != 0) {
-            poke(kState, value & ~0x10ull);
-            ++handshakes_;
+    u64 value = 0;
+    for (unsigned i = 0; i < size && i < 8; ++i) {
+        const u64 current = static_cast<u64>(address) + i;
+        u32 byte = 0xFF;
+        if (current >= base_ && current < static_cast<u64>(base_) + size_) {
+            const u32 offset = static_cast<u32>(current - base_);
+            if (known_offset(offset & ~3u)) byte = (word_value(offset & ~3u) >> ((offset & 3u) * 8)) & 0xFFu;
         }
-        return value;
+        value |= static_cast<u64>(byte) << (i * 8);
     }
-    return RegisterFile::read(address, size);
+    return value;
 }
 
 void GpioDevice::write(u32 address, unsigned size, u64 value) {
-    if (address == kSet) {
-        poke(kData, peek(kData) | value);
-        RegisterFile::write(address, size, value);
-        return;
+    const bool was_output3_high = (direction() & output_latch() & 8u) != 0;
+    u32 supplied_set = 0, supplied_clear = 0;
+    bool set_written = false, clear_written = false;
+    for (unsigned i = 0; i < size && i < 8; ++i) {
+        const u64 current = static_cast<u64>(address) + i;
+        if (current < base_ || current >= static_cast<u64>(base_) + size_) continue;
+        const u32 offset = static_cast<u32>(current - base_);
+        const u32 word = offset & ~3u;
+        if (!known_offset(word) || word == 4 || word == 0x34) continue; // hardware input/output readback
+        const u32 shift = (offset & 3u) * 8;
+        const u32 supplied = static_cast<u32>((value >> (i * 8)) & 0xFFu) << shift;
+        if (word == 8) { supplied_set |= supplied; set_written = true; }
+        else if (word == 0xC) { supplied_clear |= supplied; clear_written = true; }
+        else if (word >= 0x38) registers_[word / 4] &= ~supplied; // only supplied W1C bits
+        else registers_[word / 4] = (registers_[word / 4] & ~(0xFFu << shift)) | supplied;
     }
-    if (address == kClear) {
-        poke(kData, peek(kData) & ~value);
-        RegisterFile::write(address, size, value);
-        return;
+    // SET/CLEAR reads expose the last supplied command mask as a diagnostic
+    // snapshot; unwritten lanes are never reapplied to the output latch.
+    if (set_written) {
+        registers_[8 / 4] = supplied_set;
+        registers_[0x34 / 4] |= supplied_set;
     }
-    RegisterFile::write(address, size, value);
+    if (clear_written) {
+        registers_[0xC / 4] = supplied_clear;
+        registers_[0x34 / 4] &= ~supplied_clear;
+    }
+    const bool output3_high = (direction() & output_latch() & 8u) != 0;
+    if (legacy_jig_enabled_ && jig_asserted_ && !was_output3_high && output3_high) {
+        const u32 before = raw_input();
+        jig_asserted_ = false;
+        ++handshakes_;
+        input_changed(before); // explicit development peer release, never read-driven
+    }
+    refresh_irqs();
+    if (output_callback_) output_callback_(direction(), output_latch());
+}
+
+void GpioDevice::enumerate_registers(std::vector<RegisterInfo>& out) const {
+    for (const auto& entry : names_) {
+        const u32 offset = entry.first - base_;
+        out.push_back({entry.first, entry.second, offset >= 0x1C && offset <= 0x2C ? 0xFFFFFFFFu : 0u, 4});
+    }
+}
+
+bool GpioDevice::peek_register(const std::string& name, u64& out) const {
+    if (name == "FALLING_EDGES") { out = falling_edges_; return true; }
+    if (name == "UNSUPPORTED_EDGES") { out = unsupported_edges_; return true; }
+    if (name == "JIG_ENABLED") { out = legacy_jig_enabled_; return true; }
+    if (name == "NATIVE_PHASE") { out = native_phase_; return true; }
+    for (const auto& entry : names_) {
+        if (entry.second == name) { out = word_value(entry.first - base_); return true; }
+    }
+    return false;
+}
+
+bool GpioDevice::poke_register(const std::string& name, u64 value) {
+    for (const auto& entry : names_) {
+        if (entry.second == name) { write(entry.first, 4, value); return true; }
+    }
+    return false;
+}
+
+std::string GpioDevice::summary() const {
+    return format("direction=%08X output=%08X input=%08X edges=%llu unsupported=%llu JIG=%s releases=%llu",
+                  direction(), output_latch(), sampled_input(), static_cast<unsigned long long>(falling_edges_),
+                  static_cast<unsigned long long>(unsupported_edges_), legacy_jig_enabled_ ? "enabled" : "absent",
+                  static_cast<unsigned long long>(handshakes_));
+}
+
+void GpioDevice::describe(std::vector<std::string>& lines) const {
+    lines.push_back("  " + summary());
+    for (unsigned gate = 0; gate < kGateCount; ++gate) {
+        lines.push_back(format("    gate%u IRQ%u mask=%08X pending=%08X level=%u", gate, kParentIrqBase + gate,
+                               registers_[(0x1C + gate * 4) / 4], registers_[(0x38 + gate * 4) / 4], irq_states_[gate]));
+    }
 }
 
 // ---------------------------------------------------------------------------

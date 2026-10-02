@@ -9,7 +9,7 @@ import struct
 import sys
 
 path = sys.argv[1] if len(sys.argv) > 1 else (
-    r"C:\Work\PSVita\Vita_104_Firmware\Out\SLB2\kernel_boot_loader.self")
+    r"..\Vita_104_Firmware\Out\SLB2\kernel_boot_loader.self")
 data = open(path, "rb").read()
 u32 = lambda o: struct.unpack_from("<I", data, o)[0]
 u64 = lambda o: struct.unpack_from("<Q", data, o)[0]

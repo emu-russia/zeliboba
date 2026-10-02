@@ -26,7 +26,7 @@ build\bin\zeliboba.exe --script scripts\boot.cmd
 | `runm [n]` | `n` «срезов» машины: все ядра идут своим бюджетом (256 инструкций), ARM-точки останова при этом точные |
 | `until <addr>` | идти до адреса в активном ядре |
 | `reset` | сброс машины |
-| `core [mep\|arm\|rl78]` | показать или выбрать активное ядро |
+| `core [mep\|arm\|arm0..arm3\|rl78]` | показать или выбрать активное ядро; `arm` выбирает ARM0 |
 | `stage first\|second\|secure\|kbl\|nskbl\|kernel` | перевести цепочку загрузки на нужную стадию |
 
 Важно: `run`/`step` двигают только активное ARM-ядро (плюс MeP и RL78), поэтому на
@@ -51,6 +51,14 @@ ARM-инструкцией каждого ядра вызывается `Vita::p
 при установленном `watch` бюджет ARM автоматически опускается до **одной инструкции
 на ядро за срез** (ценой скорости).
 
+Для раннего KBL trampoline `0x4003A140` проверяйте исходный `r2` и native
+per-core allocation (`record+0x1BC` содержит top). `ZLB_KBL_CORE_STACK=<hex>`
+задаёт шаг development fallback только для измеренного shared `r2=0x4000`;
+`0` выключает его. Native tops `base+0x4000` сохраняются без bias. Для saved
+return используйте `vpa`/`vmem`: нулевое слово в кадре и fetch VA0 могут быть
+прямым возвратом по нулю, а не exception entry. `step` при установленном BP
+может снова остановиться до инструкции; штатное `runm` возобновляет её один раз.
+
 `history on` включает кольцо PC, `history arm 90` печатает последние 90 значений
 PC (сначала старые, затем новые) — и для `run`, и для `runm`. Это основной способ
 понять, *как* ядро оказалось в текущем состоянии (например, какая проверка
@@ -61,7 +69,7 @@ PC (сначала старые, затем новые) — и для `run`, и 
 | Команда | Что делает |
 |---|---|
 | `regs` / `reg <имя> <знач>` | регистры активного ядра |
-| `dis [addr] [count]` | дизассемблер (работает для MeP, ARM и RL78) |
+| `dis [addr] [count]` | дизассемблер; для ARM адрес виртуальный, используется выбранное ARM-ядро и его execution/security bank |
 | `mem [addr] [rows]` | hex-дамп с ASCII-колонкой (**физический** адрес) |
 | `vpa <va>` | перевод VA через таблицы активного ядра ARM с печатью цепочки (TTBR, L1, L2, домен) |
 | `vmem <va> [rows]` | как `vpa`, затем hex-дамп по полученному физическому адресу |
@@ -86,6 +94,26 @@ PC (сначала старые, затем новые) — и для `run`, и 
 живёт по разным физическим адресам на разных этапах (на этом потеряно несколько
 раундов, см. `docs/KBL.md`). Перед дампом объекта всегда лучше сначала спросить
 `vpa <va>`.
+
+ARM `dis` и SDL Disassembly читают instruction bytes через RAM-only inspection
+таблиц выбранного ядра. Branch targets остаются VA; Thumb32 может пересечь
+страницу с несмежным PA. Inspection не меняет CPU/MMU state, fault records,
+bus context/statistics/trace и не читает MMIO. При отсутствии mapping или RAM
+показывается `<unavailable: ...>`, а не выдуманная instruction из `FF`.
+Это отличается от явно физического `mem`/`save`; адрес этих команд не переводится.
+Tests: `build/goal-debug-arm-inspection-tests.log`.
+
+Для boot-mode проверяйте фактическую цепочку `Sysmem global → sysroot+0x3C → param`
+на выбранном ядре через `vpa`/`vmem`. В captured 1.04 kernel это
+`VA 0xCE328 → VA 0x4000 → VA 0x47C0`; адреса относятся к этому размещению модулей.
+Текущая ранняя board handoff копирует Ernie NVS `0x4A0/0x481/0x483` в param
+`+0x30/+0x31/+0x33`, с `+0x32=0`: свежий NVS даёт `FF FF 00 FF`.
+`+0x6C=4` — существующий retail/product профиль. Staging частично обходит native
+second-loader builder, поэтому наличие записи не доказывает его исполнение.
+`IsUpdateMode` проверяет byte `+0x30 != FF`, `IsExternalBootMode` — bit0 слова `+0x6C`.
+Опция `ZLB_NSKBL_BOOTCFG` удалена вместе с поздним marker, который менял эти входы;
+текущие измерения делают без неё. Provenance и отменённые выводы описаны в
+[KBL §6](KBL.md#6-boot-контекст-и-scekblparam) и [NSKBL §4.7](NSKBL.md).
 
 ### Инструменты разбора KBL
 
@@ -158,10 +186,22 @@ bpl
 * **Trace** — последние обращения к шине с именами устройств;
 * **Devices** — список устройств и регистры выбранного;
 * **Boot** — отчёт по стадиям и быстрые кнопки `stage ...`;
-* **Panel** — кадровый буфер эмулируемого дисплея (когда ядро дойдёт до
-  драйвера дисплея);
+* **Display / Panel (F7)** — guest framebuffer, выбранный настоящими IFTU
+  registers; для поддержанного RGBA8888 subset frontend показывает RGB
+  как непрозрачное изображение;
 * **Console** — строка ввода, привязанная к `Debugger::execute`, с историей и
   автодополнением по `Tab`.
 
 Горячие клавиши: `Space` — пауза/пуск, `F10` — шаг, `F11` — шаг с заходом,
 `F1..F7` — вкладки, `Esc` — закрыть строку ввода.
+
+В текущей сборке **617 tests / 0 failures** обычный cold boot исполняет
+настоящий Display producer, gzip и SetFrameBuf. Native DSI frame/IFTU IRQ204
+публикуют guest buffer, и вкладка F7 в macOS SDL3/Metal показывает белый
+PlayStation logo по центру чёрного изображения `960×544`, stride `3840`.
+Actual screenshot (image omitted from source delivery) и
+[integrated evidence](../build/goal-native-iftu-arm-integrated-evidence.md)
+подтверждают presentation; offline pixels не подставлялись. IFTU ordinary
+mode `01` использует явную ограниченную модель одного frame на full-word
+`+0x180=1`, с native zero ACK/rearm и unrecovered raw status encoding.
+Полная загрузка ядра/LiveArea и завершение fade/blending не подтверждены.

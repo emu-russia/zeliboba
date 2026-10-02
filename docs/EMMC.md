@@ -1,7 +1,8 @@
 # eMMC image reconstruction (firmware 1.04)
 
-The console we are bringing up has **no eMMC dump**, so the card is rebuilt out of
-the 1.04 firmware that we do have. This document records exactly what is written
+The console we are bringing up has **no complete 1.04 eMMC dump supplied here**,
+so the card is rebuilt out of the available 1.04 firmware. A partial dump from
+another console is a format reference. This document records exactly what is written
 where, the evidence for every layout decision, and what could not be verified.
 
 Everything described here is implemented in `src/hw/emmc/` and driven by
@@ -186,10 +187,10 @@ The 1.04 entries and where their magics land (all verified against the file):
 | 5 | kprx_auth_sm.self | 0x4A5 | 0x94A00 | 35,064 | SCE header "SCE\0" |
 | 6 | prog_rvk.srvk | 0x4EA | 0x9D400 | 1,728 | SCE header "SCE\0" |
 
-The builder slices these seven payloads straight out of the retail container, so
-the assembled table, the names and the 7 payloads are byte identical to the PUP
-(verified: the only difference inside the first 0xA000 bytes is 12 reserved
-header bytes at 0x14..0x1F).
+When the valid retail container is available, the builder copies all 647,168
+bytes verbatim, including the header, entry table, seven payloads and alignment
+padding. It assembles a container from individual `Out/SLB2` files only when the
+original container is unavailable; unused padding in that fallback can differ.
 
 The container is written to **four** places: the two eMMC boot partitions
 (`EmmcPartition::Boot0`/`Boot1`, file offsets 0xE3400000/0xE3600000 for the
@@ -289,8 +290,8 @@ Independent cross-checks that were run:
   84,375,093 bytes / 230 folders, CRC pass).
 * The partition image bytes in the finished image are byte identical to
   `PUP_dec/os0.bin` / `vs0.bin`, with a zero filled tail.
-* The eMMC boot partitions and the two `bls` copies are byte identical to each
-  other (first 0xA000 bytes).
+* The eMMC boot partitions and the two `bls` copies are byte identical to the
+  complete 647,168-byte retail SLB2 source container on the macOS rebuild.
 * End to end: `zeliboba.exe -q -ex "boot" -ex "runm 300000" -ex "boot" -ex "quit"`
   reads the container out of the image through the emulated card and stages it -
 
@@ -310,9 +311,71 @@ Independent cross-checks that were run:
   mailbox` and hands control to `0x40000`, so the container is found, parsed,
   validated by the loader's own crypto chain and executed.
 
+### Independent byte check on macOS
+
+From the repository directory, compare the reconstructed image directly with
+the original ZIP, without extracting or modifying either input:
+
+```bash
+python3 tools/verify_emmc_bytes.py --firmware-zip ../Vita_104_Firmware.zip
+python3 tools/verify_emmc_bytes.py --firmware ../Vita_104_Firmware/Out --json
+python3 tools/verify_emmc_bytes.py --firmware-zip ../Vita_104_Firmware.zip --image-sha256 --json
+```
+
+The Python standard library checker opens the image read-only and uses its own
+byte comparisons and BPB decoding. It checks `os0_0`, `os0_1`, `vs0_0`, all four
+SLB2 source prefixes, slot tail fill (zero for FAT/boot, `0xFF` for BLS), and both
+FAT copies in each volume. SLB2 header/table, payload, and padding differences are
+reported separately without changing or normalizing any bytes. Reports
+include source and image-prefix lengths and SHA256 hashes; `--image-sha256` also
+hashes the entire file. Use `--image <path>` to inspect another image. Exit status
+is 0 for a match, 1 for failed checks, and 2 for unreadable inputs.
+
+Stop the emulator while checking and keep the original ZIP unchanged as the
+reference. This establishes that firmware bytes survived reconstruction; a full
+retail eMMC dump is still needed to validate reconstructed idstorage, erased
+partitions, and the complete device layout against hardware.
+
+Apple's filesystem checker provides another independent check on copies of the
+complete FAT partition slots:
+
+```bash
+dd if=build/emmc.img of=build/validation-os0.img bs=1m skip=16 count=16
+dd if=build/emmc.img of=build/validation-vs0.img bs=1m skip=176 count=256
+/sbin/fsck_msdos -n build/validation-os0.img
+/sbin/fsck_msdos -n build/validation-vs0.img
+```
+
+Both checks returned status 0 without filesystem errors on macOS during this
+port. The `-n` option declines repair prompts, as described
+in [Apple's fsck_msdos manual](https://github.com/apple-oss-distributions/msdosfs/blob/main/fsck_msdos.tproj/fsck_msdos.8).
+
+For the image reconstructed in this workspace on 2026-10-01, the 992-file
+verification reported zero mismatches, the independent ZIP comparison passed,
+and the whole-file SHA-256 was
+`f36b4612f3e7fe497d7d9899b16434a9208b8a0cdee06f260af3ff5109264534`.
+Evidence: `build/macos-emmc-verify.log`, `build/macos-emmc-bytes.json`, and
+`build/emmc.img.sha256`. A deliberately corrupted copy failed the byte checker
+(`build/macos-emmc-negative-check.json`).
+
+A subsequent independent FAT16 audit also followed `kd/sysmem.skprx` and
+`kd/stdio.skprx` in both os0 copies: directory entries, long-name checksums,
+cluster chains and complete file bytes match the supplied firmware. Evidence:
+`build/goal-independent-os0-fat-check.json` and `.txt`. The native dependency-open
+failure was traced to an A32 unaligned word load corrupting `/kd/` into `/os0`
+in guest path normalization; the actual source path and on-card bytes are intact
+(`build/goal-arm-native-rendezvous-evidence.md`). Emulator runs use separate APFS
+clones; the verified image is preserved.
+
+This hash identifies this reconstructed image, rather than every valid Vita
+dump. A hardware dump contains console-specific and writable data. Keep a
+read-only original and a hash recorded when it was acquired; run emulation on
+a copy. For a suspected Windows image, use `--image <path>` with the same ZIP
+reference to locate firmware-region differences before considering repairs.
+
 ### What could not be verified
 
-* **No real 1.04 eMMC dump exists**, so the reconstruction is validated against
+* **No complete real 1.04 eMMC dump is supplied here**, so the reconstruction is validated against
   the PUP, the extracted tree and the machine's own boot path - not against a
   genuine 1.04 device image. The only eMMC dump available
   (`dumps/emmcdump.zip`, 24 MiB of a bricked, different console) was used for

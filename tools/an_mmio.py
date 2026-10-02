@@ -7,7 +7,7 @@ import struct
 import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.path.insert(0, r'C:\Work\PSVita\_scratch_soc')
+sys.path.insert(0, r'..\_scratch_soc')
 import kdis
 import kdis2
 

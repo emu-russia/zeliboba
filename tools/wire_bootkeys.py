@@ -1,7 +1,7 @@
 import io
 
 # 1) VitaConfig gains the flag.
-h = r'C:\Work\PSVita\zeliboba\src\machine\vita.h'
+h = r'.\src\machine\vita.h'
 s = open(h, encoding='utf-8').read()
 if 'provision_keys' not in s:
     s = s.replace('''    bool rebuild_emmc = true;        ///< build the image when it is missing''',
@@ -17,7 +17,7 @@ else:
     print('vita.h already has the flag')
 
 # 2) bootchain.cpp provisions before staging.
-c = r'C:\Work\PSVita\zeliboba\src\machine\bootchain.cpp'
+c = r'.\src\machine\bootchain.cpp'
 t = open(c, encoding='utf-8').read()
 if 'provision_boot_keys' in t:
     print('bootchain.cpp already patched')
@@ -71,7 +71,7 @@ else:
     print('patched bootchain.cpp')
 
 # 3) CLI flag --no-provision.
-cl = r'C:\Work\PSVita\zeliboba\src\debug\cli.cpp'
+cl = r'.\src\debug\cli.cpp'
 u = open(cl, encoding='utf-8').read()
 if '--no-provision' not in u:
     u = u.replace('''        else if (arg == "--no-rebuild") config.rebuild_emmc = false;''',

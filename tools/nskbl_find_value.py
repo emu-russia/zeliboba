@@ -6,7 +6,7 @@ Usage: python tools/nskbl_find_value.py 0x80024300
 import struct
 import sys
 
-IMAGE = r"C:\Work\PSVita\_scratch\nskbl_mem.bin"
+IMAGE = r"..\_scratch\nskbl_mem.bin"
 BASE = 0x51000000
 
 

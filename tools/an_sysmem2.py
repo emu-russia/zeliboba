@@ -3,10 +3,10 @@ import sys
 
 import capstone
 
-sys.path.insert(0, r'C:\Work\PSVita\_scratch_soc')
+sys.path.insert(0, r'..\_scratch_soc')
 import kdis
 
-p = r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0\kd\sysmem.elf'
+p = r'..\Vita_104_Firmware\Out\fs_dec\os0\kd\sysmem.elf'
 e = kdis.load(p)
 seg = e.segs[0]
 b = seg.data

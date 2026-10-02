@@ -1,9 +1,9 @@
 import sys
 
-sys.path.insert(0, r'C:\Work\PSVita\_scratch_soc')
+sys.path.insert(0, r'..\_scratch_soc')
 import kdis
 
-p = r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0\kd\sdif.elf'
+p = r'..\Vita_104_Firmware\Out\fs_dec\os0\kd\sdif.elf'
 e = kdis.load(p)
 seg = e.segs[0]
 print('seg vaddr 0x%08X filesz 0x%X' % (seg.vaddr, seg.filesz))

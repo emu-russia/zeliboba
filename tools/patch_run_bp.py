@@ -1,4 +1,4 @@
-p = r'C:\Work\PSVita\zeliboba\src\debug\debugger.cpp'
+p = r'.\src\debug\debugger.cpp'
 s = open(p, encoding='utf-8').read()
 old = '''void Debugger::run(int64_t count) {
     stop_requested_ = false;

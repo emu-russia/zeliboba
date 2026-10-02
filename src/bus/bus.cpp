@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#endif
 
 #include "common/log.h"
 #include "common/util.h"
@@ -85,10 +87,17 @@ static bool read_trap_enabled() { return read_trap().enabled; }
 void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
     if (!bus_write_trap_contains(address)) return;
     const MemRegion* region = region_at(address, 1);
+#if defined(_MSC_VER)
+    void* caller = _ReturnAddress();
+#elif defined(__GNUC__) || defined(__clang__)
+    void* caller = __builtin_extract_return_addr(__builtin_return_address(0));
+#else
+    void* caller = nullptr;
+#endif
     std::fprintf(stderr, "[wtrap] %-14s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
                  region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
                  static_cast<unsigned long long>(value), context.pc, context.core,
-                 _ReturnAddress());
+                 caller);
 }
 
 void Bus::note_read_trap(u32 address, unsigned size, u64 value) {
@@ -350,6 +359,7 @@ void Bus::reset_devices() {
 }
 
 void Bus::reset() {
+    context = BusContext{};
     for (auto& region : regions_) std::fill(region.bytes(), region.bytes() + region.size, 0);
     reset_devices();
     trace.clear();

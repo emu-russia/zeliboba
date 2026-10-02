@@ -236,15 +236,22 @@ void DisplayController::tick(u64 cycles) {
     }
 }
 
-const u8* DisplayController::framebuffer(int& width, int& height, int& stride) const {
+const u8* DisplayController::framebuffer(int& width, int& height, int& stride,
+                                       int* bytes_per_pixel) const {
     if ((control_ & kCtlEnable) == 0) {
         width = height = stride = 0;
+        if (bytes_per_pixel) *bytes_per_pixel = 0;
         return nullptr;
     }
     const Buffer& buffer = buffers_[active_];
     width = buffer.width;
     height = buffer.height;
     stride = buffer.stride;
+    // Row padding is independent of the pixel format. In particular, stride /
+    // width can describe neither RGB565 nor RGBA8888 for a padded framebuffer.
+    if (bytes_per_pixel) {
+        *bytes_per_pixel = static_cast<int>(DisplayController::bytes_per_pixel(buffer.format));
+    }
     return buffer.pixels.empty() ? nullptr : buffer.pixels.data();
 }
 

@@ -508,7 +508,7 @@ private:
     int frame_limit_ = 0;
     u64 frames_drawn_ = 0;
     /// --run self test: machine steps to execute before the first frame.
-    int step_limit_ = 0;
+    int step_limit_ = -1;  // unset; an explicit --run 0 captures the paused machine
     /// --screenshot <file.bmp>: capture mode. Works without any display.
     std::string screenshot_path_;
     bool screenshot_requested_ = false;

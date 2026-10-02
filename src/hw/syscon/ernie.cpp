@@ -789,6 +789,10 @@ bool ErnieBlock::load_firmware(const std::vector<u8>& dump, bool run_firmware) {
     return true;
 }
 
+bool ErnieBlock::read_nvs(u16 offset, size_t length, std::vector<u8>& out) const {
+    return impl_->nvs.read(offset, length, out);
+}
+
 std::vector<u8> ErnieBlock::dispatch_command(u32 command, const std::vector<u8>& payload) {
     Impl& impl = *impl_;
     // The fuel gauge / panel / RTC values are mirrored in ErnieBlock's own
@@ -938,5 +942,4 @@ std::vector<Device*> ErnieBlock::devices() const {
 }
 
 }  // namespace zlb
-
 

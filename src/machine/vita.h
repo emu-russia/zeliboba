@@ -64,6 +64,12 @@ struct VitaConfig {
 namespace board {
 constexpr u32 kSharedSramBase = 0x1F000000;   ///< visible to both ARM and CMeP
 constexpr u32 kSharedSramSize = 0x00040000;   ///< 256 KiB
+/// Independent 128 MiB CDRAM aperture used by the ARM/GPU/display path.
+/// The physical memory map names 0x20000000..0x27FFFFFF; hardware-tested
+/// vita-libbaremetal/display.c uses framebuffer base 0x20000000 and cdram.c
+/// enables its controller through SMC117. This is not the 0x1C000000 SRAM.
+constexpr u32 kCdramBase = 0x20000000;
+constexpr u32 kCdramSize = 0x08000000;
 /// The ARM's low window aliases the power scratchpad (wiki Physical_Memory:
 /// "0x00000000 0x40000 ARM Boot. By default, alias of physical address 0x1F000000
 /// i.e. ScePower scratchpad").  The window is 256 KiB, which is what puts the
@@ -117,15 +123,13 @@ constexpr u32 kKblParamBase = 0x1F000100;
 constexpr u32 kKblParamDram = 0x4001FD00;
 constexpr u32 kKblParamSize = 0x100;
 constexpr u32 kKblParamMagic = 0xCBAC03AAu;
-/// Where the two SLB2 kernel-module images are staged.  The wiki's Physical_Memory
-/// says the CMeP's 128 KiB SRAM (0x00800000, which the ARM sees mirrored at
-/// 0x00040000) "Stores second_loader, secure_kernel and Secure Modules", while the
-/// FW 3.60 secure-DRAM table gives the same modules offsets 0x500/0x9B00 inside the
-/// secure image layout.  The second reading is what the kernel boot loader consumes
-/// through the MeP window, so the modules are staged at those offsets from the SRAM
-/// base and the parameter records the window addresses.
-constexpr u32 kKprxAuthSmStaging = 0x00800500;  // CMeP SRAM base (0x00800000) + 0x500
-constexpr u32 kProgRvkStaging = 0x00809B00;     // CMeP SRAM base (0x00800000) + 0x9B00
+/// Firmware 1.04 second_loader.bin at 0x4181C loads context_auth_sm.self,
+/// kprx_auth_sm.self and prog_rvk.srvk in that order into shared secure DRAM.
+/// Only successful reads advance the cursor, rounded to the next 512-byte
+/// boundary (0x41860..0x41884); 0x419D6..0x419EC checks these bounds.
+/// The CMeP secure kernel runs separately in private SRAM at 0x00800000.
+constexpr u32 kSecureModuleStagingBase = 0x40000500;
+constexpr u32 kSecureModuleStagingEnd = 0x40020000;
 }  // namespace board
 
 class Vita {
@@ -353,6 +357,9 @@ private:
     bool build_kbl_param();
     /// Stage `bytes` into DRAM through the CMeP bus (shared backing store).
     bool stage_in_dram(u32 address, const std::vector<u8>& bytes);
+    /// Model the second loader's final named-file reads after its DRAM scratch
+    /// use, before transferring control to the secure kernel.
+    void stage_secure_modules();
 
     /// Parse ZLB_PCTRAP into pc_trace_lo_/hi_ (call once, before the ARM runs).
     void configure_arm_pc_trace();
@@ -426,15 +433,15 @@ private:
     u64 boot_pc_fixes_ = 0;
 
     /// Development substitution: hand the KBL's own partition the block cache it
-    /// never fills itself (see the comment on satisfy_arm_boot_pc).  Called from
-    /// the PC hook when an allocation is about to run with the cache-only flag and
-    /// a class whose cache slot is empty; writes `blocks` 0x1000/0x2000-byte
-    /// blocks taken from the region's free end into that slot (target/step 7, as
-    /// the partition's own init leaves it).  Off only with ZLB_NO_SUBSTITUTION=1,
-    /// tuned with ZLB_PART_BLOCK_CACHE=<n> (default 4).
+    /// Legacy diagnostic page-cache substitution. The native allocator now
+    /// handles cache misses and returns genuine metadata descriptors, so this
+    /// raw-page substitution is disabled by default. ZLB_PART_BLOCK_CACHE=<n>
+    /// explicitly enables it for historical comparisons; it is not a normal
+    /// boot memory source.
     bool supply_kbl_partition_block(u32 core, u32 pool_va, u32 size);
-    /// Create the per-class table the SceUID registration walks through the global
-    /// 0x400B291C; the loader never writes that global itself (round 93).
+    /// Legacy fallback: supply nine empty MemBlock descriptor free-pool records
+    /// through global 0x400B291C only while the native pointer is zero. FW1.04
+    /// builds and populates its own table; preserve it once installed.
     bool supply_kbl_class_table(u32 core);
     /// Development substitution (round 366): NSKBL's storage driver addresses its
     /// device through a hard-wired object at VA 0x240 (`str r2,[r0]` with r2 = 0x240
@@ -543,7 +550,7 @@ private:
     u32 rangechk_trace_hits_ = 0;
     /// Page index (inside the partition region) the carve experiment hands out next.
     u32 carve_page_next_ = 0;
-    u32 partition_blocks_per_class_ = 4;
+    u32 partition_blocks_per_class_ = 0;
     u32 partition_supplied_ = 0;
     u32 class_tables_supplied_ = 0;
     /// VA of the class table the model created (round 111): the loader zeroes the
@@ -609,19 +616,9 @@ private:
     /// Handle a hit recorded by cmep_pc_hook() at a slice boundary.
     bool serve_cmep_service_call();
     bool cmep_service_pending_ = false;
-    /// True while the CMeP runs the secure kernel image (set by
-    /// load_cmep_secure_kernel, cleared when its "done" jump is handled).
+    /// True while the CMeP secure kernel is installed. Its 0x101 startup status
+    /// releases the ARM to run the native scheduler's shared-buffer handshake.
     bool secure_kernel_active_ = false;
-    /// Set when the secure kernel re-enters the 0x40000 window (its "done" path).
-    bool secure_kernel_done_ = false;
-    /// The secure kernel's "done" jump returns into the *second loader*, which then
-    /// finishes its own work - and that work is what fills the ARM boot context at
-    /// the scratch +0x100.  The model lets the CMeP run on for a bounded budget
-    /// before releasing the ARM instead of halting it at the jump; otherwise the
-    /// second loader's post-processing (and with it the context the ARM reads)
-    /// never happens (see docs/KBL.md round 48.15).
-    bool cmep_finish_pending_ = false;
-    u64 cmep_finish_steps_ = 0;
     /// Round 92: the power-on path of the syscon releases the SoC as soon as the
     /// reset sequencing is done (ernie_power.cpp), so without this gate the model
     /// starts kernel_boot_loader *before* the CMeP second loader has even been
@@ -634,6 +631,10 @@ private:
     static constexpr u64 kArmWaitCmepSlices = 400000;
     /// SceKblParam inputs collected while staging the SLB2 images.
     u32 secure_kernel_size_ = 0;
+    std::array<Slb2Entry, 3> secure_module_sources_;
+    bool secure_modules_staged_ = false;
+    u32 context_auth_sm_pa_ = 0;
+    u32 context_auth_sm_size_ = 0;
     u32 kprx_auth_sm_pa_ = 0;
     u32 kprx_auth_sm_size_ = 0;
     u32 prog_rvk_pa_ = 0;

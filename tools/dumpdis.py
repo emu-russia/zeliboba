@@ -13,7 +13,7 @@ base = int(sys.argv[3], 0) if len(sys.argv) > 3 else addr
 thumb = '--thumb' in sys.argv
 stage = 'kbl' if 'kbl' in sys.argv else None
 
-exe = r'C:\Work\PSVita\zeliboba\build\bin\zeliboba.exe'
+exe = r'.\build\bin\zeliboba.exe'
 cmd = [exe, '-q']
 if stage:
     cmd += ['--stage', stage]
@@ -35,11 +35,11 @@ for line in out.splitlines():
     for byte in m.group(2).split():
         data.append(int(byte, 16))
 
-path = os.path.join(r'C:\Work\PSVita\zeliboba\build', 'dump_%X.bin' % addr)
+path = os.path.join(r'.\build', 'dump_%X.bin' % addr)
 open(path, 'wb').write(bytes(data))
 print('dumped %d bytes -> %s' % (len(data), path))
 
-zdis = r'C:\Work\PSVita\zeliboba\build\bin\zdis.exe'
+zdis = r'.\build\bin\zdis.exe'
 args = [zdis, 'arm', path, '--base', hex(base), '--count', str(rows * 8)]
 if thumb:
     args.append('--thumb')

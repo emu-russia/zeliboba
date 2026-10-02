@@ -19,6 +19,10 @@ namespace zlb {
 /// Never throws; unknown encodings come back as `.word 0x...` / `.hword 0x...`.
 std::string arm_disassemble(Bus& bus, u32 address, bool thumb, unsigned& length);
 
+/// Decode supplied instruction bytes, preserving virtual branch targets and
+/// making no bus accesses. `bytes` has four bytes of storage; T16 uses two.
+std::string arm_disassemble_bytes(const u8* bytes, u32 address, bool thumb, unsigned& length);
+
 /// Mnemonic only (the text before the first space).
 std::string arm_mnemonic(Bus& bus, u32 address, bool thumb);
 

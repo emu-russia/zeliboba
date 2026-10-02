@@ -1,0 +1,23 @@
+# CDRAM physical backing review
+
+Read-only review, before the parent's independent board implementation. No source changes or shared build were performed for this audit. The parent subsequently chose the existing `Bus::add_ram` storage/reset policy for a separate ARM CDRAM region.
+
+## Evidence and scope
+
+The physical CDRAM aperture is **0x20000000..0x27FFFFFF, 128 MiB**. It is distinct from 2 MiB scratch/display/camera SRAM at 0x1C000000 and main 512 MiB DRAM at 0x40000000. The public physical map labels VRAM nonsecure and separately lists the SRAM and DRAM windows. [Vita Developer wiki, Physical Mapping](https://www.psdevwiki.com/vita/Memory_Mapping). The previously recovered HENkaku physical map `build/research/zeliboba-vita-physical-memory.html` also explicitly lists `0x20000000`, length `0x8000000`, `128MiB CDRAM`.
+
+Independent executable baremetal sources corroborate the address and enable path: `display.c` defines framebuffer address 0x20000000, programs that physical address into IFTU configuration, and selects OLED/LCD scanout dimensions. `cdram.c` implements enable by SMC117, and the sample invokes enable before display initialization. [display.c](https://raw.githubusercontent.com/xerpi/vita-libbaremetal/master/libbaremetal/src/display.c), [cdram.c](https://raw.githubusercontent.com/xerpi/vita-libbaremetal/master/libbaremetal/src/cdram.c), [sample main.c](https://github.com/xerpi/vita-libbaremetal/blob/master/sample/src/main.c). Local saved sources are `goal-cdram-reference-display.c`, `goal-cdram-reference-cdram.c`, and `goal-cdram-reference-start.s`.
+
+Genuine 1.04 currently proves the **enable/control** path, not yet a data access into CDRAM: Lowio queues `SceCdramInit` at runtime 0x005AB9D4, callback 0x005AB98C invokes 0x005A8090 / SMC117 at 0x005A8094. Actual Secure SceDriverTzs handler 0x0054BC68 enters initializer 0x0054BA8C and accesses the separately mapped EMC device VA0x280C1000 -> PA0xE8200000. See the independent native capture/report `goal-native-e820-emctop-evidence.md` and `goal-native-e820-command-capture.log`. Graphics independently captures the genuine queued callback. No CPU/DMA CDRAM data access or need for a CMeP CDRAM view has been established by these captures.
+
+## Board mapping and implications
+
+The pre-change `Vita::build_board` has shared DRAM backing at PA0x40000000 on ARM/CMeP, an independent historical ARM window at PA0x80000000, and real scratch SRAM at PA0x1C000000. It has no CDRAM aperture. Map CDRAM as an independent writable ARM RAM region covering its exact 128 MiB aperture. ARM CPU, modeled DMA/GPU, and IFTU scanout use this same physical ARM bus, so ordinary CPU/scanout accesses share one backing automatically. Do not alias CDRAM to main DRAM or scratch SRAM; do not invent an additional physical cached/uncached alias. Guest virtual aliases and cache attributes come from guest page tables.
+
+Public classification as nonsecure does not mean Secure software is forbidden to access the backing. Existing Bus RAM paths do not enforce a physical TrustZone memory-controller policy. Preserve guest MMU permissions/security banking; do not introduce an unverified access gate or claim such controller protection is implemented. Likewise, adding RAM backing does not itself complete EMC power/calibration or SMC117. Those are separately evidenced controller operations.
+
+Existing `Bus::add_ram` eagerly initializes a vector and rebuilds cached page pointers. `Bus::reset` clears every backing, and `Vita::reset(false)` invokes it too, so the narrow region automatically follows the emulator's existing cold/warm reset semantics. Hardware reset retention has not been recovered; deterministic zeroing is an emulator policy, not a claim about real CDRAM contents.
+
+A demand-zero alternative would need stable external host backing plus an ownership/destruction policy and reset discard support. Merely using `add_ram_alias` over an anonymous mapping is insufficient: existing `Bus::reset` still touches all 128 MiB, defeating lazy physical commitment. There is no current lazy/sparse RAM storage helper. Avoid a partial aperture or aliased DRAM substitute to save allocation, since it would misrepresent the board. The parent chose the existing RAM policy for the minimal correction.
+
+Useful boundary tests: first and last CDRAM pages; addresses immediately outside the aperture; CPU byte/word transfers and RAM classification; independence from scratch SRAM and main DRAM; shared CPU/IFTU backing; reset behavior. No synthetic framebuffer or guest success callback should be introduced. The genuine boot-logo producer previously recovered at PA0x1C000000 remains its separate SRAM path; CDRAM availability does not prove that logo rendering has been reached.

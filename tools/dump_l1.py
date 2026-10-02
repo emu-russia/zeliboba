@@ -2,7 +2,7 @@
 import re
 import subprocess
 
-EXE = r'C:\Work\PSVita\zeliboba\build\bin\zeliboba.exe'
+EXE = r'.\build\bin\zeliboba.exe'
 
 
 def dump(addr, rows):

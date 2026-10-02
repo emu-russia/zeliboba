@@ -9,7 +9,7 @@ Usage: python tools/kbl_findptr.py <addr> [<addr> ...]
 import struct
 import sys
 
-IMAGE = r"C:\Work\PSVita\_scratch\kbl.bin"
+IMAGE = r"..\_scratch\kbl.bin"
 BASE = 0x40020000
 
 data = open(IMAGE, "rb").read()

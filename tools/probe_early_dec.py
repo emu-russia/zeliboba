@@ -1,8 +1,8 @@
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-enc = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
-bin_ = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin', 'rb').read()
-rom = open(r'C:\Work\PSVita\dumps\vita_prototype_bootrom.bin', 'rb').read()
+enc = open(r'..\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
+bin_ = open(r'..\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin', 'rb').read()
+rom = open(r'..\dumps\vita_prototype_bootrom.bin', 'rb').read()
 romb = lambda a, n: rom[a - 0x5C000:a - 0x5C000 + n]
 
 print('rom5E704:', romb(0x5E704, 32).hex(' '))

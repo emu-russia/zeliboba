@@ -50,20 +50,16 @@ public:
 
     // ---- TrustZone (Security Extensions) ---------------------------------
     //
-    // The core models the ARMv7-A Security Extensions to the extent the boot
-    // chain needs them. The world is held in `ns_` (and mirrored in SCR.NS)
-    // rather than in CPSR.NS: the architectural CPSR.NS aliases M[4], but this
-    // interpreter keeps the 5-bit mode field (all ARMv7 modes set bit 4) as the
-    // index of its banked register store, so overloading bit 4 would break mode
-    // banking. SPSR therefore does not carry the world either - the monitor
-    // switches it through SCR, which is what the secure kernel bootloader does.
-    bool ns_ = false;   // false = secure world, true = non-secure world
+    // Security state comes from SCR.NS and CPSR.M, not from a CPSR flag.
+    // Monitor always executes Secure. Its MRC/MCR accesses to banked CP15
+    // registers still select the bank named by SCR.NS (ARM ARM B3.15).
+    bool ns_ = false;   // mirror of SCR.NS, including while in Monitor mode
     u32 scr = 0;
     u32 mvbar = 0;
     u32 vbar_nonsecure = 0;
 
     /// True while executing in the secure world.
-    bool secure_state() const { return !ns_; }
+    bool secure_state() const { return mode() == arm::kModeMonitor || !ns_; }
 
     /// Vector base the next exception will use: MVBAR for exceptions taken to
     /// monitor mode, otherwise the VBAR of the world the exception came from.
@@ -77,6 +73,8 @@ public:
     /// decide whether it is the boot core and code that runs here is per-core.
     u32 core_id_ = 0;
 
+    /// The current execution world's translation bank, also used by machine
+    /// fault hooks and the debugger. Monitor execution always selects Secure.
     ArmMmu mmu;
     ArmVfp vfp;
 
@@ -152,12 +150,26 @@ public:
     /// Translate a virtual address for the debugger (never faults when off).
     bool translate(u32 va, bool write, bool fetch, u32& pa, std::string& fault);
 
+    /// Read-only execution-bank access for inspection. Monitor uses Secure
+    /// even when SCR.NS selects the Non-secure bank for guest MRC/MCR accesses.
+    const ArmMmu& inspection_mmu() const { return mmu_bank(!secure_state()); }
+
     /// Take a synchronous exception (ARM ARM B1.8.3 / B1.9).
     void take_exception(u32 vector_offset, u32 new_mode, u32 return_address);
 
 private:
+    // The other Security bank. Keep `mmu` as the active translation regime so
+    // bus/debugger consumers observe the same state as instruction/data access.
+    ArmMmu inactive_mmu_;
+    bool active_mmu_nonsecure_ = false;
+    void sync_mmu_bank();
+    ArmMmu& mmu_bank(bool nonsecure);
+    const ArmMmu& mmu_bank(bool nonsecure) const;
+    ArmMmu& cp15_mmu();
+
     // ---- banked registers -------------------------------------------------
 
+    // System mode aliases the User slots; it has no separate SP/LR bank.
     u32 bank_sp_[arm::kModeCount] = {};
     u32 bank_lr_[arm::kModeCount] = {};
     u32 bank_spsr_[arm::kModeCount] = {};
@@ -202,7 +214,8 @@ private:
         pc = value;
     }
     void bank_switch(u32 old_mode, u32 new_mode);
-    void write_cpsr_masked(u32 value, u32 mask);
+    u32 cpsr_instruction_mask(u32 mask) const;
+    void write_cpsr_masked(u32 value, u32 mask, bool instruction = true);
     void set_nz(u32 result);
     void set_nzcv(u32 result, bool carry, bool overflow);
 
@@ -223,6 +236,12 @@ private:
     u32 exclusive_phys(u32 va);
 
     u32 mem_read_word(u32 va, bool fetch);
+    // MemU for single-word LDR/STR. Fetch, multiple, doubleword and exclusive
+    // accesses retain their separate alignment/endianness contracts.
+    u32 mem_read_single_word(u32 va);
+    void mem_write_single_word(u32 va, u32 value);
+    void single_word_alignment_fault(u32 va, bool write);
+    bool unaligned_single_byte_allowed(u32 va, u32 byte_va, bool write);
     u32 mem_read_half(u32 va);
     u32 mem_read_byte(u32 va);
     void mem_write_word(u32 va, u32 value);
@@ -274,6 +293,7 @@ private:
     void decode_arm_rfe_srs(u32 instr);
     void decode_arm_cps_setend(u32 instr);
     void execute_arm_coprocessor(u32 instr);
+    bool cp15_thread_id_access_allowed(bool read, u32 opc1, u32 crn, u32 crm, u32 opc2);
     u32 cp15_read(u32 opc1v, u32 crn, u32 crm, u32 opc2v, int rt);
     void cp15_write(u32 opc1v, u32 crn, u32 crm, u32 opc2v, u32 value);
     void cp15_cache_op(u32 opc1v, u32 crm, u32 opc2v, u32 value);
@@ -283,11 +303,11 @@ private:
 
     // ---- Thumb-16 ----------------------------------------------------------
 
-    void execute_thumb16();
-    void thumb_shift_imm(u32 i);
-    void thumb_add_sub(u32 i);
-    void thumb_mov_cmp_imm(u32 i);
-    void thumb_alu_ops(u32 i);
+    void execute_thumb16(bool in_it_block);
+    void thumb_shift_imm(u32 i, bool setflags);
+    void thumb_add_sub(u32 i, bool setflags);
+    void thumb_mov_cmp_imm(u32 i, bool setflags);
+    void thumb_alu_ops(u32 i, bool setflags);
     void thumb_special_data(u32 i);
     void thumb_literal_load(u32 i);
     void thumb_load_store_reg(u32 i);
@@ -330,6 +350,17 @@ private:
     void execute_vfp_load_store_multiple(u32 instr, bool single);
 
     void branch_to(u32 target);
+
+    // ARM ARM B4.1.150..152: software-only 32-bit registers, banked by
+    // Security state. MRC/MCR in Monitor select their copy with SCR.NS.
+    struct ThreadIdRegisters {
+        u32 user_rw = 0;
+        u32 user_ro = 0;
+        u32 privileged_rw = 0;
+    };
+    ThreadIdRegisters thread_ids_[2];
+    ThreadIdRegisters& cp15_thread_ids() { return thread_ids_[(scr & arm::kScrNs) != 0u]; }
+    const ThreadIdRegisters& cp15_thread_ids() const { return thread_ids_[(scr & arm::kScrNs) != 0u]; }
 };
 
 }  // namespace zlb

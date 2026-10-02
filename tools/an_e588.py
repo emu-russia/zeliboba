@@ -9,9 +9,9 @@ pats = {
     'literal E5888020': bytes.fromhex('208088e5'),
     'literal E5888100': bytes.fromhex('008188e5'),
 }
-for base in (r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0\kd',
-             r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0',
-             r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0\kd'):
+for base in (r'..\Vita_104_Firmware\Out\fs_dec\os0\kd',
+             r'..\Vita_104_Firmware\Out\fs_dec\os0',
+             r'..\Vita_104_Firmware\Out\fs_dec\os0\kd'):
     for path in sorted(glob.glob(os.path.join(base, '*.elf'))):
         try:
             b = open(path, 'rb').read()

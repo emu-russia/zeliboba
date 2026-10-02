@@ -1,6 +1,6 @@
 # zeliboba
 
-![zeliboba](artwork/png/zeliboba-banner.png)
+
 
 Низкоуровневый эмулятор PlayStation Vita на C++20 с бэкендом SDL3, отладчиком и
 реконструированным образом eMMC. Цель первого этапа — довести загрузку прошивки
@@ -22,13 +22,58 @@ Ernie (RL78 syscon)  -> питание/сброс/RTC/SC-канал/eMMC-хос�
 * вторая стадия доходит до конца — до вызова сервиса `jmp 0x5FF00`, после чего
   CMeP перезапускается на secure kernel (это подстановка: кода сервиса в дампах
   нет, см. `docs/STATUS.md` §4);
-* ARM `kernel_boot_loader` исполняет настоящий код, распаковывает NSKBL своим
-  `sceArlzDecode` и передаёт управление в Non-Secure (`SCR.NS=1`);
-* NSKBL доходит до чекпойнта `0xA9`: том `os0` читается и `psp2bootconfig.skprx`
-  находится, но данные файла не читаются — устройство хранения, к которому
-  обращается драйвер (VA `0x240`), в модели никем не заполняется.
+* ARM `kernel_boot_loader` исполняет настоящий код; исправленный путь сам
+  выделяет память, релокирует и запускает SceSysmem, SceExcpmgr и SceKernelIntrMgr.
+  IntrMgr устанавливает настоящие exception/SMC-векторы;
+* текущий прогон проходит настоящее рукопожатие `0x101/0x102`, доставляет
+  mailbox IRQ в CMeP и успешно запускает SceSblSmsched. RVK validation возвращает
+  настоящий `0`: DMA, metadata AES-CBC, SHA-256, section-copy, HMAC и AES-CTR
+  исполняются с проверенными результатами. Гость публикует 21 запись RVK;
+* mailbox Secure FIQ доставляется на ARM3. Исправлен SPI reset: level-sensitive
+  источник не сохраняет событие после polling ACK, прежний Smsched panic исчез.
+  NSKBL достигает `0xA9` и читает os0 через ADMA. Public retail identity profile
+  устраняет отказ platform/RVK policy `0x800F0B31`; parser/policy возвращают `0`,
+  CTR и streamed HMAC (`0x24B3/0x2CB3/0x28B3`) дают настоящие результаты:
+  payload return `0`, loader return `1`, CMeP исполняет entry `0x80B000`.
+  Plaintext совпадает с исходным ELF, digest — с authenticated metadata.
+  Исправленный MeP SWI регистрирует native IRQ9 handler, модуль входит в work loop.
+  DRAM-size slot `0x513` согласован с board 512 MiB. Сервисы `0x10001/0x20001/0x30001`
+  аутентифицируют и расшифровывают первый os0 segment `psp2bootconfig.skprx`.
+  Исправлено точное адресование single-word accesses A32/Thumb16/Thumb32:
+  настоящий inflater выдаёт исходный ELF segment, path normalizer сохраняет
+  `/kd/sysmem.skprx`. Low CMeP SRAM теперь
+  разделяет private SRAM после secure-kernel handoff, поэтому helper `0x400CE`
+  исполняется. Native Bigmac zero-fill также исправлен: cleanup сохраняет kernel,
+  CMeP возвращается в sleep `0x80048A`. Гость читает следующие os0 modules и
+  успешно загружает оба списка из 28 os0 modules и запускает все 14 core modules
+  и Stdio, Lowio, Syscon, OLED, Display, SblSsSmComm. Исправленный NEON decoder
+  исполняет initializer ThreadMgr и настоящий Syscon VMOV/VST1 padding block.
+  TPIDR registers сохраняют гостевые per-core context pointers; native threads
+  работают. I2C reset/idle subset позволяет Lowio завершить start.
+  LT5/WT7 считают elapsed time и доставляют настоящие timer IRQs.
+  Все шесть SceEmcTop commands завершены, настоящий SMC117 возвращает `0`;
+  независимый CDRAM aperture добавлен. GPIO248/sub4 принимает настоящий SPI reply;
+  RFE Thumb context восстановлен, OLED выдаёт точные18 bytes и отвергает
+  моделируемый high input (ready2). Настоящий Syscon checksum SIMD теперь работает.
+  Исправлены исходные NVS boot flags и вмешательство в native per-core stacks.
+  Display включает DSI0 и исполняет настоящий logo producer: gzip возвращает
+  `0x1FE000`, SetFrameBuf — `0`, гостевые пиксели совпадают с embedded logo.
+  IFTU публикует подготовленный bank1 на DSI frame boundary через physical IRQ204;
+  настоящий Lowio handler подтверждает IRQ, rearm и replay в старый bank0.
+  Console-specific identity в дампах не предоставлена;
+* [Graphics PDF review](docs/GRAPHICS_REFERENCES.md) и настоящие 1.04 drivers
+  дали [native display contract](docs/FIRMWARE_DISPLAY_104.md). Минимальный IFTU0
+  читает guest framebuffer по настоящим регистрам. Embedded logo теперь
+  распакован самим обычным гостем, без копирования offline asset в RAM.
+  DSI0 vblank/IRQ213, IFTU turnover/IRQ204 и настоящий callback работают.
+  Blending и полное физическое поведение контроллера ещё не реализованы.
 
-Ближайший шаг — научить это устройство отвечать на управляющий запрос драйвера.
+Последняя полная проверка macOS: **617 тестов, 0 отказов**. Настоящие os0 kernel
+modules загружены; native SDL3 показывает белый PlayStation logo на чёрном фоне.
+Скриншот (image omitted from source delivery) и
+[проверка native producer/IRQ/presentation](build/goal-native-iftu-arm-integrated-evidence.md)
+сохранены. Полная загрузка ядра, LiveArea и SGX rendering ещё не подтверждены;
+IFTU timing/rearm/status используют явно ограниченную модель.
 
 ## Что внутри
 
@@ -77,6 +122,43 @@ msbuild zeliboba.slnx -p:Configuration=Release -p:Platform=x64 -m
 эмулятор. Список исходников в проектах задан масками, поэтому новые `.cpp`
 подхватываются автоматически, а вывод идёт в тот же `build/bin`, что и у
 CMake-сборки. Подробности — `msvc/README.md`.
+
+### macOS (Apple Silicon и Intel)
+
+Нужны инструменты командной строки Apple (`xcode-select --install`), CMake и
+SDL3. Если CMake или SDL3 ещё не установлены: `brew install cmake sdl3`.
+Visual Studio Code можно использовать как редактор; для сборки он не требуется.
+
+Дампы и распакованная прошивка должны находиться рядом с каталогом исходников.
+Имя каталога исходников может быть любым; текущая раскладка:
+
+```text
+zeliboba/
+├── dumps/vita_prototype_bootrom.bin   # CMeP first_loader
+├── ernie-master/USS-1001.bin          # Ernie / Syscon
+├── Vita_104_Firmware/Out/             # SLB2/, PUP_dec/, fs/, fs_dec/
+└── zeliboba-main/                    # этот проект
+```
+
+Архив `Vita_104_Firmware.zip` нужно распаковать так, чтобы `Out` лежал именно
+по показанному пути. Образ eMMC создаётся автоматически при первом запуске в
+`zeliboba-main/build/emmc.img`; существующий образ используется повторно.
+
+```bash
+cd zeliboba-main
+./build-macos.sh                       # CLI, инструменты, тесты и SDL3
+./run-macos.sh                         # SDL3, SPACE запускает/приостанавливает
+./run-macos.sh --run 0 -ex "runm 1000000" # cold boot до гостевого PS logo; F7 — Display
+./run-macos.sh --cli                   # интерактивный отладчик
+./run-macos.sh --cli --info            # карта памяти и устройств
+./run-macos.sh --cli -ex "boot" -ex "runm 300000" -ex "boot" -ex "gpo" -ex "quit"
+ctest --test-dir build --output-on-failure
+```
+
+Для сборки без SDL3: `./build-macos.sh --headless`, затем `./run-macos.sh --cli`.
+Дополнительные параметры CMake можно передать в `build-macos.sh`, например
+`-DCMAKE_BUILD_TYPE=Debug`. Параметры после `--cli` (или все параметры при запуске
+SDL3) передаются эмулятору; список — `./run-macos.sh --cli --help`.
 
 ## Запуск
 

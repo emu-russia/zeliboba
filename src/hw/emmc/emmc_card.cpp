@@ -27,6 +27,8 @@
 #include <io.h>
 #include <windows.h>
 #include <winioctl.h>
+#else
+#include <unistd.h>
 #endif
 
 namespace zlb {

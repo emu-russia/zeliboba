@@ -32,7 +32,7 @@ import os
 import random
 import sys
 
-ROOT = r'C:\Work\PSVita'
+ROOT = r'..'
 OUT = os.path.join(ROOT, 'zeliboba', 'src', 'machine', 'bootkeys_data.h')
 IMAGE = os.path.join(ROOT, 'Vita_104_Firmware', 'Out', 'SLB2', 'second_loader.enc')
 SIGNATURE_OFFSET = 0x1C0

@@ -29,7 +29,7 @@ from collections import defaultdict
 
 import capstone
 
-IMAGE = r"C:\Work\PSVita\_scratch\kbl.bin"
+IMAGE = r"..\_scratch\kbl.bin"
 BASE = 0x40020000
 ENTRY = 0x40020284          # ARM boot entry the KBL starts at (bootchain.cpp)
 

@@ -33,7 +33,7 @@ except ImportError:                                    # pragma: no cover
     print("capstone is required: pip install capstone", file=sys.stderr)
     sys.exit(2)
 
-DEFAULT_IMAGE = r"C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin"
+DEFAULT_IMAGE = r"..\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin"
 DEFAULT_BASE = 0x51000000
 DEFAULT_ENTRY = 0x51000100
 

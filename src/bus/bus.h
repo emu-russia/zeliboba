@@ -56,10 +56,12 @@ bool bus_write_trap_contains(u32 address);
 void bus_install_read_trap(u32 low, u32 high);
 bool bus_read_trap_contains(u32 address);
 
-/// Who is currently executing, for the access trace.
+/// Executing core and transaction attributes for MMIO views and access traces.
 struct BusContext {
     const char* core = "none";   // borrowed: the cores assign name.c_str()
     u32 pc = 0;
+    bool nonsecure = false;
+    u32 core_id = 0;
 };
 
 class Bus {

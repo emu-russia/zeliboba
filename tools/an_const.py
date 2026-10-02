@@ -7,10 +7,10 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, r'C:\Work\PSVita\_scratch_soc')
+sys.path.insert(0, r'..\_scratch_soc')
 import kdis
 
-KD = r'C:\Work\PSVita\Vita_104_Firmware\Out\fs_dec\os0\kd'
+KD = r'..\Vita_104_Firmware\Out\fs_dec\os0\kd'
 constants = [int(a, 16) for a in sys.argv[1:]] or [0xE2040000]
 
 for path in sorted(glob.glob(os.path.join(KD, '*.elf'))):

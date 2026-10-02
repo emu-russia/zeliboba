@@ -41,6 +41,7 @@
 //   0x1C SC_IRQ_ENABLE   bit0 raise the syscon SPI when a response arrives
 //   0x20 SC_DOORBELL     alternative trigger (same as writing SC_COMMAND)
 #include "hw/soc/soc_internal.h"
+#include "hw/cmep/cmep_internal.h"
 
 namespace zlb::kermit {
 
@@ -69,14 +70,17 @@ constexpr u32 kScuPowerStatus = 0x08;
 /// The device names KermitBlock::tick advances; must match install().
 bool needs_tick(const std::string& name) {
     return name == "Kermit.GIC" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.Sdif0" ||
-           name == "Kermit.Sdif1" || name == "Kermit.Sdif2" || name == "Kermit.DMA" || name == "Kermit.Display";
+           name == "Kermit.Sdif1" || name == "Kermit.Sdif2" || name == "Kermit.DMA" || name == "Kermit.Display" ||
+           name == "Kermit.DSI0" || name == "Kermit.EmcTop" || name == "Kermit.LT5" || name == "Kermit.WT7" || name == "Kermit.Spi0";
 }
 
 /// The devices KermitBlock::devices() reports; must match install().
 bool is_owned(const std::string& name) {
     return name == "Kermit.SCU" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.GIC" ||
            name == "Kermit.Uart" || name == "Kermit.Sdif0" || name == "Kermit.Sdif1" || name == "Kermit.Sdif2" ||
-           name == "Kermit.DMA" || name == "Kermit.Display" || name == "Kermit.Syscon" ||
+           name == "Kermit.DMA" || name == "Kermit.Display" || name == "Kermit.IFTU0" || name == "Kermit.DSI0" ||
+           name == "Kermit.Syscon" || name == "Kermit.I2c0" || name == "Kermit.I2c1" || name == "Kermit.EmcTop" ||
+           name == "Kermit.LT5" || name == "Kermit.WT7" ||
            name.compare(0, 18, "Kermit.PeriphPower") == 0 || name == "Kermit.BootHandshake";
 }
 
@@ -516,6 +520,8 @@ struct KermitBlock::Impl {
     kermit::Spi* spi2 = nullptr;
     kermit::DmaController* dma = nullptr;
     kermit::DisplayController* display = nullptr;
+    kermit::IftuController* iftu = nullptr;
+    kermit::DsiController* dsi = nullptr;
     kermit::SysconBridge* syscon_bridge = nullptr;
 
     Cpu* cpu = nullptr;
@@ -572,8 +578,8 @@ const kermit::Gic* find_gic(const Bus& bus) {
 // are free functions (declared in soc_internal.h) that look the GIC up on the
 // bus. KermitBlock::install() must have run first.
 
-void kermit_set_cpu(Bus& bus, Cpu* cpu) {
-    if (kermit::Gic* gic = find_gic(bus)) gic->set_cpu(cpu);
+void kermit_set_cpu(Bus& bus, Cpu* cpu, unsigned core) {
+    if (kermit::Gic* gic = find_gic(bus)) gic->set_cpu(cpu, core);
 }
 
 void kermit_set_secure_world_left_enabled(Bus& bus, bool value) {
@@ -614,10 +620,32 @@ void kermit_attach_syscon_spi(Bus& bus, Bus& other, ErnieBlock* ernie) {
         if (!spi && !periph_power && !emmc) continue;
         shared.push_back(device.get());
     }
+    cmep_detail::GpioDevice* gpio = nullptr;
+    for (const auto& device : other.devices()) {
+        if (device->name() == "CMeP.GPIO") gpio = static_cast<cmep_detail::GpioDevice*>(device.get());
+    }
     for (Device* device : shared) {
         if (device->name() == "Kermit.Spi0") {
             static_cast<kermit::Spi*>(device)->set_slave(
                 [ernie](const std::vector<u8>& request) { return ernie->spi_transfer(request); });
+            if (gpio != nullptr) {
+                auto* spi0 = static_cast<kermit::Spi*>(device);
+                // One shared GPIO object owns input and latches; endpoint
+                // wiring alone delivers physical parent248..252 to this GIC.
+                gpio->set_irq_callback([&bus](u32 id, bool level) {
+                    if (auto* gic = find_gic(bus)) { gic->distributor().set_level(id, level); gic->refresh_line(); }
+                });
+                spi0->set_syscon_ready_callback([gpio](bool high) { gpio->set_external_input(0x10, high ? 0x10 : 0); });
+                gpio->set_reset_callback([spi0] { spi0->reset_syscon_ready_wire(); });
+                gpio->set_output_callback([gpio, spi0](u32 direction, u32 output) {
+                    u64 mode = 0, mask = 0;
+                    gpio->peek_register("MODE_0_15", mode);
+                    gpio->peek_register("MASK0", mask);
+                    const bool qualified = (direction & 0x10) == 0 &&
+                        ((mode >> 8) & 3) == 3 && (mask & 0x10) == 0;
+                    spi0->set_syscon_gpio(qualified, (direction & output & 8) != 0);
+                });
+            }
         }
         // The SDHCI block moves data by ADMA2 on the CMeP side, so it has to be
         // able to read and write that address space as well as the ARM's.
@@ -646,8 +674,6 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
 
     auto cpu_interface =
         std::make_unique<kermit::GicCpuInterface>("Kermit.GIC.cpu", periph_base + kermit::kIccOffset, kermit::kIccSize);
-    auto cpu_interface_alias =
-        std::make_unique<DeviceMirror>(*cpu_interface, periph_base + kermit::kIccAliasOffset, kermit::kIccSize);
     // The GIC's outer window must cover only the MPCore peripheral block, never
     // the whole SCU/DRAM window: Bus::find_device prefers a device over RAM, so a
     // 128 MiB window here shadows the kernel boot loader image at 0x40020000 and
@@ -655,7 +681,7 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.bus.add_device(std::make_unique<kermit::Gic>(kermit::kScuBase, kermit::kPeripheralWindowSize,
                                                    periph_base + kermit::kGicDistOffset, kermit::kGicDistSize,
                                                    periph_base + kermit::kIccOffset, kermit::kIccSize,
-                                                   std::move(cpu_interface_alias), std::move(cpu_interface)));
+                                                   nullptr, std::move(cpu_interface)));
 
     d.bus.add_device(std::make_unique<kermit::Uart>("Kermit.Uart", kermit::kUartBase, kermit::kUartSize));
     // 0xE2040000 is the *second console* of the firmware's console table, not an
@@ -688,6 +714,17 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.bus.add_device(std::make_unique<kermit::Spi>("Kermit.Spi1", kermit::kSpi1Base, kermit::kSpiSize, 1));
     d.bus.add_device(std::make_unique<kermit::Spi>("Kermit.Spi2", kermit::kSpi2Base, kermit::kSpiSize, 2));
 
+    // Lowio initializes both native I2C windows, even before any slave is used.
+    // These controllers implement only idle/reset; transfers remain visibly
+    // unsupported and never assert a guessed IRQ or fabricate a slave ACK.
+    d.bus.add_device(std::make_unique<kermit::I2cController>("Kermit.I2c0", kermit::kI2c0Base, 0));
+    d.bus.add_device(std::make_unique<kermit::I2cController>("Kermit.I2c1", kermit::kI2c1Base, 1));
+
+    // SceDriverTzs SMC117 programs this native CDRAM controller window.
+    // Exact initialization commands and mode requests have bounded timing;
+    // unknown commands stay busy and calibration IRQ34 remains unattached.
+    d.bus.add_device(std::make_unique<kermit::EmcTopController>());
+
     // PowerVR SGX register window (task part 2 of the Live Area goal). The window
     // identifies itself and implements the command-queue kick handshake; the
     // command buffers themselves and the OpenGL side come next (docs/GPU.md).
@@ -701,6 +738,7 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.global_timer = static_cast<kermit::GlobalTimer*>(kermit::detail::find_device(d.bus, "Kermit.GT"));
     d.private_timer = static_cast<kermit::PrivateTimer*>(kermit::detail::find_device(d.bus, "Kermit.PT"));
     d.gic = static_cast<kermit::Gic*>(kermit::detail::find_device(d.bus, "Kermit.GIC"));
+    d.gic->set_access_context(&d.bus.context);
     d.uart = static_cast<kermit::Uart*>(kermit::detail::find_device(d.bus, "Kermit.Uart"));
     d.sdif0 = static_cast<kermit::Sdif*>(kermit::detail::find_device(d.bus, "Kermit.Sdif0"));
     d.sdif1 = static_cast<kermit::Sdif*>(kermit::detail::find_device(d.bus, "Kermit.Sdif1"));
@@ -718,6 +756,9 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.bus.add_device(std::make_unique<kermit::DisplayController>("Kermit.Display", kermit::kDisplayBase,
                                                                  kermit::kDisplaySize, kermit::kPanelWidth,
                                                                  kermit::kPanelHeight));
+    d.bus.add_device(std::make_unique<kermit::IftuController>("Kermit.IFTU0", kermit::kIftu0Base,
+                                                              kermit::kIftu0Size, d.bus));
+    d.bus.add_device(std::make_unique<kermit::DsiController>());
     d.bus.add_device(std::make_unique<kermit::SysconBridge>("Kermit.Syscon", kermit::kSysconBridgeBase,
                                                             kermit::kSysconBridgeSize));
     // Peripheral power/clock glue and the boot handshake window: both are windows
@@ -730,16 +771,15 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     }
     d.bus.add_device(std::make_unique<kermit::BootHandshake>("Kermit.BootHandshake", kermit::kBootHandshakeBase,
                                                              kermit::kBootHandshakeSize));
-    // Two windows KBL touches that no workspace material documents:
-    //   0xE8000000  - KBL writes 0x0A to +0x10 (0x40021480) right after it
-    //                 programs 0xE6000090/94 and reads a structure back;
-    //   0xE20B6000  - a five word block {0, 0, 0xFFFFFFFF, 0xFFFFFFFF, ...,
-    //                 +0x1C = 0x2F345008 / 0x2F34500D} written at
-    //                 0x4002158E..0x40021598, which reads like a kick/descriptor.
-    // Both are plain register blocks: writes are stored and read back, the same
-    // treatment the CMeP's unidentified 0xE0100000 gets.
+    // E8000000 remains opaque peripheral glue. E20B6000 is now established
+    // as native ThreadMgr LT5, not an empty/drop-write descriptor window.
     d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE8000", 0xE8000000, 0x1000));
-    d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE20B6", 0xE20B6000, 0x1000));
+    auto lt5 = std::make_unique<kermit::VitaSystemTimer>("Kermit.LT5", kermit::kLt5Base, true, kermit::kIrqLt5);
+    auto wt7 = std::make_unique<kermit::VitaSystemTimer>("Kermit.WT7", kermit::kWt7Base, false, kermit::kIrqWt7);
+    lt5->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
+    wt7->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
+    d.bus.add_device(std::move(lt5));
+    d.bus.add_device(std::move(wt7));
     // Round 142: 0x1D000000 is the hardware /dev/null window (wiki Physical_Memory):
     // SceMsif drains its data stream here.  An empty RegisterBlock is exactly that -
     // reads return 0 (no defined register) and writes are dropped.
@@ -747,6 +787,8 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
                                                              kermit::kNullDeviceSize));
     d.dma = static_cast<kermit::DmaController*>(kermit::detail::find_device(d.bus, "Kermit.DMA"));
     d.display = static_cast<kermit::DisplayController*>(kermit::detail::find_device(d.bus, "Kermit.Display"));
+    d.iftu = static_cast<kermit::IftuController*>(kermit::detail::find_device(d.bus, "Kermit.IFTU0"));
+    d.dsi = static_cast<kermit::DsiController*>(kermit::detail::find_device(d.bus, "Kermit.DSI0"));
     // The display scans its framebuffer out of guest memory (round 191), so it
     // needs the bus the buffers live on.
     if (d.display != nullptr) d.display->set_bus(&d.bus);
@@ -759,6 +801,9 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     d.sdif1->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.sdif2->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.dma->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
+    d.iftu->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
+    d.dsi->set_frame_callback([&d](u64 frames) { d.iftu->frame_boundary(frames); });
+    d.dsi->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.syscon_bridge->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
 
     // The DMA engine may address the memory mapped peripherals that have a data
@@ -834,11 +879,21 @@ u64 KermitBlock::last_emmc_lba() const { return impl_->sdif0 ? impl_->sdif0->las
 
 u32 KermitBlock::last_emmc_count() const { return impl_->sdif0 ? impl_->sdif0->last_count() : 0; }
 
-const u8* KermitBlock::framebuffer(int& width, int& height, int& stride) const {
-    return impl_->display->framebuffer(width, height, stride);
+const u8* KermitBlock::framebuffer(int& width, int& height, int& stride,
+                                 int* bytes_per_pixel) const {
+    if (impl_->iftu) {
+        const u8* pixels = impl_->iftu->framebuffer(width, height, stride, bytes_per_pixel);
+        if (pixels) return pixels;
+    }
+    return impl_->display->framebuffer(width, height, stride, bytes_per_pixel);
 }
 
-u64 KermitBlock::frame_counter() const { return impl_->display->frame_counter(); }
+u64 KermitBlock::frame_counter() const {
+    int width = 0, height = 0, stride = 0;
+    // Native scanout has no fabricated frame-completion timer or counter.
+    if (impl_->iftu && impl_->iftu->framebuffer(width, height, stride)) return 0;
+    return impl_->display->frame_counter();
+}
 
 void KermitBlock::describe(std::vector<std::string>& lines) const {
     const Impl& d = *impl_;
@@ -859,6 +914,8 @@ void KermitBlock::describe(std::vector<std::string>& lines) const {
     if (d.sdif0) d.sdif0->describe(lines);
     if (d.dma) d.dma->describe(lines);
     if (d.display) d.display->describe(lines);
+    if (d.iftu) d.iftu->describe(lines);
+    if (d.dsi) d.dsi->describe(lines);
     if (d.syscon_bridge) d.syscon_bridge->describe(lines);
     lines.push_back(format("  time: %llu CPU cycles = %.6f s", static_cast<unsigned long long>(d.total_cycles),
                            static_cast<double>(d.total_cycles) / kermit::kCpuClockHz));

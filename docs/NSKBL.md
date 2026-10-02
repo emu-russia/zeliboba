@@ -1,8 +1,164 @@
 # NSKBL — небезопасный загрузчик ядра (прошивка 1.04)
 
+## Текущий прогон 2026-10-01
+
+**Текущая сборка — IFTU arm, 617 tests / 0 failures.** Неизменённый
+Syscon checksum block проходит после исправлений SIMD по ARM manual. Native
+allocated stacks сохраняются; старый shared-stack fallback ограничен исходным
+`r2=0x4000`. В captured cold-stack boot фактический param имеет `+0x30..0x33 =
+FF FF 00 FF` и `+0x6C=4`; все четыре Display boot predicates возвращают `0`.
+Настоящий Display logo producer исполняется на `0x005B7048`. Native gzip
+`0x005B70AC → 0x005B70B0` декодирует guest payload в `VA0x10000000` и возвращает
+`0x1FE000` bytes; `SetFrameBuf` на `0x005B70DE → 0x005B70E2` возвращает `0`.
+Native vblank wait также возвращает `0`. В предыдущем explicit-only IFTU
+guest pixels уже были готовы, но bank0 оставался пустым, а logo descriptor
+находился в deferred bank1. В сборке 617 ordinary IFTU mode pair `01` получает
+один turnover на следующей настоящей DSI frame boundary после полного
+`+0x180=1`: единый active bank определяет `+4` bit1 и scanout, затем физический
+IRQ204/205 сообщает completion. Внутренний pending latch очищает native
+word-zero ACK `+0x40`; raw status читается как `0`, так как его bit encoding
+не восстановлен. Native handler заново пишет `+0x180=1` и копирует descriptor
+в старый bank; rearm не переключает bank до следующего frame.
+
+Один frame на arm — **явный ограниченный выбор модели**, а не доказанная
+hardware timing семантика: continuous/rearmed turnover и точная функция
+`+0x180` ещё не установлены. Shared `+4` bit0 — alpha merge, не commit;
+manual mode `00` сохраняет explicit selects, неизвестные modes остаются
+вне автоматического subset. События не зависят от guest software pending,
+содержимого pixels или валидности descriptor. Blending не реализован.
+Настоящий Lowio IRQ204 handler выполняет ACK/rearm/replay, а macOS SDL3/Metal
+показывает белый PlayStation logo по центру чёрного framebuffer `960×544`,
+RGBA8888. Screenshot независимо просмотрен; capture завершился с exit `0`
+за `108.528 s`, 10753 reads и 0 writes. Полная загрузка ядра, LiveArea и
+завершение fade/blending этим не подтверждаются.
+
+На ранней board handoff используются существующие NVS Ernie:
+`0x4A0/0x481/0x483 → param+0x30/+0x31/+0x33`, `+0x32=0`, по умолчанию
+`FF FF 00 FF`; retail/product профиль `+0x6C=4` сохранён. Это моделируемая
+передача по provenance настоящего second loader, часть которого staging
+обходит; исполнение native builder не заявляется. Поздний marker и опция
+`ZLB_NSKBL_BOOTCFG` удалены. Бит0 — native `IsExternalBootMode`, а не разрешение
+файлового I/O: при нуле диспетчер вызывает настоящий opener через альтернативный
+путь (§4.7). Предыдущая модель оставляла `+0x30=0` и marker менял `+0x6C`
+с `4` на `5`, поэтому прежний Display work выходил через `IsUpdateMode=1`.
+Подробные evidence/provenance:
+native SDL screenshot (image omitted from source delivery),
+[IFTU integrated evidence](../build/goal-native-iftu-arm-integrated-evidence.md),
+[goal-native-cold-stack-integrated-evidence.md](../build/goal-native-cold-stack-integrated-evidence.md),
+[IFTU independent review](../build/goal-native-iftu-frame-completion-review.md),
+[617 tests](../build/goal-native-iftu-arm-tests.log),
+actual graphics capture (local capture omitted from source delivery),
+[goal-native-kbl-param-provenance.md](../build/goal-native-kbl-param-provenance.md).
+
+Bounded smoke supplied retail first-loader RAM snapshot тоже проходит layout
+check (shift `-128`, `16/16` marker bytes), native `SUCCESS` и достигает
+relocated os0 kernel/Syscon worker execution при cold `FF FF 00 FF`/`+0x6C=4`.
+Прогон остановлен ровно после `runm 300000`: 10753 reads, 0 writes, image
+не dirty; native startup ещё идёт. Это не отдельное подтверждение всех
+module-list returns или logo.
+[Retail evidence](../build/goal-native-iftu-arm-retail-evidence.md).
+
+После исправления native heap, таблицы MemBlock, allocator и Thumb32 `LDR.W PC`
+обычный прогон загружает настоящие модули TrustZone, проходит `0x101/0x102`
+с live CMeP и доставляет mailbox IRQ. Настоящий SceSblSmsched возвращает start `0`,
+регистрирует буфер команд и SMC `0x12D..0x13C`. Исправлена проверка relocated
+IntrMgr handler: его VA `0x003BE1C8` переводится в PA перед проверкой RAM,
+поэтому настоящий Monitor-вектор сохраняется.
+
+Текущий совместный прогон с per-core Secure FIQ достигает NSKBL/A9:
+SPI reset исправлен на level-sensitive, polling ACK больше не оставляет
+stale pending и прежний Smsched panic исчез. RVK validation успешна:
+callback `0`, 21 запись опубликована гостем; DMA, metadata AES-CBC, SHA-256,
+section-copy/HMAC и CTR дают проверенные результаты. Thumb16 `MOV PC,Rm`
+и Nonsecure F-mask write protection также исправлены.
+
+Parser и начальный policy `kprx_auth_sm.self` возвращают `0`. Public retail
+prefix в identity slot `0x509` устраняет прежний platform/RVK отказ `0x800F0B31`:
+native classifier распознаёт CEX, следующий policy возвращает `0`.
+Это модель public platform identity; индивидуальные console bytes недоступны.
+Payload CTR и streamed HMAC `0x24B3/0x2CB3/0x28B3` теперь проверены:
+payload return `0`, outer launch `1`, подлинный entry `0x80B000` исполнен.
+28596 plaintext bytes совпадают с ELF; final digest совпадает с metadata.
+MeP SWI теперь входит в native vector `0x800014`: registration returns `1`,
+IRQ9 callback `0x80E55E` исполнен, модуль остаётся в work loop `0x80E84A`.
+Slot `0x513` теперь выдаёт board DRAM 512 MiB, byte/word coherent. Настоящие
+`0x10001/0x20001/0x30001` возвращают service `0` и transport `1`: first os0
+segment `psp2bootconfig.skprx` authenticated/decrypted. Независимый zlib decoder
+распаковывает guest 733-byte stream в 1624 bytes, совпадающие с ELF PT_LOAD0.
+Native ARM inflater `0x51024E18 → 0x51024E8C` исправлен через точное
+unaligned Thumb32 word addressing. Неизменённый guest decoder возвращает
+`0x658`, все 1624 bytes совпадают с ELF PT_LOAD0. Прежний wrapper error
+`0x800F0516` и ARM error loop `0x51000D0C` устранены.
+Native module stop/exit завершается; secure-kernel handoff теперь alias-ит low
+SRAM к private backing, и uncached helper `0x400CE` исполняется. Hardware register,
+выбирающий этот remap, пока неизвестен и моделируется на board boundary.
+Полный прогон (599 tests / 0) также распаковывает relocation segment `0x318`
+точно как ELF. Все три segment loads и native relocation возвращают `0`.
+Bigmac zero-fill `0x000C` теперь правильно очищает module arena; cleanup сохраняет
+secure kernel и возвращается в native sleep `0x80048A`.
+Оба bootconfig list loads теперь возвращают `0`; все 28 modules получают
+положительные UID и проходят native relocation. Прежний `0x803FF007` был вызван
+A32 unaligned word load, который портил `/kd/` в path normalizer. Common MemU
+исправлен для A32/Thumb16/Thumb32. Прежний null sysroot callback/restart больше
+не является текущей границей. NEON `VORR D1,D0,D0` по `0x004A0008` также
+исправлен по ARM manual; все cores проходят настоящий initializer ThreadMgr.
+Все 14 core-module starts, Stdio, Lowio, Syscon, OLED, Display и SblSsSmComm успешны.
+Exact I2C reset/idle subset
+устраняет прежний Lowio wait на `0xE050001C`; оба порта получают reset7.
+TPIDR registers сохраняют native per-core thread pointers и отдельные security
+banks; прежние I2C object errors `0x80027101` были вызваны потерянными CP15 writes.
+Syscon VMOV/VST1 padding block исполняется после исправления Thumb NEON decode.
+LT5/WT7 теперь считают elapsed time; native IRQ135 handler освобождает delay
+wait. Все шесть SceEmcTop commands завершены, SMC117 возвращает `0`; CDRAM
+имеет независимый 128 MiB backing. GPIO248/sub4 выполняет receive/ACK/stop;
+RFE Thumb return сохраняет OLED stack, A1 выдаёт точные18 bytes. Guest отвергает
+моделируемый SPI2 high input (ready2), Display WaitReady/script/head возвращают0
+и включают DSI0. Историческая остановка 599 на Syscon checksum SIMD
+`F962070D/4F8B56` исправлена; свежий cold-stack capture достигает native
+logo producer, gzip и успешного SetFrameBuf, как описано выше.
+GPIO остаётся `0xA9`. Секторов прочитано 10753, записей 0,
+WFE counter patches/forced cluster wakes 0. Настоящие os0 kernel modules
+запускаются; native guest framebuffer декодирован и передан Display.
+Bounded IFTU frame completion публикует framebuffer: белый PlayStation logo
+наблюдается в настоящем SDL3/Metal окне. Полная загрузка системы не заявляется.
+Текущие artifacts: `build/goal-native-iftu-arm-build.log`,
+`build/goal-native-iftu-arm-tests.log`,
+[integrated evidence](../build/goal-native-iftu-arm-integrated-evidence.md),
+native SDL screenshot (image omitted from source delivery),
+`build/goal-native-cold-stack-integrated-evidence.md`,
+`build/goal-arm-native-syscon-oled-cold-stack.log/.json`,
+`build/goal-native-cold-stack-tests.log`. Исторические artifacts:
+`build/goal-native-early-ready-full.log`,
+`build/goal-native-early-ready-tests.log`,
+`build/goal-arm-native-syscon-oled-early-ready.log/.json`,
+`build/goal-native-timers-graphics-evidence.md`, `build/goal-native-emc-syscon-full.log`,
+`build/goal-native-emc-syscon-tests.log`, `build/goal-native-syscon-neon-cpu-fix.md`,
+`build/goal-native-e820-emctop-evidence.md`, `build/goal-native-tpidr-cpu-fix.md`,
+`build/goal-debug-arm-inspection-fix.md`, `build/goal-native-lowio-i2c-evidence.md`.
+
+Предыдущий прогон до исправления GIC достигал NSKBL/A9, читал os0 через ADMA
+(8345 чтений, 0 записей) и отправлял auth-запрос для `kprx_auth_sm.self`.
+ARM0 ждал завершения на `0x51016CA4`, CMeP — ACK статуса `0x8026` на `0x8004D2`.
+Это не подтверждало успешное authentication или kernel boot.
+
+Прежний путь после исправлений ARM IT/LSL, AP/AFE, Secure/Nonsecure MMU и ATS/PAR
+достигал A9 после ошибок загрузки TrustZone. Исправление SDIF CommandTimeout
+позволяло гостю пройти CMD8/CMD5/CMD55, определить MMC и прочитать os0 через ADMA:
+LBA 0, 65536, 65568 и 72800, по 32 сектора; последняя передача включает данные
+`psp2bootconfig.skprx`. За полный прогон 8345 чтений секторов, 0 записей.
+ARM0 в том прогоне ждал secure-module scheduler в `0x51016CA6`; ядро не загружено.
+Объект драйвера создавался по `0x5117CB00`;
+старый диагноз незаполненной структуры `0x240` не описывает этот прогон.
+Реальные SCE-байты auth-модулей сохраняются после второй стадии; SMC входит
+в Secure Monitor через построенные прошивкой векторы, которые больше не затирает
+хук модели. Тот прежний прогон ещё не дошёл до загрузки ядра os0 и логотипа. Журналы и текущие результаты
+сборки — [STATUS.md](STATUS.md), ABI последующих auth-вызовов —
+[SMC_AUTH_104.md](SMC_AUTH_104.md). Старые раунды ниже — исторические измерения.
+
 NSKBL — небезопасная (Non-Secure) ступень загрузки. Сжатый ARZL-поток лежит в `kernel_boot_loader.self`
 (5-й сегмент), SKBL распаковывает его по `0x50000000` в `0x51000000` и передаёт управление с
-`SCR.NS = 1`; NSKBL работает с выключенной MMU (после `0x51000138` `SCTLR = 0`), проходит pre-init до
+`SCR.NS = 1`; NSKBL начинает с выключенной MMU (после `0x51000138` `SCTLR_NS = 0`), затем
+включает её при pre-init и проходит до
 чекпойнта `0xA9` и первым внешним действием грузит `os0:psp2bootconfig.skprx`. Ниже — только
 подтверждённые трассой/трапом/дампом/дизассемблером/прогоном/покрытием данные раундов 155–368
 (сводка прежнего журнала на 538 КБ).
@@ -51,6 +207,15 @@ memsz `0x5706C`); #4 paddr **`0x50000000`**, **`0x194CF`** (ARZL-поток NSKB
 * Стадия KBL `0x400204A8` вызывается через ARM-трамплин `0x4003A140` (`mov r13,r2` / `bx r1`) с
   `r0=0x400B2B30 r1=0x400204A9 r2=0x0001A140 r3=0`; адрес собирается `0x400207F8` (`r1=0x04A9`) …
   `0x400207FE` (`movt r1,#0x4002`) … `0x40020806 blx 0x4003A140`.
+  Это исторический capture аргументов. Текущая модель сохраняет native
+  allocated stack top: caller выделяет `0x4000` байт и берёт `base+size` из
+  per-core record `+0x1BC`. `ZLB_KBL_CORE_STACK` применяется только к старому
+  измеренному shared top `r2=0x4000`; смещение остальных tops за пределы
+  allocation было причиной ранней cold-profile регрессии. При старом bias
+  native POP `0x4002F808` на ARM2 получил нулевой сохранённый return
+  (`VA0x85D14 → PA0x4012FD14`), затем fetch VA0. CPU exception entry здесь
+  не подтверждён. Исправленный cold-stack прогон проходит эту границу и
+  достигает native Display producer/gzip/SetFrameBuf (текущий результат выше).
 
 ## 2. Карта чекпойнтов и паник
 
@@ -227,12 +392,24 @@ ARM-примитивы: `0x5101474C` (`ldrexh`/`strexh`), `0x5101477C` (атом
 (owner = CPU 0) — «дедлок» был следствием стены `0x80320011`.
 
 **4.7 Boot-config, SC, консоль.** «Ворота» `0x51010F14`: `movw r0,#0xB61C; movt r0,#0x5113` →
-`[r0]` = `0x00004000` (VA) → `[+0x3C]` = boot-config **`VA 0x47C0`** (`PA 0x403047C0`, 768 байт);
-признак «валиден» — `cmp [r3,#0x33],#0xFF`; режим/причина сброса — `[r3,#0xC4] & 0x7F` (`0xB`, `0x4`);
-маски клавиш — `[r3,#0xCC]` (`0x54`, `0xC0`). Трап по `PA 0x403047C0-0x403048F0` — 142 записи, все
-нулевые (инициализатор `0x51011D5C-0x51011DA8`); `strb` по `+0x33` в образе нет; `ZLB_NSKBL_BOOTCFG`
-(включена) пишет `0xFF` в `PA 0x403047F3`; два «вентиля» открытия читают `[+0x6C]`
-(`PA 0x4030482C`): `0x51010F00` — бит 0, `0x51010EEC` — бит 2. Safe Mode: `0x5100100C cbz
+`[r0]` = `0x00004000` (VA) → `[+0x3C]` = SceKblParam **`VA 0x47C0`** (`PA 0x403047C0`, копия `0x100` байт).
+`cmp [r3,#0x33],#0xFF` проверяет safe-mode byte из Ernie NVS `0x483`, а не общую
+«валидность» структуры; режим/причина сброса — `[r3,#0xC4] & 0x7F` (`0xB`, `0x4`),
+маски клавиш — `[r3,#0xCC]` (`0x54`, `0xC0`). Исторический трап 142 нулевых записей
+сохранён как результат старого прогона; прежний вывод «NSKBL обнуляет boot-config» отменён:
+`0x51011D5C..51011DA8` находятся внутри **A32 memcpy** `0x51011C80`.
+Настоящий код копирует `0x40300100 → 0x51184E98 → выделенный param`, сохраняемый в sysroot `+0x3C`.
+Модель теперь читает NVS `0x4A0/0x481/0x483 → +0x30/+0x31/+0x33` при ранней передаче ARM,
+с `+0x32=0` и default `FF FF 00 FF`; native builder частично обходится staging.
+Старый поздний `ZLB_NSKBL_BOOTCFG` marker удалён вместе с опцией: он писал `+0x33=FF`
+и `+0x6C|=1`, скрывая NVS safe request и ошибочно выбирая external boot.
+`0x51010F00` читает bit0 (`IsExternalBootMode`), `0x51010EEC` — bit2 retail/product профиля;
+модель оставляет `+0x6C=4`. Нулевой bit0 отправляет dispatcher `0x51018F6C` в
+`0x51019116`, где он выбирает число попыток и возвращается к настоящему opener `0x51001548`;
+это **не failure exit**. `0x51017304` читает `[sysroot+0x2E]&1`.
+Прежняя ссылка на запись bit0 по `0x5101587C` также отменена: это вторая половина
+`BLX 0x51014528` (core-ID) внутри barrier, а не store в параметр.
+Safe Mode: `0x5100100C cbz
 r0,0x51001026`; `0x5100100E bl 0x51000338` (читает `0x51184E98`, байт `0x51184EC5`, `and r0,#1`);
 формат `.Safe Mode : [ YES ]` = `0x510281BC`.
 Логгер/консоль: `[0x5102B048]`, `[0x5102B044]`, обёртка `0x51011AC8-0x51011B58`, printf `0x51011078`;
@@ -660,7 +837,9 @@ r0 = 0x00010005   r1 = 0x5102BF4C (имя на стеке)   r6 = 0x510B3204 (п
 
 Внутри диспетчера перед обслуживанием проверяются два флага по глобалу `[0x5113B61C] → +0x3C → +0x6C`
 (биты 0 и 2, функции `0x51010F00`/`0x51010EEC`); если флаг нулевой, вызывается `0x51017304`.
-Итог: первая внешняя загрузка срывается на **первом же шаге** — открытии `os0:`, и до чтения файла
+**Поправка 2026-10-01:** вызов `0x51017304` не означает отказ. Он выбирает retry policy,
+после чего обе ветки вызывают opener `0x51001548`; boot-type bit0 не требуется для файлового I/O.
+Исторический итог этого прогона: первая внешняя загрузка срывается на **первом же шаге** — открытии `os0:`, и до чтения файла
 дело не доходит вовсе.
 
 **Раунд 382: код отказа — `0x8032001A`, и он приходит из стека хранения.**
@@ -1292,6 +1471,10 @@ MeP-покрытие: впервые исполнены 0x403C0 (сервис), 
 `ZLB_RTRAP`, `ZLB_NSKBL_LOWIDENT`. Инструменты: `ZLB_ARM_BRANCH_LOG` **не** сообщает целей переходов в
 `0x51020000..0x51030000`, хотя код там исполняется; точки останова сравнивают PC точно
 (`debugger.cpp:262`); `insns` — счётчик планировщика (слайс = `budget_.arm` шагов на ядро).
+
+`ZLB_NSKBL_BOOTCFG` в этом историческом списке удалена; её больше не следует
+использовать для воспроизведения текущего board profile. Boot-mode bytes теперь
+получаются из существующего Ernie NVS на ранней границе (§4.7).
 
 ### Раунд 390: цикл опроса завершается успешно, и `0x80320002` рождается не там
 

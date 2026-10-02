@@ -47,6 +47,7 @@
 
 #include "common/log.h"
 #include "hw/cmep/cmep_internal.h"
+#include "loader/loader_extra.h"
 
 namespace zlb {
 
@@ -526,6 +527,64 @@ void hmac_sha256_digest(const u8* key, size_t key_length, const u8* data, size_t
     sha256_digest(outer.data(), outer.size(), out);
 }
 
+namespace {
+
+bool native_hmac_function(u32 function) {
+    return function == 0x20B3u || function == 0x24B3u ||
+           function == 0x28B3u || function == 0x2CB3u;
+}
+
+struct NativeHmacStream {
+    std::array<u32, 8> inner = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                                0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    std::array<u8, 64> key{};
+    u64 inner_bytes = 64u;  // Includes the already compressed HMAC ipad block.
+    std::array<u8, 40> image{};
+};
+
+// Native reserves 40 opaque state bytes at context+4, before its digest at
+// +2C. The real hardware serialization has not been recovered. This model
+// writes canonical SHA chaining words plus a little-endian byte count there,
+// and binds the state to its guest pointer/key. Checking the image prevents
+// reuse after the guest overwrites or reinitializes that memory. Relocating a
+// raw hardware context to a new pointer is not supported by this model yet.
+std::array<u8, 40> native_hmac_state_image(const NativeHmacStream& stream) {
+    std::array<u8, 40> image{};
+    for (size_t i = 0; i < stream.inner.size(); ++i) {
+        for (size_t byte = 0; byte < 4u; ++byte) {
+            image[i * 4u + byte] = static_cast<u8>(stream.inner[i] >> (24u - byte * 8u));
+        }
+    }
+    for (size_t i = 0; i < 8u; ++i) image[32u + i] = static_cast<u8>(stream.inner_bytes >> (i * 8u));
+    return image;
+}
+
+void native_hmac_finish(NativeHmacStream& stream, const u8* data, size_t length, u8 digest[32]) {
+    size_t offset = 0;
+    while (length - offset >= 64u) {
+        sha256_compress(stream.inner.data(), data + offset);
+        offset += 64u;
+    }
+    u8 tail[128]{};
+    const size_t rest = length - offset;
+    if (rest != 0) std::memcpy(tail, data + offset, rest);
+    tail[rest] = 0x80u;
+    const size_t padded = rest < 56u ? 64u : 128u;
+    const u64 bits = (stream.inner_bytes + length) * 8u;
+    for (size_t i = 0; i < 8u; ++i) tail[padded - 1u - i] = static_cast<u8>(bits >> (i * 8u));
+    for (size_t i = 0; i < padded; i += 64u) sha256_compress(stream.inner.data(), tail + i);
+    u8 outer[96];
+    for (size_t i = 0; i < stream.key.size(); ++i) outer[i] = stream.key[i] ^ 0x5Cu;
+    for (size_t i = 0; i < stream.inner.size(); ++i) {
+        for (size_t byte = 0; byte < 4u; ++byte) {
+            outer[64u + i * 4u + byte] = static_cast<u8>(stream.inner[i] >> (24u - byte * 8u));
+        }
+    }
+    sha256_digest(outer, sizeof(outer), digest);
+}
+
+}  // namespace
+
 void aes_encrypt_block(const u8* key, unsigned key_bits, const u8 in[16], u8 out[16]) {
     AesKey ks;
     aes_expand_key(key, key_bits, ks);
@@ -619,7 +678,10 @@ namespace cmep_detail {
 
 struct BigmacDevice::Impl {
     std::map<u32, u64> regs;
-    std::array<u32, kDataWords> data{};
+    std::map<u32, NativeHmacStream> native_hmac_states;
+    // Native 0x8062AC stages a complete SHA/HMAC key block, including words
+    // +220..+23C; AES and the legacy keyring wrappers use the first 8 words.
+    std::array<u32, 16> data{};
     u32 start = 0;
     u32 status = 0;
     u32 exception = 0;
@@ -638,6 +700,7 @@ BigmacDevice::~BigmacDevice() = default;
 
 void BigmacDevice::reset() {
     impl_->regs.clear();
+    impl_->native_hmac_states.clear();
     impl_->data.fill(0);
     impl_->start = 0;
     impl_->status = 0;
@@ -670,6 +733,7 @@ const char* BigmacDevice::register_name(u32 address) const {
         case kStatus: return "Bigmac status (bit0 busy)";
         case 0xE0050028: return "Bigmac ctx";
         case 0xE0050030: return "Bigmac ctx+0x8";
+        case 0xE0050034: return "Bigmac native fill value (zero verified)";
         case kException: return "Bigmac exception status";
         case kDataWindow: return "Bigmac key window[0]";
         case kDataWindow + 0x04: return "Bigmac key window[1]";
@@ -679,13 +743,21 @@ const char* BigmacDevice::register_name(u32 address) const {
         case kDataWindow + 0x14: return "Bigmac key window[5]";
         case kDataWindow + 0x18: return "Bigmac key window[6]";
         case kDataWindow + 0x1C: return "Bigmac key window[7]";
+        case kDataWindow + 0x20: return "Bigmac HMAC key window[8]";
+        case kDataWindow + 0x24: return "Bigmac HMAC key window[9]";
+        case kDataWindow + 0x28: return "Bigmac HMAC key window[10]";
+        case kDataWindow + 0x2C: return "Bigmac HMAC key window[11]";
+        case kDataWindow + 0x30: return "Bigmac HMAC key window[12]";
+        case kDataWindow + 0x34: return "Bigmac HMAC key window[13]";
+        case kDataWindow + 0x38: return "Bigmac HMAC key window[14]";
+        case kDataWindow + 0x3C: return "Bigmac HMAC key window[15]";
         default: return nullptr;
     }
 }
 
 void BigmacDevice::enumerate_registers(std::vector<RegisterInfo>& out) const {
     static const u32 addrs[] = {kCmd, kArg0, kArg1, kFunction, kArg2, kArg3, kStart, kStatus,
-                                kException, kDataWindow};
+                                0xE0050034, kException, kDataWindow};
     for (u32 a : addrs) {
         RegisterInfo info;
         info.address = a;
@@ -704,7 +776,7 @@ u64 BigmacDevice::read(u32 address, unsigned size) {
     }
     if (address == kException) return impl_->exception;
     if (address == kStart) return impl_->start;
-    if (address >= kDataWindow && address < kDataWindow + 4 * kDataWords) {
+    if (address >= kDataWindow && address < kDataWindow + 4 * impl_->data.size()) {
         const u32 word = impl_->data[(address - kDataWindow) / 4];
         const unsigned shift = 8 * ((address - kDataWindow) % 4);
         const u64 value = (static_cast<u64>(word) >> shift) & 0xFFFFFFFFull;
@@ -717,7 +789,7 @@ u64 BigmacDevice::read(u32 address, unsigned size) {
 
 void BigmacDevice::write(u32 address, unsigned size, u64 value) {
     const u32 v = static_cast<u32>(value);
-    if (address >= kDataWindow && address < kDataWindow + 4 * kDataWords) {
+    if (address >= kDataWindow && address < kDataWindow + 4 * impl_->data.size()) {
         impl_->data[(address - kDataWindow) / 4] = v;
         return;
     }
@@ -772,8 +844,8 @@ void BigmacDevice::write(u32 address, unsigned size, u64 value) {
                 // For every other operation the +0x200 window holds the key/IV
                 // the caller staged with `sw`, and +0x00 is the *data* address:
                 // a key must never be read from it here.
-                std::array<u8, 32> window{};
-                for (int i = 0; i < 8; ++i) {
+                std::vector<u8> window(native_hmac_function(cmd.function) ? 64u : 32u);
+                for (size_t i = 0; i < window.size() / 4; ++i) {
                     window[4 * i + 0] = static_cast<u8>(impl_->data[i]);
                     window[4 * i + 1] = static_cast<u8>(impl_->data[i] >> 8);
                     window[4 * i + 2] = static_cast<u8>(impl_->data[i] >> 16);
@@ -785,11 +857,10 @@ void BigmacDevice::write(u32 address, unsigned size, u64 value) {
                     }
                     return false;
                 }();
-                if (!transfer && window_nonzero) {
-                    // `sw` stores in bigmac_cmd's order: +0x04 first (arg0),
-                    // then +0x00, +0x08, +0x14, +0x10 (flags), so the key is in
-                    // words 0-3 and the IV in words 4-7.  execute() takes the IV
-                    // from the tail of a 32-byte key material.
+                if (!transfer && (window_nonzero || cmd.used_window_key())) {
+                    // Bit 7 explicitly selects window material, including an
+                    // all-zero key. Legacy AES-128 uses key || IV here; native
+                    // AES-256 uses all eight words for the key and +14 for IV.
                     key.assign(window.begin(), window.end());
                 }
 
@@ -950,8 +1021,9 @@ s32 BigmacDevice::execute(const BigmacCommand& cmd, const std::vector<u8>* key_m
     std::vector<u8> key;
     if (key_material != nullptr) {
         key = *key_material;
-    } else if (cmd.used_window_key() || cmd.pointer < 0x1000) {        key.resize(32);
-        for (int i = 0; i < 8; ++i) {
+    } else if (cmd.used_window_key() || cmd.pointer < 0x1000) {
+        key.resize(native_hmac_function(cmd.function) ? 64u : 32u);
+        for (size_t i = 0; i < key.size() / 4; ++i) {
             key[4 * i + 0] = static_cast<u8>(impl_->data[i]);
             key[4 * i + 1] = static_cast<u8>(impl_->data[i] >> 8);
             key[4 * i + 2] = static_cast<u8>(impl_->data[i] >> 16);
@@ -983,6 +1055,190 @@ s32 BigmacDevice::execute(const BigmacCommand& cmd, const std::vector<u8>* key_m
         }
         return true;
     };
+
+    // The native secure-kernel wrappers use +00/+04 as source/destination.
+    // Validate the complete range before allocating or writing, including
+    // adjacent RAM regions, so a bad DMA destination cannot receive a prefix
+    // while the command reports an error.
+    const auto native_range_mapped = [this](u32 address, size_t length) {
+        if (static_cast<u64>(address) + length > 0x100000000ull) return false;
+        if (length == 0) return true;
+        return bus_.is_mapped(address) && bus_.first_unmapped(address, length) == 0;
+    };
+
+    if (cmd.function == 0x000Cu && cmd.pointer == 0 && cmd.flags == 0) {
+        // Genuine secure-kernel 0x8055A0, called by module cleanup 0x80056E,
+        // writes the fill value at +34, then source=0, destination=+04,
+        // byte length=+08 and function=0x000C. The captured zero-fill form
+        // ignores the stale IV/key registers. It must not pass through the
+        // legacy in-place AES decoder: resolving source zero to boot SRAM
+        // would overwrite the kernel through its uncached SRAM alias.
+        // Nonzero fill pattern width/serialization is not yet established;
+        // reject it rather than guessing a pattern or reporting completion.
+        last_op_ = BigmacOp::None;
+        const auto fill = impl_->regs.find(0xE0050034u);
+        if (fill != impl_->regs.end() && fill->second != 0) return fail(0x0014);
+        if (!native_range_mapped(cmd.raw_command, cmd.length)) return fail(0x0013);
+        bus_.memset_bytes(cmd.raw_command, 0, cmd.length);
+        return ok();
+    }
+
+    if (cmd.function == 0 || cmd.function == 0x2080u) {
+        // 0x8055D6 copies the RVK SCE header through channel 0: +00 source,
+        // +04 destination, +08 byte length, +0C zero, +1C start. This is real
+        // DMA, including the ARM-RAM to CMeP-private-RAM transfer. The native
+        // 0x806C78 wrapper retains context bits 0x2080 for the same transfer;
+        // RVK uses that form to read its plain 32-byte section at image +400.
+        last_op_ = BigmacOp::None;
+        if (!native_range_mapped(cmd.pointer, cmd.length)) return fail(0x0012);
+        if (!native_range_mapped(cmd.raw_command, cmd.length)) return fail(0x0013);
+        std::vector<u8> buffer(cmd.length);
+        bus_.read_bytes(cmd.pointer, buffer.data(), buffer.size());
+        bus_.write_bytes(cmd.raw_command, buffer.data(), buffer.size());
+        return ok();
+    }
+
+    if (cmd.function == 0x238Au || cmd.function == 0x218Au) {
+        // Native 0x804514 -> 0x805D56: AES-CBC decrypt, with 256-bit (0x238A)
+        // or 128-bit (0x218A) key at +200, an independent IV buffer addressed
+        // by +14, source at +00 and destination at +04. Both RVK metadata
+        // operations must produce their output before reporting success.
+        last_op_ = BigmacOp::Aes;
+        aes_operations_++;
+        const size_t key_bytes = cmd.function == 0x238Au ? 32u : 16u;
+        if (cmd.length == 0 || (cmd.length % 16) != 0) return fail(0x0011);
+        if (key.size() < key_bytes) return fail(0x0010);
+        if (!native_range_mapped(cmd.pointer, cmd.length) ||
+            !native_range_mapped(cmd.extra, 16)) return fail(0x0012);
+        if (!native_range_mapped(cmd.raw_command, cmd.length)) return fail(0x0013);
+        std::vector<u8> buffer(cmd.length);
+        bus_.read_bytes(cmd.pointer, buffer.data(), buffer.size());
+        key.resize(key_bytes);
+        store_key(key);
+        bus_.read_bytes(cmd.extra, last_iv_.data(), last_iv_.size());
+        std::vector<u8> out(buffer.size());
+        if (key_bytes == 32u) {
+            aes256_cbc_decrypt(key.data(), last_iv_.data(), buffer.data(), buffer.size(), out.data());
+        } else {
+            aes128_cbc_decrypt(key.data(), last_iv_.data(), buffer.data(), buffer.size(), out.data());
+        }
+        bus_.write_bytes(cmd.raw_command, out.data(), out.size());
+        return ok();
+    }
+
+    if (cmd.function == 0x21A1u) {
+        // Native 0x804514 -> 0x805D56: AES-128-CTR, source +00, destination
+        // +04, byte length +08, key +200 and mutable counter buffer at +14.
+        // 0x8045D8 reverses all 16 IV bytes before hardware; 0x804620 reverses
+        // the updated counter back for the caller's next chunk. Live RVK
+        // 0x805E62 confirms this representation for its 672-byte section.
+        last_op_ = BigmacOp::Aes;
+        aes_operations_++;
+        if ((cmd.length % 16) != 0) return fail(0x0011);
+        if (key.size() < 16u) return fail(0x0010);
+        if (!native_range_mapped(cmd.pointer, cmd.length) ||
+            !native_range_mapped(cmd.extra, 16)) return fail(0x0012);
+        if (!native_range_mapped(cmd.raw_command, cmd.length)) return fail(0x0013);
+        std::vector<u8> buffer(cmd.length);
+        bus_.read_bytes(cmd.pointer, buffer.data(), buffer.size());
+        key.resize(16u);
+        store_key(key);
+        bus_.read_bytes(cmd.extra, last_iv_.data(), last_iv_.size());
+        std::array<u8, 16> counter{};
+        for (size_t i = 0; i < counter.size(); ++i) counter[i] = last_iv_[15u - i];
+        std::vector<u8> out(buffer.size());
+        aes_ctr_crypt(key.data(), counter.data(), buffer.data(), buffer.size(), out.data());
+        // Add the consumed block count to the complete big-endian counter,
+        // retaining carry across every byte and wrapping modulo 2^128.
+        u64 carry = cmd.length / 16u;
+        for (size_t i = counter.size(); i != 0; --i) {
+            const u64 sum = counter[i - 1u] + (carry & 0xFFu);
+            counter[i - 1u] = static_cast<u8>(sum);
+            carry = (carry >> 8u) + (sum >> 8u);
+        }
+        std::array<u8, 16> hardware_counter{};
+        for (size_t i = 0; i < counter.size(); ++i) hardware_counter[i] = counter[15u - i];
+        bus_.write_bytes(cmd.raw_command, out.data(), out.size());
+        bus_.write_bytes(cmd.extra, hardware_counter.data(), hardware_counter.size());
+        return ok();
+    }
+
+    if (cmd.function == 0x2093u) {
+        // Native 0x805EF2 -> 0x806110 issues one-shot SHA-256: +00 source,
+        // +04 32-byte digest destination and +08 source length. The retained
+        // +10 field belongs to key selection, not a digest-size argument.
+        // RVK hashes 768 bytes at 0x808FF0; kprx hashes its staged SCE header.
+        last_op_ = BigmacOp::Sha;
+        hash_operations_++;
+        if (!native_range_mapped(cmd.pointer, cmd.length)) return fail(0x0020);
+        if (!native_range_mapped(cmd.raw_command, 32)) return fail(0x0021);
+        // Keep a valid pointer for the SHA helper even for an empty message.
+        std::vector<u8> buffer(cmd.length == 0 ? 1u : cmd.length);
+        bus_.read_bytes(cmd.pointer, buffer.data(), cmd.length);
+        std::array<u8, 32> digest{};
+        sha256_digest(buffer.data(), cmd.length, digest.data());
+        bus_.write_bytes(cmd.raw_command, digest.data(), digest.size());
+        return ok();
+    }
+
+    if (native_hmac_function(cmd.function)) {
+        // Native 0x8061E0 final, single-shot HMAC-SHA256: +00 source, +04
+        // 32-byte digest destination, +08 message length, and the caller's
+        // padded 64-byte key block at +200..+23F. +14 points at incremental
+        // state (context +4); this form starts/finalizes a fresh hash, without
+        // consuming that previous state. Native kprx now also reaches first
+        // non-final 0x24B3 (28544 bytes) then final 0x28B3 (52 bytes), sharing
+        // one context+4 pointer/key. 0x2CB3 is the same wrapper's continuation.
+        last_op_ = BigmacOp::Hmac;
+        hash_operations_++;
+        if (key.size() != 64u) return fail(0x0022);
+        if (!native_range_mapped(cmd.pointer, cmd.length)) return fail(0x0020);
+        if (!native_range_mapped(cmd.raw_command, 32)) return fail(0x0021);
+        const bool first = cmd.function == 0x24B3u;
+        const bool final = cmd.function == 0x28B3u;
+        const bool streaming = cmd.function != 0x20B3u;
+        NativeHmacStream stream;
+        if (streaming) {
+            if (!final && (cmd.length % 64u) != 0) return fail(0x0023);
+            if (!native_range_mapped(cmd.extra, stream.image.size())) return fail(0x0024);
+            if (first) {
+                std::memcpy(stream.key.data(), key.data(), stream.key.size());
+                std::array<u8, 64> ipad{};
+                for (size_t i = 0; i < ipad.size(); ++i) ipad[i] = stream.key[i] ^ 0x36u;
+                sha256_compress(stream.inner.data(), ipad.data());
+            } else {
+                const auto previous = impl_->native_hmac_states.find(cmd.extra);
+                if (previous == impl_->native_hmac_states.end()) return fail(0x0024);
+                stream = previous->second;
+                std::array<u8, 40> image{};
+                bus_.read_bytes(cmd.extra, image.data(), image.size());
+                if (image != stream.image ||
+                    std::memcmp(stream.key.data(), key.data(), stream.key.size()) != 0) return fail(0x0024);
+            }
+            if (stream.inner_bytes > 0x1FFFFFFFFFFFFFFFull - cmd.length) return fail(0x0023);
+        }
+        std::vector<u8> buffer(cmd.length == 0 ? 1u : cmd.length);
+        bus_.read_bytes(cmd.pointer, buffer.data(), cmd.length);
+        std::array<u8, 32> digest{};
+        store_key(key);
+        if (!streaming) {
+            hmac_sha256_digest(key.data(), key.size(), buffer.data(), cmd.length, digest.data());
+            bus_.write_bytes(cmd.raw_command, digest.data(), digest.size());
+            impl_->native_hmac_states.erase(cmd.extra);
+        } else if (final) {
+            native_hmac_finish(stream, buffer.data(), cmd.length, digest.data());
+            bus_.write_bytes(cmd.raw_command, digest.data(), digest.size());
+            impl_->native_hmac_states.erase(cmd.extra);
+        } else {
+            for (size_t i = 0; i < cmd.length; i += 64u) sha256_compress(stream.inner.data(), buffer.data() + i);
+            stream.inner_bytes += cmd.length;
+            stream.image = native_hmac_state_image(stream);
+            bus_.write_bytes(cmd.extra, stream.image.data(), stream.image.size());
+            impl_->native_hmac_states[cmd.extra] = stream;
+            // Non-final calls publish chaining state, not a completed HMAC.
+        }
+        return ok();
+    }
 
     // 0x010A (wrapper 0x5CCC0) unwraps the staged image.  0x5CBCC passes
     //   +0x00 = image+0x2C0 (source), +0x04 = image (destination),
@@ -1022,6 +1278,10 @@ s32 BigmacDevice::execute(const BigmacCommand& cmd, const std::vector<u8>* key_m
         return ok();
     }
 
+    // These small AES encodings are the legacy emulator protocol. In
+    // particular, the first-loader 0x5CD06 function0x000C call has a nonzero
+    // source/destination and its hardware meaning remains unverified. Keep
+    // that existing interpretation distinct from the native fill above.
     switch (opcode) {
         case static_cast<u32>(BigmacFunction::AesCbcEncrypt):
         case static_cast<u32>(BigmacFunction::AesCbcDecrypt):
@@ -1143,8 +1403,8 @@ s32 BigmacDevice::execute(const BigmacCommand& cmd, const std::vector<u8>* key_m
         default:
             break;
     }
-    // The second loader's keyed family (bit 13 of the function word, e.g.
-    // 0x2309/0x238A/0x2093, plus the 0x03xx variants such as 0x033B that the
+    // The remaining second-loader keyed family (bit 13 of the function word,
+    // e.g. 0x2309, plus the 0x03xx variants such as 0x033B that the
     // wrapper 0x453AA builds from the keyring descriptor at 0x2300 and its
     // caller's mode bits) is used only by the per-console SMI/config paths, and
     // its keyslot 0x213/0x212 is missing from every dump in the workspace, so

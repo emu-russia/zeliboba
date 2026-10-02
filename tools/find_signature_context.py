@@ -1,11 +1,11 @@
 import os
 
 files = [
-    r'C:\Work\PSVita\dumps\pch-5c-cold_first_loader.bin',
-    r'C:\Work\PSVita\_scratch\second_loader.bin',
-    r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\secure_kernel.bin',
-    r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin',
-    r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin',
+    r'..\dumps\pch-5c-cold_first_loader.bin',
+    r'..\_scratch\second_loader.bin',
+    r'..\Vita_104_Firmware\Out\SLB2_dec\secure_kernel.bin',
+    r'..\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin',
+    r'..\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin',
 ]
 for path in files:
     if not os.path.exists(path):

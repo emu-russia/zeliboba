@@ -120,11 +120,12 @@ const char* const kSlb2Names[] = {
 
 struct Slb2Source {
     std::vector<Slb2File> files;
+    std::vector<u8> original_container;
     std::string description;
 };
 
 /// Preferred source: the authentic container inside the 1.04 PUP
-/// (boot_slb2-00.pkg.seg02), sliced by its own entry table. Falls back to the
+/// (boot_slb2-00.pkg.seg02), preserved verbatim after validation. Falls back to the
 /// individual files in Out/SLB2 so the tool still works if the extracted
 /// container is missing.
 bool collect_slb2_source(const std::string& firmware_root, Slb2Source& out, std::string& message) {
@@ -135,8 +136,8 @@ bool collect_slb2_source(const std::string& firmware_root, Slb2Source& out, std:
             Slb2View view;
             if (parse_slb2_container(*data, view) && view.valid) {
                 std::vector<Slb2File> files;
-                bool ok = true;
-                std::string detail;
+                bool ok = data->size() <= kBootPartitionSize;
+                std::string detail = ok ? "" : "SLB2 container exceeds the boot partition size";
                 for (const auto& entry : view.entries) {
                     if (entry.offset + entry.size > data->size()) {
                         ok = false;
@@ -151,7 +152,8 @@ bool collect_slb2_source(const std::string& firmware_root, Slb2Source& out, std:
                     files.push_back(file);
                 }
                 if (ok && !files.empty()) {
-                    out.files = files;
+                    out.files = std::move(files);
+                    out.original_container = std::move(*data);
                     out.description = format("retail 1.04 SLB2 (%s, %u entries)",
                                              path_filename(container_path).c_str(), view.count);
                     message = out.description;
@@ -684,14 +686,18 @@ EmmcImagePlan build_emmc_image(const std::string& firmware_root, const std::stri
               "Sony master block + 1.04 partition table (see docs/EMMC.md)");
 
     // 2) SLB2 container, written to both boot partitions and both bls copies.
-    const std::vector<u8> slb2 = build_slb2_container(slb2_source.files, verbose);
+    // Preserve the original header, payload positions and alignment padding
+    // whenever the PUP supplies a complete container.
+    const std::vector<u8> slb2 = slb2_source.original_container.empty()
+                                   ? build_slb2_container(slb2_source.files, verbose)
+                                   : std::move(slb2_source.original_container);
     if (slb2.empty()) {
         plan.message = "failed to assemble the SLB2 container";
         return plan;
     }
     Slb2View slb2_view;
     if (!parse_slb2_container(slb2, slb2_view)) {
-        plan.message = format("assembled SLB2 container is invalid: %s", slb2_view.message.c_str());
+        plan.message = format("SLB2 container is invalid: %s", slb2_view.message.c_str());
         return plan;
     }
     plan.notes.push_back(format("SLB2 container: %s (%s, %u entries)", slb2_view.message.c_str(),

@@ -349,6 +349,20 @@ ZLB_TEST(ernie_nvs_and_scratchpad_are_offset_length_stores) {
     ZLB_EXPECT_EQ(static_cast<u32>(flags[2]), 8u);
     for (int i = 0; i < 8; ++i) ZLB_EXPECT_EQ(static_cast<u32>(flags[3 + i]), 0xFFu);
 
+    // Board handoff reads the same persisted state without posting a guest
+    // command or replacing the pending response. These are the exact 1.04
+    // update/recovery/safe-mode NVS sources used by the second loader.
+    const auto cold_commands = ernie.commands_served();
+    const auto cold_response = ernie.response();
+    std::vector<u8> board_nvs;
+    for (const u16 offset : {u16(0x04A0), u16(0x0481), u16(0x0483)}) {
+        ZLB_EXPECT_TRUE(ernie.read_nvs(offset, 1, board_nvs));
+        ZLB_EXPECT_EQ(board_nvs.size(), size_t(1));
+        ZLB_EXPECT_EQ(static_cast<u32>(board_nvs[0]), 0xFFu);
+    }
+    ZLB_EXPECT_EQ(ernie.commands_served(), cold_commands);
+    ZLB_EXPECT_TRUE(ernie.response() == cold_response);
+
     // A write goes back out through the same offset/length header.
     std::vector<u8> write = le16(0x04A0);
     write.push_back(2);
@@ -363,6 +377,15 @@ ZLB_TEST(ernie_nvs_and_scratchpad_are_offset_length_stores) {
     ZLB_EXPECT_EQ(static_cast<u32>(stored[2]), 2u);
     ZLB_EXPECT_EQ(static_cast<u32>(stored[3]), 0x11u);
     ZLB_EXPECT_EQ(static_cast<u32>(stored[4]), 0x22u);
+
+    const auto written_commands = ernie.commands_served();
+    const auto written_response = ernie.response();
+    ZLB_EXPECT_TRUE(ernie.read_nvs(0x04A0, 2, board_nvs));
+    ZLB_EXPECT_EQ(board_nvs.size(), size_t(2));
+    ZLB_EXPECT_EQ(static_cast<u32>(board_nvs[0]), 0x11u);
+    ZLB_EXPECT_EQ(static_cast<u32>(board_nvs[1]), 0x22u);
+    ZLB_EXPECT_EQ(ernie.commands_served(), written_commands);
+    ZLB_EXPECT_TRUE(ernie.response() == written_response);
 
     // A request beyond the store is refused instead of silently truncated.
     std::vector<u8> far = le16(0xFFFF);

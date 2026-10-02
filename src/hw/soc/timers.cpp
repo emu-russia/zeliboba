@@ -23,6 +23,8 @@
 // PPI 30 and the global timer comparator raises PPI 27 (TRM 4.3, page 4-70).
 #include "hw/soc/soc_internal.h"
 
+#include <limits>
+
 namespace zlb::kermit {
 
 namespace {
@@ -366,6 +368,214 @@ void PrivateTimer::describe(std::vector<std::string>& lines) const {
     lines.push_back(format("    watchdog: %s load=%u counter=%u reset_status=%u disabled=%u",
                            watchdog_.running ? "running" : "stopped", watchdog_.load, watchdog_.value,
                            watchdog_reset_status_ ? 1u : 0u, watchdog_disabled_ ? 1u : 0u));
+}
+
+// ---------------------------------------------------------------------------
+// Vita LT5 / WT7, outside the Cortex-A9 private peripheral region.
+// ---------------------------------------------------------------------------
+// Supplied FW1.04: KBL4002158E..1598 programs LT5; ThreadMgr4B762C..76C4
+// writes deadlines and IRQ141 handler4B7B18 acknowledges2 at+18. Secure
+// IntrMgr3BF148..214 programs WT7, and IRQ135 handler3BF000..136 stops it,
+// acknowledges3 at+14 and releases genuine per-core locks when current>due.
+// https://www.psdevwiki.com/vita/Hardware_Timers corroborates layouts,
+// enable bit0 and source/prescaler fields, but leaves lower mode bits uncertain.
+// See build/goal-native-systimer-proposal.md for the complete evidence/limits.
+//
+// Model choices: fixed222 MHz WT input; comparison on elapsed counting ticks,
+// with a latch and explicit rearming; only compare status bit1 is projected
+// (proven by LT5 ACK2, inferred for the same family's WT ACK3). Overflow event
+// bit0, auto-reload/capture modes and auxiliary counter behavior remain inert.
+// Nothing increments on reads or changes a guest lock/service return.
+
+VitaSystemTimer::VitaSystemTimer(std::string name, u32 base, bool longrange, u32 irq_id)
+    : Device(std::move(name), base, kVitaTimerSize), longrange_(longrange), irq_id_(irq_id) {
+    if (longrange_) {
+        register_name_entry(base_ + 0x00, "COUNTER_LO");
+        register_name_entry(base_ + 0x04, "COUNTER_HI");
+        register_name_entry(base_ + 0x08, "DEADLINE_LO");
+        register_name_entry(base_ + 0x0C, "DEADLINE_HI");
+        register_name_entry(base_ + 0x10, "AUX_LO");
+        register_name_entry(base_ + 0x14, "AUX_HI");
+    } else {
+        register_name_entry(base_ + 0x00, "DEADLINE");
+        register_name_entry(base_ + 0x04, "COUNTER");
+        register_name_entry(base_ + 0x0C, "AUX_0C");
+        register_name_entry(base_ + 0x10, "AUX_10");
+    }
+    register_name_entry(base_ + config_offset(), "CONFIG");
+    register_name_entry(base_ + status_offset(), "STATUS");
+}
+
+bool VitaSystemTimer::known_offset(u32 offset) const {
+    return (offset & 3u) == 0 && offset <= (longrange_ ? 0x1Cu : 0x14u);
+}
+
+bool VitaSystemTimer::supported_config(u32 config) const {
+    // Prescale[31:24] is documented; all other fields must match a captured
+    // profile. Retain opaque LT5 fields345000 without guessing their meaning.
+    const u32 body = config & 0x00FFFFFFu;
+    if (body == 0) return true;  // native ISR/reset stop; divider is irrelevant
+    if (longrange_) return body == 0x00345008 || body == 0x0034500C || body == 0x0034500D;
+    return body == 0x0000000C || body == 0x0000000D;
+}
+
+bool VitaSystemTimer::running() const {
+    return !unsupported_ && (registers_[config_offset() / 4] & 1u) != 0;
+}
+
+u64 VitaSystemTimer::counter() const {
+    const u32 slot = counter_offset() / 4;
+    return registers_[slot] | (longrange_ ? static_cast<u64>(registers_[slot + 1]) << 32 : 0);
+}
+
+u64 VitaSystemTimer::deadline() const {
+    const u32 slot = deadline_offset() / 4;
+    return registers_[slot] | (longrange_ ? static_cast<u64>(registers_[slot + 1]) << 32 : 0);
+}
+
+void VitaSystemTimer::refresh_irq() {
+    // Only a reached comparison profile drives the line. Gating by the
+    // captured 0xC mode pattern (not individual bit names) is an inference;
+    // Stop0 disables output but retains the event until native W1C follows.
+    const bool want = !unsupported_ && (registers_[config_offset() / 4] & 0xCu) == 0xCu &&
+                      (registers_[status_offset() / 4] & 2u) != 0;
+    if (want == irq_state_) return;
+    irq_state_ = want;
+    if (irq_) irq_(irq_id_, want);
+}
+
+u64 VitaSystemTimer::read(u32 address, unsigned size) {
+    u64 value = 0;
+    for (unsigned i = 0; i < size && i < 8; ++i) {
+        const u64 current = static_cast<u64>(address) + i;
+        u32 byte = 0xFF;
+        if (current >= base_ && current < static_cast<u64>(base_) + size_) {
+            const u32 offset = static_cast<u32>(current - base_);
+            if (known_offset(offset & ~3u)) {
+                byte = (registers_[offset / 4] >> ((offset & 3u) * 8)) & 0xFFu;
+            }
+        }
+        value |= static_cast<u64>(byte) << (i * 8);
+    }
+    return value;
+}
+
+void VitaSystemTimer::write(u32 address, unsigned size, u64 value) {
+    const u32 prior_config = registers_[config_offset() / 4];
+    const bool was_running = running();
+    bool config_written = false;
+    bool counter_or_deadline_written = false;
+    for (unsigned i = 0; i < size && i < 8; ++i) {
+        const u64 current = static_cast<u64>(address) + i;
+        if (current < base_ || current >= static_cast<u64>(base_) + size_) continue;
+        const u32 offset = static_cast<u32>(current - base_);
+        const u32 word = offset & ~3u;
+        if (!known_offset(word)) continue;
+        const u32 shift = (offset & 3u) * 8;
+        const u32 supplied = static_cast<u32>((value >> (i * 8)) & 0xFFu) << shift;
+        u32& stored = registers_[word / 4];
+        if (word == status_offset()) {
+            stored &= ~(supplied & 3u); // zero/upper lanes never clear low pending bits
+            continue;
+        }
+        stored = (stored & ~(0xFFu << shift)) | supplied;
+        config_written |= word == config_offset();
+        counter_or_deadline_written |= word == counter_offset() || word == deadline_offset() ||
+                                      (longrange_ && (word == counter_offset() + 4 || word == deadline_offset() + 4));
+    }
+    if (config_written) {
+        const u32 config = registers_[config_offset() / 4];
+        unsupported_ = !supported_config(config);
+        if (config != prior_config) fractional_ = 0; // explicit divider-phase reset choice
+        if (unsupported_ && config != prior_config) {
+            ++unsupported_configs_;
+            ZLB_LOG_WARN("timer", "%s unsupported configuration %08X; count/output stopped",
+                         name_.c_str(), config);
+        }
+        if (!was_running && running()) armed_ = true;
+    }
+    // Even identical counter/deadline writes are explicit programming and
+    // rearm. An identical active config write and W1C alone do not rearm.
+    if (counter_or_deadline_written) armed_ = true;
+    refresh_irq();
+}
+
+void VitaSystemTimer::tick(u64 periph_ticks) {
+    if (!running() || periph_ticks == 0) return;
+    const u32 config = registers_[config_offset() / 4];
+    const u64 input_hz = longrange_ ? 48000000u : kVitaTimerSysClockHz;
+    const u64 divisor = static_cast<u64>((config >> 24) + 1) * kPeriphClockHz;
+    // Portable quotient/remainder arithmetic also works on MSVC. The partial
+    // product is bounded by 256MHz*222MHz; the whole-count product may wrap,
+    // so retain its low modular value and separately detect a full64-bit span.
+    const u64 whole = periph_ticks / divisor;
+    const u64 remainder = periph_ticks % divisor;
+    const u64 partial = remainder * input_hz + fractional_;
+    const u64 extra = partial / divisor;
+    fractional_ = partial % divisor;
+    const bool full_span = whole > (std::numeric_limits<u64>::max() - extra) / input_hz;
+    const u64 counts = whole * input_hz + extra;
+    if (counts == 0 && !full_span) return;
+    const u64 before = counter();
+    const u64 target = deadline();
+    // Unsigned absolute comparison is a model choice. A newly armed equal or
+    // overdue target expires on the next actual count. Otherwise measure the
+    // distance before adding, so a batch that wraps past the target still fires.
+    const u64 distance = before >= target ? 1 : target - before;
+    if (armed_ && (full_span || counts >= distance)) {
+        armed_ = false;
+        registers_[status_offset() / 4] |= 2u;
+        ++comparisons_;
+    }
+    const u64 after = before + counts; // modular64/32 arithmetic
+    const u32 slot = counter_offset() / 4;
+    registers_[slot] = static_cast<u32>(after);
+    if (longrange_) registers_[slot + 1] = static_cast<u32>(after >> 32);
+    refresh_irq();
+}
+
+void VitaSystemTimer::reset() {
+    registers_.fill(0);
+    fractional_ = comparisons_ = unsupported_configs_ = 0;
+    armed_ = unsupported_ = false;
+    refresh_irq();
+}
+
+void VitaSystemTimer::enumerate_registers(std::vector<RegisterInfo>& out) const {
+    for (const auto& entry : names_) out.push_back({entry.first, entry.second, 0, 4});
+}
+
+bool VitaSystemTimer::peek_register(const std::string& name, u64& out) const {
+    if (name == "UNSUPPORTED") { out = unsupported_; return true; }
+    if (name == "COMPARISONS") { out = comparisons_; return true; }
+    if (name == "UNSUPPORTED_CONFIGS") { out = unsupported_configs_; return true; }
+    for (const auto& entry : names_) {
+        if (entry.second == name) { out = registers_[(entry.first - base_) / 4]; return true; }
+    }
+    return false;
+}
+
+bool VitaSystemTimer::poke_register(const std::string& name, u64 value) {
+    for (const auto& entry : names_) {
+        if (entry.second == name) { write(entry.first, 4, value); return true; }
+    }
+    return false;
+}
+
+std::string VitaSystemTimer::summary() const {
+    return format("%s counter=%llu deadline=%llu config=%08X %s irq%u=%s comparisons=%llu unsupported=%llu",
+                  name_.c_str(), static_cast<unsigned long long>(counter()), static_cast<unsigned long long>(deadline()),
+                  registers_[config_offset() / 4], unsupported_ ? "unsupported" : running() ? "running" : "stopped",
+                  irq_id_, irq_state_ ? "asserted" : "idle", static_cast<unsigned long long>(comparisons_),
+                  static_cast<unsigned long long>(unsupported_configs_));
+}
+
+void VitaSystemTimer::describe(std::vector<std::string>& lines) const {
+    lines.push_back("  " + summary());
+    lines.push_back(format("    input=%u Hz divider=%u; compare-only model%s",
+                           longrange_ ? 48000000u : kVitaTimerSysClockHz,
+                           (registers_[config_offset() / 4] >> 24) + 1,
+                           longrange_ ? "" : "; SysClock222 MHz is a modeled board input"));
 }
 
 }  // namespace zlb::kermit

@@ -4,6 +4,62 @@
 
 Карта документации: `docs/BOOT.md`, `docs/STATUS.md`, `docs/NSKBL.md`, `docs/SYSCON.md`.
 
+**Текущая сборка — IFTU arm, 617 tests / 0 failures.** Настоящие os0 modules
+запускаются; Syscon checksum helper проходит без изменения guest bytes.
+Cold boot с `FF FF 00 FF` и `+0x6C=4` возвращает `0` из всех четырёх Display
+boot predicates. Native logo producer `0x005B7048` исполняется, gzip возвращает
+`0x1FE000` bytes в `VA0x10000000`, а `SetFrameBuf` (`0x005B70DE → 0x005B70E2`)
+возвращает `0`. Предыдущий explicit-only IFTU оставлял ready pixels в
+deferred bank1. Теперь bounded ordinary mode `01` переключает единый active
+bank на следующем настоящем DSI frame после word `+0x180=1`, сообщает
+физический IRQ204/205 и ждёт native zero ACK/rearm. Raw `+0x40=0` не выдаётся
+за recovered status encoding; один frame на arm является явным выбором
+модели, continuous/rearmed hardware timing неизвестен. Нет guest software
+pending/pixel gates; manual selects сохранены, blending не реализован.
+Настоящий Lowio IRQ204 handler выполняет ACK/rearm/replay. macOS SDL3/Metal
+показывает белый PlayStation logo по центру чёрного guest framebuffer `960×544`,
+RGBA8888; screenshot независимо просмотрен. Capture завершился с exit `0`
+за `108.528 s`, 10753 reads и 0 writes. Полная загрузка ядра, LiveArea и
+завершение fade/blending не подтверждены. Evidence:
+native SDL screenshot (image omitted from source delivery),
+[IFTU integrated evidence](../build/goal-native-iftu-arm-integrated-evidence.md),
+[goal-native-cold-stack-integrated-evidence.md](../build/goal-native-cold-stack-integrated-evidence.md),
+[IFTU independent review](../build/goal-native-iftu-frame-completion-review.md),
+[617 tests](../build/goal-native-iftu-arm-tests.log),
+actual graphics capture (local capture omitted from source delivery).
+
+Bounded smoke supplied retail first-loader RAM snapshot тоже проходит layout
+check (shift `-128`, `16/16` marker bytes), native `SUCCESS` и достигает
+relocated os0 kernel/Syscon worker execution при cold `FF FF 00 FF`/`+0x6C=4`.
+Прогон остановлен ровно после `runm 300000`: 10753 reads, 0 writes, image
+не dirty; native startup ещё идёт. Это не отдельное подтверждение всех
+module-list returns или logo.
+[Retail evidence](../build/goal-native-iftu-arm-retail-evidence.md).
+
+**Текущие boot-параметры (2026-10-01).** На ранней границе передачи ARM
+`Vita::build_kbl_param()` читает существующий NVS модели Ernie:
+`0x4A0 → SceKblParam+0x30`, `0x481 → +0x31`, `0x483 → +0x33`; `+0x32 = 0`
+по холодному initializer настоящего second loader. Незаписанный NVS даёт
+`FF FF 00 FF` (`0xFF00FFFF`), а не нулевые boot flags. `+0x6C = 4` остаётся
+существующим retail/product профилем платы. Это **моделируемая ранняя передача**,
+основанная на supplied native builder; staging по-прежнему частично обходит
+second loader, поэтому исполнение самого builder не заявляется.
+Поздний marker `ZLB_NSKBL_BOOTCFG` удалён: он затирал safe-byte `+0x33` и
+необоснованно ставил external-boot bit0 в `+0x6C`. Исторические результаты ниже
+относятся к прежним версиям. Точная provenance/copy chain и причины отмены:
+[goal-native-kbl-param-provenance.md](../build/goal-native-kbl-param-provenance.md),
+[NSKBL §4.7](NSKBL.md).
+
+**Текущий stage stack fallback.** На `0x4003A140` модель добавляет per-core bias
+только при исходном `r2 = 0x4000` — измеренном старом общем стеке. Native caller
+`0x400207B0..0x40020806` выделяет каждому ядру `0x4000` байт, сохраняет
+`base+size` в его record `+0x1BC` и передаёт этот top в `r2`; такие выделенные
+стеки теперь сохраняются без смещения. Безусловный старый bias в cold run
+сдвигал tops `0x50000/0x84000/0x40000` в `0x51000/0x86000/0x43000` за пределы
+выделения. Перед native `pop.w` на ARM2 (`0x4002F808`, `SP=0x85CF4`) сохранённый
+return `[SP+0x20]` был нулём; последующий fetch VA0 не доказывает exception entry.
+Это исправление границы модели, а не изменение CPU или boot-mode flags.
+
 ## 1. Образ и сегменты
 
 | vaddr | размер | что |
@@ -138,9 +194,9 @@ NSKBL и окна: `0x50000000` `0x51000000` `0x52000000`+; `0xE0A00000` `0xE0B0
 
 * **PA `0x00000000..0x7FFF` на ARM — CMeP scratch (32 КиБ), он же shared SRAM, видимый CMeP по `0x1F000000`.** ARM стартует с PC `0x00000000`, где second loader оставил векторы: `ldr pc,[pc,#0x18]` → литерал по `0x20` = `0x40020000`. `0x0000..0x3FFF` — boot context (KBL читает до MMU `+0x1C4`, слова `0x000`/`0x100`), `0x4000..0x7FFF` KBL очищает под свой boot-info. Вики `Boot Sequence`: second loader «writes the ARM exception vector and some boot context information to the 32kB scratch buffer (mirror mapped to `0x00000000` on ARM)», затем secure kernel велит Syscon сбросить ARM CPU на `0x00000000`.
 * **SceKblParam: база PA `0x1F000100`, размер `0x100`, magic `0xCBAC03AA`; копия без magic — PA `0x4001FD00`.** База подтверждена дизассемблером сборщика (`0x41B4A` грузит `0x1F000100`; `0x41B38` обнуляет там 256 байт) и сверкой полей с вики (DRAM base `+0x60`, `kprx_auth_sm` `+0x90`); ранняя `0x1F000040` — ошибка на `0xC0` ниже (из фразы про fallback DIP switches по PA `0x80`) и перекрывала заголовок структуры. Константы: `kKblParamBase = 0x1F000100`, `kKblParamDram = 0x4001FD00`, `kKblParamSize = 0x100`, `kKblParamMagic = 0xCBAC03AA`.
-* Раскладка вики `KBL_Param` (0x100 или 0x200 байт): `0x00/0x02` version/size; `0x04/0x08` текущая/минимальная версия прошивки; `0x20/0x30` QA flags / boot flags; `0x40..0x5F` DIP switches; `0x60/0x64` DRAM base/size; `0x6C` boot type indicator 1; `0x80/0x84` paddr/size `secure_kernel.enp`; `0x90/0x94` `0x98/0x9C` paddr/size `kprx_auth_sm.self` и `prog_rvk.srvk`; `0xC0/0xC4` sleep/wakeup factor (syscon cmd 3 / `0x10`); `0xD4` hardware info (cmd 5); `0xFC` magic. Модель (`Vita::build_kbl_param()`, порядок: структура, затем зеркало scratch на PA 0): version `1`, size `0x100`, версия `0x01040000`, QA/boot flags 0, DIP release (`+0x50` SDK 0, `+0x54` shell 0, `+0x58 = 0x00080002`, `+0x5C = 0x20000000`), DRAM `0x40000000` + `kermit::kScuSize`, boot type `4`, `secure_kernel` `0x00800000` + размер, `kprx_auth_sm` `0x00800500`, `prog_rvk` `0x00809B00`, session id, sleep/wakeup factor, hardware info `0x00406000` (IRS-002 — ответ модели на команду 5), power info, ревизия, magic `0xCBAC03AA`; `Vita::mirror_cmep_scratch_to_arm()` копирует первые 32 КиБ SRAM в ARM-овское PA 0 (проверено дампом).
-* **Состояние записи в обычном прогоне (измерено покрытием и трапом).** В дефолтной конфигурации запись по PA `0x1F000100` **нулевая**: вторая стадия исполняет только обнуление (`0x41B38` → memset 256 байт), а до сборщика (`0x41B4A`) не доходит, потому что модель останавливает CMeP на «done»-прыжке secure kernel; C++-сборщик при включённых подстановках не вызывается вовсе (`bootchain.cpp`: `if (!substitutions_enabled_static()) build_kbl_param();`). Трап `ZLB_RTRAP=0x100-0x1D0` показывает чтения KBL по `0x400376E4` (128 байт PA `0x100` → `0x400B2DC8`) и `0x4002028C` (`+0x1C4`) — все слова `0`. **KBL доходит до Non-Secure с пустой записью.**
-* Дамп PA `0x100`, когда запись пишет **C++-сборщик** (проверено с `ZLB_NO_SUBSTITUTION=1` + `--stage kbl`; в обычном прогоне этих значений нет): `+0x00 = 0x00000060` sleep, `+0x04 = 0x0000FF14` wakeup (холод), `+0x08 = 0x40` USB, `+0x10 = 0x00406000` hardware info, `+0x14 = 0x0C` power, `+0x38 = 0x00010000` revision, `+0x3C = 0xCBAC03AA` magic; PA `0x1A0` = `FF FF FF FF FF FF 00 3F` (записал second_loader, pc `0x41A9C..0x41AC8`). DRAM-копия `0x4001FD00` = `01 00 00 01 00 00 04 01 00 00 04 01 …` (version 1, size `0x100`, firmware 01.04.0000). `SceKblParam + 0xC0` = PA `0x100`. Потребление: `0x400376E4` копирует 128 байт PA `0x100` → `0x400B2DC8` (вызывающий `0x40021203`), затем → PA `0x40300100`. Гейт `ZLB_ARM_WAIT_CMEP` снимает объяснение «порядок событий», но стену Stage 1 не убирает.
+* Раскладка вики `KBL_Param` (0x100 или 0x200 байт): `0x00/0x02` version/size; `0x04/0x08` текущая/минимальная версия прошивки; `0x20/0x30` QA flags / boot flags; `0x40..0x5F` DIP switches; `0x60/0x64` DRAM base/size; `0x6C` boot type indicator 1; `0x80/0x84` paddr/size `secure_kernel.enp`; `0x90/0x94` `0x98/0x9C` paddr/size `kprx_auth_sm.self` и `prog_rvk.srvk`; `0xC0/0xC4` sleep/wakeup factor (syscon cmd 3 / `0x10`); `0xD4` hardware info (cmd 5); `0xFC` magic. Модель (`Vita::build_kbl_param()`, порядок: структура, затем зеркало scratch на PA 0): version `1`, size `0x100`, версия `0x01040000`, QA flags 0; boot bytes `+0x30/+0x31/+0x33` из Ernie NVS `0x4A0/0x481/0x483`, `+0x32=0` (по умолчанию `FF FF 00 FF`); DIP release (`+0x50` SDK 0, `+0x54` shell 0, `+0x58 = 0x00080002`, `+0x5C = 0x20000000`), DRAM `0x40000000` + `kermit::kScuSize`, boot type `4`, `secure_kernel` `0x00800000` + размер, `kprx_auth_sm` `0x00800500`, `prog_rvk` `0x00809B00`, session id, sleep/wakeup factor, hardware info `0x00406000` (IRS-002 — ответ модели на команду 5), power info, ревизия, magic `0xCBAC03AA`; `Vita::mirror_cmep_scratch_to_arm()` копирует первые 32 КиБ SRAM в ARM-овское PA 0 (проверено дампом).
+* **Историческое состояние записи (до нынешнего board handoff; текущий код описан выше).** В дефолтной конфигурации запись по PA `0x1F000100` **нулевая**: вторая стадия исполняет только обнуление (`0x41B38` → memset 256 байт), а до сборщика (`0x41B4A`) не доходит, потому что модель останавливает CMeP на «done»-прыжке secure kernel; C++-сборщик при включённых подстановках не вызывается вовсе (`bootchain.cpp`: `if (!substitutions_enabled_static()) build_kbl_param();`). Трап `ZLB_RTRAP=0x100-0x1D0` показывает чтения KBL по `0x400376E4` (128 байт PA `0x100` → `0x400B2DC8`) и `0x4002028C` (`+0x1C4`) — все слова `0`. **KBL доходит до Non-Secure с пустой записью.**
+* Исторический дамп с прежними адресацией/порядком зеркала (не текущая раскладка PA `0x100`): когда запись пишет **C++-сборщик** (проверено с `ZLB_NO_SUBSTITUTION=1` + `--stage kbl`; в обычном прогоне этих значений нет): `+0x00 = 0x00000060` sleep, `+0x04 = 0x0000FF14` wakeup (холод), `+0x08 = 0x40` USB, `+0x10 = 0x00406000` hardware info, `+0x14 = 0x0C` power, `+0x38 = 0x00010000` revision, `+0x3C = 0xCBAC03AA` magic; PA `0x1A0` = `FF FF FF FF FF FF 00 3F` (записал second_loader, pc `0x41A9C..0x41AC8`). DRAM-копия `0x4001FD00` = `01 00 00 01 00 00 04 01 00 00 04 01 …` (version 1, size `0x100`, firmware 01.04.0000). `SceKblParam + 0xC0` = PA `0x100`. Потребление: `0x400376E4` копирует 128 байт PA `0x100` → `0x400B2DC8` (вызывающий `0x40021203`), затем → PA `0x40300100`. Гейт `ZLB_ARM_WAIT_CMEP` снимает объяснение «порядок событий», но стену Stage 1 не убирает.
 * «Холодная» ветка `0x40858` (`0x4112E → 0x40A4A → 0x41A64/68/6C → 0x40F5E`) собирает KBL-параметр (`0x40A4A` вызов, `0x41A64/68/6C` записи полей); `0x40850` = бит 7 слова hardware info: `0x0000FF14` (холод) → бит 7 = 0 → ветка берётся; `0xFF80` (resume) → бит 7 = 1 → контекст из DRAM не копируется.
 
 ## 7. Исправленные баги ядра ARM и модели
@@ -476,6 +532,8 @@ KBL сводит в одну физическую страницу 0, модел
 `ZLB_NSKBL_LOWWIN`, `ZLB_KBL_OBJMGR_NOLOCK`, `ZLB_NSKBL_BOOTCFG`, `ZLB_KBL_HEAP`,
 `ZLB_KBL_CARVE_STATE` в `0` при `ZLB_NO_SUBSTITUTION=1`) даёт тот же `0x8D`: в честном
 режиме все они уже выключены, потому что `ZLB_NO_SUBSTITUTION` имеет приоритет.
+`ZLB_NSKBL_BOOTCFG` в этой исторической матрице — удалённая опция; нынешние boot bytes
+поступают из Ernie NVS на ранней границе передачи ARM (см. §6).
 
 **Что остаётся открытым (главный вопрос следующего раунда).** Таблицы трансляции у
 обоих прогонов в момент первого обращения к VA `0x34` одинаковы
@@ -1682,7 +1740,7 @@ FAIL expected true: !kermit_irq_line(fx.bus)
 
 ## 11. Индекс: прежние номера раундов и разделов → новые
 
-Ссылки в коде/документах (grep по `C:\Work\PSVita\zeliboba`: `src/**`, `tools/**`, `tests/**`, `docs/**`, `*.md`, `*.ps1`) на «`docs/KBL.md` …» и «`KBL.md` …»:
+Ссылки в коде/документах (grep по `.`: `src/**`, `tools/**`, `tests/**`, `docs/**`, `*.md`, `*.ps1`) на «`docs/KBL.md` …» и «`KBL.md` …»:
 
 * round 21 — idstorage SMI-лист, keyslot `0x213` в сборщике eMMC-образа (`emmc_image.cpp`) → §3.5
 * round 23 — подстановка проверок SMI-листа (`bigmac.cpp`) → §7

@@ -1,9 +1,9 @@
 import hashlib
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-enc = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
-enp = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2\second_loader.enp', 'rb').read()
-bin_ = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin', 'rb').read()
+enc = open(r'..\Vita_104_Firmware\Out\SLB2\second_loader.enc', 'rb').read()
+enp = open(r'..\Vita_104_Firmware\Out\SLB2\second_loader.enp', 'rb').read()
+bin_ = open(r'..\Vita_104_Firmware\Out\SLB2_dec\second_loader.bin', 'rb').read()
 
 KEY = bytes([0xAA] * 16)
 IV = bytes.fromhex('AF5F2CB04AC1751ABF51CEF1C8096210')

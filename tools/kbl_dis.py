@@ -8,7 +8,7 @@ Usage: python tools/kbl_dis.py <addr> <count> [--arm]
 import sys
 import capstone
 
-IMAGE = r"C:\Work\PSVita\_scratch\kbl.bin"
+IMAGE = r"..\_scratch\kbl.bin"
 BASE = 0x40020000
 
 addr = int(sys.argv[1], 0)

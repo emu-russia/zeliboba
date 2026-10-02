@@ -39,17 +39,11 @@ constexpr u32 kDramWindowBase = 0x40000000;  ///< physical DRAM window ("arm_pri
                                               ///< the SKBL exception/monitor vector page, which
                                               ///< the wiki pins at PA 0x40000000 ("SKBL Reset
                                               ///< Vector (ARM entry!)")
-constexpr u32 kScuBase = 0x1E000000;   ///< MPCore peripheral block (SCU/GIC/timers).  Round 162:
-                                        ///< this used to sit at 0x40000000, but that window is
-                                        ///< DRAM: kernel_boot_loader maps its vector page to
-                                        ///< VA 0x16100 -> PA 0x40000100 and writes the TrustZone
-                                        ///< monitor table to PA 0x40000140 (measured with
-                                        ///< ZLB_WTRAP), and with the GIC there those writes were
-                                        ///< swallowed by the device, leaving the `smc` entry
-                                        ///< empty.  No firmware access to this block has been
-                                        ///< observed yet, so its placement is a model decision
-                                        ///< until the kernel shows where the Vita puts it.
-constexpr u32 kPeripheralWindowSize = 0x00010000;  ///< MPCore peripheral block (SCU/GIC/timers)
+/// Vita Physical Memory map and native IntrMgr: PERIPHBASE includes SCU,
+/// the CPU interface at +0x100, timers, and the distributor at +0x1000.
+/// The adjacent +0x2000 page belongs to PL310, not another CPU interface.
+constexpr u32 kScuBase = 0x1A000000;
+constexpr u32 kPeripheralWindowSize = 0x00002000;
 constexpr u32 kScuSize = 0x20000000;    ///< 512 MiB DRAM window (wiki Physical_Memory:
                                         ///< "0x40000000 0x20000000 512MiB DRAM"); covers the
                                         ///< secure DRAM, the non-secure shared DRAM and the
@@ -125,7 +119,8 @@ public:
     // ------------------------------------------------------------------
 
     /// Currently selected framebuffer, or nullptr when the display is off.
-    const u8* framebuffer(int& width, int& height, int& stride) const;
+    const u8* framebuffer(int& width, int& height, int& stride,
+                          int* bytes_per_pixel = nullptr) const;
     /// Block until the display has been written, used for the UI refresh timer.
     u64 frame_counter() const;
 

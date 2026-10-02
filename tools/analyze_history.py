@@ -1,7 +1,7 @@
 import re
 import sys
 
-path = sys.argv[1] if len(sys.argv) > 1 else r'C:\Work\PSVita\zeliboba\build\hist.txt'
+path = sys.argv[1] if len(sys.argv) > 1 else r'.\build\hist.txt'
 lines = open(path, encoding='utf-8', errors='replace').read()
 
 # The history command prints "last N PCs of ARM:" followed by wrapped hex tokens.

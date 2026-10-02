@@ -2,6 +2,7 @@
 #include "debug/debugger.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "cpu/arm/arm_core.h"
+#include "cpu/arm/arm_disasm.h"
 #include "cpu/arm/arm_mmu.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
@@ -110,6 +112,22 @@ bool parse_watch_kind(const std::string& text, unsigned& kind) {
         else return false;
     }
     if (kind == 0) kind = 7;
+    return true;
+}
+
+bool inspect_arm_instruction_byte(const ArmCore& cpu, u32 va, u8& value, std::string& reason) {
+    const arm::MmResult result = cpu.inspection_mmu().inspect_translation(va, true, cpu.mode());
+    if (!result.ok) {
+        reason = arm::fault_text(result.fault, va, false, true);
+        return false;
+    }
+    const Bus& bus = *cpu.bus;
+    const MemRegion* region = bus.region_at(result.phys_addr);
+    if (!region || bus.find_device(result.phys_addr)) {
+        reason = format("PA 0x%08X is not RAM", result.phys_addr);
+        return false;
+    }
+    value = region->bytes()[result.phys_addr - region->base];
     return true;
 }
 
@@ -483,7 +501,7 @@ std::vector<u32> Debugger::history(Arch arch, size_t count) const {
 std::vector<Debugger::DisassemblyLine> Debugger::disassemble(u32 address, int count, Arch arch) {
     std::vector<DisassemblyLine> lines;
     if (arch == Arch::Unknown) arch = active_arch_;
-    Cpu* cpu = vita_.core(arch);
+    Cpu* cpu = arch == Arch::Arm ? vita_.arm_core(arm_core_index_) : vita_.core(arch);
     if (!cpu) return lines;
 
     u32 pc = cpu->get_pc();
@@ -491,11 +509,37 @@ std::vector<Debugger::DisassemblyLine> Debugger::disassemble(u32 address, int co
         unsigned length = 0;
         DisassemblyLine line;
         line.address = address;
-        line.text = cpu->disassemble(address, length);
+        if (const auto* arm = dynamic_cast<const ArmCore*>(cpu)) {
+            std::array<u8, 4> bytes{};
+            std::string reason;
+            length = arm->thumb ? 2u : 4u;
+            bool available = true;
+            for (unsigned b = 0; b < length; ++b) {
+                if (static_cast<u64>(address) + b > 0xFFFFFFFFull) {
+                    reason = "instruction crosses address-space end";
+                    available = false;
+                    break;
+                }
+                if (!inspect_arm_instruction_byte(*arm, address + b, bytes[b], reason)) {
+                    available = false;
+                    break;
+                }
+                line.bytes.push_back(bytes[b]);
+                if (arm->thumb && b == 1u) {
+                    const u32 hw1 = static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8);
+                    if ((hw1 & 0xF800u) >= 0xE800u) length = 4u;
+                }
+            }
+            line.text = available ? arm_disassemble_bytes(bytes.data(), address, arm->thumb, length) :
+                                    format("<unavailable: %s>", reason.c_str());
+        } else {
+            line.text = cpu->disassemble(address, length);
+            for (unsigned b = 0; b < length && b < 8; ++b) line.bytes.push_back(cpu->bus->read8(address + b));
+        }
         if (length == 0) length = 4;
+        line.length = length;
         line.is_pc = (address == pc);
         line.has_breakpoint = breakpoints(arch).count(address) != 0;
-        for (unsigned b = 0; b < length && b < 8; ++b) line.bytes.push_back(cpu->bus->read8(address + b));
         lines.push_back(std::move(line));
         address += length;
     }
@@ -993,10 +1037,10 @@ bool Debugger::execute(const std::string& line) {
     }
     if (command == "gpo") {
         // Boot checkpoint: the stages clear bits in 0xE20A000C and set the next
-        // code in 0xE20A0008, so the GPIO data register holds it in bits 16..23
+        // code in 0xE20A0008, so output latch+34 holds it in bits 16..23
         // (KBL writes 0x00840000 for code 0x84).  Both processors drive the same
         // lines, so the value is whichever stage wrote last.
-        const u32 raw = vita_.arm_bus().read32(0xE20A0000);
+        const u32 raw = vita_.arm_bus().read32(0xE20A0034);
         const u32 value = (raw >> 16) & 0xFFu;
         emit(format("GPO raw=0x%08X checkpoint=0x%02X - %s", raw, value,
                     boot_checkpoint_text(value).c_str()));
@@ -1183,7 +1227,7 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  devget <dev>.<reg>     read a named register\n"
         "  devset <dev>.<reg> <v> write a named register\n"
         "  emmc info|read|write   inspect the attached card\n"
-        "  gpo                    boot checkpoint from the GPO lines (0xE20A0000)\n"
+        "  gpo                    boot checkpoint from the GPIO output latch (0xE20A0034)\n"
         "  console                pending firmware console output (UART +0x70)\n"
         "  bootctx                ARM boot context: CMeP DRAM source and the PA 0 mirror\n"
         "  faults [all]           MMU fault ring: faulting pc, VA and page-table entry\n"
@@ -1356,31 +1400,36 @@ std::string Debugger::cmd_devices(const std::vector<std::string>& args) {
 }
 
 std::string Debugger::cmd_dev(const std::vector<std::string>& args, bool write) {
-    if (args.size() < 2) return "usage: devget <device>.<register> | devset <device>.<register> <value>";
-    std::string spec = args[0];
-    size_t dot = spec.rfind('.');
-    if (dot == std::string::npos) return "expected <device>.<register>";
-    std::string device_name = spec.substr(0, dot);
-    std::string register_name = spec.substr(dot + 1);
+    if (args.size() < (write ? 2u : 1u))
+        return "usage: devget <device>.<register> | devset <device>.<register> <value>";
+    const std::string& spec = args[0];
+    if (spec.find('.') == std::string::npos || spec.back() == '.')
+        return "expected <device>.<register>";
 
+    // Both device and register names can contain dots. Match the longest
+    // installed device name, leaving e.g. CPU3.ICCICR intact as the register.
+    Device* selected = nullptr;
     Bus* buses[3] = {&vita_.cmep_bus(), &vita_.arm_bus(), &vita_.syscon_bus()};
     for (Bus* bus : buses) {
         for (const auto& device : bus->devices()) {
-            if (device->name() != device_name) continue;
-            if (write) {
-                u64 value = 0;
-                if (args.size() < 3 || !parse_u64(args[1], value)) return "invalid value";
-                if (!device->poke_register(register_name, value)) return "device rejected the write";
-                return format("%s.%s <- 0x%llX", device_name.c_str(), register_name.c_str(),
-                              static_cast<unsigned long long>(value));
-            }
-            u64 value = 0;
-            if (!device->peek_register(register_name, value)) return "no such register";
-            return format("%s.%s = 0x%llX", device_name.c_str(), register_name.c_str(),
-                          static_cast<unsigned long long>(value));
+            const std::string& name = device->name();
+            if (spec.size() <= name.size() + 1 || spec.compare(0, name.size(), name) != 0 ||
+                spec[name.size()] != '.') continue;
+            if (!selected || name.size() > selected->name().size()) selected = device.get();
         }
     }
-    return "no such device";
+    if (!selected) return "no such device";
+    const std::string register_name = spec.substr(selected->name().size() + 1);
+    u64 value = 0;
+    if (write) {
+        if (!parse_u64(args[1], value)) return "invalid value";
+        if (!selected->poke_register(register_name, value)) return "device rejected the write";
+        return format("%s.%s <- 0x%llX", selected->name().c_str(), register_name.c_str(),
+                      static_cast<unsigned long long>(value));
+    }
+    if (!selected->peek_register(register_name, value)) return "no such register";
+    return format("%s.%s = 0x%llX", selected->name().c_str(), register_name.c_str(),
+                  static_cast<unsigned long long>(value));
 }
 
 std::string Debugger::cmd_emmc(const std::vector<std::string>& args) {

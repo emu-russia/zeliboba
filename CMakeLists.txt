@@ -52,7 +52,7 @@ if(ZLB_ENABLE_SDL3)
     if(SDL3_FOUND)
         set(ZLB_SDL3_AVAILABLE ON)
         message(STATUS "SDL3: found via find_package")
-    else()
+    elseif(WIN32)
         # 2) a vendored developer package under third_party/SDL3-devel-VC
         file(GLOB ZLB_SDL3_VC_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3-devel-VC"
                                    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3-devel-*-VC")
@@ -126,12 +126,14 @@ if(ZLB_SDL3_AVAILABLE)
             target_sources(zeliboba_ui PRIVATE
                            "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/zeliboba_ui.rc")
         endif()
-        # SDL3 is loaded at runtime: keep the DLL next to the executables so the
-        # frontend runs straight from the build tree.
-        add_custom_command(TARGET zeliboba_ui POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:zeliboba_ui>
-            COMMENT "Copying SDL3.dll next to zeliboba_ui")
+        if(WIN32)
+            # Windows needs the runtime DLL beside the executable. Installed
+            # macOS/Linux SDL3 packages already carry their runtime paths.
+            add_custom_command(TARGET zeliboba_ui POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:zeliboba_ui>
+                COMMENT "Copying SDL3.dll next to zeliboba_ui")
+        endif()
     else()
         message(STATUS "SDL3 present but src/ui is empty - frontend skipped")
     endif()

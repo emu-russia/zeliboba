@@ -10,7 +10,7 @@ Usage: python tools/nskbl_error_codes.py [--image FILE] [--base 0x...]
 import argparse
 import sys
 
-DEFAULT_IMAGE = r"C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin"
+DEFAULT_IMAGE = r"..\Vita_104_Firmware\Out\SLB2_dec\nsbl.bin"
 DEFAULT_BASE = 0x51000000
 
 # movt rN, #0x8032 -> halfwords 0xF2C8, (N << 8) | 0x32

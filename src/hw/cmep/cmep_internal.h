@@ -106,11 +106,16 @@ public:
 
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
+    void reset() override;
+    /// ARM producer/consumer port; reads share the CMeP register state.
+    void write_arm(u32 address, unsigned size, u64 value);
 
     u32 cmep_to_arm() const { return static_cast<u32>(peek(kCmepToArm)); }
     u32 arm_to_cmep() const { return static_cast<u32>(peek(kArmToCmep)); }
-    void set_arm_to_cmep(u32 value) { poke(kArmToCmep, value); }
-    void set_cmep_to_arm(u32 value) { poke(kCmepToArm, value); }
+    void set_arm_to_cmep(u32 value);
+    void set_cmep_to_arm(u32 value);
+    void set_irq_callbacks(CmepBlock::MailboxIrqCallback to_cmep,
+                           CmepBlock::MailboxIrqCallback to_arm);
 
     u64 debug_posts() const { return debug_posts_; }
     u64 debug_acks() const { return debug_acks_; }
@@ -126,10 +131,32 @@ public:
     static constexpr u32 kDebuggerToCmep2 = 0xE0000060;
 
 private:
+    bool write_data_mailbox(u32 address, unsigned size, u64 value, bool arm_port);
+    bool write_clear_alias(u32 address, unsigned size, u64 value);
+    void refresh_irqs(bool force = false);
+    CmepBlock::MailboxIrqCallback to_cmep_irq_;
+    CmepBlock::MailboxIrqCallback to_arm_irq_;
+    std::array<bool, 4> to_cmep_levels_{};
+    std::array<bool, 4> to_arm_levels_{};
     Bus& bus_;
     CmepBlock& owner_;
     u64 debug_posts_ = 0;
     u64 debug_acks_ = 0;
+};
+
+/// The same mailbox registers have opposite set/ack semantics at each CPU
+/// endpoint, so the ARM attachment must retain its port identity explicitly.
+class ArmMailboxEndpoint final : public DeviceMirror {
+public:
+    explicit ArmMailboxEndpoint(MailboxDevice& mailbox)
+        : DeviceMirror(mailbox, cmep::kMailboxBase, 0x100), mailbox_(mailbox) {}
+
+    void write(u32 address, unsigned size, u64 value) override {
+        mailbox_.write_arm(address, size, value);
+    }
+
+private:
+    MailboxDevice& mailbox_;
 };
 
 // ---------------------------------------------------------------------------
@@ -428,29 +455,67 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 0xE20A0000 - GPIO / external-agent handshake
+// 0xE20A0000 - native GPIO0, shared by CMeP and ARM
 // ---------------------------------------------------------------------------
 
-class GpioDevice : public RegisterFile {
+class GpioDevice : public Device {
 public:
     GpioDevice();
-
-    /// mailbox_debug_sc polls +0x04 twice at 0x5E4FC and 0x5E560.  Bit 4 is
-    /// modelled as the debugger handshake: it reads set once and then clears,
-    /// so the polling loop terminates (documented in cmep_block.cpp).
     u64 read(u32 address, unsigned size) override;
     void write(u32 address, unsigned size, u64 value) override;
     void reset() override;
+    void enumerate_registers(std::vector<RegisterInfo>& out) const override;
+    bool peek_register(const std::string& name, u64& out) const override;
+    bool poke_register(const std::string& name, u64 value) override;
+    std::string summary() const override;
+    void describe(std::vector<std::string>& lines) const override;
+
+    /// Board input, never a guest register write or read-consumed handshake.
+    /// Only the reached pin4/input/mode3 falling path currently creates events.
+    void set_external_input(u32 mask, u32 levels);
+    void set_irq_callback(std::function<void(u32, bool)> callback);
+    /// Direction/output/phase notification for board wiring, not a guest IRQ.
+    void set_output_callback(std::function<void(u32, u32)> callback);
+    void set_reset_callback(std::function<void()> callback) { board_reset_ = std::move(callback); }
+    bool native_phase() const { return native_phase_; }
+    u32 direction() const { return registers_[0]; }
+    u32 output_latch() const { return registers_[0x34 / 4]; }
+    u32 sampled_input() const;
+
+    /// Explicit development JIG peer, default absent. Its release requires an
+    /// actual output3 rise, never a read. Board handoff may permanently disable
+    /// it until reset; no automatic native-phase/JIG selection is guessed here.
+    bool set_legacy_jig_enabled(bool enabled);
+    void enter_native_phase();
 
     u64 handshakes() const { return handshakes_; }
 
-    static constexpr u32 kData = 0xE20A0000;
+    static constexpr u32 kDirection = 0xE20A0000;
     static constexpr u32 kState = 0xE20A0004;
     static constexpr u32 kSet = 0xE20A0008;
     static constexpr u32 kClear = 0xE20A000C;
+    static constexpr u32 kOutput = 0xE20A0034;
+    static constexpr u32 kParentIrqBase = 248;
+    static constexpr unsigned kGateCount = 5;
 
 private:
+    bool known_offset(u32 offset) const;
+    u32 raw_input() const;
+    u32 word_value(u32 offset) const;
+    void input_changed(u32 before);
+    void refresh_irqs();
+    std::array<u32, 0x4C / 4> registers_{};
+    std::array<bool, kGateCount> irq_states_{};
+    std::function<void(u32, bool)> irq_;
+    std::function<void(u32, u32)> output_callback_;
+    std::function<void()> board_reset_;
+    u32 external_input_ = 0;
     u64 handshakes_ = 0;
+    u64 falling_edges_ = 0;
+    u64 unsupported_edges_ = 0;
+    bool legacy_jig_enabled_ = false;
+    bool jig_asserted_ = false;
+    bool native_phase_ = false;
 };
 
 // ---------------------------------------------------------------------------

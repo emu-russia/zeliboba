@@ -2,7 +2,7 @@ import sys
 
 import capstone
 
-b = open(r'C:\Work\PSVita\Vita_104_Firmware\Out\SLB2_dec\kernel_boot_loader.self.seg01', 'rb').read()
+b = open(r'..\Vita_104_Firmware\Out\SLB2_dec\kernel_boot_loader.self.seg01', 'rb').read()
 base = 0x40020000
 md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
 md.detail = True

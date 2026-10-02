@@ -30,8 +30,8 @@ namespace zlb {
 
 class MePCore : public Cpu {
 public:
-    /// Software model of the control bus (`stcb`/`ldcb`) space.  The CMeP has no
-    /// architectural registers there: locations 0x400..0x405 drive a hardware
+    /// Software model of the control bus (`stcb`/`ldcb`) space. The INTC
+    /// registers at 0..7 are 32-bit words. Locations 0x400..0x405 drive a hardware
     /// one shot timer that both loaders poll (first loader 0x5E660, second
     /// loader 0x45500).  The real device lives in the hardware layer, so this
     /// model is deliberately small and deterministic - enough that the poll
@@ -40,7 +40,9 @@ public:
     ///   0x402        control, bit 0 = enable (start)
     ///   0x404        status, bit 0 = "the count reached zero" latch
     struct ControlBus {
-        std::array<u8, 0x420> regs{};
+        std::array<u32, 0x420> regs{};
+        u32 irq_levels = 0;
+        u32 irq_edges = 0;
 
         /// Reload value assembled from 0x400 (high) and 0x401 (low).
         u32 count = 0;
@@ -53,14 +55,18 @@ public:
         bool force_expired = false;
 
         void reset();
-        /// Read a control bus byte; `ldcb $rn,0x404` is the poll.
+        /// Read one control bus word; `ldcb $rn,0x404` is the timer poll.
         u32 read(unsigned address) const;
-        /// Write a control bus byte; writing the count reloads the timer.
+        /// Write one control bus word; writing the count reloads the timer.
         void write(unsigned address, u32 value);
         /// Advance the one shot timer by one instruction.
         void advance();
         /// True while the timer is still counting (status bit 0 reads 0).
         bool busy() const;
+        void set_irq_level(unsigned source, bool asserted);
+        /// Highest eligible interrupt, or -1; equal levels favor larger channels.
+        int pending_irq() const;
+        void acknowledge_irq(unsigned source);
     };
 
     explicit MePCore(Bus& bus);
@@ -72,6 +78,13 @@ public:
     /// the core *before* the instruction executes and records the halt reason,
     /// so the machine can substitute the service at a slice boundary.
     std::function<bool(u32)> pc_hook;
+    /// External INTC input. Requests remain pending until the device deasserts
+    /// its level or software clears an edge-triggered ISR bit.
+    void set_irq_level(unsigned source, bool asserted);
+    /// Board-selected boot vector bank used while CFG.EVM=0. Ordinary MeP
+    /// systems use zero; the CMeP boot stages remap this bank through hardware
+    /// whose register interface is not yet modeled.
+    void set_boot_vector_base(u32 base) { boot_vector_base_ = base; }
 
     // ------------------------------------------------------------------ Cpu
     Arch arch() const override { return Arch::MeP; }
@@ -147,6 +160,8 @@ private:
     void repeat_step_end(u32 address, bool branch_taken);
     /// set_pc plus the "a branch was taken" flag the hardware loop unit needs.
     void branch_to(u32 target);
+    void refresh_irq_line();
+    bool take_pending_irq();
     void cop_word(const mep::Insn& insn, u32 word, u32 address);
     void cop_word64(const mep::Insn& insn, u32 word, u32 address);
     /// Mark the current instruction as unimplemented.  The PC is left on the
@@ -181,6 +196,7 @@ private:
     /// and comparing PCs is not enough: a branch to the next instruction is still
     /// a taken branch.
     bool branch_taken_ = false;
+    u32 boot_vector_base_ = 0;
 };
 
 }  // namespace zlb

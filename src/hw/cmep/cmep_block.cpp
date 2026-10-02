@@ -26,7 +26,6 @@
 //         0xE0000000 <- 1 on success (0x5C5F0) or <- 2 and hang on failure
 //         (0x5C610..0x5C618).
 #include <cstring>
-#include <cstring>
 
 #include "common/log.h"
 #include "hw/cmep.h"
@@ -210,6 +209,15 @@ void CmepBlock::set_boot_mode(u8 mode) {
 // ---------------------------------------------------------------------------
 // Mailboxes
 // ---------------------------------------------------------------------------
+
+void CmepBlock::install_arm_mailbox(Bus& arm_bus) {
+    arm_bus.add_device(std::make_unique<cmep_detail::ArmMailboxEndpoint>(mailbox_device()));
+}
+
+void CmepBlock::set_mailbox_irq_callbacks(MailboxIrqCallback to_cmep,
+                                         MailboxIrqCallback to_arm) {
+    mailbox_device().set_irq_callbacks(std::move(to_cmep), std::move(to_arm));
+}
 
 u32 CmepBlock::arm_to_cmep_command() const {
     return mailbox_device().arm_to_cmep();
@@ -410,6 +418,12 @@ void CmepBlock::describe(std::vector<std::string>& lines) const {
     for (const auto& entry : captured_keyrings()) {
         lines.push_back(format("CMeP keyring[0x%03X] flags=0x%04X locked=%d", entry.first,
                                entry.second.flags, entry.second.locked ? 1 : 0));
+    }
+}
+
+void CmepBlock::enter_native_gpio_phase() {
+    if (auto* device = device_by_name("CMeP.GPIO")) {
+        static_cast<GpioDevice*>(device)->enter_native_phase();
     }
 }
 

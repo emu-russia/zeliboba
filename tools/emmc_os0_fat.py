@@ -6,7 +6,7 @@ psp2bootconfig.skprx can be converted into the LBA the loader must read.
 """
 import struct
 
-IMAGE = r"C:\Work\PSVita\zeliboba\build\emmc.img"
+IMAGE = r".\build\emmc.img"
 PART_LBA = 65536
 BLOCK = 512
 

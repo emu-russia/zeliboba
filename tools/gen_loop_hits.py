@@ -3,5 +3,5 @@ for i in range(24):
     lines.append('regs')
     lines.append('run 3000000')
 lines.append('quit')
-open(r'C:\Work\PSVita\zeliboba\build\loop_hits.txt', 'w', encoding='ascii').write('\n'.join(lines) + '\n')
+open(r'.\build\loop_hits.txt', 'w', encoding='ascii').write('\n'.join(lines) + '\n')
 print('written')

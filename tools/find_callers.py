@@ -1,6 +1,6 @@
 import sys
 
-path = r'C:\Work\PSVita\_scratch\kbl.bin'
+path = r'..\_scratch\kbl.bin'
 base = 0x40020000
 targets = [int(x, 16) for x in sys.argv[1:]] or [0x4002B048]
 

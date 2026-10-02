@@ -4,6 +4,7 @@
 // mapped registers on a real Bus, using the register sequences documented in
 // src/hw/cmep/*.cpp (every claim there carries the instruction address of the
 // annotated boot ROM listing that proves it).
+#include <array>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -12,8 +13,10 @@
 #include "bus/bus.h"
 #include "common/log.h"
 #include "common/util.h"
+#include "cpu/mep/mep_core.h"
 #include "hw/cmep.h"
 #include "hw/cmep/cmep_internal.h"
+#include "hw/soc.h"
 #include "machine/bootkeys.h"
 #include "machine/bootkeys_data.h"
 #include "machine/vita.h"
@@ -41,6 +44,27 @@ const u8 kEncKey[16] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
                         0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
 const u8 kEncIv[16] = {0xAF, 0x5F, 0x2C, 0xB0, 0x4A, 0xC1, 0x75, 0x1A,
                        0xBF, 0x51, 0xCE, 0xF1, 0xC8, 0x09, 0x62, 0x10};
+
+void issue_native_bigmac(Fixture& f, u32 source, u32 destination, u32 length,
+                        u32 function, u32 iv = 0) {
+    f.bus.write32(0xE0050000u, source);
+    f.bus.write32(0xE0050004u, destination);
+    f.bus.write32(0xE0050008u, length);
+    f.bus.write32(0xE005000Cu, function);
+    f.bus.write32(0xE0050014u, iv);
+    f.bus.write32(0xE0050104u, 3u);
+    f.bus.write32(0xE005001Cu, 1u);
+}
+
+void stage_bigmac_key(Fixture& f, const u8* key, size_t length) {
+    for (size_t i = 0; i < length; i += 4) {
+        const u32 word = static_cast<u32>(key[i]) |
+                         (static_cast<u32>(key[i + 1]) << 8) |
+                         (static_cast<u32>(key[i + 2]) << 16) |
+                         (static_cast<u32>(key[i + 3]) << 24);
+        f.bus.write32(0xE0050200u + static_cast<u32>(i), word);
+    }
+}
 
 }  // namespace
 
@@ -187,6 +211,137 @@ ZLB_TEST(cmep_emmc_crypto_and_strap) {
     ZLB_EXPECT_EQ(f.bus.read32(0xE0064060), 0x00010002u);
 }
 
+ZLB_TEST(cmep_public_retail_identity_slot_registers) {
+    Fixture f;
+    const u32 identity = 0xE0058000u + (0x509u << 5u);
+    // Public PCH-1001 prefix only; the console-unique remainder is unavailable.
+    const u8 prefix[8] = {0x00, 0x00, 0x00, 0x01, 0x01, 0x04, 0x00, 0x10};
+    ZLB_EXPECT_EQ(identity, 0xE0062120u);
+    ZLB_EXPECT_EQ(f.bus.read32(identity), 0x01000000u);
+    ZLB_EXPECT_EQ(f.bus.read32(identity + 4u), 0x10000401u);
+    for (u32 i = 0; i < sizeof(prefix); ++i) ZLB_EXPECT_EQ(f.bus.read8(identity + i), prefix[i]);
+    for (u32 i = sizeof(prefix); i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(identity + i), 0u);
+    ZLB_EXPECT_EQ(f.bus.read16(identity + 4u), 0x0401u);
+    Device* device = f.bus.find_device(identity);
+    ZLB_EXPECT_TRUE(device != nullptr);
+    if (device != nullptr) {
+        const char* name = device->register_name(identity + 4u);
+        ZLB_EXPECT_TRUE(name != nullptr && std::string(name).find("modeled public") != std::string::npos);
+        ZLB_EXPECT_TRUE(device->summary().find("console_product=0x0104") != std::string::npos);
+    }
+    // Overrides are never normalized into a valid product. The saved native
+    // all-zero classifier capture proves guest rejection; don't duplicate it.
+    f.bus.write32(identity + 4u, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(identity + 4u), 0u);
+    f.bus.write16(identity + 4u, 0xFFFFu);
+    ZLB_EXPECT_EQ(f.bus.read32(identity + 4u), 0x0000FFFFu);
+    f.bus.write8(identity + 7u, 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read32(identity + 4u), 0xA500FFFFu);
+    f.bus.write8(identity + 15u, 0x5Au);
+    ZLB_EXPECT_EQ(f.bus.read8(identity + 15u), 0x5Au);
+    f.cmep.reset();
+    for (u32 i = 0; i < sizeof(prefix); ++i) ZLB_EXPECT_EQ(f.bus.read8(identity + i), prefix[i]);
+    for (u32 i = sizeof(prefix); i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(identity + i), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0062020u), 0u);
+}
+
+ZLB_TEST(cmep_modeled_dram_capacity_slot_registers) {
+    Fixture f;
+    constexpr u32 base = 0xE0062260u;
+    ZLB_EXPECT_EQ(f.bus.read32(base), kermit::kScuSize);
+    ZLB_EXPECT_EQ(f.bus.read64(base), static_cast<u64>(kermit::kScuSize));
+    ZLB_EXPECT_EQ(f.bus.read16(base), 0u);
+    ZLB_EXPECT_EQ(f.bus.read16(base + 2u), kermit::kScuSize >> 16u);
+    for (u32 i = 0; i < 32u; ++i) {
+        const u32 expected = i < 4u ? ((kermit::kScuSize >> (i * 8u)) & 0xFFu) : 0u;
+        ZLB_EXPECT_EQ(f.bus.read8(base + i), expected);
+    }
+    ZLB_EXPECT_TRUE(std::string(f.cmep.strap_device().register_name(base)).find("0x513") != std::string::npos);
+    ZLB_EXPECT_TRUE(f.cmep.strap_device().summary().find("dram_capacity=0x20000000") != std::string::npos);
+    // Unaligned partial overrides preserve other lanes, crossing a word edge.
+    f.bus.write16(base + 3u, 0xABCDu);
+    ZLB_EXPECT_EQ(f.bus.read32(base), 0xCD000000u);
+    ZLB_EXPECT_EQ(f.bus.read32(base + 4u), 0xABu);
+    ZLB_EXPECT_EQ(f.bus.read16(base + 3u), 0xABCDu);
+    f.bus.write32(base, 0xFFFFFFFFu);
+    ZLB_EXPECT_EQ(f.bus.read32(base), 0xFFFFFFFFu); // No normalization of raw inputs.
+    f.bus.write8(base + 31u, 0x5Au);
+    f.cmep.reset();
+    ZLB_EXPECT_EQ(f.bus.read32(base), kermit::kScuSize);
+    for (u32 i = 4; i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(base + i), 0u);
+}
+
+ZLB_TEST(cmep_dram_capacity_drives_native_kprx_buffer_validator) {
+    // Genuine FW1.04 kprx bytes 0x80E55E..0x80E6E5 from the authenticated
+    // guest payload; see docs/SMC_AUTH_104.md. Run the actual byte loads,
+    // 33-bit aperture/end arithmetic and failure response, without copying
+    // the guest validator into C++. Stop a valid request before payload copy.
+    const u8 validator[] = {
+        0x80, 0x6F, 0x21, 0xC3, 0x00, 0xE0, 0x1A, 0x7B, 0x34, 0xC3, 0x14, 0x00, 0x16, 0x45, 0x12, 0x46,
+        0x0E, 0x47, 0x0A, 0x4B, 0x3E, 0x05, 0x55, 0xC2, 0x01, 0x00, 0x00, 0xE2, 0xB1, 0x00, 0xFE, 0x50,
+        0x3A, 0x05, 0x01, 0x15, 0x5E, 0x06, 0x63, 0xC3, 0x40, 0x00, 0x04, 0xE3, 0xA7, 0x00, 0x01, 0xC0,
+        0x00, 0x10, 0x63, 0x00, 0x04, 0xE0, 0xA2, 0x00, 0x21, 0xC3, 0x06, 0xE0, 0x34, 0xC3, 0x60, 0x22,
+        0x3C, 0x03, 0xF8, 0xC3, 0x04, 0x00, 0x21, 0xC3, 0x06, 0xE0, 0x34, 0xC3, 0x61, 0x22, 0x3C, 0x03,
+        0xF8, 0xC3, 0x05, 0x00, 0x21, 0xC3, 0x06, 0xE0, 0x34, 0xC3, 0x62, 0x22, 0x3C, 0x03, 0xF8, 0xC3,
+        0x06, 0x00, 0x21, 0xC3, 0x06, 0xE0, 0x34, 0xC3, 0x63, 0x22, 0x3C, 0x03, 0xF8, 0xC3, 0x07, 0x00,
+        0x21, 0xC3, 0x2F, 0x40, 0x34, 0xC3, 0xFF, 0xFF, 0x53, 0x03, 0x07, 0x4A, 0x00, 0xE0, 0x6F, 0x00,
+        0x21, 0xC2, 0x00, 0x40, 0x23, 0x9A, 0xA3, 0x03, 0x00, 0x0A, 0x07, 0xA0, 0x33, 0x05, 0x14, 0xA0,
+        0x62, 0x95, 0x53, 0x02, 0x00, 0x01, 0x03, 0x0A, 0x0B, 0xA0, 0xA5, 0xE1, 0x27, 0x00, 0x23, 0x03,
+        0x48, 0xA0, 0x21, 0xC3, 0x00, 0x1F, 0x34, 0xC3, 0xFF, 0x7F, 0x53, 0x03, 0x04, 0xE0, 0x5F, 0x00,
+        0x62, 0x95, 0x53, 0x02, 0x04, 0xE0, 0x5B, 0x00, 0x21, 0xC3, 0x00, 0x1F, 0x34, 0xC3, 0x00, 0x80,
+        0x23, 0x03, 0x04, 0xE0, 0x54, 0x00, 0x22, 0xB0, 0x21, 0xC3, 0x85, 0x1F, 0x34, 0xC3, 0xFF, 0xFF,
+        0x53, 0x03, 0x04, 0xE0, 0x53, 0x00, 0x63, 0x95, 0x53, 0x03, 0x04, 0xE0, 0x4F, 0x00, 0x21, 0xC0,
+        0x86, 0x1F, 0x33, 0x00, 0x04, 0xE0, 0x4A, 0x00, 0xC0, 0xD1, 0x2F, 0x81, 0x50, 0x02, 0x60, 0x03,
+        0xE9, 0xDF, 0x0A, 0x00, 0x55, 0xA0, 0xC3, 0xE7, 0x2F, 0x81, 0x65, 0xE7, 0x3F, 0x00, 0xC7, 0xE2,
+        0x2F, 0x81, 0xFF, 0x51, 0xAF, 0xE3, 0x1F, 0x81, 0x15, 0xE2, 0x04, 0x00, 0x3A, 0x00, 0x6E, 0xB0,
+        0x3E, 0xC1, 0x04, 0x00, 0x22, 0xB0, 0xFE, 0x53, 0x31, 0x11, 0x1E, 0x03, 0x25, 0xE3, 0x0B, 0x00,
+        0x1E, 0xC3, 0x08, 0x00, 0xC0, 0xD2, 0x2F, 0x81, 0x20, 0x61, 0x00, 0x56, 0x3E, 0x03, 0x3F, 0x10,
+        0x0A, 0xB0, 0x1E, 0xC1, 0x04, 0x00, 0xE1, 0xA1, 0x02, 0x56, 0x50, 0x01, 0xC0, 0xD2, 0x2F, 0x81,
+        0x70, 0x03, 0x59, 0xDD, 0x0A, 0x00, 0x04, 0xA0, 0x08, 0x56, 0x21, 0xC3, 0x00, 0xE0, 0x34, 0xC3,
+        0x04, 0x00, 0x64, 0xC6, 0x01, 0x00, 0x3A, 0x06, 0x24, 0xB0, 0x21, 0xC3, 0xFF, 0x1E, 0x34, 0xC3,
+        0xFF, 0xFF, 0x53, 0x03, 0x04, 0xE0, 0x9F, 0xFF, 0x10, 0xB0, 0x21, 0xC3, 0x83, 0x1F, 0x34, 0xC3,
+        0xFF, 0xFF, 0x53, 0x03, 0x04, 0xE0, 0xAA, 0xFF, 0x04, 0x56, 0xD0, 0xBF, 0x0F, 0x47, 0x13, 0x46,
+        0x17, 0x45, 0x0B, 0x4B, 0x20, 0x4F, 0xBE, 0x10,
+    };
+    struct Request { u32 pa, length, capacity; bool accepted; };
+    const Request requests[] = {
+        {0x40350200u, 0x190u, kermit::kScuSize, true}, // Captured command10001.
+        {0x5FFFFE70u, 0x190u, kermit::kScuSize, true}, // End equals aperture end.
+        {0x5FFFFE74u, 0x190u, kermit::kScuSize, false},
+        {0x60000000u, 0x190u, kermit::kScuSize, false},
+        {0x402FFFF0u, 0x190u, kermit::kScuSize, false}, // Protected first3MiB.
+        {0x40350200u, 0x190u, 0u, false},             // Previous model input.
+        // Raw overrides exercise carry at the 32-bit address-space boundary.
+        {0xFFFFFFF0u, 0x190u, 0xC0000000u, false},
+        {0xFFFFFE70u, 0x190u, 0xC0000000u, true},
+        {0x40350200u, 0x3Fu, kermit::kScuSize, false},
+        {0x40350200u, 0x1004u, kermit::kScuSize, false},
+    };
+    for (const Request& request : requests) {
+        Fixture f;
+        auto arm = std::make_unique<Bus>();
+        f.cmep.install_arm_mailbox(*arm);
+        f.bus.load(0x80E55Eu, validator, sizeof(validator), "native kprx PA validator");
+        f.bus.add_ram("native request header", 0x1000u, request.pa & ~0xFFFu, "validator input");
+        f.bus.write32(request.pa, request.length);
+        f.bus.write32(0xE0062260u, request.capacity);
+        arm->write32(0xE0000014u, request.pa | 1u);
+        MePCore cpu(f.bus);
+        cpu.reset(0x80E55Eu);
+        cpu.r[15] = 0x81E000u;
+        for (unsigned step = 0; step < 200u; ++step) {
+            if (cpu.pc == 0x80E646u || cpu.pc == 0x80E6B6u) break;
+            const StepResult result = cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            if (result.faulted) break;
+        }
+        ZLB_EXPECT_EQ(cpu.pc, request.accepted ? 0x80E646u : 0x80E6B6u);
+        ZLB_EXPECT_EQ(f.bus.read32(0xE0000014u), 0u); // Genuine incoming ACK.
+        ZLB_EXPECT_EQ(f.bus.read32(0xE0000004u), request.accepted ? 0u : 5u);
+        ZLB_EXPECT_EQ(f.bus.read32(request.pa), request.length);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mailboxes (0xE0000000)
 // ---------------------------------------------------------------------------
@@ -214,22 +369,217 @@ ZLB_TEST(cmep_mailboxes) {
     ZLB_EXPECT_EQ(f.bus.read32(0xE0000024), 0x9ABCDEF0u);
 }
 
+ZLB_TEST(cmep_mailbox_native_shared_buffer_handshake) {
+    Fixture f;
+    auto arm = std::make_unique<Bus>();
+    f.cmep.install_arm_mailbox(*arm);
+    constexpr u32 status = 0xE0000000u;
+    constexpr u32 command = 0xE0000010u;
+    constexpr u32 shared_pa = 0x40378000u;
+
+    // Genuine 1.04 secure_kernel posts101; native ARM Smsched acknowledges
+    // that status before submitting a shared-buffer PA and a separate doorbell.
+    f.bus.write32(status, 0x101u);
+    ZLB_EXPECT_EQ(arm->read32(status), 0x101u);
+    arm->write32(status, 0x101u);
+    ZLB_EXPECT_EQ(f.bus.read32(status), 0u);
+    arm->write32(command, shared_pa);
+    arm->write32(command, 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(command), shared_pa | 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(command) & ~3u, shared_pa);
+
+    // The CMeP consumes the request and clears the incoming word with -1
+    // (80042E), then posts102, which ARM acknowledges through its own port.
+    f.bus.write32(command, 0xFFFFFFFFu);
+    ZLB_EXPECT_EQ(arm->read32(command), 0u);
+    f.bus.write32(status, 0x102u);
+    ZLB_EXPECT_EQ(arm->read32(status), 0x102u);
+    arm->write32(status, 0x102u);
+    ZLB_EXPECT_EQ(f.bus.read32(status), 0u);
+
+    // A second submission must not retain the earlier address or its doorbell.
+    constexpr u32 next_pa = 0x40500000u;
+    arm->write32(command, next_pa);
+    arm->write32(command, 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(command), next_pa | 1u);
+}
+
+ZLB_TEST(cmep_mailbox_endpoints_ack_only_selected_bits) {
+    Fixture f;
+    auto arm = std::make_unique<Bus>();
+    f.cmep.install_arm_mailbox(*arm);
+
+    // Scheduler mailboxes1..3 use the same directional set/clear contract.
+    // A receiver ACK must leave separately pending notifications intact.
+    for (u32 i = 0; i < 4u; ++i) {
+        const u32 incoming_arm = 0xE0000000u + i * 4u;
+        const u32 incoming_cmep = 0xE0000010u + i * 4u;
+        f.bus.write32(incoming_arm, 0x101u);
+        f.bus.write32(incoming_arm, 0x10000u);
+        arm->write32(incoming_arm, 0x101u);
+        ZLB_EXPECT_EQ(arm->read32(incoming_arm), 0x10000u);
+        arm->write32(incoming_arm, 0x10000u);
+        ZLB_EXPECT_EQ(f.bus.read32(incoming_arm), 0u);
+
+        arm->write32(incoming_cmep, 0xA5000101u);
+        f.bus.write32(incoming_cmep, 0x101u);
+        ZLB_EXPECT_EQ(arm->read32(incoming_cmep), 0xA5000000u);
+        f.bus.write32(incoming_cmep, 0xFFFFFFFFu);
+        ZLB_EXPECT_EQ(arm->read32(incoming_cmep), 0u);
+    }
+
+    // Byte ACKs clear their own lane, preserving both adjacent bytes and bits
+    // not included in the mask. Both buses still read the same register word.
+    f.bus.write32(0xE0000000u, 0xA5C30007u);
+    arm->write8(0xE0000002u, 0xC1u);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000000u), 0xA5020007u);
+    ZLB_EXPECT_EQ(f.bus.read8(0xE0000002u), 2u);
+
+    // Boot-ROM stand-in setters explicitly assign values, rather than adopting
+    // a guest endpoint's set/clear behavior.
+    f.cmep.set_cmep_status(1u);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000000u), 1u);
+    f.cmep.set_arm_to_cmep_command(0x40378001u);
+    f.cmep.set_arm_to_cmep_command(1u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0000010u), 1u);
+    f.bus.reset();
+    ZLB_EXPECT_EQ(arm->read32(0xE0000000u), 0u);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000010u), 0u);
+}
+
+ZLB_TEST(cmep_mailbox_doorbell_and_status_irq_levels) {
+    Fixture f;
+    auto arm = std::make_unique<Bus>();
+    f.cmep.install_arm_mailbox(*arm);
+    std::array<bool, 4> to_cmep{};
+    std::array<bool, 4> to_arm{};
+    unsigned cmep_edges = 0;
+    f.cmep.set_mailbox_irq_callbacks(
+        [&](unsigned channel, bool asserted) {
+            to_cmep[channel] = asserted;
+            ++cmep_edges;
+        },
+        [&](unsigned channel, bool asserted) { to_arm[channel] = asserted; });
+
+    // Native Smsched submits PA first, then bit 0. Only the completed request
+    // may interrupt CMeP; clearing the doorbell drops the level even while the
+    // address bits remain readable until the consumer finishes its ACK.
+    const unsigned initial_edges = cmep_edges;
+    arm->write32(0xE0000010u, 0x401402C0u);
+    ZLB_EXPECT_FALSE(to_cmep[0]);
+    ZLB_EXPECT_EQ(cmep_edges, initial_edges);
+    arm->write32(0xE0000010u, 1u);
+    ZLB_EXPECT_TRUE(to_cmep[0]);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0000010u), 0x401402C1u);
+    f.bus.write32(0xE0000010u, 1u);
+    ZLB_EXPECT_FALSE(to_cmep[0]);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000010u), 0x401402C0u);
+    f.bus.write32(0xE0000010u, 0xFFFFFFFFu);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000010u), 0u);
+
+    // The subsequent genuine RVK command asserts the same interrupt without
+    // a fabricated response. Its consumer ACK clears the pending request.
+    arm->write32(0xE0000010u, 0x80A01u);
+    ZLB_EXPECT_TRUE(to_cmep[0]);
+    f.bus.write32(0xE0000010u, 0xFFFFFFFFu);
+    ZLB_EXPECT_FALSE(to_cmep[0]);
+
+    // ARM status has pending notifications above bit 0 too. A partial ACK
+    // leaves the line asserted until every remaining pending bit is consumed.
+    f.bus.write32(0xE0000000u, 0x101u);
+    ZLB_EXPECT_TRUE(to_arm[0]);
+    arm->write32(0xE0000000u, 1u);
+    ZLB_EXPECT_TRUE(to_arm[0]);
+    ZLB_EXPECT_EQ(arm->read32(0xE0000000u), 0x100u);
+    arm->write32(0xE0000000u, 0x100u);
+    ZLB_EXPECT_FALSE(to_arm[0]);
+    f.bus.write32(0xE0000000u, 0x10000u);
+    ZLB_EXPECT_TRUE(to_arm[0]);
+    arm->write32(0xE0000000u, 0x10000u);
+    ZLB_EXPECT_FALSE(to_arm[0]);
+}
+
+ZLB_TEST(cmep_mailbox_clear_aliases_and_irq_lifecycle) {
+    Fixture f;
+    auto arm = std::make_unique<Bus>();
+    f.cmep.install_arm_mailbox(*arm);
+    std::array<bool, 4> to_cmep{};
+    std::array<bool, 4> to_arm{};
+
+    // Installing the CPU wiring after a pending request must publish its
+    // current levels, including host-assigned boot-ROM handshake values.
+    f.cmep.set_arm_to_cmep_command(1u);
+    f.cmep.set_cmep_status(0x101u);
+    f.cmep.set_mailbox_irq_callbacks(
+        [&](unsigned channel, bool asserted) { to_cmep[channel] = asserted; },
+        [&](unsigned channel, bool asserted) { to_arm[channel] = asserted; });
+    ZLB_EXPECT_TRUE(to_cmep[0]);
+    ZLB_EXPECT_TRUE(to_arm[0]);
+    f.cmep.set_arm_to_cmep_command(0u);
+    f.cmep.set_cmep_status(0u);
+    ZLB_EXPECT_FALSE(to_cmep[0]);
+    ZLB_EXPECT_FALSE(to_arm[0]);
+
+    // Producers cancel their own outstanding word through the +0x40 W1C
+    // alias: CMeP uses +0x44/48/4C, ARM uses +0x54/58/5C. Every channel must
+    // share its data and pending interrupt state across the two bus endpoints.
+    for (unsigned channel = 0; channel < 4u; ++channel) {
+        const u32 status = 0xE0000000u + channel * 4u;
+        const u32 command = 0xE0000010u + channel * 4u;
+        f.bus.write32(status, 0x10000u);
+        arm->write32(command, 0x80A01u);
+        ZLB_EXPECT_TRUE(to_arm[channel]);
+        ZLB_EXPECT_TRUE(to_cmep[channel]);
+        f.bus.write32(status + 0x40u, 0xFFFFFFFFu);
+        arm->write32(command + 0x40u, 0xFFFFFFFFu);
+        ZLB_EXPECT_EQ(arm->read32(status), 0u);
+        ZLB_EXPECT_EQ(f.bus.read32(command), 0u);
+        ZLB_EXPECT_FALSE(to_arm[channel]);
+        ZLB_EXPECT_FALSE(to_cmep[channel]);
+    }
+
+    // Clear aliases acknowledge selected bits and byte lanes from either
+    // endpoint. Cancelling one notification preserves the other pending bit.
+    f.bus.write32(0xE0000008u, 0xA5C30007u);
+    arm->write8(0xE000004Au, 0xC1u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0000008u), 0xA5020007u);
+    ZLB_EXPECT_TRUE(to_arm[2]);
+    f.bus.write32(0xE0000048u, 0xFFFFFFFFu);
+    ZLB_EXPECT_FALSE(to_arm[2]);
+
+    // Bus reset clears the observable words and every asserted direction,
+    // while retaining the installed callbacks for a later cold boot.
+    for (unsigned channel = 0; channel < 4u; ++channel) {
+        f.bus.write32(0xE0000000u + channel * 4u, 0x101u);
+        arm->write32(0xE0000010u + channel * 4u, 1u);
+    }
+    f.bus.reset();
+    for (unsigned channel = 0; channel < 4u; ++channel) {
+        ZLB_EXPECT_FALSE(to_arm[channel]);
+        ZLB_EXPECT_FALSE(to_cmep[channel]);
+        ZLB_EXPECT_EQ(arm->read32(0xE0000000u + channel * 4u), 0u);
+        ZLB_EXPECT_EQ(f.bus.read32(0xE0000010u + channel * 4u), 0u);
+    }
+    arm->write32(0xE0000010u, 1u);
+    ZLB_EXPECT_TRUE(to_cmep[0]);
+}
+
 // ---------------------------------------------------------------------------
 // GPIO (0xE20A0000) - mailbox_debug_sc (0x5E4E4)
 // ---------------------------------------------------------------------------
 
-ZLB_TEST(cmep_gpio_handshake) {
+ZLB_TEST(cmep_gpio_default_has_no_jig_peer_and_separates_direction_from_output) {
     Fixture f;
     f.cmep.reset();
-    f.bus.write32(0xE20A0000, 8);  // 0x5E4FA
-    const u32 first = f.bus.read32(0xE20A0004);
-    ZLB_EXPECT_TRUE((first & 0x10u) != 0);  // 0x5E4FC expects bit 4 set
-    const u32 second = f.bus.read32(0xE20A0004);
-    ZLB_EXPECT_TRUE((second & 0x10u) == 0);  // 0x5E560 waits for it to clear
-    f.bus.write32(0xE20A0008, 8);            // GPIO set (0x5E558)
-    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0000) & 8u, 8u);
-    f.bus.write32(0xE20A000C, 8);  // GPIO clear (0x5E5BA)
-    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0000) & 8u, 0u);
+    f.bus.write32(0xE20A0000, 8);  // genuine mailbox_debug_sc direction setup
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0004) & 0x10u, 0u); // absent peer, native no-JIG path
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0004) & 0x10u, 0u); // reads never consume a line
+    f.bus.write32(0xE20A0008, 8);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0034) & 8u, 8u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0000), 8u);
+    f.bus.write32(0xE20A000C, 8);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0034) & 8u, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE20A0000), 8u);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +746,713 @@ ZLB_TEST(bigmac_aes_cbc_through_registers) {
     std::vector<u8> decoded(32);
     f.bus.read_bytes(0x41000, decoded.data(), decoded.size());
     for (size_t i = 0; i < plain.size(); ++i) ZLB_EXPECT_EQ(decoded[i], plain[i]);
+}
+
+ZLB_TEST(bigmac_native_dma_copies_arm_ram_to_private_ram) {
+    Fixture f;
+    // 0x80287C -> 0x8055D6 reads the first 48 bytes of the staged RVK image
+    // into the native secure-kernel header buffer through function zero.
+    std::array<u8, 48> source{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<u8>(i * 7u + 3u);
+    f.bus.load(0x40008F00u, source.data(), source.size(), "native_dma_source");
+    f.bus.memset_bytes(0x808FEFu, 0xA5u, source.size() + 2u);
+    issue_native_bigmac(f, 0x40008F00u, 0x808FF0u, source.size(), 0u);
+    std::array<u8, 48> copied{};
+    f.bus.read_bytes(0x808FF0u, copied.data(), copied.size());
+    ZLB_EXPECT_EQ(std::memcmp(copied.data(), source.data(), source.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(0x808FEFu), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x809020u), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005001Cu), 0u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_operations(), 1u);
+}
+
+ZLB_TEST(bigmac_native_zero_fill_executes_genuine_module_wipe_wrapper) {
+    Fixture f;
+    const auto image = read_file(resolve_workspace_path(
+        "Vita_104_Firmware/Out/SLB2_dec/secure_kernel.bin"));
+    ZLB_EXPECT_TRUE(image.has_value());
+    if (!image) return;
+    ZLB_EXPECT_TRUE(f.bus.load(cmep::kPrivateBase, image->data(), image->size(),
+                               "native_secure_kernel"));
+    auto* low = f.bus.region_at(cmep::kRamBase, cmep::kRamSize);
+    auto* priv = f.bus.region_at(cmep::kPrivateBase);
+    ZLB_EXPECT_TRUE(low != nullptr && priv != nullptr);
+    if (!low || !priv) return;
+    low->external = priv->bytes();
+    f.bus.rebuild_map();
+
+    // Execute the unchanged 0x8055A0 wrapper with the live module-cleanup
+    // arguments. Its source=0 is not a boot-SRAM offset. With the real SRAM
+    // alias, the old AES interpretation destroys code and its return stack.
+    constexpr u32 destination = 0x80A000u;
+    constexpr u32 length = 0x16000u;
+    constexpr u32 returned = 0x808000u;
+    f.bus.memset_bytes(destination - 1u, 0xA5u, length + 2u);
+    std::array<u8, 32> stale_key{};
+    stale_key.fill(0x5Au);
+    stage_bigmac_key(f, stale_key.data(), stale_key.size());
+    f.bus.write32(0xE0050014u, 0xFFFFFFF0u);  // stale, unmapped IV is ignored
+    MePCore cpu(f.bus);
+    cpu.reset(0x8055A0u);
+    cpu.psw = 0;
+    cpu.r[1] = destination;
+    cpu.r[2] = 0;
+    cpu.r[3] = length;
+    cpu.r[4] = 0;
+    cpu.r[15] = 0x808F80u;
+    cpu.lp = returned;
+    for (unsigned i = 0; i < 300 && cpu.get_pc() != returned; ++i) {
+        const auto step = cpu.step();
+        ZLB_EXPECT_FALSE(step.faulted);
+        if (step.faulted) break;
+    }
+    ZLB_EXPECT_EQ(cpu.get_pc(), returned);
+    ZLB_EXPECT_EQ(cpu.r[0], 0u);
+    ZLB_EXPECT_EQ(cpu.r[15], 0x808F80u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050000u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050004u), destination);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050008u), length);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005000Cu), 0xCu);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050034u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_operations(), 1u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_op(), BigmacOp::None);
+    std::vector<u8> kernel(image->size());
+    f.bus.read_bytes(cmep::kPrivateBase, kernel.data(), kernel.size());
+    ZLB_EXPECT_EQ(std::memcmp(kernel.data(), image->data(), kernel.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(cmep::kRamBase), f.bus.read32(cmep::kPrivateBase));
+    std::vector<u8> arena(length);
+    f.bus.read_bytes(destination, arena.data(), arena.size());
+    ZLB_EXPECT_TRUE(arena == std::vector<u8>(length, 0));
+    ZLB_EXPECT_EQ(f.bus.read8(destination - 1u), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(destination + length), 0xA5u);
+}
+
+ZLB_TEST(bigmac_native_zero_fill_byte_ranges_and_errors) {
+    Fixture f;
+    // An odd byte count crossing a page must clear exactly the requested
+    // bytes; neither AES alignment nor source/IV mapping applies to a fill.
+    constexpr u32 destination = 0x50FF3u;
+    constexpr u32 length = 37u;
+    f.bus.memset_bytes(destination - 1u, 0xA5u, length + 2u);
+    f.bus.write32(0xE0050034u, 0u);
+    issue_native_bigmac(f, 0u, destination, length, 0xCu, 0xFFFFFFF0u);
+    std::array<u8, length> cleared{};
+    std::array<u8, length> result{};
+    f.bus.read_bytes(destination, result.data(), result.size());
+    ZLB_EXPECT_EQ(std::memcmp(result.data(), cleared.data(), result.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(destination - 1u), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(destination + length), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+
+    f.bus.add_ram("native_fill_destination", 16u, 0x10000000u, "partial fill range");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    issue_native_bigmac(f, 0u, 0x10000000u, 32u, 0xCu);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0x10000000u), 0xA5A5A5A5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0x1000000Cu), 0xA5A5A5A5u);
+    issue_native_bigmac(f, 0u, 0xFFFFFFF0u, 32u, 0xCu);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    issue_native_bigmac(f, 0u, 0x100u, 16u, 0xCu);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+
+    // No verified nonzero pattern protocol is claimed; reject before writing.
+    f.bus.memset_bytes(destination, 0xA5u, length);
+    f.bus.write32(0xE0050034u, 0x12345678u);
+    issue_native_bigmac(f, 0u, destination, length, 0xCu);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(destination), 0xA5A5A5A5u);
+    f.bus.write32(0xE0050034u, 0u);
+    issue_native_bigmac(f, 0u, 0x100u, 0u, 0xCu);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+}
+
+ZLB_TEST(bigmac_native_dma_rejects_unmapped_and_wrapping_ranges) {
+    Fixture f;
+    const std::array<u8, 32> source{};
+    const std::array<u8, 16> destination = {0xA5u};
+    f.bus.load(0x50000u, source.data(), source.size(), "native_dma_source");
+    f.bus.add_ram("native_dma_destination", 16u, 0x10000000u, "partial DMA range");
+    f.bus.load(0x10000000u, destination.data(), destination.size(), "native_dma_destination");
+    // The mapped prefix must remain intact when the remainder is unmapped.
+    issue_native_bigmac(f, 0x50000u, 0x10000000u, 32u, 0u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    std::array<u8, 16> unchanged{};
+    f.bus.read_bytes(0x10000000u, unchanged.data(), unchanged.size());
+    ZLB_EXPECT_EQ(std::memcmp(unchanged.data(), destination.data(), unchanged.size()), 0);
+    issue_native_bigmac(f, 0x100u, 0x50000u, 16u, 0u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    // Native addresses are absolute: low unmapped addresses must not be
+    // redirected into the legacy boot SRAM staging buffer.
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    issue_native_bigmac(f, 0xFFFFFFF0u, 0x50000u, 32u, 0u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+}
+
+ZLB_TEST(bigmac_native_aes256_cbc_register_protocol) {
+    Fixture f;
+    // NIST SP 800-38A F.2.6: independent AES-256-CBC known-answer bytes.
+    // This verifies all 32 key bytes, a separate IV, CBC chaining, and the
+    // native source/destination layout rather than the old in-place protocol.
+    const u8 key[32] = {
+        0x60, 0x3D, 0xEB, 0x10, 0x15, 0xCA, 0x71, 0xBE,
+        0x2B, 0x73, 0xAE, 0xF0, 0x85, 0x7D, 0x77, 0x81,
+        0x1F, 0x35, 0x2C, 0x07, 0x3B, 0x61, 0x08, 0xD7,
+        0x2D, 0x98, 0x10, 0xA3, 0x09, 0x14, 0xDF, 0xF4};
+    const u8 iv[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+    const u8 cipher[32] = {
+        0xF5, 0x8C, 0x4C, 0x04, 0xD6, 0xE5, 0xF1, 0xBA,
+        0x77, 0x9E, 0xAB, 0xFB, 0x5F, 0x7B, 0xFB, 0xD6,
+        0x9C, 0xFC, 0x4E, 0x96, 0x7E, 0xDB, 0x80, 0x8D,
+        0x67, 0x9F, 0x77, 0x7B, 0xC6, 0x70, 0x2C, 0x7D};
+    const u8 plain[32] = {
+        0x6B, 0xC1, 0xBE, 0xE2, 0x2E, 0x40, 0x9F, 0x96,
+        0xE9, 0x3D, 0x7E, 0x11, 0x73, 0x93, 0x17, 0x2A,
+        0xAE, 0x2D, 0x8A, 0x57, 0x1E, 0x03, 0xAC, 0x9C,
+        0x9E, 0xB7, 0x6F, 0xAC, 0x45, 0xAF, 0x8E, 0x51};
+    f.bus.load(0x40008F00u, cipher, sizeof(cipher), "native_aes_source");
+    f.bus.load(0x806000u, iv, sizeof(iv), "native_aes_iv");
+    stage_bigmac_key(f, key, sizeof(key));
+    issue_native_bigmac(f, 0x40008F00u, 0x808FF0u, sizeof(cipher), 0x238Au, 0x806000u);
+    u8 decoded[32];
+    f.bus.read_bytes(0x808FF0u, decoded, sizeof(decoded));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, plain, sizeof(plain)), 0);
+    u8 retained_cipher[32];
+    f.bus.read_bytes(0x40008F00u, retained_cipher, sizeof(retained_cipher));
+    ZLB_EXPECT_EQ(std::memcmp(retained_cipher, cipher, sizeof(cipher)), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_key_bits(), 256u);
+    ZLB_EXPECT_EQ(std::memcmp(f.cmep.bigmac_device().last_key().data(), key, sizeof(key)), 0);
+    ZLB_EXPECT_EQ(std::memcmp(f.cmep.bigmac_device().last_iv().data(), iv, sizeof(iv)), 0);
+    // The next native decrypt may be in-place, using the same staged key.
+    issue_native_bigmac(f, 0x40008F00u, 0x40008F00u, sizeof(cipher), 0x238Au, 0x806000u);
+    f.bus.read_bytes(0x40008F00u, decoded, sizeof(decoded));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, plain, sizeof(plain)), 0);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().aes_operations(), 2u);
+}
+
+ZLB_TEST(bigmac_native_aes256_cbc_accepts_zero_window_key) {
+    Fixture f;
+    // AES-256 with an all-zero key/IV encrypts one zero block to these fixed
+    // bytes. Bit 7 selects a valid window key even when every key word is zero.
+    const u8 cipher[16] = {0xDC, 0x95, 0xC0, 0x78, 0xA2, 0x40, 0x89, 0x89,
+                           0xAD, 0x48, 0xA2, 0x14, 0x92, 0x84, 0x20, 0x87};
+    const u8 zero_iv[16] = {};
+    f.bus.load(0x50000u, cipher, sizeof(cipher), "native_zero_key_cipher");
+    f.bus.load(0x50100u, zero_iv, sizeof(zero_iv), "native_zero_key_iv");
+    issue_native_bigmac(f, 0x50000u, 0x50000u, sizeof(cipher), 0x238Au, 0x50100u);
+    for (u32 i = 0; i < 16u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x50000u + i), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_aes128_cbc_register_protocol) {
+    Fixture f;
+    // NIST SP 800-38A F.2.2. Native RVK function 0x218A uses only the first
+    // 16 window bytes, even if a prior AES-256 operation left a nonzero tail.
+    const u8 key_window[32] = {
+        0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+        0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C,
+        0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5,
+        0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5};
+    const u8 iv[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+    const u8 cipher[32] = {
+        0x76, 0x49, 0xAB, 0xAC, 0x81, 0x19, 0xB2, 0x46,
+        0xCE, 0xE9, 0x8E, 0x9B, 0x12, 0xE9, 0x19, 0x7D,
+        0x50, 0x86, 0xCB, 0x9B, 0x50, 0x72, 0x19, 0xEE,
+        0x95, 0xDB, 0x11, 0x3A, 0x91, 0x76, 0x78, 0xB2};
+    const u8 plain[32] = {
+        0x6B, 0xC1, 0xBE, 0xE2, 0x2E, 0x40, 0x9F, 0x96,
+        0xE9, 0x3D, 0x7E, 0x11, 0x73, 0x93, 0x17, 0x2A,
+        0xAE, 0x2D, 0x8A, 0x57, 0x1E, 0x03, 0xAC, 0x9C,
+        0x9E, 0xB7, 0x6F, 0xAC, 0x45, 0xAF, 0x8E, 0x51};
+    f.bus.load(0x809060u, cipher, sizeof(cipher), "native_aes128_source");
+    f.bus.load(0x806000u, iv, sizeof(iv), "native_aes128_iv");
+    stage_bigmac_key(f, key_window, sizeof(key_window));
+    issue_native_bigmac(f, 0x809060u, 0x809060u, sizeof(cipher), 0x218Au, 0x806000u);
+    u8 decoded[32];
+    f.bus.read_bytes(0x809060u, decoded, sizeof(decoded));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, plain, sizeof(plain)), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_key_bits(), 128u);
+    ZLB_EXPECT_EQ(std::memcmp(f.cmep.bigmac_device().last_key().data(), key_window, 16u), 0);
+    ZLB_EXPECT_EQ(std::memcmp(f.cmep.bigmac_device().last_iv().data(), iv, sizeof(iv)), 0);
+    // Malformed input must error instead of reaching the old 0x20xx fallback.
+    issue_native_bigmac(f, 0x809060u, 0x809060u, 31u, 0x218Au, 0x806000u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+}
+
+ZLB_TEST(bigmac_native_aes256_cbc_rejects_bad_inputs) {
+    Fixture f;
+    const u8 cipher[32] = {};
+    const u8 iv[16] = {};
+    f.bus.load(0x50000u, cipher, sizeof(cipher), "native_aes_invalid_source");
+    f.bus.load(0x50100u, iv, sizeof(iv), "native_aes_invalid_iv");
+    issue_native_bigmac(f, 0x50000u, 0x50000u, 31u, 0x238Au, 0x50100u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    issue_native_bigmac(f, 0x50000u, 0x50000u, 32u, 0x238Au, 0x100u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    issue_native_bigmac(f, 0x10000000u, 0x50000u, 32u, 0x238Au, 0x50100u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    const u8 prefix[16] = {0xA5u};
+    f.bus.add_ram("native_aes_invalid_destination", 16u, 0x10000000u, "partial AES range");
+    f.bus.load(0x10000000u, prefix, sizeof(prefix), "native_aes_invalid_destination");
+    issue_native_bigmac(f, 0x50000u, 0x10000000u, 32u, 0x238Au, 0x50100u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    u8 unchanged[16];
+    f.bus.read_bytes(0x10000000u, unchanged, sizeof(unchanged));
+    ZLB_EXPECT_EQ(std::memcmp(unchanged, prefix, sizeof(prefix)), 0);
+    // An error must not poison the next valid request.
+    issue_native_bigmac(f, 0x50000u, 0x50000u, 32u, 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+}
+
+ZLB_TEST(bigmac_native_aes128_ctr_register_protocol) {
+    Fixture f;
+    // NIST SP 800-38A F.5.1/F.5.2, with the native wrapper's full 16-byte
+    // IV reversal. The poisoned window tail must not become AES-256 material.
+    const u8 key_window[32] = {
+        0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+        0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C,
+        0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5,
+        0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5};
+    const u8 hardware_iv[16] = {
+        0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8,
+        0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0xF2, 0xF1, 0xF0};
+    const u8 after_four[16] = {
+        0x03, 0xFF, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8,
+        0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0xF2, 0xF1, 0xF0};
+    const u8 cipher[64] = {
+        0x87, 0x4D, 0x61, 0x91, 0xB6, 0x20, 0xE3, 0x26, 0x1B, 0xEF, 0x68, 0x64, 0x99, 0x0D, 0xB6, 0xCE,
+        0x98, 0x06, 0xF6, 0x6B, 0x79, 0x70, 0xFD, 0xFF, 0x86, 0x17, 0x18, 0x7B, 0xB9, 0xFF, 0xFD, 0xFF,
+        0x5A, 0xE4, 0xDF, 0x3E, 0xDB, 0xD5, 0xD3, 0x5E, 0x5B, 0x4F, 0x09, 0x02, 0x0D, 0xB0, 0x3E, 0xAB,
+        0x1E, 0x03, 0x1D, 0xDA, 0x2F, 0xBE, 0x03, 0xD1, 0x79, 0x21, 0x70, 0xA0, 0xF3, 0x00, 0x9C, 0xEE};
+    const u8 plain[64] = {
+        0x6B, 0xC1, 0xBE, 0xE2, 0x2E, 0x40, 0x9F, 0x96, 0xE9, 0x3D, 0x7E, 0x11, 0x73, 0x93, 0x17, 0x2A,
+        0xAE, 0x2D, 0x8A, 0x57, 0x1E, 0x03, 0xAC, 0x9C, 0x9E, 0xB7, 0x6F, 0xAC, 0x45, 0xAF, 0x8E, 0x51,
+        0x30, 0xC8, 0x1C, 0x46, 0xA3, 0x5C, 0xE4, 0x11, 0xE5, 0xFB, 0xC1, 0x19, 0x1A, 0x0A, 0x52, 0xEF,
+        0xF6, 0x9F, 0x24, 0x45, 0xDF, 0x4F, 0x9B, 0x17, 0xAD, 0x2B, 0x41, 0x7B, 0xE6, 0x6C, 0x37, 0x10};
+    stage_bigmac_key(f, key_window, sizeof(key_window));
+    f.bus.load(0x50000u, cipher, sizeof(cipher), "native_ctr_source");
+    f.bus.load(0x50100u, hardware_iv, sizeof(hardware_iv), "native_ctr_iv");
+    f.bus.memset_bytes(0x502FFu, 0xA5u, 66u);
+    issue_native_bigmac(f, 0x50000u, 0x50300u, sizeof(cipher), 0x21A1u, 0x50100u);
+    u8 decoded[64], updated[16];
+    f.bus.read_bytes(0x50300u, decoded, sizeof(decoded));
+    f.bus.read_bytes(0x50100u, updated, sizeof(updated));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, plain, sizeof(plain)), 0);
+    ZLB_EXPECT_EQ(std::memcmp(updated, after_four, sizeof(updated)), 0);
+    ZLB_EXPECT_EQ(std::memcmp(f.cmep.bigmac_device().last_iv().data(), hardware_iv, 16u), 0);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_key_bits(), 128u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x502FFu), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x50340u), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005001Cu), 0u);
+    for (size_t i = 0; i < sizeof(cipher); ++i) ZLB_EXPECT_EQ(f.bus.read8(0x50000u + i), cipher[i]);
+    // In-place encryption must be symmetric, and consume the same counter.
+    f.bus.write_bytes(0x50100u, hardware_iv, sizeof(hardware_iv));
+    issue_native_bigmac(f, 0x50300u, 0x50300u, sizeof(plain), 0x21A1u, 0x50100u);
+    f.bus.read_bytes(0x50300u, decoded, sizeof(decoded));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, cipher, sizeof(cipher)), 0);
+    // Two calls continue through the hardware-updated IV, as native streams do.
+    f.bus.write_bytes(0x50100u, hardware_iv, sizeof(hardware_iv));
+    issue_native_bigmac(f, 0x50000u, 0x50300u, 16u, 0x21A1u, 0x50100u);
+    issue_native_bigmac(f, 0x50010u, 0x50310u, 48u, 0x21A1u, 0x50100u);
+    f.bus.read_bytes(0x50300u, decoded, sizeof(decoded));
+    f.bus.read_bytes(0x50100u, updated, sizeof(updated));
+    ZLB_EXPECT_EQ(std::memcmp(decoded, plain, sizeof(plain)), 0);
+    ZLB_EXPECT_EQ(std::memcmp(updated, after_four, sizeof(updated)), 0);
+}
+
+ZLB_TEST(bigmac_native_aes128_ctr_zero_key_counter_wrap) {
+    Fixture f;
+    // Independent OpenSSL AES-128-CTR answer, zero key/plaintext and initial
+    // counter 2^128-1. The second block uses counter zero, then writes back 1.
+    const u8 expected[32] = {
+        0x3F, 0x5B, 0x8C, 0xC9, 0xEA, 0x85, 0x5A, 0x0A, 0xFA, 0x73, 0x47, 0xD2, 0x3E, 0x8D, 0x66, 0x4E,
+        0x66, 0xE9, 0x4B, 0xD4, 0xEF, 0x8A, 0x2C, 0x3B, 0x88, 0x4C, 0xFA, 0x59, 0xCA, 0x34, 0x2B, 0x2E};
+    f.bus.memset_bytes(0x50000u, 0u, 32u);
+    f.bus.memset_bytes(0x50100u, 0xFFu, 16u);
+    issue_native_bigmac(f, 0x50000u, 0x50000u, 32u, 0x21A1u, 0x50100u);
+    u8 result[32];
+    f.bus.read_bytes(0x50000u, result, sizeof(result));
+    ZLB_EXPECT_EQ(std::memcmp(result, expected, sizeof(expected)), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(0x50100u), 1u);
+    for (u32 i = 1; i < 16; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x50100u + i), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    // A zero-length aligned request consumes no counter blocks.
+    issue_native_bigmac(f, 0x100u, 0x100u, 0u, 0x21A1u, 0x50100u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x50100u), 1u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_aes128_ctr_rejects_bad_ranges_without_writeback) {
+    Fixture f;
+    f.bus.memset_bytes(0x50000u, 0u, 32u);
+    f.bus.memset_bytes(0x50100u, 0xFFu, 16u);
+    f.bus.memset_bytes(0x50200u, 0xA5u, 32u);
+    f.bus.add_ram("native_ctr_partial_destination", 16u, 0x10000000u, "partial CTR output");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    const u32 requests[][4] = {
+        {0x50000u, 0x50200u, 31u, 0x50100u},
+        {0x100u, 0x50200u, 32u, 0x50100u},
+        {0xFFFFFFF0u, 0x50200u, 32u, 0x50100u},
+        {0x50000u, 0x10000000u, 32u, 0x50100u},
+        {0x50000u, 0xFFFFFFF0u, 32u, 0x50100u},
+        {0x50000u, 0x50200u, 32u, 0x100u},
+        {0x50000u, 0x50200u, 32u, 0xFFFFFFF8u}};
+    for (const auto& request : requests) {
+        issue_native_bigmac(f, request[0], request[1], request[2], 0x21A1u, request[3]);
+        ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+        ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+        for (u32 i = 0; i < 16u; ++i) {
+            ZLB_EXPECT_EQ(f.bus.read8(0x50100u + i), 0xFFu);
+            ZLB_EXPECT_EQ(f.bus.read8(0x10000000u + i), 0xA5u);
+        }
+        for (u32 i = 0; i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x50200u + i), 0xA5u);
+    }
+    issue_native_bigmac(f, 0x50000u, 0x50200u, 32u, 0x21A1u, 0x50100u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x50100u), 1u);
+}
+
+ZLB_TEST(bigmac_native_sha256_register_protocol) {
+    Fixture f;
+    // FIPS 180-4 SHA-256 examples, passed through the native 0x806110 layout.
+    // Fixed expected bytes verify the device's digest and byte order without
+    // using the SHA helper under test to generate the expected answer.
+    const u8 abc[3] = {'a', 'b', 'c'};
+    const u8 abc_digest[32] = {
+        0xBA, 0x78, 0x16, 0xBF, 0x8F, 0x01, 0xCF, 0xEA,
+        0x41, 0x41, 0x40, 0xDE, 0x5D, 0xAE, 0x22, 0x23,
+        0xB0, 0x03, 0x61, 0xA3, 0x96, 0x17, 0x7A, 0x9C,
+        0xB4, 0x10, 0xFF, 0x61, 0xF2, 0x00, 0x15, 0xAD};
+    const char two_block_message[] = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    const u8 two_block_digest[32] = {
+        0x24, 0x8D, 0x6A, 0x61, 0xD2, 0x06, 0x38, 0xB8,
+        0xE5, 0xC0, 0x26, 0x93, 0x0C, 0x3E, 0x60, 0x39,
+        0xA3, 0x3C, 0xE4, 0x59, 0x64, 0xFF, 0x21, 0x67,
+        0xF6, 0xEC, 0xED, 0xD4, 0x19, 0xDB, 0x06, 0xC1};
+    f.bus.load(0x808FF0u, abc, sizeof(abc), "native_sha_source");
+    f.bus.memset_bytes(0x808C7Bu, 0xA5u, 34u);
+    // The native caller can leave a nonzero key selector from prior crypto.
+    // It must still write the entire 32-byte digest, with no output truncation.
+    f.bus.write32(0xE0050010u, 0x216u);
+    issue_native_bigmac(f, 0x808FF0u, 0x808C7Cu, sizeof(abc), 0x2093u);
+    u8 digest[32];
+    f.bus.read_bytes(0x808C7Cu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, abc_digest, sizeof(digest)), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(0x808C7Bu), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x808C9Cu), 0xA5u);
+    for (size_t i = 0; i < sizeof(abc); ++i) ZLB_EXPECT_EQ(f.bus.read8(0x808FF0u + i), abc[i]);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005001Cu), 0u);
+
+    // 56 input bytes require two final compression blocks after SHA padding.
+    f.bus.load(0x808FF0u, reinterpret_cast<const u8*>(two_block_message),
+               sizeof(two_block_message) - 1u, "native_sha_padding_source");
+    issue_native_bigmac(f, 0x808FF0u, 0x808C7Cu, sizeof(two_block_message) - 1u, 0x2093u);
+    f.bus.read_bytes(0x808C7Cu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, two_block_digest, sizeof(digest)), 0);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().hash_operations(), 2u);
+}
+
+ZLB_TEST(bigmac_native_sha256_full_blocks_and_empty_message) {
+    Fixture f;
+    // Independent hashlib/OpenSSL answer for a 768-byte, 12-block source, the
+    // size used by the native RVK signature check. Each byte is (i*7+3)&255.
+    std::array<u8, 768> source{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<u8>(i * 7u + 3u);
+    const u8 expected[32] = {
+        0xAC, 0x31, 0x5A, 0x0B, 0xE0, 0x63, 0xFF, 0x33,
+        0x1C, 0x93, 0x91, 0x3F, 0x8B, 0x57, 0x30, 0x05,
+        0xD4, 0x8F, 0x9E, 0x62, 0xC0, 0x92, 0x26, 0xC0,
+        0x52, 0x7C, 0x96, 0x34, 0x9C, 0x2C, 0xA3, 0x4F};
+    const u8 empty_digest[32] = {
+        0xE3, 0xB0, 0xC4, 0x42, 0x98, 0xFC, 0x1C, 0x14,
+        0x9A, 0xFB, 0xF4, 0xC8, 0x99, 0x6F, 0xB9, 0x24,
+        0x27, 0xAE, 0x41, 0xE4, 0x64, 0x9B, 0x93, 0x4C,
+        0xA4, 0x95, 0x99, 0x1B, 0x78, 0x52, 0xB8, 0x55};
+    f.bus.load(0x808FF0u, source.data(), source.size(), "native_sha_blocks");
+    issue_native_bigmac(f, 0x808FF0u, 0x808C7Cu, source.size(), 0x2093u);
+    u8 digest[32];
+    f.bus.read_bytes(0x808C7Cu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, expected, sizeof(digest)), 0);
+    // Empty hashing does not dereference the source, even when unmapped.
+    issue_native_bigmac(f, 0x100u, 0x808C7Cu, 0u, 0x2093u);
+    f.bus.read_bytes(0x808C7Cu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, empty_digest, sizeof(digest)), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_sha256_rejects_invalid_ranges) {
+    Fixture f;
+    const u8 source[64] = {};
+    f.bus.load(0x50000u, source, sizeof(source), "native_sha_invalid_source");
+    f.bus.memset_bytes(0x808C7Cu, 0xA5u, 32u);
+    issue_native_bigmac(f, 0x100u, 0x808C7Cu, 16u, 0x2093u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    for (u32 i = 0; i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x808C7Cu + i), 0xA5u);
+    issue_native_bigmac(f, 0xFFFFFFF0u, 0x808C7Cu, 32u, 0x2093u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    f.bus.add_ram("native_sha_partial_destination", 16u, 0x10000000u, "partial digest range");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    issue_native_bigmac(f, 0x50000u, 0x10000000u, sizeof(source), 0x2093u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    for (u32 i = 0; i < 16u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x10000000u + i), 0xA5u);
+    issue_native_bigmac(f, 0x50000u, 0xFFFFFFF0u, sizeof(source), 0x2093u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    // A subsequent valid operation clears the hardware error indication.
+    issue_native_bigmac(f, 0x50000u, 0x808C7Cu, sizeof(source), 0x2093u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+}
+
+ZLB_TEST(bigmac_native_stream_hmac_matches_kprx_chunk_sizes) {
+    Fixture f;
+    std::array<u8, 64> key{};
+    for (size_t i = 0; i < key.size(); ++i) key[i] = static_cast<u8>(i);
+    std::vector<u8> source(28596u);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<u8>(i * 7u + 3u);
+    // Python hashlib/OpenSSL known answer; exactly the live kprx 28544+52 split.
+    const std::array<u8, 32> expected = {
+        0x25, 0xBF, 0x34, 0x9E, 0x49, 0xF1, 0x74, 0xD8, 0x42, 0x07, 0x25, 0xEB, 0x94, 0x29, 0x78, 0xDE,
+        0x25, 0xC4, 0xD4, 0x69, 0x8F, 0x6B, 0xDA, 0xD9, 0x95, 0x53, 0xDF, 0x94, 0xD8, 0xA3, 0x64, 0xD8};
+    f.bus.load(0x40001D00u, source.data(), source.size(), "native_stream_hmac_source");
+    f.bus.memset_bytes(0x808B40u, 0xA5u, 0xD4u);
+    stage_bigmac_key(f, key.data(), key.size());
+    issue_native_bigmac(f, 0x40001D00u, 0x808B6Cu, 28544u, 0x24B3u, 0x808B44u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    for (u32 i = 0; i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x808B6Cu + i), 0xA5u);
+    // The first chunk is already compressed; later mutation must not rehash it.
+    f.bus.memset_bytes(0x40001D00u, 0xFEu, 16u);
+    issue_native_bigmac(f, 0x40001D00u + 28544u, 0x808B6Cu, 52u, 0x28B3u, 0x808B44u);
+    std::array<u8, 32> digest{};
+    f.bus.read_bytes(0x808B6Cu, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected.data(), digest.size()), 0);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_key_bits(), 512u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    // Finalization retires the context instead of accepting a stale second tail.
+    issue_native_bigmac(f, 0x40001D00u + 28544u, 0x808B6Cu, 52u, 0x28B3u, 0x808B44u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    f.bus.write_bytes(0x40001D00u, source.data(), 16u);
+    issue_native_bigmac(f, 0x40001D00u, 0x808B6Cu, source.size(), 0x20B3u, 0x808B44u);
+    f.bus.read_bytes(0x808B6Cu, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected.data(), digest.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_stream_hmac_continuation_and_context_isolation) {
+    Fixture f;
+    std::array<u8, 64> key_a{}, key_b{};
+    for (size_t i = 0; i < key_a.size(); ++i) key_a[i] = static_cast<u8>(i);
+    key_b.fill(0xA5u);
+    std::array<u8, 193> source_a{};
+    std::array<u8, 129> source_b{};
+    for (size_t i = 0; i < source_a.size(); ++i) source_a[i] = static_cast<u8>(i * 13u + 5u);
+    for (size_t i = 0; i < source_b.size(); ++i) source_b[i] = static_cast<u8>(255u - i);
+    const std::array<u8, 32> expected_a = {
+        0x5A, 0x05, 0x4B, 0x0A, 0xE2, 0xDE, 0xD8, 0x68, 0x1A, 0x0B, 0x58, 0x8D, 0xB3, 0x8C, 0x0A, 0x5D,
+        0xAD, 0x9F, 0x80, 0x0E, 0xC8, 0x82, 0x5D, 0xF7, 0xCA, 0x11, 0xE1, 0xA4, 0x28, 0xDA, 0x08, 0x44};
+    const std::array<u8, 32> expected_b = {
+        0xA4, 0xB2, 0x26, 0xE0, 0x02, 0x7F, 0xC0, 0xE2, 0x82, 0x29, 0x7B, 0x6A, 0xA0, 0x1D, 0xA3, 0x08,
+        0x07, 0x87, 0x97, 0xF5, 0x6E, 0x20, 0x0E, 0xC1, 0xDE, 0xC7, 0x5E, 0xAF, 0xE5, 0x0F, 0x40, 0x68};
+    f.bus.load(0x50000u, source_a.data(), source_a.size(), "native_stream_hmac_a");
+    f.bus.load(0x51000u, source_b.data(), source_b.size(), "native_stream_hmac_b");
+    stage_bigmac_key(f, key_a.data(), key_a.size());
+    issue_native_bigmac(f, 0x50000u, 0x52100u, 64u, 0x24B3u, 0x52000u);
+    stage_bigmac_key(f, key_b.data(), key_b.size());
+    issue_native_bigmac(f, 0x51000u, 0x52300u, 128u, 0x24B3u, 0x52200u);
+    // A different staged key cannot accidentally continue the first context.
+    issue_native_bigmac(f, 0x50040u, 0x52100u, 64u, 0x2CB3u, 0x52000u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    stage_bigmac_key(f, key_a.data(), key_a.size());
+    issue_native_bigmac(f, 0x50040u, 0x52100u, 64u, 0x2CB3u, 0x52000u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    stage_bigmac_key(f, key_b.data(), key_b.size());
+    issue_native_bigmac(f, 0x51080u, 0x52300u, 1u, 0x28B3u, 0x52200u);
+    std::array<u8, 32> digest{};
+    f.bus.read_bytes(0x52300u, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected_b.data(), digest.size()), 0);
+    stage_bigmac_key(f, key_a.data(), key_a.size());
+    issue_native_bigmac(f, 0x50080u, 0x52100u, 65u, 0x28B3u, 0x52000u);
+    f.bus.read_bytes(0x52100u, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected_a.data(), digest.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_stream_hmac_errors_reset_and_reinitialization) {
+    Fixture f;
+    std::array<u8, 64> key{};
+    for (size_t i = 0; i < key.size(); ++i) key[i] = static_cast<u8>(i);
+    std::array<u8, 65> source{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<u8>(i * 13u + 5u);
+    const std::array<u8, 32> expected = {
+        0x22, 0xEE, 0xB9, 0x2A, 0xD1, 0xAB, 0x42, 0xDF, 0x31, 0x1C, 0x65, 0xE7, 0xFF, 0x03, 0x64, 0xDA,
+        0x4E, 0x60, 0xC7, 0x53, 0x26, 0x2A, 0x33, 0x44, 0xAA, 0x01, 0xEB, 0x78, 0x3C, 0x49, 0x22, 0xA4};
+    f.bus.load(0x50000u, source.data(), source.size(), "native_stream_hmac_errors");
+    f.bus.memset_bytes(0x50500u, 0xA5u, 32u);
+    f.bus.add_ram("native_stream_hmac_partial_destination", 16u, 0x10000000u, "partial HMAC digest");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    stage_bigmac_key(f, key.data(), key.size());
+    issue_native_bigmac(f, 0x50000u, 0x50500u, 64u, 0x24B3u, 0x50400u);
+    std::array<u8, 40> state{};
+    f.bus.read_bytes(0x50400u, state.data(), state.size());
+    const u32 requests[][5] = {
+        {0x50040u, 0x10000000u, 1u, 0x28B3u, 0x50400u},
+        {0x50000u, 0x50500u, 63u, 0x2CB3u, 0x50400u},
+        {0x100u, 0x50500u, 1u, 0x28B3u, 0x50400u},
+        {0x50040u, 0x50500u, 1u, 0x28B3u, 0x100u},
+        {0x50000u, 0x50500u, 64u, 0x24B3u, 0xFFFFFFF0u}};
+    for (const auto& request : requests) {
+        issue_native_bigmac(f, request[0], request[1], request[2], request[3], request[4]);
+        ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+        std::array<u8, 40> unchanged{};
+        f.bus.read_bytes(0x50400u, unchanged.data(), unchanged.size());
+        ZLB_EXPECT_EQ(std::memcmp(state.data(), unchanged.data(), state.size()), 0);
+        for (u32 i = 0; i < 32u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x50500u + i), 0xA5u);
+        for (u32 i = 0; i < 16u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x10000000u + i), 0xA5u);
+    }
+    // A relocated opaque state image cannot silently inherit another pointer's
+    // host context; this limit is explicit until hardware serialization is known.
+    f.bus.write_bytes(0x50600u, state.data(), state.size());
+    issue_native_bigmac(f, 0x50040u, 0x50500u, 1u, 0x28B3u, 0x50600u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    f.bus.write8(0x50400u, state[0] ^ 0xFFu);
+    issue_native_bigmac(f, 0x50040u, 0x50500u, 1u, 0x28B3u, 0x50400u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    f.bus.write_bytes(0x50400u, state.data(), state.size());
+    issue_native_bigmac(f, 0x50040u, 0x50500u, 1u, 0x28B3u, 0x50400u);
+    std::array<u8, 32> digest{};
+    f.bus.read_bytes(0x50500u, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected.data(), digest.size()), 0);
+    // A new first chunk reinitializes a reused pointer. Reset retires it.
+    issue_native_bigmac(f, 0x50000u, 0x50500u, 64u, 0x24B3u, 0x50400u);
+    f.cmep.reset();
+    stage_bigmac_key(f, key.data(), key.size());
+    issue_native_bigmac(f, 0x50040u, 0x50500u, 1u, 0x28B3u, 0x50400u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    issue_native_bigmac(f, 0x50000u, 0x50500u, 64u, 0x24B3u, 0x50400u);
+    issue_native_bigmac(f, 0x50040u, 0x50500u, 1u, 0x28B3u, 0x50400u);
+    f.bus.read_bytes(0x50500u, digest.data(), digest.size());
+    ZLB_EXPECT_EQ(std::memcmp(digest.data(), expected.data(), digest.size()), 0);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+}
+
+ZLB_TEST(bigmac_native_context_transfer_register_protocol) {
+    Fixture f;
+    // Native 0x806C78 retains the context's 0x2080 bits for a plain transfer.
+    // Its RVK caller reads the 32-byte section at image +0x400.
+    const u32 section[8] = {5u, 1u, 0u, 0x104u, 0x15u, 0u, 0u, 0u};
+    f.bus.load(0x40009300u, section, sizeof(section), "native_rvk_plain_section");
+    f.bus.memset_bytes(0x8093EFu, 0xA5u, sizeof(section) + 2u);
+    issue_native_bigmac(f, 0x40009300u, 0x8093F0u, sizeof(section), 0x2080u);
+    u32 copied[8];
+    f.bus.read_bytes(0x8093F0u, copied, sizeof(copied));
+    ZLB_EXPECT_EQ(std::memcmp(copied, section, sizeof(section)), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(0x8093EFu), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x809410u), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    // Reject the entire request without changing a mapped destination prefix.
+    f.bus.add_ram("native_context_partial_destination", 16u, 0x10000000u, "partial transfer");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    issue_native_bigmac(f, 0x40009300u, 0x10000000u, sizeof(section), 0x2080u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    for (u32 i = 0; i < 16u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x10000000u + i), 0xA5u);
+    issue_native_bigmac(f, 0xFFFFFFF0u, 0x8093F0u, sizeof(section), 0x2080u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+}
+
+ZLB_TEST(bigmac_native_hmac_sha256_register_protocol) {
+    Fixture f;
+    // RFC 4231 test case 1, staged as the native padded 64-byte key block.
+    std::array<u8, 64> key{};
+    for (size_t i = 0; i < 20u; ++i) key[i] = 0x0Bu;
+    const u8 message[8] = {'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e'};
+    const u8 expected[32] = {
+        0xB0, 0x34, 0x4C, 0x61, 0xD8, 0xDB, 0x38, 0x53,
+        0x5C, 0xA8, 0xAF, 0xCE, 0xAF, 0x0B, 0xF1, 0x2B,
+        0x88, 0x1D, 0xC2, 0x00, 0xC9, 0x83, 0x3D, 0xA7,
+        0x26, 0xE9, 0x37, 0x6C, 0x2E, 0x32, 0xCF, 0xF7};
+    f.bus.load(0x8093F0u, message, sizeof(message), "native_hmac_source");
+    f.bus.memset_bytes(0x808CB4u, 0xA5u, 40u);
+    f.bus.memset_bytes(0x808CDBu, 0xA5u, 34u);
+    stage_bigmac_key(f, key.data(), key.size());
+    f.bus.write32(0xE0050010u, 0x216u);
+    issue_native_bigmac(f, 0x8093F0u, 0x808CDCu, sizeof(message), 0x20B3u, 0x808CB4u);
+    u8 digest[32];
+    f.bus.read_bytes(0x808CDCu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, expected, sizeof(digest)), 0);
+    ZLB_EXPECT_EQ(f.bus.read8(0x808CDBu), 0xA5u);
+    ZLB_EXPECT_EQ(f.bus.read8(0x808CFCu), 0xA5u);
+    for (size_t i = 0; i < sizeof(message); ++i) {
+        ZLB_EXPECT_EQ(f.bus.read8(0x8093F0u + i), message[i]);
+    }
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().last_op(), BigmacOp::Hmac);
+    ZLB_EXPECT_EQ(f.cmep.bigmac_device().hash_operations(), 1u);
+
+    // A nonzero upper half with zero lower half proves words +220..+23C are
+    // staged and consumed. Fixed empty-message answer from hashlib/OpenSSL.
+    key.fill(0);
+    for (size_t i = 32; i < key.size(); ++i) key[i] = 0xA5u;
+    const u8 tail_key_digest[32] = {
+        0xB9, 0x40, 0x0B, 0x93, 0xAB, 0xF0, 0x22, 0xFC,
+        0x74, 0x12, 0x8B, 0x60, 0x33, 0xB9, 0x52, 0x27,
+        0x20, 0x5F, 0xE5, 0x68, 0xF1, 0x77, 0xBB, 0x41,
+        0x38, 0xFB, 0x05, 0x19, 0x37, 0x01, 0xDE, 0xDC};
+    stage_bigmac_key(f, key.data(), key.size());
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050220u), 0xA5A5A5A5u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005023Cu), 0xA5A5A5A5u);
+    issue_native_bigmac(f, 0x100u, 0x808CDCu, 0u, 0x20B3u, 0x808CB4u);
+    f.bus.read_bytes(0x808CDCu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, tail_key_digest, sizeof(digest)), 0);
+}
+
+ZLB_TEST(bigmac_native_hmac_sha256_full_blocks_and_invalid_ranges) {
+    Fixture f;
+    std::array<u8, 64> key{};
+    for (size_t i = 0; i < key.size(); ++i) key[i] = static_cast<u8>(i);
+    std::array<u8, 768> source{};
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<u8>(i * 7u + 3u);
+    const u8 expected[32] = {
+        0x98, 0xDC, 0xB9, 0xA1, 0x45, 0x64, 0x84, 0xD8,
+        0xB3, 0xCC, 0xA2, 0xDA, 0xA2, 0xF2, 0xDE, 0x9B,
+        0x6E, 0xD8, 0xAA, 0x19, 0xA7, 0xB0, 0xD0, 0x4E,
+        0x78, 0x1C, 0x71, 0x58, 0xC2, 0x4A, 0xE2, 0xD2};
+    f.bus.load(0x808FF0u, source.data(), source.size(), "native_hmac_blocks");
+    stage_bigmac_key(f, key.data(), key.size());
+    issue_native_bigmac(f, 0x808FF0u, 0x808CDCu, source.size(), 0x20B3u, 0x808CB4u);
+    u8 digest[32];
+    f.bus.read_bytes(0x808CDCu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, expected, sizeof(digest)), 0);
+    issue_native_bigmac(f, 0x100u, 0x808CDCu, 16u, 0x20B3u, 0x808CB4u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    f.bus.read_bytes(0x808CDCu, digest, sizeof(digest));
+    ZLB_EXPECT_EQ(std::memcmp(digest, expected, sizeof(digest)), 0);
+    f.bus.add_ram("native_hmac_partial_digest", 16u, 0x10000000u, "partial HMAC output");
+    f.bus.memset_bytes(0x10000000u, 0xA5u, 16u);
+    issue_native_bigmac(f, 0x808FF0u, 0x10000000u, source.size(), 0x20B3u, 0x808CB4u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE005003Cu), 0u);
+    for (u32 i = 0; i < 16u; ++i) ZLB_EXPECT_EQ(f.bus.read8(0x10000000u + i), 0xA5u);
+    issue_native_bigmac(f, 0xFFFFFFF0u, 0x808CDCu, 32u, 0x20B3u, 0x808CB4u);
+    ZLB_EXPECT_NE(f.bus.read32(0xE0050024u) & 0x78000u, 0u);
+    issue_native_bigmac(f, 0x808FF0u, 0x808CDCu, source.size(), 0x20B3u, 0x808CB4u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE0050024u), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(0xE005003Cu), 0u);
 }
 
 ZLB_TEST(bigmac_unknown_function_raises_exception) {
@@ -791,4 +1848,3 @@ ZLB_TEST(second_loader_substitutions_stay_inside_the_staged_image) {
         ZLB_EXPECT_TRUE(!patch.forced || patch.word != 0u);
     }
 }
-

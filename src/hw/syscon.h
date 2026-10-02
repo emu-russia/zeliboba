@@ -151,6 +151,10 @@ public:
     /// Functional SC command dispatch (also used by tests).
     std::vector<u8> dispatch_command(u32 command, const std::vector<u8>& payload);
 
+    /// Read the modeled NVS for board handoff inputs without issuing a guest
+    /// SC command or changing mailbox/protocol state.
+    bool read_nvs(u16 offset, size_t length, std::vector<u8>& out) const;
+
     // ------------------------------------------------------------------
     // SPI0 link (0xE0A00000) - the boot chain's own path to the syscon
     // ------------------------------------------------------------------

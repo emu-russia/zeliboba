@@ -31,12 +31,7 @@ constexpr u32 kFlagA = 1u << 8;   // asynchronous abort mask
 constexpr u32 kFlagI = 1u << 7;   // IRQ mask
 constexpr u32 kFlagF = 1u << 6;   // FIQ mask
 constexpr u32 kFlagT = 1u << 5;   // Thumb state
-// NOTE: bit 4 is *not* CPSR.NS in this core. The architectural CPSR.NS aliases
-// M[4], but every ARMv7 mode constant has bit 4 set (SVC = 0x13, IRQ = 0x12, ...)
-// and the interpreter indexes its banked register store by the 5-bit mode field,
-// so borrowing bit 4 for security state would corrupt the mode. The world is
-// tracked explicitly in ArmCore::ns_ / SCR and reported by the debugger; see the
-// comment on ArmCore::ns_.
+// CPSR has no Security-state bit: SCR.NS and Monitor mode determine the world.
 constexpr u32 kModeMask = 0x1Fu;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +102,7 @@ enum class MmFaultKind : int {
     Page,
     Domain,
     Permission,
+    AccessFlag,
 };
 
 const char* fault_name(MmFaultKind kind);
@@ -121,6 +117,7 @@ struct MmResult {
     bool strongly_ordered = false;
     bool device = false;
     bool normal = false;
+    bool supersection = false;
     MmFaultKind fault = MmFaultKind::None;
     u32 fsr_status = 0;
     u32 fsr_full = 0;

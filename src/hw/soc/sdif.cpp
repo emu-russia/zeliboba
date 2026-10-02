@@ -26,6 +26,7 @@
 // image file directly.
 #include "hw/soc/soc_internal.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -106,6 +107,7 @@ constexpr u16 kIntBufferWriteReady = 1u << 4;
 constexpr u16 kIntBufferReadReady = 1u << 5;
 constexpr u16 kIntCardInsertion = 1u << 6;
 constexpr u16 kIntBufferReadOverrun = 1u << 7;
+constexpr u16 kIntError = 1u << 15;
 constexpr u16 kIntCommandTimeout = 1u << 0;  // error interrupt status
 
 // Transfer mode bits.
@@ -125,7 +127,11 @@ constexpr u16 kCmdIndexCheck = 1u << 4;
 constexpr u16 kCmdDataPresent = 1u << 5;
 constexpr u16 kCmdIndexShift = 8;
 
-constexpr u32 kCommandTimeoutTicks = 1000000;  // 1 s at PERIPHCLK = 1 MHz
+// SD Host Controller Simplified Specification 2.00, section 2.2.18/Table 2-24:
+// the command response timeout is 64 SDCLK cycles, independent of the DAT
+// Timeout Control register. The model approximates that window with 64
+// PERIPHCLK ticks; it does not simulate individual command/response wire clocks.
+constexpr u32 kResponseTimeoutTicks = 64;
 
 std::string cmd_name(u8 index) {
     switch (index) {
@@ -214,10 +220,14 @@ void Sdif::reset() {
     data_pending_ = false;
     read_direction_ = false;
     command_ok_ = true;
+    command_no_response_ = false;
     app_cmd_ = false;
     rca_ = 0;
     busy_left_ = 0;
     command_error_in_ = 0;
+    data_ready_in_ = 0;
+    transfer_complete_in_ = 0;
+    dma_complete_ = false;
     error_status_ = 0;
     last_command_register_ = 0;
     last_lba_ = 0;
@@ -248,6 +258,32 @@ u64 Sdif::read(u32 address, unsigned size) {
 
 void Sdif::write(u32 address, unsigned size, u64 value) {
     const u32 offset = address - base_;
+    // Interrupt status is write-one-to-clear. Handle the original byte enables
+    // here, before RegisterBlock replaces the stored word with the write value.
+    // A normal-status acknowledgement must preserve other pending events, and
+    // an error-status-only write must leave the normal half untouched.
+    if (offset < kNormalIntStatus + 4 && offset + size > kNormalIntStatus) {
+        u32 clear = 0;
+        for (unsigned i = 0; i < size; ++i) {
+            const u32 byte_offset = offset + i;
+            const u8 byte = static_cast<u8>(value >> (8 * i));
+            if (byte_offset >= kNormalIntStatus && byte_offset < kNormalIntStatus + 4) {
+                clear |= static_cast<u32>(byte) << (8 * (byte_offset - kNormalIntStatus));
+            } else {
+                RegisterBlock::write(base_ + byte_offset, 1, byte);
+            }
+        }
+        const u16 normal = static_cast<u16>(peek(kNormalIntStatus));
+        if (sdif_trace()) {
+            std::fprintf(stderr,
+                         "[sdif] ack INT_STATUS word 0x%08X (normal was 0x%04X, error 0x%04X)\n",
+                         clear, static_cast<unsigned>(normal), static_cast<unsigned>(error_status_));
+        }
+        store(kNormalIntStatus, normal & ~static_cast<u16>(clear));
+        error_status_ = static_cast<u16>(error_status_ & ~static_cast<u16>(clear >> 16));
+        update_irq();
+        return;
+    }
     if (offset >= kBufferDataPort && offset < kBufferDataPort + 4) {
         write_data_port(static_cast<u8>(value & 0xFF));
         update_irq();
@@ -266,6 +302,15 @@ void Sdif::write(u32 address, unsigned size, u64 value) {
         sdif_trace_write(name_.c_str(), offset, value, size);
     }
     RegisterBlock::write(address, size, value);
+    if (offset < kNormalIntStatusEnable + 4 && offset + size > kNormalIntStatusEnable) {
+        // Status enables share a word just like command/transfer mode. Masking
+        // an error source clears its latched status (SDHCI section 1.8).
+        error_status_ &= static_cast<u16>(peek(kNormalIntStatusEnable) >> 16);
+        update_irq();
+    }
+    if (offset < kNormalIntSignalEnable + 4 && offset + size > kNormalIntSignalEnable) {
+        update_irq();
+    }
     if (!touches_command) return;
     const u32 command_bits = (static_cast<u32>(store(kTransferMode)) >> 16) & 0x3FFF;
     // A write that lands exactly on the command register is always a command
@@ -286,6 +331,7 @@ u64 Sdif::read_word(u32 offset, u64 stored) {
             state |= kPsCmdInhibitDat;
         }
         if (busy_left_ != 0) state |= kPsCmdInhibit | kPsCmdInhibitDat;
+        if (command_no_response_ && command_error_in_ != 0) state |= kPsCmdInhibit;
         return state;
     }
     if (offset == kClockControl) {
@@ -314,6 +360,9 @@ u64 Sdif::read_word(u32 offset, u64 stored) {
         // 0x32 is decoded here through the word offset, so the error half has to be
         // merged in (it does not live in the byte image - see error_status_).
         value |= static_cast<u32>(error_status_) << 16;
+        // Normal status bit15 is a read-only summary, not an independently
+        // acknowledged event (SDHCI section 2.2.17/Table 2-23).
+        value = (value & ~static_cast<u32>(kIntError)) | (error_status_ != 0 ? kIntError : 0);
         return value;
     }
     if (offset >= kResponse0 && offset <= kResponse3) {
@@ -328,27 +377,9 @@ void Sdif::write_word(u32 offset, u64 value) {
     // transfer mode / command pair at 0x0C) must not call store() here, or the
     // sibling bits would be lost; the command register is handled in write().
     const u32 value32 = static_cast<u32>(value);
-    if (sdif_trace() && offset == kNormalIntStatus) {
-        std::fprintf(stderr, "[sdif] ack INT_STATUS word 0x%08X (normal was 0x%04X, error 0x%04X)\n",
-                     value32, static_cast<unsigned>(peek(kNormalIntStatus) & 0xFFFF),
-                     static_cast<unsigned>(error_status_));
-    }
     // The command register is decoded in write(), which knows whether the access
     // actually covered 0x0E (a zero command half is a valid CMD0).
     switch (offset) {
-        case kNormalIntStatus:
-            // The word at 0x30 carries NORMAL_INT_STATUS in its low half and
-            // ERROR_INT_STATUS (0x32) in its high half, and write_word() is only
-            // ever handed the *word* offset - so a `case kErrorIntStatus` could
-            // never match (the same trap the software-reset byte above fell into).
-            // Write one to clear: the caller's low bytes clear the normal status,
-            // its high bytes clear the error status.
-            store(kNormalIntStatus,
-                  (peek(kNormalIntStatus) & 0xFFFFull) & ~static_cast<u64>(value32 & 0xFFFFu));
-            error_status_ =
-                static_cast<u16>(error_status_ & ~static_cast<u16>((value32 >> 16) & 0xFFFFu));
-            update_irq();
-            return;
         case kClockControl: {
             // 0x2C..0x2F share this 32 bit word: clock control (16 bit at 0x2C),
             // timeout control (0x2E) and software reset (0x2F). RegisterBlock
@@ -358,19 +389,29 @@ void Sdif::write_word(u32 offset, u64 value) {
             // set forever, which hangs the CMeP second loader (it writes 1 to
             // 0x2F and spins on the read at 0x47496..0x474A6).
             // SDHCI 2.0: bit 0 = reset the whole host, bit 1 = reset the command
-            // circuit, bit 2 = reset the data circuit.  The model executes commands
-            // synchronously, so every one of them completes immediately; each bit
-            // must therefore self-clear, or a driver that polls it spins forever.
+            // circuit, bit 2 = reset the data circuit. The model resets these
+            // circuits synchronously, so each bit self-clears once pending work
+            // has been cancelled.
             // NSKBL only sets bit 0 for its first command (0x5101D788..0x5101D790,
             // round 241) but its error path resets the *command* circuit with bit 1
             // (0x5101ED04, `strb r1,#2` / poll at 0x5101ED0A..0x5101ED12) and parked
             // there once the error status became visible (round 303).
             const u32 reset = (value32 >> 24) & 0x07u;
             if (reset != 0u) {
+                if ((reset & 0x03u) != 0u) {   // the whole host or command circuit
+                    command_error_in_ = 0;
+                    command_no_response_ = false;
+                    busy_left_ = 0;
+                    store(kNormalIntStatus, peek(kNormalIntStatus) & ~static_cast<u64>(kIntCmdComplete));
+                }
+                if ((reset & 0x01u) != 0u) error_status_ = 0;
                 if ((reset & 0x05u) != 0u) {   // the whole host or the data circuit
                     data_.clear();
                     data_index_ = 0;
                     data_pending_ = false;
+                    data_ready_in_ = 0;
+                    transfer_complete_in_ = 0;
+                    dma_complete_ = false;
                 }
                 // Self clearing: the bits read back zero once the reset is done - and
                 // they have to be cleared in the *stored* word as well.  The write that
@@ -378,6 +419,7 @@ void Sdif::write_word(u32 offset, u64 value) {
                 // reset byte set the very bit the caller polls.
                 RegisterBlock::write(base_ + kSoftwareReset, 0, 0);
                 store(kClockControl, peek(kClockControl) & ~(static_cast<u64>(0x07u) << 24));
+                update_irq();
             }
             return;
         }
@@ -477,6 +519,9 @@ void Sdif::execute_command() {
 
     command_ok_ = true;
     command_no_response_ = false;
+    // A response deadline belongs to the command that created it. A newly
+    // accepted command must never inherit an earlier deferred timeout.
+    command_error_in_ = 0;
     response_.fill(0);
     last_lba_ = current_lba();
     last_count_ = blocks;
@@ -754,21 +799,20 @@ void Sdif::execute_command() {
         // interrupt arrives after the driver has posted the request it belongs to,
         // and the driver's completion path (0x5101EBE4) only maps the error status
         // into its own code while [dev+0x2428] still names that request.
-        command_error_in_ = [] {
+        const u32 default_delay = command_no_response_ ? kResponseTimeoutTicks : 8u;
+        command_error_in_ = [default_delay] {
             const char* value = std::getenv("ZLB_SDIF_ERR_DELAY");
-            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8u;
+            const u32 delay = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10))
+                                               : default_delay;
+            return std::max(delay, 1u);
         }();
     }
-    // A deliberate "do not answer this command" (CMD5 on an eMMC, CMD8 without the
-    // check pattern) is NOT a command failure.  Reporting it as one raised error-status
-    // bit 0, which NSKBL's completion path maps to 0x80320002 and stores in the request
-    // status, so the driver's serve loop never saw the request as finished
-    // (docs/NSKBL.md round 403).  Such a command now stays silent instead.
-    // The model executes a command synchronously, so the command inhibit bits
-    // have to clear immediately: the CMeP second loader polls Present State bit 0
-    // between command issues (0x477E8) and a fixed inhibit window longer than its
-    // retry loop left the bit set forever. The DAT line stays "active" while a
-    // data phase is still waiting to be drained (data_pending_).
+    // An eMMC does not answer SDIO CMD5 or a rejected SD CMD8 probe. The host
+    // still reports Command Timeout when its response window expires; suppressing
+    // both completion and timeout leaves the guest's status poll waiting forever.
+    // Successful commands execute synchronously, so their command inhibit bit
+    // clears immediately. Missing responses hold it until the response deadline.
+    // The DAT line stays active while data is waiting to be drained.
 
     busy_left_ = 0;
     update_irq();
@@ -937,7 +981,8 @@ void Sdif::tick(u64 cycles) {
         // error is mapped (see execute_command()).
         if (cycles >= command_error_in_) {
             command_error_in_ = 0;
-            error_status_ = static_cast<u16>(error_status_ | 0x0001);
+            const u16 enabled = static_cast<u16>(peek(kNormalIntStatusEnable) >> 16);
+            error_status_ = static_cast<u16>(error_status_ | (kIntCommandTimeout & enabled));
             if (sdif_trace()) {
                 std::fprintf(stderr, "[sdif] %s raise CommandError -> error_status_=0x%04X\n",
                              name_.c_str(), static_cast<unsigned>(error_status_));
@@ -993,7 +1038,7 @@ void Sdif::update_irq() {
     const u16 normal = static_cast<u16>(peek(kNormalIntStatus));
     const u16 normal_signal = static_cast<u16>(peek(kNormalIntSignalEnable));
     const u16 error = error_status_;
-    const u16 error_signal = static_cast<u16>(peek(kErrorIntSignalEnable));
+    const u16 error_signal = static_cast<u16>(peek(kNormalIntSignalEnable) >> 16);
     const bool want = ((normal & normal_signal) != 0) || ((error & error_signal) != 0);
     // Round 340 diagnostic: nothing in the guest enables the GIC, so the ARM never
     // takes an interrupt; this log shows whether the controller asserts its own line

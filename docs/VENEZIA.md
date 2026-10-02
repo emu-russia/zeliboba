@@ -83,7 +83,7 @@ PowerVR SGX543MP4+, 512 МиБ LPDDR2 + 128 МиБ CDRAM (у GPU две 512-би
 * таблицы CGEN для IVC2 (VLIW-пары) и MeP-c5 (`mep-ivc2.cpu`, `mep-c5.cpu`,
   `mep-h1.cpu`, `mep-default.cpu`, `mep-ext-cop.cpu`) в рабочей папке
   **отсутствуют** — на них ссылались прежние раунды, но ни одного `*.cpu` в
-  `C:\Work\PSVita` нет. Для IVC2 таблицы придётся взять из binutils/GDB или
+  `..` нет. Для IVC2 таблицы придётся взять из binutils/GDB или
   восстановить по коду прошивки; до этого описание IVC2 остаётся планом;
 * в референсной C# реализации есть профиль `MePProfile.Venezia`
   (`Sandbox.SetVenezia()`), который включает распознавание IVC2 и добавляет

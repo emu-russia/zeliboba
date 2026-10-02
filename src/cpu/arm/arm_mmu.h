@@ -4,7 +4,7 @@
 // SCTLR.M is set:
 //
 //   * first level descriptors: fault / coarse page table / section / supersection
-//   * second level descriptors: fault / large page (64K, 4 subpages) / small page (4K)
+//   * second level descriptors: fault / large page (64K) / small page (4K)
 //   * domains (DACR), AP/APX permissions, XN/XNX execute-never, TEX/C/B attributes
 //   * access-flag update and DFSR/IFSR/DFAR/IFAR fault reporting
 //
@@ -125,6 +125,10 @@ public:
     /// Translate a virtual address. Always succeeds when the MMU is off.
     arm::MmResult translate(u32 va, bool write, bool fetch, u32 mode);
 
+    /// Inspect an address using a state copy and RAM-only descriptor reads.
+    /// Never touches bus devices, statistics, traces, or the live fault records.
+    arm::MmResult inspect_translation(u32 va, bool fetch, u32 mode) const;
+
     /// Update DFSR/DFAR for a data abort.
     void report_data_abort(const arm::MmResult& result, u32 va, bool write);
     /// Update IFSR/IFAR for a prefetch abort.
@@ -145,6 +149,7 @@ public:
 private:
     u32 read_table(u32 address);
     u32 select_ttbr(u32 va, int& ttbr_num) const;
+    template <bool Inspect>
     arm::MmResult translate_walk(u32 va, bool write, bool fetch, u32 mode);
 
     Bus* bus_;

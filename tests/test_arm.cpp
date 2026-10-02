@@ -111,6 +111,59 @@ constexpr u32 arm_vmov_d_imm(u32 dd, u32 imm8) {
            (((dd >> 4) & 1u) << 22) | (imm8 & 0xFu);
 }
 
+// ARM ARM Table A7-9: AND, BIC, ORR, ORN, EOR, BSL, BIT, BIF.
+constexpr u32 arm_neon_logical(u32 op, bool quad, u32 d, u32 n, u32 m) {
+    return 0xF2000110u | ((op >> 2) << 24) | ((op & 3u) << 20) |
+           ((d >> 4) << 22) | ((d & 15u) << 12) | ((n >> 4) << 7) |
+           ((n & 15u) << 16) | ((m >> 4) << 5) | (m & 15u) | (quad ? 0x40u : 0u);
+}
+
+constexpr u32 arm_neon_mov_imm(u32 d, bool quad, u32 cmode, bool op, u32 imm8) {
+    return 0xF2800010u | ((d >> 4) << 22) | ((d & 15u) << 12) |
+           ((imm8 >> 7) << 24) | (((imm8 >> 4) & 7u) << 16) | (imm8 & 15u) |
+           (cmode << 8) | (quad ? 0x40u : 0u) | (op ? 0x20u : 0u);
+}
+
+constexpr u32 arm_neon_vst1(u32 d, u32 type, u32 size, u32 align, u32 n, u32 m) {
+    return 0xF4000000u | ((d >> 4) << 22) | ((d & 15u) << 12) | (n << 16) |
+           (type << 8) | (size << 6) | (align << 4) | m;
+}
+
+constexpr u32 arm_neon_vld1(u32 d, u32 type, u32 size, u32 align, u32 n, u32 m) {
+    return arm_neon_vst1(d, type, size, align, n, m) | 0x00200000u;
+}
+
+constexpr u32 arm_neon_movl(u32 width, bool uns, u32 d, u32 m) {
+    return 0xF2800A10u | ((width / 8u) << 19) | (uns ? 0x01000000u : 0u) |
+           ((d >> 4) << 22) | ((d & 15u) << 12) | ((m >> 4) << 5) | (m & 15u);
+}
+
+constexpr u32 arm_neon_add(u32 size, bool quad, u32 d, u32 n, u32 m) {
+    return 0xF2000800u | (size << 20) | ((d >> 4) << 22) | ((d & 15u) << 12) |
+           ((n >> 4) << 7) | ((n & 15u) << 16) | ((m >> 4) << 5) | (m & 15u) |
+           (quad ? 0x40u : 0u);
+}
+
+constexpr u32 arm_neon_padd(u32 size, u32 d, u32 n, u32 m) {
+    return (arm_neon_add(size,false,d,n,m)&~0x00000F00u)|0x00000B10u;
+}
+
+constexpr u32 arm_vmov_scalar32(u32 rt, u32 d, bool upper, bool to_core) {
+    return 0xEE000B10u | ((d & 15u) << 16) | ((d >> 4) << 7) | (rt << 12) |
+           (upper ? 0x00200000u : 0u) | (to_core ? 0x00100000u : 0u);
+}
+
+void load_neon(Fixture& f, u32 instr, bool thumb) {
+    if (thumb) {
+        const u32 t32 = (instr & 0x0F000000u) == 0x04000000u ?
+            0xF9000000u | (instr & 0x00FFFFFFu) :
+            0xEF000000u | (instr & 0x00FFFFFFu) | ((instr & 0x01000000u) << 4);
+        f.load_halfwords(kCodeBase, {static_cast<u16>(t32 >> 16), static_cast<u16>(t32)});
+    } else f.load(kCodeBase, {instr});
+    f.cpu.reset(kCodeBase | (thumb ? 1u : 0u));
+    f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+}
+
 // Thumb encoders -----------------------------------------------------------
 
 constexpr u32 t16_mov_imm(u32 rd, u32 imm8) { return 0x2000u | (rd << 8) | (imm8 & 0xFFu); }
@@ -618,23 +671,235 @@ ZLB_TEST(thumb_it_block_it_else) {
     Fixture f;
     // movs r0, #1 ; cmp r0, #1 ; ite eq ; mov.w r1, #1 ; mov.w r2, #2
     //
-    // The bodies use MOV.W, not MOVS: `movs` would update Z, and the "else" half
-    // of an ITE block is evaluated with the flags as they are when it executes, so
-    // a flag-setting "then" would legitimately let the "else" run.
+    // This checks the explicit non-flag-setting wide encoding. The narrow MOV
+    // encoding also preserves flags inside IT, as the validator test below checks.
     const std::vector<u16> code = {
         static_cast<u16>(t16_mov_imm(0, 1)),
         static_cast<u16>(t16_cmp_imm(0, 1)),   // Z = 1
         0xBF0Cu,                               // ite eq -> mask 1100
+        0xF04Fu, 0x0101u,                      // mov.w r1, #1
+        0xF04Fu, 0x0202u,                      // mov.w r2, #2
     };
-    const std::vector<u32> words = pack_halfwords(code);
-    std::vector<u32> all = words;
-    all.push_back(0x0101F04Fu);                // mov.w r1, #1
-    all.push_back(0x0202F04Fu);                // mov.w r2, #2
-    f.load(kCodeBase, all);
+    f.load_halfwords(kCodeBase, code);
     f.cpu.reset(kCodeBase | 1u);
     for (int i = 0; i < 5; ++i) f.cpu.step();
     ZLB_EXPECT_EQ(f.reg(1), 1u);   // "then" executes
     ZLB_EXPECT_EQ(f.reg(2), 0u);   // "else" is skipped
+}
+
+ZLB_TEST(thumb_it_nskbl_sce_validator_returns_two) {
+    // NSKBL 0x5101A4D2: BF0C / 2002 / 2000 selects 2 for a zero fourth
+    // header byte. Narrow MOV does not set flags in IT, so the EQ half must
+    // not clear Z and accidentally enable the NE half. The last slot also
+    // preserves flags even though the core has advanced ITSTATE to zero.
+    for (u32 fourth_byte : {0u, 1u}) {
+        Fixture f;
+        f.load_halfwords(kCodeBase, {
+            0x2B00u, // cmp r3, #0
+            0xBF0Cu, // ite eq
+            0x2002u, // moveq r0, #2
+            0x2000u, // movne r0, #0
+            0xB900u, // cbnz r0, .+4 (the caller's nonzero-result continuation)
+            0xBF00u,
+            0xBF00u,
+        });
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(0, 0xFFFFFFFFu);
+        f.set_reg(3, fourth_byte);
+        f.cpu.step();
+        const u32 flags_after_cmp = f.cpu.cpsr & 0xF0000000u;
+        for (int step = 0; step < 3; ++step) f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(0), fourth_byte == 0u ? 2u : 0u);
+        ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags_after_cmp);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + (fourth_byte == 0u ? 12u : 10u));
+        ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    }
+}
+
+ZLB_TEST(thumb_it_narrow_data_processing_preserves_flags) {
+    struct Case { u16 instruction; u32 result; };
+    // r0=0x80000000, r1=1, C=1. Check results as well as all four flags:
+    // ADC/SBC must still consume C, and register shifts must suppress the
+    // shifter's separate carry update along with their N/Z update.
+    const Case cases[] = {
+        {0x0008u, 1u},           // MOV register (LSL #0 alias)
+        {0x0048u, 2u},           // LSL immediate
+        {0x0848u, 0u},           // LSR immediate
+        {0x1048u, 0u},           // ASR immediate
+        {0x1840u, 0x80000001u},  // ADD register
+        {0x1A40u, 0x7FFFFFFFu},  // SUB register
+        {0x1C40u, 0x80000001u},  // ADD immediate (imm3)
+        {0x1E40u, 0x7FFFFFFFu},  // SUB immediate (imm3)
+        {0x2002u, 2u},           // MOV immediate
+        {0x3001u, 0x80000001u},  // ADD immediate (imm8)
+        {0x3801u, 0x7FFFFFFFu},  // SUB immediate (imm8)
+        {0x4008u, 0u},           // AND
+        {0x4048u, 0x80000001u},  // EOR
+        {0x4088u, 0u},           // LSL register
+        {0x40C8u, 0x40000000u},  // LSR register
+        {0x4108u, 0xC0000000u},  // ASR register
+        {0x4148u, 0x80000002u},  // ADC
+        {0x4188u, 0x7FFFFFFFu},  // SBC
+        {0x41C8u, 0x40000000u},  // ROR register
+        {0x4248u, 0xFFFFFFFFu},  // RSB #0
+        {0x4308u, 0x80000001u},  // ORR
+        {0x4348u, 0x80000000u},  // MUL
+        {0x4388u, 0x80000000u},  // BIC
+        {0x43C8u, 0xFFFFFFFEu},  // MVN
+    };
+    constexpr u32 flags = arm::kFlagZ | arm::kFlagC | arm::kFlagV;
+    for (const Case& test : cases) {
+        for (u16 it : {0xBF08u, 0xBF04u}) { // single/final slot, first slot of ITT EQ
+            Fixture f;
+            f.load_halfwords(kCodeBase, {it, test.instruction, 0x2242u, 0x2301u});
+            f.cpu.reset(kCodeBase | 1u);
+            f.set_reg(0, 0x80000000u);
+            f.set_reg(1, 1u);
+            f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | flags;
+            f.cpu.step();
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.reg(0), test.result);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags);
+            f.cpu.step(); // mov r2,#0x42: inside ITT, outside single-slot IT
+            ZLB_EXPECT_EQ(f.reg(2), 0x42u);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u,
+                          it == 0xBF04u ? flags : (arm::kFlagC | arm::kFlagV));
+            f.cpu.step(); // MOV outside either block must set N/Z normally
+            ZLB_EXPECT_EQ(f.reg(3), 1u);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, arm::kFlagC | arm::kFlagV);
+            ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        }
+    }
+}
+
+ZLB_TEST(thumb_it_comparisons_and_explicit_wide_s_still_set_flags) {
+    struct Case { u16 instruction; u32 r0; u32 flags; };
+    const Case cases[] = {
+        {0x2801u, 2u, arm::kFlagC},                 // CMP immediate
+        {0x4288u, 2u, arm::kFlagC},                 // CMP register
+        {0x4588u, 2u, arm::kFlagC},                 // CMP high register (r8,r1)
+        {0x42C8u, 0x7FFFFFFFu, arm::kFlagN | arm::kFlagV}, // CMN register
+        {0x4208u, 2u, arm::kFlagZ | arm::kFlagC | arm::kFlagV}, // TST
+    };
+    for (const Case& test : cases) {
+        Fixture f;
+        f.load_halfwords(kCodeBase, {0xBF08u, test.instruction}); // IT EQ
+        f.cpu.reset(kCodeBase | 1u);
+        f.set_reg(0, test.r0);
+        f.set_reg(1, 1u);
+        f.set_reg(8, test.r0);
+        f.cpu.cpsr |= 0xF0000000u;
+        f.cpu.step();
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(0), test.r0);
+        ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, test.flags);
+    }
+    Fixture f;
+    f.load_halfwords(kCodeBase, {0xBF08u, 0xF05Fu, 0x0002u}); // IT EQ; MOVS.W r0,#2
+    f.cpu.reset(kCodeBase | 1u);
+    f.cpu.cpsr |= 0xF0000000u;
+    f.cpu.step();
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(0), 2u);
+    ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, arm::kFlagC | arm::kFlagV);
+}
+
+ZLB_TEST(thumb_lsl_immediate_carry_feeds_adc_and_is_preserved_in_it) {
+    struct Case { u32 source; u32 amount; u32 result; bool carry; };
+    const Case cases[] = {
+        {0x80000000u, 1u, 0u, true},
+        {1u, 1u, 2u, false},
+        {0x08000001u, 5u, 0x20u, true},
+        {0x80000010u, 5u, 0x200u, false},
+        {3u, 31u, 0x80000000u, true},
+        {0x40000000u, 31u, 0u, false},
+        {0x80000001u, 0u, 0x80000001u, false}, // MOV alias preserves incoming C
+    };
+    for (const Case& test : cases) {
+        for (bool incoming_carry : {false, true}) {
+            for (bool in_it : {false, true}) {
+                Fixture f;
+                const u16 lsl = static_cast<u16>(t16_lsl_imm(0, 1, test.amount));
+                if (in_it) f.load_halfwords(kCodeBase, {0xBF08u, lsl, 0x415Au});
+                else f.load_halfwords(kCodeBase, {lsl, 0x415Au});
+                f.cpu.reset(kCodeBase | 1u);
+                f.set_reg(1, test.source);
+                f.set_reg(2, 10u);
+                f.set_reg(3, 0u); // following ADCS r2,r3 adds only the carry
+                const u32 initial_flags = arm::kFlagZ | arm::kFlagV |
+                                          (incoming_carry ? arm::kFlagC : 0u);
+                f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | initial_flags;
+                if (in_it) f.cpu.step();
+                f.cpu.step();
+                const bool carry = (in_it || test.amount == 0u) ? incoming_carry : test.carry;
+                const u32 shifted_flags = (test.result & arm::kFlagN) |
+                                          (test.result == 0u ? arm::kFlagZ : 0u) |
+                                          (carry ? arm::kFlagC : 0u) | arm::kFlagV;
+                ZLB_EXPECT_EQ(f.reg(0), test.result);
+                ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, in_it ? initial_flags : shifted_flags);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.reg(2), carry ? 11u : 10u);
+                ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, 0u);
+                ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+            }
+        }
+    }
+}
+
+ZLB_TEST(thumb_modified_immediate_logical_carry_feeds_adc) {
+    struct Immediate { u16 encoding; u32 value; bool rotated; bool carry; };
+    // ThumbExpandImm_C (ARM ARM A6-231): zero extension and all three byte
+    // replication forms preserve incoming C, regardless of the byte's bit 7.
+    // The final two cases rotate 0x80 by 8/9 and must instead replace C.
+    const Immediate immediates[] = {
+        {0x0080u, 0x00000080u, false, false},
+        {0x1080u, 0x00800080u, false, false},
+        {0x2080u, 0x80008000u, false, false},
+        {0x3080u, 0x80808080u, false, false},
+        {0x007Fu, 0x0000007Fu, false, false},
+        {0x107Fu, 0x007F007Fu, false, false},
+        {0x207Fu, 0x7F007F00u, false, false},
+        {0x307Fu, 0x7F7F7F7Fu, false, false},
+        {0x4000u, 0x80000000u, true, true},
+        {0x4080u, 0x40000000u, true, false},
+    };
+    struct Instruction { u16 hw1; u16 hw2; u32 source; bool writes_result; };
+    const Instruction instructions[] = {
+        {0xF05Fu, 0x0000u, 0u, true},           // MOVS.W r0,#imm
+        {0xF010u, 0x0000u, 0xFFFFFFFFu, true},  // ANDS.W r0,r0,#imm
+        {0xF010u, 0x0F00u, 0xFFFFFFFFu, false}, // TST.W r0,#imm
+        {0xF090u, 0x0F00u, 0u, false},          // TEQ.W r0,#imm
+    };
+    for (const Immediate& imm : immediates) {
+        for (const Instruction& instruction : instructions) {
+            for (bool incoming_carry : {false, true}) {
+                Fixture f;
+                f.load_halfwords(kCodeBase, {
+                    instruction.hw1,
+                    static_cast<u16>(instruction.hw2 | imm.encoding),
+                    0x415Au, // ADCS r2,r3 consumes the immediate's carry result
+                });
+                f.cpu.reset(kCodeBase | 1u);
+                f.set_reg(0, instruction.source);
+                f.set_reg(2, 10u);
+                f.set_reg(3, 0u);
+                f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) |
+                             arm::kFlagN | arm::kFlagZ | arm::kFlagV |
+                             (incoming_carry ? arm::kFlagC : 0u);
+                f.cpu.step();
+                const bool carry = imm.rotated ? imm.carry : incoming_carry;
+                ZLB_EXPECT_EQ(f.reg(0), instruction.writes_result ? imm.value : instruction.source);
+                ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u,
+                              (imm.value & arm::kFlagN) | arm::kFlagV |
+                              (carry ? arm::kFlagC : 0u));
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.reg(2), carry ? 11u : 10u);
+                ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, 0u);
+                ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+            }
+        }
+    }
 }
 
 // The same ITE block with loads as the bodies, i.e. the exact shape KBL uses at
@@ -751,7 +1016,7 @@ ZLB_TEST(arm_fiq_masks_irq) {
     f.cpu.step();
     ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeFiq);
     ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagF) != 0);
-    ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagI) == 0);  // FIQ does not mask IRQ
+    ZLB_EXPECT_TRUE((f.cpu.cpsr & arm::kFlagI) != 0);  // FIQ entry masks IRQ
 }
 
 ZLB_TEST(arm_reset_honours_thumb_bit) {
@@ -1051,7 +1316,7 @@ ZLB_TEST(mmu_section_translate_and_permission_fault) {
     mmu.dacr = 0x00000001u;   // domain 0 = client
     mmu.sctlr |= 1u;          // MMU on
 
-    // Section descriptor for VA 0x81000000 -> PA 0x80000000, AP = 0b01 (RW all),
+    // Section descriptor for VA 0x81000000 -> PA 0x80000000, AP = 0b001 (privileged RW),
     // domain 0 (client), TEX/C/B = 0b011 (normal write-back, no write allocate).
     const u32 index = (0x81000000u >> 20) & 0xFFFu;
     const u32 descriptor = 0x80000000u | (2u << 0) | (0u << 5) | (1u << 10) | (3u << 2);
@@ -1065,8 +1330,8 @@ ZLB_TEST(mmu_section_translate_and_permission_fault) {
     ZLB_EXPECT_EQ(pa, 0x800FFFFFu);
     ZLB_EXPECT_TRUE(mmu.walks >= 2u);
 
-    // Now a read-only section (AP = 0b10) must fault on a write.
-    const u32 ro = 0x80000000u | (2u << 0) | (0u << 5) | (2u << 10) | (3u << 2);
+    // AP=0b101 is privileged read-only: AP[2] is section descriptor bit 15.
+    const u32 ro = 0x80000000u | 2u | (1u << 10) | (1u << 15) | (3u << 2);
     f.bus.write32(l1_table + index * 4u, ro);
     mmu.walks = 0;
     ZLB_EXPECT_FALSE(f.cpu.translate(0x81000000u, true, false, pa, fault));
@@ -1094,7 +1359,7 @@ ZLB_TEST(mmu_ttbcr_n_uses_ttbr1_for_the_top_half) {
     mmu.sctlr |= 1u;                 // MMU on
 
     // TTBR0: VA 0x00000000 -> PA 0x80100000 (a 1 MiB section).
-    // AP[1:0] = 0b01 (RW for all), domain 0, TEX/C/B = 0b011 (normal WB).
+    // AP[2:0] = 0b001 (privileged RW), domain 0, TEX/C/B = 0b011 (normal WB).
     const u32 lo_index = (0x00000000u >> 20) & 0xFFFu;
     const u32 lo_desc = 0x80100000u | 2u | (0u << 5) | (1u << 10) | (3u << 2);
     f.bus.write32(ttbr0_base + lo_index * 4u, lo_desc);
@@ -1144,16 +1409,16 @@ ZLB_TEST(mmu_ttbcr_n_uses_ttbr1_for_the_top_half) {
 }
 
 ZLB_TEST(mmu_dacr_domain_zero_client_others_fault) {
-    // DACR = 2 means only domain 0 is client; domains 1..15 are "no access" and
+    // DACR = 1 means only domain 0 is client; domains 1..15 are "no access" and
     // must fault even for a perfectly valid section descriptor.
     Fixture f;
     ArmMmu& mmu = f.cpu.mmu;
     mmu.ttbr0 = 0x80010000u;
-    mmu.dacr = 0x00000002u;
+    mmu.dacr = 0x00000001u;
     mmu.sctlr |= 1u;
 
     const u32 index = (0x81000000u >> 20) & 0xFFFu;
-    // Domain 0 descriptor: allowed (AP = 0b01 RW for all).
+    // Domain 0 descriptor: allowed (AP = 0b001 privileged RW).
     f.bus.write32(0x80010000u + index * 4u, 0x80000000u | 2u | (0u << 5) | (1u << 10) | (3u << 2));
     u32 pa = 0;
     std::string fault;
@@ -1175,6 +1440,163 @@ ZLB_TEST(mmu_dacr_domain_zero_client_others_fault) {
     ZLB_EXPECT_EQ(mmu.dfsr & 0xFu, 0x9u);
     ZLB_EXPECT_EQ((mmu.dfsr >> 4) & 0xFu, 3u);
     ZLB_EXPECT_EQ(mmu.dfar, 0x81000000u);
+}
+
+ZLB_TEST(cp15_native_threadmgr_context_gate_preserves_per_core_thread_pointer) {
+    Fixture f;
+    // Genuine ThreadMgr writer at 4A1DE8, followed by an architectural URO
+    // setup. All four writes precede every read to detect shared-core state.
+    f.load_halfwords(kCodeBase, {0xEE0Du, 0x9F90u, 0xEE0Du, 0x7F70u});
+    constexpr u32 gate = kCodeBase + 0x100u;
+    // Unchanged mutex context check from linked 8100C3A0..8100C3BA. It reads
+    // PRW/URO, masks URO, rereads PRW, and skips ILLEGAL_CONTEXT on nonzero PRW.
+    f.load_halfwords(gate, {
+        0xEE1Du, 0x8F90u, 0xEE1Du, 0x4F70u, 0x0420u, 0xEE0Du, 0x0F70u,
+        0xEE1Du, 0x2F90u, 0xF247u, 0x1901u, 0xF2C8u, 0x0902u, 0xB92Au,
+    });
+    const u32 pointers[] = {0x6BA28u, 0x6BC28u, 0x6BE28u, 0x6B828u};
+    std::vector<std::unique_ptr<ArmCore>> cores;
+    for (u32 core = 0; core < 4; ++core) {
+        cores.push_back(std::make_unique<ArmCore>(f.bus));
+        ArmCore& cpu = *cores.back();
+        cpu.core_id_ = core;
+        cpu.reset(kCodeBase | 1u);
+        cpu.set_register("CPSR", arm::kModeSystem | arm::kFlagT);
+        cpu.set_register("SCR", 5);
+        cpu.r[9] = pointers[core];
+        cpu.r[7] = 0x12340056u + core;
+        ZLB_EXPECT_FALSE(cpu.step().faulted);
+        ZLB_EXPECT_FALSE(cpu.step().faulted);
+    }
+    for (u32 core = 0; core < 4; ++core) {
+        ArmCore& cpu = *cores[core];
+        cpu.set_pc(gate);
+        for (int i = 0; i < 8; ++i) ZLB_EXPECT_FALSE(cpu.step().faulted);
+        ZLB_EXPECT_EQ(cpu.r[8], pointers[core]);
+        ZLB_EXPECT_EQ(cpu.r[2], pointers[core]);
+        ZLB_EXPECT_EQ(cpu.r[4], 0x12340056u + core);
+        ZLB_EXPECT_EQ(cpu.get_pc(), gate + 0x28u); // native nonzero-context branch
+        u64 uro = 0;
+        ZLB_EXPECT_TRUE(cpu.get_register("TPIDRURO", uro));
+        ZLB_EXPECT_EQ(uro, (0x12340056u + core) << 16);
+    }
+}
+
+ZLB_TEST(cp15_thread_ids_enforce_user_read_write_permissions_a32_and_thumb32) {
+    const char* names[] = {"TPIDRURW", "TPIDRURO", "TPIDRPRW"};
+    for (bool thumb : {false, true}) {
+        for (bool nonsecure : {false, true}) {
+            for (u32 op = 2; op <= 4; ++op) {
+                for (bool read : {false, true}) {
+                    Fixture f;
+                    f.cpu.reset(kCodeBase + 0x100u);
+                    f.cpu.set_register("CPSR", arm::kModeSystem);
+                    f.cpu.set_register("SCR", nonsecure ? 1u : 0u);
+                    // Seed all three using privileged instructions, not a
+                    // public register shortcut; forbidden writes must retain it.
+                    f.load(kCodeBase + 0x100u, {
+                        arm_cp15(false, 0, 13, 0, 0, 2),
+                        arm_cp15(false, 0, 13, 0, 0, 3),
+                        arm_cp15(false, 0, 13, 0, 0, 4),
+                    });
+                    for (u32 seed = 2; seed <= 4; ++seed) {
+                        f.set_reg(0, 0x12340000u + seed);
+                        ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+                    }
+                    const u32 instr = arm_cp15(read, 0, 13, read ? 2u : 0u, 0, op);
+                    if (thumb) f.load_halfwords(kCodeBase, {static_cast<u16>(instr >> 16), static_cast<u16>(instr)});
+                    else f.load(kCodeBase, {instr});
+                    f.cpu.set_register("CPSR", arm::kModeUser | (thumb ? arm::kFlagT : 0u));
+                    f.cpu.set_pc(kCodeBase);
+                    f.set_reg(0, 0x56780000u + op);
+                    f.set_reg(2, 0xDEADC0DEu);
+                    const StepResult result = f.cpu.step();
+                    const bool allowed = op == 2u || (op == 3u && read);
+                    ZLB_EXPECT_EQ(result.faulted, !allowed);
+                    ZLB_EXPECT_EQ(f.cpu.undefined_instruction, !allowed);
+                    if (read) {
+                        ZLB_EXPECT_EQ(f.reg(2), allowed ? 0x12340000u + op : 0xDEADC0DEu);
+                    }
+                    for (u32 stored = 2; stored <= 4; ++stored) {
+                        u64 value = 0;
+                        ZLB_EXPECT_TRUE(f.cpu.get_register(names[stored - 2], value));
+                        const u32 expected = allowed && !read && stored == op ? 0x56780000u + op :
+                                                                                 0x12340000u + stored;
+                        ZLB_EXPECT_EQ(value, expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+ZLB_TEST(cp15_thread_id_security_banks_monitor_access_roundtrip_and_reset) {
+    Fixture f;
+    f.cpu.reset(kCodeBase);
+    f.cpu.set_register("CPSR", arm::kModeSystem);
+    const auto seed = [&](u32 base) {
+        f.load(kCodeBase + 0x400u, {
+            arm_cp15(false, 0, 13, 0, 0, 2),
+            arm_cp15(false, 0, 13, 0, 0, 3),
+            arm_cp15(false, 0, 13, 0, 0, 4),
+        });
+        f.cpu.set_pc(kCodeBase + 0x400u);
+        for (u32 op = 2; op <= 4; ++op) {
+            f.set_reg(0, base + op);
+            ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+        }
+    };
+    seed(0x12340000u);
+    f.cpu.set_register("SCR", 1);
+    seed(0x56780000u);
+    f.cpu.mvbar = kCodeBase + 0x100u;
+    f.load(kCodeBase, {
+        0xE1600070u,                         // SMC #0 from Non-secure SYS
+        arm_cp15(true, 0, 13, 6, 0, 2),
+        arm_cp15(true, 0, 13, 7, 0, 3),
+        arm_cp15(true, 0, 13, 8, 0, 4),
+    });
+    f.load(kCodeBase + 0x108u, {
+        arm_cp15(true, 0, 13, 4, 0, 4),       // Monitor, SCR.NS=1: PRW_NS
+        0xE3A00000u, arm_cp15(false, 0, 1, 0, 1, 0), // SCR.NS=0
+        arm_cp15(true, 0, 13, 5, 0, 4),       // PRW_S
+        0xE3A00001u, arm_cp15(false, 0, 1, 0, 1, 0), // SCR.NS=1
+        0xE1B0F00Eu,                         // MOVS PC,LR: return to Non-secure
+    });
+    f.cpu.set_pc(kCodeBase);
+    ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeMonitor);
+    ZLB_EXPECT_TRUE(f.cpu.secure_state());
+    for (int i = 0; i < 7; ++i) ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    ZLB_EXPECT_EQ(f.reg(4), 0x56780004u);
+    ZLB_EXPECT_EQ(f.reg(5), 0x12340004u);
+    ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeSystem);
+    ZLB_EXPECT_FALSE(f.cpu.secure_state());
+    for (int i = 0; i < 3; ++i) ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    ZLB_EXPECT_EQ(f.reg(6), 0x56780002u);
+    ZLB_EXPECT_EQ(f.reg(7), 0x56780003u);
+    ZLB_EXPECT_EQ(f.reg(8), 0x56780004u);
+
+    // Other Op1/CRm combinations are not aliases for these registers.
+    f.load(kCodeBase + 0x200u, {arm_cp15(false, 1, 13, 0, 0, 4),
+                              arm_cp15(false, 0, 13, 0, 1, 4)});
+    f.cpu.set_pc(kCodeBase + 0x200u);
+    f.set_reg(0, 0xDEADBEEFu);
+    ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    u64 value = 0;
+    ZLB_EXPECT_TRUE(f.cpu.get_register("TPIDRPRW", value));
+    ZLB_EXPECT_EQ(value, 0x56780004u);
+
+    // UNKNOWN hardware reset values use the emulator's documented zero choice.
+    f.cpu.reset(kCodeBase);
+    for (u32 ns : {0u, 1u}) {
+        f.cpu.set_register("SCR", ns);
+        for (const char* name : {"TPIDRURW", "TPIDRURO", "TPIDRPRW"}) {
+            ZLB_EXPECT_TRUE(f.cpu.get_register(name, value));
+            ZLB_EXPECT_EQ(value, 0u);
+        }
+    }
 }
 
 ZLB_TEST(cp15_dacr_read_returns_the_written_value) {
@@ -1256,14 +1678,14 @@ ZLB_TEST(cp15_va_to_pa_probe_publishes_par) {
     f.cpu.step();
     f.cpu.step();
     ZLB_EXPECT_FALSE(f.cpu.halted);
-    ZLB_EXPECT_EQ(mmu.par, 0x80004001u);  // PAR[0] = 1: translation succeeded
-    ZLB_EXPECT_EQ(f.reg(5), 0x80004001u);
+    ZLB_EXPECT_EQ(mmu.par, 0x80004000u);  // PAR.F=0: translation succeeded
+    ZLB_EXPECT_EQ(f.reg(5), 0x80004000u);
     ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 8u);
 }
 
 ZLB_TEST(cp15_va_to_pa_probe_reports_a_fault_instead_of_aborting) {
     // A probe of an unmapped address must not raise a prefetch/data abort; the
-    // status goes into PAR with PAR[0] = 0.
+    // status goes into PAR with PAR.F=1.
     Fixture f;
     ArmMmu& mmu = f.cpu.mmu;
     f.load(kCodeBase, {
@@ -1283,50 +1705,169 @@ ZLB_TEST(cp15_va_to_pa_probe_reports_a_fault_instead_of_aborting) {
     f.cpu.step();
     ZLB_EXPECT_FALSE(f.cpu.halted);
     ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 8u);
-    ZLB_EXPECT_EQ(mmu.par & 1u, 0u);
+    ZLB_EXPECT_EQ(mmu.par, 0xBu);  // Section translation fault FS=5, F=1
     ZLB_EXPECT_TRUE((mmu.par >> 1) != 0u);
     // The probe fault is accounted for, but no exception was taken: only the
     // probe failed, the two instruction fetches translated fine.
     ZLB_EXPECT_EQ(mmu.total_faults, faults_before + 1u);
 }
 
-ZLB_TEST(mmu_section_ap_and_apx_semantics) {
-    // ARMv7 short descriptors are not LPAE: for a *first level* (section)
-    // descriptor AP[1:0] lives in bits [11:10] and bit 15 is APX, an override to
-    // "no user access" - not an AP[2] read-only bit. AP = 0b11 with APX = 0 is
-    // therefore readable *and writable* by user code, which is what the kernel
-    // boot loader's identity sections rely on.
-    Fixture f;
-    ArmMmu& mmu = f.cpu.mmu;
-    mmu.ttbr0 = 0x80010000u;
-    mmu.dacr = 0x00000001u;
-    mmu.sctlr |= 1u;
-    const u32 index = (0x81000000u >> 20) & 0xFFFu;
-    const u32 base = 0x81000000u | 2u | (3u << 2);  // identity section, C/B = 1
-    const auto put = [&](u32 ap, u32 apx) {
-        f.bus.write32(0x80010000u + index * 4u, base | (ap << 10) | (apx << 15));
+ZLB_TEST(cp15_va_to_pa_access_encodings_and_fault_status_match_armv7) {
+    struct Permission {
+        u32 ap;
+        bool allowed[4];  // ATS1CPR, ATS1CPW, ATS1CUR, ATS1CUW
     };
+    const Permission permissions[] = {
+        {1u, {true, true, false, false}},
+        {2u, {true, true, true, false}},
+        {3u, {true, true, true, true}},
+        {5u, {true, false, false, false}},
+        {6u, {true, false, true, false}},
+    };
+    for (const Permission& permission : permissions) {
+        for (u32 operation = 0; operation < 4; ++operation) {
+            Fixture f;
+            f.load(kCodeBase, {
+                arm_cp15(false, 0, 7, 4, 8, operation),
+                arm_cp15(true, 0, 7, 5, 4, 0),
+            });
+            f.cpu.reset(kCodeBase);
+            f.cpu.mmu.ttbr0 = kDataBase;
+            f.cpu.mmu.dacr = 1u | (1u << 6);  // client domains 0 and 3
+            f.cpu.mmu.sctlr |= 1u;
+            f.bus.write32(kDataBase + 0x800u * 4u, kCodeBase | (3u << 10) | 2u);
+            f.bus.write32(kDataBase + 0x900u * 4u,
+                          kCodeBase | ((permission.ap & 3u) << 10) |
+                          ((permission.ap >> 2) << 15) | (3u << 5) | 2u);
+            f.set_reg(4, 0x90001000u);
+            f.cpu.step();
+            f.cpu.step();
+            // FS=13 for permission fault; PAR excludes DFSR domain and WnR.
+            ZLB_EXPECT_EQ(f.reg(5), permission.allowed[operation] ? 0x80001000u : 0x1Bu);
+            ZLB_EXPECT_EQ(f.cpu.exception_count, 0u);
+            ZLB_EXPECT_FALSE(f.cpu.halted);
+        }
+    }
+}
 
-    put(3, 0);  // read/write for everyone
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, false, false, arm::kModeUser).ok);
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, true, false, arm::kModeUser).ok);
+ZLB_TEST(cp15_va_to_pa_supersection_sets_ss_and_returns_supersection_address) {
+    Fixture f;
+    f.load(kCodeBase, {
+        arm_cp15(false, 0, 7, 4, 8, 0),
+        arm_cp15(true, 0, 7, 5, 4, 0),
+    });
+    f.cpu.reset(kCodeBase);
+    f.cpu.mmu.ttbr0 = kDataBase;
+    f.cpu.mmu.dacr = 1u;
+    f.cpu.mmu.sctlr |= 1u;
+    f.bus.write32(kDataBase + 0x800u * 4u, kCodeBase | (3u << 10) | 2u);
+    f.bus.write32(kDataBase + 0x905u * 4u, kCodeBase | (1u << 18) | (3u << 10) | 2u);
+    f.set_reg(4, 0x90567000u);
+    f.cpu.step();
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(5), 0x80000002u); // SS=1, PA[23:12] comes from the input VA
+}
 
-    put(1, 0);  // privileged RW, user read-only
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, false, false, arm::kModeUser).ok);
-    ZLB_EXPECT_FALSE(mmu.translate(0x81000000u, true, false, arm::kModeUser).ok);
+ZLB_TEST(mmu_short_descriptor_ap_permissions_match_armv7) {
+    // ARM ARM table B3-8 applies to sections, small pages and entire large
+    // pages. Each mask below is {user W, user R, privileged W, privileged R}.
+    // 0b100 is reserved, so this table asserts only architecturally defined APs.
+    struct Case { u32 ap; u32 permissions; };
+    const Case cases[] = {{0u, 0u}, {1u, 3u}, {2u, 7u}, {3u, 15u},
+                          {5u, 1u}, {6u, 5u}, {7u, 5u}};
+    constexpr u32 l1 = 0x80010000u;
+    constexpr u32 l2 = 0x80018000u;
+    constexpr u32 va = 0x81000000u;
+    for (u32 format : {0u, 1u, 2u}) { // section, small, large
+        for (const Case& test : cases) {
+            Fixture f;
+            ArmMmu& mmu = f.cpu.mmu;
+            mmu.ttbr0 = l1;
+            mmu.dacr = 1u;
+            mmu.sctlr |= 1u; // AFE=0: full AP[2:0] model
+            const u32 l1_address = l1 + (va >> 20) * 4u;
+            if (format == 0u) {
+                f.bus.write32(l1_address, 0x80000002u |
+                              ((test.ap & 3u) << 10) | ((test.ap >> 2) << 15));
+            } else {
+                f.bus.write32(l1_address, l2 | 1u);
+                for (u32 index = 0; index < 16u; ++index) {
+                    const u32 base = format == 2u ? 0x80000000u : 0x80000000u + index * 0x1000u;
+                    f.bus.write32(l2 + index * 4u, base | (format == 2u ? 1u : 2u) |
+                                  ((test.ap & 3u) << 4) | ((test.ap >> 2) << 9));
+                }
+            }
+            // The old large-page check invented different permissions in each
+            // 16KiB quarter. Every quarter must obey the same AP field.
+            for (u32 offset : {0u, 0x4000u, 0x8000u, 0xC000u}) {
+                for (u32 mode : {arm::kModeSystem, arm::kModeUser}) {
+                    for (bool write : {false, true}) {
+                        const u32 permission_bit = (mode == arm::kModeUser ? 2u : 0u) + (write ? 1u : 0u);
+                        const bool allowed = (test.permissions & (1u << permission_bit)) != 0u;
+                        const auto result = mmu.translate(va + offset, write, false, mode);
+                        ZLB_EXPECT_EQ(result.ok, allowed);
+                        if (allowed) ZLB_EXPECT_EQ(result.phys_addr, 0x80000000u + offset);
+                        else ZLB_EXPECT_TRUE(result.fault == arm::MmFaultKind::Permission);
+                    }
+                }
+            }
+        }
+    }
+}
 
-    put(3, 1);  // APX set: no user access, and AP = 0b11 becomes privileged read-only
-    ZLB_EXPECT_FALSE(mmu.translate(0x81000000u, false, false, arm::kModeUser).ok);
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, false, false, arm::kModeSupervisor).ok);
-    ZLB_EXPECT_FALSE(mmu.translate(0x81000000u, true, false, arm::kModeSupervisor).ok);
+ZLB_TEST(mmu_nskbl_large_page_allows_genuine_privileged_clear) {
+    // The actual NSKBL STRD fault walk at 0x51013548. Its large-page AP=001
+    // permits privileged writes across all 64KiB; XN prohibits only fetches.
+    Fixture f;
+    f.bus.add_ram("nskbl", 0x70000u, 0x40300000u, "genuine walk");
+    ArmMmu& mmu = f.cpu.mmu;
+    mmu.sctlr = 0x20005805u; // AFE=1, AF already set in the descriptor
+    mmu.ttbr0 = 0x40308000u;
+    mmu.ttbr1 = 0x4030C04Au;
+    mmu.ttbcr = 2u;
+    mmu.dacr = 0x55555555u;
+    f.bus.write32(0x40308C00u, 0x40316181u); // coarse table, domain12
+    for (u32 index = 0; index < 16u; ++index)
+        f.bus.write32(0x40316000u + index * 4u, 0x40359011u);
+    for (u32 offset : {0u, 0x3FF8u, 0x4000u, 0x8000u, 0xC000u, 0xFFF8u}) {
+        const auto store = mmu.translate(0x30000000u + offset, true, false, arm::kModeSystem);
+        ZLB_EXPECT_TRUE(store.ok);
+        ZLB_EXPECT_EQ(store.phys_addr, 0x40350000u + offset);
+        ZLB_EXPECT_TRUE(store.normal); // TEX=001,C=B=0: Normal, non-cacheable
+        ZLB_EXPECT_FALSE(mmu.translate(0x30000000u + offset, false, true, arm::kModeSystem).ok);
+    }
+    ZLB_EXPECT_FALSE(mmu.translate(0x30000000u, false, false, arm::kModeUser).ok);
+    ZLB_EXPECT_EQ(f.bus.read32(0x40316000u), 0x40359011u);
+}
 
-    put(1, 1);  // APX set with AP = 0b01: privileged keeps read/write, user loses access
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, true, false, arm::kModeSupervisor).ok);
-    ZLB_EXPECT_FALSE(mmu.translate(0x81000000u, false, false, arm::kModeUser).ok);
-
-    put(2, 0);  // privileged read-only
-    ZLB_EXPECT_TRUE(mmu.translate(0x81000000u, false, false, arm::kModeSupervisor).ok);
-    ZLB_EXPECT_FALSE(mmu.translate(0x81000000u, true, false, arm::kModeSupervisor).ok);
+ZLB_TEST(mmu_afe_access_flag_is_ap_zero_for_all_short_descriptors) {
+    constexpr u32 l1 = 0x80010000u;
+    constexpr u32 l2 = 0x80018000u;
+    constexpr u32 va = 0x81000000u;
+    for (u32 format : {0u, 1u, 2u}) {
+        Fixture f;
+        ArmMmu& mmu = f.cpu.mmu;
+        mmu.ttbr0 = l1;
+        mmu.dacr = 1u;
+        mmu.sctlr |= 1u;
+        const u32 l1_address = l1 + (va >> 20) * 4u;
+        const u32 address = format == 0u ? l1_address : l2;
+        // AP=010 grants privileged RW when AFE=0. AFE=1 instead makes
+        // AP[0]=0 an access-flag fault, even though AP[2:1] permits writing.
+        const u32 descriptor = format == 0u ? (0x80000002u | (2u << 10))
+                                             : (0x80000000u | (format == 2u ? 1u : 2u) | (2u << 4));
+        if (format != 0u) f.bus.write32(l1_address, l2 | 1u);
+        f.bus.write32(address, descriptor);
+        ZLB_EXPECT_TRUE(mmu.translate(va, true, false, arm::kModeSystem).ok);
+        mmu.sctlr |= 1u << 29;
+        const auto fault = mmu.translate(va, true, false, arm::kModeSystem);
+        ZLB_EXPECT_FALSE(fault.ok);
+        ZLB_EXPECT_TRUE(fault.fault == arm::MmFaultKind::AccessFlag);
+        ZLB_EXPECT_EQ(fault.fsr_full, format == 0u ? 0x803u : 0x806u);
+        ZLB_EXPECT_EQ(f.bus.read32(address), descriptor); // software must set AF
+        f.bus.write32(address, descriptor | (1u << (format == 0u ? 10u : 4u)));
+        ZLB_EXPECT_TRUE(mmu.translate(va, true, false, arm::kModeUser).ok);
+    }
 }
 
 ZLB_TEST(mmu_fault_registers_are_exposed) {    // `info` must be able to answer "why did it abort" without the bus trace.
@@ -1398,7 +1939,7 @@ ZLB_TEST(mmu_coarse_page_translate) {
     const u32 index1 = (0x81000000u >> 20) & 0xFFFu;
     f.bus.write32(l1 + index1 * 4u, l2 | 1u);          // coarse page table, domain 0
     const u32 index2 = (0x81000000u >> 12) & 0xFFu;
-    f.bus.write32(l2 + index2 * 4u, 0x80010000u | 2u | (3u << 4) | (1u << 9));  // small page, AP=0b011
+    f.bus.write32(l2 + index2 * 4u, 0x80010000u | 2u | (3u << 4) | (1u << 9));  // small page, AP=0b111 (RO all)
 
     u32 pa = 0;
     std::string fault;
@@ -1689,6 +2230,701 @@ ZLB_TEST(neon_vdup_and_vorr_execute) {
     ZLB_EXPECT_TRUE(result.faulted);
     ZLB_EXPECT_TRUE(g.cpu.undefined_instruction);
     ZLB_EXPECT_TRUE(g.cpu.halt_reason.find("Advanced SIMD") != std::string::npos);
+}
+
+ZLB_TEST(neon_native_threadmgr_register_initializer) {
+    // Firmware 1.04 ThreadMgr PT_LOAD0, linked 81000000..81000044. The native
+    // boot stopped at F2201110: Q=0 legally copies D0 to the odd register D1.
+    // Keep the instruction bytes unchanged and relocate only the data pointer.
+    Fixture f;
+    f.load(kCodeBase, {
+        0xE59F009Cu, 0xED900B00u, 0xF2201110u, 0xF2204150u,
+        0xF2206150u, 0xF2208150u, 0xF220A150u, 0xF220C150u,
+        0xF220E150u, 0xF2600150u, 0xF2602150u, 0xF2604150u,
+        0xF2606150u, 0xF2608150u, 0xF260A150u, 0xF260C150u,
+        0xF260E150u, 0xE12FFF1Eu, 0x7F80DEADu, 0x7FF8DEADu,
+    });
+    f.bus.write32(kCodeBase + 0xA4u, kCodeBase + 0x48u);
+    f.cpu.reset(kCodeBase);
+    f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+    f.cpu.vfp.fpscr = 0xA1000015u;
+    f.cpu.cpsr |= 0xA0000000u;
+    const u32 cpsr_before = f.cpu.cpsr;
+    for (int d = 0; d < 32; ++d) f.cpu.vfp.write_d32(d, 0x0123456789ABCDEFull + d);
+    f.set_reg(14, kCodeBase + 0x200u);
+    for (int i = 0; i < 18; ++i) {
+        const StepResult result = f.cpu.step();
+        ZLB_EXPECT_FALSE(result.faulted);
+        if (result.faulted) return;
+    }
+    for (int d = 0; d < 32; ++d) {
+        const u64 expected = d == 2 || d == 3 ? 0x0123456789ABCDEFull + d :
+                                               0x7FF8DEAD7F80DEADull;
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d), expected);
+    }
+    ZLB_EXPECT_EQ(f.reg(15), kCodeBase + 0x200u);
+    ZLB_EXPECT_EQ(f.cpu.cpsr, cpsr_before);
+    ZLB_EXPECT_EQ(f.cpu.vfp.fpscr, 0xA1000015u);
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+}
+
+ZLB_TEST(neon_native_syscon_command_padding) {
+    // Unchanged Syscon PT_LOAD0 81001BEA..81001CA0. Actual ARM3 stops on
+    // FFC70E1F at VA4F9BEA with R2=28,R7=3,R12=24,LR=4. The vector fill
+    // and byte tail must fill exactly buffer[20..47], leaving its header intact.
+    Fixture f;
+    f.load_halfwords(kCodeBase, {
+        0xFFC7,0x0E1F,0x2001,0xF106,0x0913,0x4287,0xF107,0x38FF,
+        0xF106,0x031B,0xF008,0x0803,0xF949,0x070F,0xD927,0xF1B8,
+        0x0F00,0xD012,0xF1B8,0x0F01,0xD00A,0xF1B8,0x0F02,0xD004,
+        0xF943,0x070F,0x2002,0xF106,0x0323,0x3001,0xF943,0x070D,
+        0x3001,0xF943,0x070D,0x4287,0xD911,0x461E,0xF103,0x0908,
+        0x3004,0xF946,0x070D,0x3608,0xF949,0x070F,0xF946,0x070F,
+        0xF103,0x0618,0x3320,0x4287,0xF946,0x070F,0xD8ED,0x4594,
+        0x44E6,0xD021,0xF10E,0x0301,0x22FF,0x2B1F,0xF1CE,0x071F,
+        0xF801,0x200E,0xF007,0x0003,0xDC16,0xB158,0x2801,0xD005,
+        0x2802,0xBF1C,0x54CA,0x3301,0x54CA,0x3301,0x54CA,0x3301,
+        0x2B1F,0xDC09,0x54CA,0x1C58,0x1CDE,0x1C9F,0x3304,0x540A,
+        0x2B1F,0x55CA,0x558A,0xDDF5,
+    });
+    f.cpu.reset(kCodeBase | 1u);
+    f.cpu.cpsr = 0x6000003Fu;
+    f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+    f.cpu.vfp.fpscr = 0xA1000015u;
+    f.set_reg(0, 0xFFFFFFFDu); f.set_reg(1, kDataBase + 16u);
+    f.set_reg(2, 28u); f.set_reg(3, 0u); f.set_reg(4, kDataBase);
+    f.set_reg(6, kDataBase + 1u); f.set_reg(7, 3u);
+    f.set_reg(8, 2u); f.set_reg(12, 24u); f.set_reg(14, 4u);
+    for (u32 byte = 0; byte < 56u; ++byte) f.bus.write8(kDataBase + byte, static_cast<u8>(byte));
+    for (int d = 0; d < 32; ++d) f.cpu.vfp.write_d32(d, 0x0123456789ABCDEFull + d);
+    constexpr u32 end = kCodeBase + 0xB8u; // native 81001CA2
+    for (int step = 0; step < 200 && f.cpu.get_pc() != end; ++step) {
+        const StepResult result = f.cpu.step();
+        ZLB_EXPECT_FALSE(result.faulted);
+        if (result.faulted) return;
+    }
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), end);
+    for (u32 byte = 0; byte < 56u; ++byte) {
+        ZLB_EXPECT_EQ(f.bus.read8(kDataBase + byte), byte >= 20u && byte < 48u ? 0xFFu : byte);
+    }
+    for (int d = 0; d < 32; ++d) {
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d), d == 16 ? ~u64{0} : 0x0123456789ABCDEFull + d);
+    }
+    ZLB_EXPECT_EQ(f.cpu.vfp.fpscr, 0xA1000015u);
+    unsigned length = 0;
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase, true, length) == "vmov.i8 d16, #FF");
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 0x18u, true, length) == "vst1.8 {d16}, [r9]");
+}
+
+ZLB_TEST(neon_modified_immediate_vmoves_and_thumb_class_selection) {
+    struct Case { u32 cmode; bool op; u32 imm8; u64 expected; };
+    const Case cases[] = {
+        {0,false,0xA5,0x000000A5000000A5ull}, {2,false,0xA5,0x0000A5000000A500ull},
+        {4,false,0xA5,0x00A5000000A50000ull}, {6,false,0xA5,0xA5000000A5000000ull},
+        {8,false,0xA5,0x00A500A500A500A5ull}, {10,false,0xA5,0xA500A500A500A500ull},
+        {12,false,0xA5,0x0000A5FF0000A5FFull}, {13,false,0xA5,0x00A5FFFF00A5FFFFull},
+        {14,false,0xA5,0xA5A5A5A5A5A5A5A5ull}, {14,true,0xA5,0xFF00FF0000FF00FFull},
+        {15,false,0x70,0x3F8000003F800000ull}, {14,false,0,0}, {0,false,0,0},
+    };
+    for (bool thumb : {false, true}) {
+        for (const Case& test : cases) {
+            for (u32 d : {1u, 16u, 30u, 31u}) {
+                const bool quad = d == 30u;
+                Fixture f;
+                load_neon(f, arm_neon_mov_imm(d, quad, test.cmode, test.op, test.imm8), thumb);
+                f.cpu.cpsr |= 0xA8000000u;
+                const u32 psr = f.cpu.cpsr;
+                for (int reg = 0; reg < 32; ++reg) f.cpu.vfp.write_d32(reg, 0x1122334455667788ull + reg);
+                const StepResult result = f.cpu.step();
+                ZLB_EXPECT_FALSE(result.faulted);
+                for (int reg = 0; reg < 32; ++reg) {
+                    const bool written = reg == static_cast<int>(d) || (quad && reg == static_cast<int>(d + 1u));
+                    ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(reg), written ? test.expected : 0x1122334455667788ull + reg);
+                }
+                ZLB_EXPECT_EQ(f.cpu.cpsr, psr);
+                ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 4u);
+            }
+        }
+        for (u32 instr : {arm_neon_mov_imm(17,true,14,false,0xFF),
+                         arm_neon_mov_imm(16,false,15,true,0xA5),
+                         arm_neon_mov_imm(16,false,1,false,0xA5),
+                         arm_neon_mov_imm(16,false,2,false,0)}) {
+            Fixture f; load_neon(f, instr, thumb);
+            f.cpu.vfp.write_d32(16, 0xABCDEF1234567890ull);
+            ZLB_EXPECT_TRUE(f.cpu.step().faulted);
+            ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(16), 0xABCDEF1234567890ull);
+        }
+    }
+    // EF and FF also carry the existing register logical families, with U
+    // preserved at its architectural A32 position rather than dropped.
+    for (u32 op : {2u, 4u}) {
+        Fixture f; load_neon(f, arm_neon_logical(op,false,17,1,31),true);
+        f.cpu.vfp.write_d32(1, 0x0F0F0F0F0F0F0F0Full);
+        f.cpu.vfp.write_d32(31, 0x3333333333333333ull);
+        ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(17), op == 2u ? 0x3F3F3F3F3F3F3F3Full : 0x3C3C3C3C3C3C3C3Cull);
+    }
+}
+
+ZLB_TEST(neon_vst1_element_endian_register_lists_and_writeback) {
+    constexpr u32 types[] = {7u,10u,6u,2u};
+    for (bool thumb : {false,true}) for (bool big : {false,true}) {
+        for (u32 size = 0; size < 4u; ++size) for (u32 count = 1; count <= 4u; ++count) {
+            for (u32 m : {15u,13u,2u,0u}) {
+                Fixture f; load_neon(f,arm_neon_vst1(32u-count,types[count-1],size,0,0,m),thumb);
+                // Unaligned base exercises MemU. Register-index writeback must
+                // use the old Rm, including Rm == Rn.
+                const u32 address = kDataBase + 3u;
+                f.set_reg(0,address); f.set_reg(2,37u);
+                if (big) f.cpu.cpsr |= arm::kFlagE;
+                const u32 psr = f.cpu.cpsr;
+                for (u32 reg = 0; reg < count; ++reg) f.cpu.vfp.write_d32(static_cast<int>(32u-count+reg),0x0123456789ABCDEFull + reg);
+                f.bus.write8(address-1u,0xAAu); f.bus.write8(address+8u*count,0xBBu);
+                ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+                const u32 width = 1u << size;
+                for (u32 reg = 0; reg < count; ++reg) for (u32 byte = 0; byte < 8u; ++byte) {
+                    const u32 source = (byte / width) * width + (big ? width-1u-byte%width : byte%width);
+                    const u32 expected = static_cast<u32>(((0x0123456789ABCDEFull+reg) >> (source*8u)) & 0xFFu);
+                    ZLB_EXPECT_EQ(f.bus.read8(address+reg*8u+byte),expected);
+                }
+                const u32 increment = m == 13u ? 8u*count : m == 0u ? address : 37u;
+                ZLB_EXPECT_EQ(f.reg(0),m == 15u ? address : address+increment);
+                ZLB_EXPECT_EQ(f.bus.read8(address-1u),0xAAu);
+                ZLB_EXPECT_EQ(f.bus.read8(address+8u*count),0xBBu);
+                ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+            }
+        }
+    }
+}
+
+ZLB_TEST(neon_vst1_alignment_translation_fault_and_it_suppression) {
+    // Crossing two independently translated pages must never write the
+    // physically adjacent decoy; a second-page fault leaves Rn unchanged.
+    for (bool fault : {false,true}) {
+        Fixture f; load_neon(f,arm_neon_vst1(31,7,0,0,0,13),true);
+        ArmMmu& mmu=f.cpu.mmu; mmu.ttbr0=kDataBase; mmu.dacr=1u; mmu.sctlr|=1u;
+        const u32 l2=kDataBase+0x8000u;
+        f.bus.write32(kDataBase+0x800u*4u,0x80000C0Eu);
+        f.bus.write32(kDataBase+0x810u*4u,l2|1u);
+        f.bus.write32(l2,0x8001A01Eu); f.bus.write32(l2+4u,fault ? 0u : 0x8001C01Eu);
+        f.bus.write32(0x8001B000u,0xA5A5A5A5u);
+        f.set_reg(0,0x81000FFCu); f.cpu.vfp.write_d32(31,0x0123456789ABCDEFull);
+        ZLB_EXPECT_EQ(f.cpu.step().faulted,fault);
+        ZLB_EXPECT_EQ(f.bus.read32(0x8001AFFCu),0x89ABCDEFu);
+        ZLB_EXPECT_EQ(f.bus.read32(0x8001B000u),0xA5A5A5A5u);
+        if (fault) {
+            ZLB_EXPECT_EQ(f.reg(0),0x81000FFCu); ZLB_EXPECT_EQ(mmu.dfar,0x81001000u);
+        } else {
+            ZLB_EXPECT_EQ(f.reg(0),0x81001004u); ZLB_EXPECT_EQ(f.bus.read32(0x8001C000u),0x01234567u);
+        }
+    }
+    for (u32 size : {1u,2u,3u}) {
+        Fixture f; load_neon(f,arm_neon_vst1(16,7,size,0,0,13),true);
+        f.cpu.mmu.sctlr|=2u; f.set_reg(0,kDataBase+1u); f.bus.write32(kDataBase,0xA5A5A5A5u);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.reg(0),kDataBase+1u);
+        ZLB_EXPECT_EQ(f.cpu.mmu.dfsr,0x801u); ZLB_EXPECT_EQ(f.bus.read32(kDataBase),0xA5A5A5A5u);
+    }
+    for (u32 cb : {0u,4u}) for (u32 size : {1u,2u,3u}) {
+        Fixture f; load_neon(f,arm_neon_vst1(16,7,size,0,0,13),true);
+        ArmMmu& mmu=f.cpu.mmu; mmu.ttbr0=kDataBase; mmu.dacr=1u; mmu.sctlr|=1u;
+        const u32 l2=kDataBase+0x8000u;
+        f.bus.write32(kDataBase+0x800u*4u,0x80000C0Eu);
+        f.bus.write32(kDataBase+0x810u*4u,l2|1u);
+        f.bus.write32(l2,0x8001A012u|cb); // Strongly-ordered or Device, A=0
+        f.bus.write32(0x8001A000u,0xA5A5A5A5u); f.set_reg(0,0x81000001u);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.reg(0),0x81000001u);
+        ZLB_EXPECT_EQ(mmu.dfar,0x81000001u); ZLB_EXPECT_EQ(mmu.dfsr,0x801u);
+        ZLB_EXPECT_EQ(f.bus.read32(0x8001A000u),0xA5A5A5A5u);
+    }
+    Fixture byte_store; load_neon(byte_store,arm_neon_vst1(31,7,0,0,0,13),true);
+    byte_store.cpu.mmu.sctlr|=2u; byte_store.set_reg(0,kDataBase+1u);
+    byte_store.cpu.vfp.write_d32(31,0x0123456789ABCDEFull);
+    ZLB_EXPECT_FALSE(byte_store.cpu.step().faulted); // bytes retain alignment 1 with A=1
+    ZLB_EXPECT_EQ(byte_store.bus.read64(kDataBase+1u),0x0123456789ABCDEFull);
+    ZLB_EXPECT_EQ(byte_store.reg(0),kDataBase+9u);
+    // Explicit :64 alignment faults with A=0, while illegal list/alignment
+    // encodings are undefined before any write or register update.
+    for (u32 instr : {arm_neon_vst1(16,7,0,1,0,13),arm_neon_vst1(31,10,0,0,0,13),
+                     arm_neon_vst1(16,7,0,2,0,13),arm_neon_vst1(16,7,0,0,15,13)}) {
+        Fixture f; load_neon(f,instr,true); f.set_reg(0,kDataBase+1u); f.bus.write32(kDataBase,0xA5A5A5A5u);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.reg(0),kDataBase+1u);
+        ZLB_EXPECT_EQ(f.bus.read32(kDataBase),0xA5A5A5A5u);
+    }
+    Fixture skipped;
+    skipped.load_halfwords(kCodeBase,{0xBF08u,0xFFC7u,0x0E1Fu,0xBF08u,0xF940u,0x070Du});
+    skipped.cpu.reset(kCodeBase|1u); skipped.cpu.cpsr &= ~arm::kFlagZ;
+    skipped.set_reg(0,kDataBase); skipped.cpu.vfp.write_d32(16,0x0123456789ABCDEFull);
+    for (int step=0;step<4;++step) ZLB_EXPECT_FALSE(skipped.cpu.step().faulted);
+    ZLB_EXPECT_EQ(skipped.cpu.vfp.read_d32(16),0x0123456789ABCDEFull);
+    ZLB_EXPECT_EQ(skipped.bus.read32(kDataBase),0u); ZLB_EXPECT_EQ(skipped.reg(0),kDataBase);
+}
+
+ZLB_TEST(neon_vld1_exact_native_syscon_halfword_instruction_and_neighbors) {
+    Fixture f;
+    // Genuine Syscon4F8B4C..4F8B5E: R7 is the response buffer, LR is the
+    // eight-byte block count. The VLD1 itself starts at a halfword-only PC.
+    f.load_halfwords(kCodeBase + 2u, {0x463Au,0x2101u,0x458Eu,0xF10Eu,0x3CFFu,
+                                     0xF962u,0x070Du,0xF00Cu,0x0C03u});
+    f.cpu.reset((kCodeBase + 2u) | 1u);
+    f.set_reg(7,kDataBase + 3u); f.set_reg(14,1u); f.set_reg(13,kDataBase + 0xF00u);
+    for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,0x8877665544332211ull + d);
+    constexpr u8 response[] = {4u,0u,6u,0u,0u,0x60u,0x40u,0u,0x55u,0u};
+    for (u32 i=0;i<sizeof(response);++i) f.bus.write8(kDataBase + 3u + i,response[i]);
+    for (unsigned step=0;step<6;++step) ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+    ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(16),0x0040600000060004ull);
+    ZLB_EXPECT_EQ(f.reg(2),kDataBase + 11u); ZLB_EXPECT_EQ(f.reg(7),kDataBase + 3u);
+    ZLB_EXPECT_EQ(f.reg(13),kDataBase + 0xF00u); ZLB_EXPECT_EQ(f.reg(14),1u);
+    ZLB_EXPECT_EQ(f.cpu.get_pc(),kCodeBase + 20u); ZLB_EXPECT_EQ(f.reg(12),0u);
+    for (int d=0;d<32;++d) if (d !=16) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),0x8877665544332211ull + d);
+    for (u32 i=0;i<sizeof(response);++i) ZLB_EXPECT_EQ(f.bus.read8(kDataBase+3u+i),response[i]);
+}
+
+ZLB_TEST(neon_vld1_elements_endian_lists_and_postindex) {
+    constexpr u32 types[] = {7u,10u,6u,2u};
+    for (bool thumb : {false,true}) for (bool big : {false,true}) {
+        for (u32 size=0;size<4u;++size) for (u32 count=1;count<=4u;++count) {
+            for (u32 m : {15u,13u,2u,0u}) {
+                Fixture f; load_neon(f,arm_neon_vld1(32u-count,types[count-1],size,0,0,m),thumb);
+                const u32 address=kDataBase+3u;
+                f.set_reg(0,address); f.set_reg(2,37u); f.set_reg(13,kDataBase+0xF00u);
+                if (big) f.cpu.cpsr |=arm::kFlagE;
+                const u32 psr=f.cpu.cpsr;
+                for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,0x8877665544332211ull+d);
+                for (u32 byte=0;byte<8u*count;++byte) f.bus.write8(address+byte,static_cast<u8>(byte*29u+7u));
+                ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+                const u32 width=1u<<size;
+                for (u32 reg=0;reg<count;++reg) {
+                    u64 expected=0;
+                    for (u32 byte=0;byte<8u;++byte) {
+                        const u32 source=(byte/width)*width+(big ? width-1u-byte%width : byte%width);
+                        expected |=static_cast<u64>(static_cast<u8>((reg*8u+source)*29u+7u)) << (byte*8u);
+                    }
+                    ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(static_cast<int>(32u-count+reg)),expected);
+                }
+                for (u32 d=0;d<32u-count;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(static_cast<int>(d)),0x8877665544332211ull+d);
+                const u32 increment=m==13u ? 8u*count : m==0u ? address : 37u;
+                ZLB_EXPECT_EQ(f.reg(0),m==15u ? address : address+increment);
+                ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u); ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+            }
+        }
+    }
+}
+
+ZLB_TEST(neon_vld1_alignment_page_fault_and_it_suppression) {
+    // For a 64-bit element, the ARM pseudocode reads the low result word
+    // first: address+4 for BE, address for LE. Both pages are absent here.
+    for (bool big : {false,true}) {
+        Fixture f; load_neon(f,arm_neon_vld1(31,7,3,0,0,13),true);
+        if (big) f.cpu.cpsr|=arm::kFlagE;
+        ArmMmu& mmu=f.cpu.mmu; mmu.ttbr0=kDataBase; mmu.dacr=1u; mmu.sctlr|=1u;
+        const u32 l2=kDataBase+0x8000u;
+        f.bus.write32(kDataBase+0x800u*4u,0x80000C0Eu); f.bus.write32(kDataBase+0x810u*4u,l2|1u);
+        f.set_reg(0,0x81000FFCu); f.cpu.vfp.write_d32(31,0x0123456789ABCDEFull);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(mmu.dfar,big ? 0x81001000u : 0x81000FFCu);
+        ZLB_EXPECT_EQ(f.reg(0),0x81000FFCu); ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(31),0x0123456789ABCDEFull);
+    }
+    for (bool fault : {false,true}) {
+        Fixture f; load_neon(f,arm_neon_vld1(31,7,0,0,0,13),true);
+        ArmMmu& mmu=f.cpu.mmu; mmu.ttbr0=kDataBase; mmu.dacr=1u; mmu.sctlr|=1u;
+        const u32 l2=kDataBase+0x8000u;
+        f.bus.write32(kDataBase+0x800u*4u,0x80000C0Eu); f.bus.write32(kDataBase+0x810u*4u,l2|1u);
+        f.bus.write32(l2,0x8001A01Eu); f.bus.write32(l2+4u,fault ? 0u : 0x8001C01Eu);
+        f.bus.write32(0x8001AFFCu,0x89ABCDEFu); f.bus.write32(0x8001B000u,0xA5A5A5A5u);
+        f.bus.write32(0x8001C000u,0x01234567u); f.set_reg(0,0x81000FFCu);
+        f.cpu.vfp.write_d32(31,0x8877665544332211ull);
+        ZLB_EXPECT_EQ(f.cpu.step().faulted,fault);
+        if (fault) {
+            ZLB_EXPECT_EQ(f.reg(0),0x81000FFCu); ZLB_EXPECT_EQ(mmu.dfar,0x81001000u);
+            ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(31),0x8877665589ABCDEFull);
+        } else {
+            ZLB_EXPECT_EQ(f.reg(0),0x81001004u); ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(31),0x0123456789ABCDEFull);
+        }
+        ZLB_EXPECT_EQ(f.bus.read32(0x8001B000u),0xA5A5A5A5u);
+    }
+    for (u32 size : {1u,2u,3u}) {
+        Fixture f; load_neon(f,arm_neon_vld1(16,7,size,0,0,13),true);
+        f.cpu.mmu.sctlr|=2u; f.set_reg(0,kDataBase+1u); f.cpu.vfp.write_d32(16,0xAABBCCDDEEFF0011ull);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.cpu.mmu.dfsr,1u);
+        ZLB_EXPECT_EQ(f.reg(0),kDataBase+1u); ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(16),0xAABBCCDDEEFF0011ull);
+    }
+    for (u32 cb : {0u,4u}) for (u32 size : {1u,2u,3u}) {
+        Fixture f; load_neon(f,arm_neon_vld1(16,7,size,0,0,13),true);
+        ArmMmu& mmu=f.cpu.mmu; mmu.ttbr0=kDataBase; mmu.dacr=1u; mmu.sctlr|=1u;
+        const u32 l2=kDataBase+0x8000u;
+        f.bus.write32(kDataBase+0x800u*4u,0x80000C0Eu); f.bus.write32(kDataBase+0x810u*4u,l2|1u);
+        f.bus.write32(l2,0x8001A012u|cb); f.set_reg(0,0x81000001u);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.reg(0),0x81000001u);
+        ZLB_EXPECT_EQ(mmu.dfar,0x81000001u); ZLB_EXPECT_EQ(mmu.dfsr,1u);
+    }
+    for (u32 instr : {arm_neon_vld1(16,7,0,1,0,13),arm_neon_vld1(31,10,0,0,0,13),
+                     arm_neon_vld1(16,7,0,2,0,13),arm_neon_vld1(16,7,0,0,15,13)}) {
+        Fixture f; load_neon(f,instr,true); f.set_reg(0,kDataBase+1u);
+        f.cpu.vfp.write_d32(16,0xAABBCCDDEEFF0011ull);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_EQ(f.reg(0),kDataBase+1u);
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(16),0xAABBCCDDEEFF0011ull);
+    }
+    Fixture skipped; skipped.load_halfwords(kCodeBase,{0xBF08u,0xF962u,0x070Du});
+    skipped.cpu.reset(kCodeBase|1u); skipped.cpu.cpsr &= ~arm::kFlagZ;
+    skipped.set_reg(2,0xF0000000u); skipped.cpu.vfp.write_d32(16,0xAABBCCDDEEFF0011ull);
+    ZLB_EXPECT_FALSE(skipped.cpu.step().faulted); ZLB_EXPECT_FALSE(skipped.cpu.step().faulted);
+    ZLB_EXPECT_EQ(skipped.reg(2),0xF0000000u); ZLB_EXPECT_EQ(skipped.cpu.vfp.read_d32(16),0xAABBCCDDEEFF0011ull);
+}
+
+ZLB_TEST(neon_movl_signed_unsigned_widths_and_source_overlap) {
+    struct Registers {u32 d,m;};
+    for (bool thumb : {false,true}) for (bool uns : {false,true}) for (u32 width : {8u,16u,32u}) {
+        for (const Registers registers : {Registers{16,16},Registers{16,17},Registers{30,31},Registers{0,31}}) {
+            Fixture f; load_neon(f,arm_neon_movl(width,uns,registers.d,registers.m),thumb);
+            u64 before[32],expected[32];
+            for (u32 d=0;d<32;++d) before[d]=expected[d]=0x8034FE91A5FF7E00ull+d;
+            for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,before[d]);
+            expected[registers.d]=expected[registers.d+1]=0;
+            const u64 source=before[registers.m];
+            const u64 mask=(1ull<<width)-1u;
+            for (u32 e=0;e<64u/width;++e) {
+                const u64 element=(source>>(e*width))&mask;
+                const s64 signed_element=(element&(1ull<<(width-1u))) ?
+                    static_cast<s64>(element)-(1ll<<width) : static_cast<s64>(element);
+                const u64 value=uns ? element : static_cast<u64>(signed_element);
+                const u32 output_width=width*2u,offset=e*output_width;
+                const u64 output_mask=output_width==64u ? ~0ull : (1ull<<output_width)-1u;
+                expected[registers.d+offset/64u] |= (value&output_mask)<<(offset%64u);
+            }
+            f.set_reg(13,kDataBase+0xF00u); f.cpu.cpsr|=0xA0000000u;
+            const u32 psr=f.cpu.cpsr; f.cpu.vfp.fpscr=0xA1000015u;
+            ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+            for (int d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),expected[d]);
+            ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u); ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+            ZLB_EXPECT_EQ(f.cpu.vfp.fpscr,0xA1000015u);
+        }
+    }
+}
+
+ZLB_TEST(neon_movl_rejects_invalid_quad_and_related_shifts) {
+    for (bool thumb : {false,true}) {
+        for (u32 instruction : {arm_neon_movl(8,true,17,16),arm_neon_movl(16,false,31,0),
+                                arm_neon_movl(8,true,16,16)|0x10000u}) {
+            Fixture f; load_neon(f,instruction,thumb);
+            for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,0xAABBCCDDEEFF0000ull+d);
+            ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+            for (int d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),0xAABBCCDDEEFF0000ull+d);
+        }
+    }
+    Fixture skipped; skipped.load_halfwords(kCodeBase,{0xBF08u,0xFFC8u,0x0A30u});
+    skipped.cpu.reset(kCodeBase|1u); skipped.cpu.cpsr &=~arm::kFlagZ;
+    skipped.cpu.vfp.write_d32(16,0xAABBCCDDEEFF0011ull);
+    ZLB_EXPECT_FALSE(skipped.cpu.step().faulted); ZLB_EXPECT_FALSE(skipped.cpu.step().faulted);
+    ZLB_EXPECT_EQ(skipped.cpu.vfp.read_d32(16),0xAABBCCDDEEFF0011ull);
+}
+
+ZLB_TEST(neon_add_integer_lane_wrap_and_register_aliases) {
+    struct Registers {bool quad;u32 d,n,m;};
+    const Registers registers[]={{false,17,31,19},{false,31,31,17},{false,17,31,17},
+                                 {true,30,16,30},{true,16,16,30}};
+    for (bool thumb : {false,true}) for (u32 size=0;size<4u;++size) for (const Registers& regs : registers) {
+        Fixture f; load_neon(f,arm_neon_add(size,regs.quad,regs.d,regs.n,regs.m),thumb);
+        u64 before[32],expected[32];
+        for (int d=0;d<32;++d) {
+            before[d]=expected[d]=0xFEFF8000FF7FFFFFull+(d&1);
+            f.cpu.vfp.write_d32(d,before[d]);
+        }
+        const u32 width=8u<<size;
+        const u64 mask=width==64u ? ~0ull : (1ull<<width)-1u;
+        for (u32 reg=0;reg<(regs.quad?2u:1u);++reg) {
+            u64 result=0;
+            for (u32 offset=0;offset<64u;offset+=width) {
+                const u64 left=(before[regs.n+reg]>>offset)&mask;
+                const u64 right=(before[regs.m+reg]>>offset)&mask;
+                result |= ((left+right)&mask)<<offset;
+            }
+            expected[regs.d+reg]=result;
+        }
+        f.set_reg(13,kDataBase+0xF00u); f.cpu.cpsr|=0xA0000000u;
+        const u32 psr=f.cpu.cpsr; f.cpu.vfp.fpscr=0xA1000015u;
+        ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+        for (int d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),expected[d]);
+        ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u); ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+        ZLB_EXPECT_EQ(f.cpu.vfp.fpscr,0xA1000015u);
+    }
+}
+
+ZLB_TEST(neon_add_rejects_odd_quad_and_preserves_other_families) {
+    for (bool thumb : {false,true}) {
+        for (u32 instruction : {arm_neon_add(2,true,17,16,30),arm_neon_add(2,true,16,17,30),
+                                arm_neon_add(2,true,16,30,31),arm_neon_add(2,false,16,16,16)|0x01000000u}) {
+            Fixture f; load_neon(f,instruction,thumb);
+            for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,0xAABBCCDDEEFF0000ull+d);
+            ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+            for (int d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),0xAABBCCDDEEFF0000ull+d);
+        }
+    }
+    Fixture skipped; skipped.load_halfwords(kCodeBase,{0xBF08u,0xEF62u,0x28A4u});
+    skipped.cpu.reset(kCodeBase|1u); skipped.cpu.cpsr &=~arm::kFlagZ;
+    skipped.cpu.vfp.write_d32(18,0xAABBCCDDEEFF0011ull);
+    ZLB_EXPECT_FALSE(skipped.cpu.step().faulted); ZLB_EXPECT_FALSE(skipped.cpu.step().faulted);
+    ZLB_EXPECT_EQ(skipped.cpu.vfp.read_d32(18),0xAABBCCDDEEFF0011ull);
+}
+
+ZLB_TEST(neon_pairwise_add_integer_reduction_and_source_overlap) {
+    struct Registers {u32 d,n,m;};
+    const Registers registers[]={{24,24,24},{31,17,31},{17,17,31},{19,17,31}};
+    for (bool thumb : {false,true}) for (u32 size=0;size<3u;++size) for (const Registers& regs : registers) {
+        Fixture f; load_neon(f,arm_neon_padd(size,regs.d,regs.n,regs.m),thumb);
+        u64 before[32];
+        for (int d=0;d<32;++d) {
+            before[d]=0xFF00807FFFFF0001ull+d; f.cpu.vfp.write_d32(d,before[d]);
+        }
+        const u32 width=8u<<size;
+        const u64 mask=(1ull<<width)-1u;
+        u64 expected=0;
+        for (u32 lane=0;lane<64u/width;++lane) {
+            const bool second=lane>=32u/width;
+            const u32 pair=lane%(32u/width);
+            const u64 source=before[second ? regs.m : regs.n];
+            const u64 left=(source>>(pair*2u*width))&mask;
+            const u64 right=(source>>((pair*2u+1u)*width))&mask;
+            expected |= ((left+right)&mask)<<(lane*width);
+        }
+        f.set_reg(13,kDataBase+0xF00u); f.cpu.cpsr|=0xA0000000u;
+        const u32 psr=f.cpu.cpsr; f.cpu.vfp.fpscr=0xA1000015u;
+        ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+        for (u32 d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),d==regs.d ? expected : before[d]);
+        ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u); ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+        ZLB_EXPECT_EQ(f.cpu.vfp.fpscr,0xA1000015u);
+    }
+}
+
+ZLB_TEST(neon_pairwise_add_rejects_invalid_size_and_quad) {
+    for (bool thumb : {false,true}) for (u32 instruction : {
+        arm_neon_padd(3,24,24,24),arm_neon_padd(2,24,24,24)|0x40u,
+        arm_neon_padd(2,24,24,24)|0x01000000u}) {
+        Fixture f; load_neon(f,instruction,thumb);
+        f.cpu.vfp.write_d32(24,0x0123456789ABCDEFull);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(24),0x0123456789ABCDEFull);
+    }
+    Fixture skipped; skipped.load_halfwords(kCodeBase,{0xBF08u,0xEF68u,0x8BB8u});
+    skipped.cpu.reset(kCodeBase|1u); skipped.cpu.cpsr &=~arm::kFlagZ;
+    skipped.cpu.vfp.write_d32(24,0x0123456789ABCDEFull);
+    ZLB_EXPECT_FALSE(skipped.cpu.step().faulted); ZLB_EXPECT_FALSE(skipped.cpu.step().faulted);
+    ZLB_EXPECT_EQ(skipped.cpu.vfp.read_d32(24),0x0123456789ABCDEFull);
+}
+
+ZLB_TEST(neon_scalar_word_high_d_read_write_preserves_neighbors) {
+    for (bool thumb : {false,true}) for (bool upper : {false,true}) for (bool to_core : {false,true}) {
+        for (u32 target : {0u,15u,16u,24u,31u}) {
+            Fixture f; const u32 instruction=arm_vmov_scalar32(2,target,upper,to_core);
+            if (thumb) f.load_halfwords(kCodeBase+2u,{static_cast<u16>(instruction>>16),static_cast<u16>(instruction)});
+            // A32 instructions require word alignment; Thumb starts at +2.
+            else f.load(kCodeBase,{instruction});
+            f.cpu.reset(thumb ? (kCodeBase+2u)|1u : kCodeBase);
+            f.cpu.vfp.fpexc=ArmVfp::kFpexcEn;
+            u64 before[32];
+            for (int d=0;d<32;++d) {before[d]=0xAABBCCDD10203000ull+d;f.cpu.vfp.write_d32(d,before[d]);}
+            f.set_reg(2,0xFE234567u); f.set_reg(13,kDataBase+0xF00u);
+            f.cpu.cpsr|=0xA0000000u; const u32 psr=f.cpu.cpsr; f.cpu.vfp.fpscr=0xA1000015u;
+            ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+            const u32 shift=upper ? 32u : 0u;
+            ZLB_EXPECT_EQ(f.reg(2),to_core ? static_cast<u32>(before[target]>>shift) : 0xFE234567u);
+            for (u32 d=0;d<32;++d) {
+                const u64 mask=0xFFFFFFFFull<<shift;
+                const u64 expected=!to_core && d==target ?
+                    (before[d]&~mask)|(0xFE234567ull<<shift) : before[d];
+                ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),expected);
+            }
+            ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u); ZLB_EXPECT_EQ(f.cpu.cpsr,psr);
+            ZLB_EXPECT_EQ(f.cpu.vfp.fpscr,0xA1000015u);
+            ZLB_EXPECT_EQ(f.cpu.get_pc(),kCodeBase+(thumb ? 6u : 4u));
+        }
+    }
+}
+
+ZLB_TEST(neon_scalar_word_rejects_invalid_core_register_and_other_sizes) {
+    for (bool thumb : {false,true}) for (u32 instruction : {
+        arm_vmov_scalar32(15,24,false,true),arm_vmov_scalar32(2,24,false,true)|0x00400000u,
+        arm_vmov_scalar32(2,24,false,true)|0x20u}) {
+        Fixture f;
+        if (thumb) f.load_halfwords(kCodeBase,{static_cast<u16>(instruction>>16),static_cast<u16>(instruction)});
+        else f.load(kCodeBase,{instruction});
+        f.cpu.reset(kCodeBase|(thumb ? 1u : 0u)); f.cpu.vfp.fpexc=ArmVfp::kFpexcEn;
+        f.cpu.vfp.write_d32(24,0x0123456789ABCDEFull); f.set_reg(2,0xF1234567u);
+        ZLB_EXPECT_TRUE(f.cpu.step().faulted); ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+        ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(24),0x0123456789ABCDEFull); ZLB_EXPECT_EQ(f.reg(2),0xF1234567u);
+    }
+    Fixture invalid_sp; const u32 instruction=arm_vmov_scalar32(13,24,false,true);
+    invalid_sp.load_halfwords(kCodeBase,{static_cast<u16>(instruction>>16),static_cast<u16>(instruction)});
+    invalid_sp.cpu.reset(kCodeBase|1u); invalid_sp.cpu.vfp.fpexc=ArmVfp::kFpexcEn;
+    invalid_sp.set_reg(13,kDataBase+0xF00u);
+    ZLB_EXPECT_TRUE(invalid_sp.cpu.step().faulted); ZLB_EXPECT_EQ(invalid_sp.reg(13),kDataBase+0xF00u);
+}
+
+ZLB_TEST(neon_unchanged_native_syscon_checksum_matches_scalar_oracle) {
+    // Original 1.04 Syscon PT_LOAD bytes +B26..DB4, an inline checksum block
+    // (linked 81000B26, captured at 004F8B26). Relative branches are retained.
+    // The short scalar initialization at +165C is its other basic block.
+    // Success rejoins the callback at +DB4; failure branches to +372.
+    constexpr char code[] =
+        "bb78012b7ff622acd81c8045fff41eac981c4fead00e07284feace0340f28b85"
+        "002b00f088853a4601218e450ef1ff3c62f90d070cf0030cc8ff300a60efb021"
+        "61efb101d0ff322ad0ff300a62efb24163efb32162efa42860efb03163efa228"
+        "61efb10160efa28840f2d780bcf1000f5ed0bcf1010f3cd0bcf1020f1cd062f9"
+        "0d070221c8ff300a60efb02161efb101d0ff322ad0ff300a62efb24164efa888"
+        "63efb32162efa82860efb03163efa22861efb10160efa28862f90d070131c8ff"
+        "300a60efb02161efb101d0ff322ad0ff300a62efb24164efa88863efb32162ef"
+        "a82860efb03163efa22861efb10160efa28862f90d0701318e45c8ff300a60ef"
+        "b02161efb101d0ff322ad0ff300a62efb24164efa88863efb32162efa82860ef"
+        "b03163efa22861efb10160efa28874d9944602f11808043120326cf90d478e45"
+        "c8ff344a6cf90d2764efb46165efb541d0ff366ac8ff322ad0ff344a66efb691"
+        "69efa88867efb76166efa88862efb26164efb491d0ff366a69efa8886cf90f47"
+        "65efa88863efb32166efb691c8ff344ad0ff322a69efa88867efb76166efa888"
+        "64efb46162efb291d0ff366a69efa88863efb32168f90f0762efa82865efb541"
+        "66efb631c8ff300ad0ff344a63efa22867efb76166efa26860efb02164efb471"
+        "d0ff322a67efa66865efb54164efa64861efb10162efb251d0ff300a65efa448"
+        "63efb32162efa42860efb03163efa22861efb10160efa2888ad868efb88b8342"
+        "18ee902b2cd0d94317f803e001330918984201f00301724422d971b1012907d0"
+        "022902d0f95c01335218f95c01335218f95c013398420a4412d9591c17f803a0"
+        "17f801c0991c03f1030817f801e0524417f8081004336244984272440a44ecd8"
+        "3b5cd04300f0ff079f427ff4dfaa";
+    const auto nibble=[](char ch) -> u8 {return static_cast<u8>(ch>='a' ? ch-'a'+10 : ch-'0');};
+    const auto load_code=[&](Fixture& f) {
+        for (u32 i=0;i<(sizeof(code)-1u)/2u;++i)
+            f.bus.write8(kCodeBase+0xB26u+i,static_cast<u8>((nibble(code[i*2u])<<4)|nibble(code[i*2u+1u])));
+        f.load_halfwords(kCodeBase+0x165Cu,{0x2200u,0x4613u,0xF7FFu,0xBB74u});
+        f.cpu.reset((kCodeBase+0xB26u)|1u); f.cpu.vfp.fpexc=ArmVfp::kFpexcEn;
+        for (int d=0;d<32;++d) f.cpu.vfp.write_d32(d,0xAABBCCDDEEFF0000ull+d);
+    };
+    const auto run_block=[](Fixture& f) {
+        unsigned steps=0;
+        while (steps<2000u && !f.cpu.halted && f.cpu.get_pc()!=kCodeBase+0xDB4u &&
+               f.cpu.get_pc()!=kCodeBase+0x372u) {f.cpu.step();++steps;}
+        ZLB_EXPECT_FALSE(f.cpu.halted); ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        ZLB_EXPECT_TRUE(steps<2000u);
+    };
+    // These lengths exercise the scalar path, every short vector unroll and
+    // the long four-block loop, including 255-byte length and all alignments.
+    for (u32 length : {2u,3u,4u,5u,6u,7u,8u,9u,14u,15u,22u,23u,30u,31u,38u,39u,62u,63u,126u,127u,254u,255u}) {
+        for (u32 offset=0;offset<8u;++offset) for (bool valid : {false,true}) {
+            Fixture f; load_code(f); const u32 source=kDataBase+offset;
+            std::vector<u8> packet(length+3u);
+            for (u32 byte=0;byte<length+2u;++byte) packet[byte]=static_cast<u8>(byte*73u+length*11u);
+            packet[2]=static_cast<u8>(length);
+            u32 sum=0; for (u32 byte=0;byte<length+2u;++byte) sum+=packet[byte];
+            const u8 checksum=static_cast<u8>(~sum);
+            packet.back()=static_cast<u8>(checksum^(valid ? 0u : 0x80u));
+            for (u32 byte=0;byte<packet.size();++byte) f.bus.write8(source+byte,packet[byte]);
+            f.set_reg(7,source); f.set_reg(8,length+3u); f.set_reg(13,kDataBase+0xF00u);
+            f.set_reg(4,0xC1234567u); f.set_reg(5,0xD2345678u); f.set_reg(6,0xE3456789u);
+            f.cpu.vfp.fpscr=0xA1000015u; run_block(f);
+            ZLB_EXPECT_EQ(f.cpu.get_pc(),kCodeBase+(valid ? 0xDB4u : 0x372u));
+            ZLB_EXPECT_EQ(f.reg(2),sum); ZLB_EXPECT_EQ(f.reg(7),checksum);
+            ZLB_EXPECT_EQ(f.reg(13),kDataBase+0xF00u);
+            ZLB_EXPECT_EQ(f.reg(4),0xC1234567u); ZLB_EXPECT_EQ(f.reg(5),0xD2345678u); ZLB_EXPECT_EQ(f.reg(6),0xE3456789u);
+            for (int d=0;d<32;++d) if (d<16 || d>25)
+                ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),0xAABBCCDDEEFF0000ull+d);
+            ZLB_EXPECT_EQ(f.cpu.vfp.fpscr,0xA1000015u);
+            for (u32 byte=0;byte<packet.size();++byte) ZLB_EXPECT_EQ(f.bus.read8(source+byte),packet[byte]);
+        }
+    }
+    for (u32 length : {0u,1u,6u}) {
+        Fixture f; load_code(f); f.bus.write8(kDataBase+2u,static_cast<u8>(length));
+        f.set_reg(7,kDataBase); f.set_reg(8,length==6u ? 8u : 32u);
+        run_block(f); ZLB_EXPECT_EQ(f.cpu.get_pc(),kCodeBase+0x372u);
+        ZLB_EXPECT_EQ(f.reg(7),kDataBase); // rejected before checksum processing
+        for (int d=0;d<32;++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d),0xAABBCCDDEEFF0000ull+d);
+    }
+}
+
+ZLB_TEST(neon_logical_exact_d_q_registers_and_bit_selection) {
+    // Truth-table bit index is (old destination, N, M). This checks the
+    // architectural bit definitions independently of the implementation's
+    // algebra, including VBSL's old-destination mask and operand overlap.
+    constexpr u32 truth_tables[] = {0x88u, 0x44u, 0xEEu, 0xDDu,
+                                    0x66u, 0xCAu, 0xD8u, 0xE4u};
+    constexpr const char* names[] = {"vand", "vbic", "vorr", "vorn",
+                                    "veor", "vbsl", "vbit", "vbif"};
+    struct Layout { bool quad; u32 d, n, m; };
+    const Layout layouts[] = {
+        {false, 1, 17, 31}, {false, 31, 5, 19},
+        {false, 17, 17, 31}, {false, 31, 17, 31},
+        {true, 30, 16, 2}, {true, 16, 16, 30}, {true, 30, 16, 30},
+    };
+    for (u32 op = 0; op < 8; ++op) {
+        for (const Layout& layout : layouts) {
+            Fixture f;
+            f.load(kCodeBase, {arm_neon_logical(op, layout.quad, layout.d, layout.n, layout.m)});
+            unsigned length = 0;
+            const char* prefix = layout.quad ? "q" : "d";
+            const std::string expected_disasm = std::string(names[op]) + " " + prefix +
+                std::to_string(layout.quad ? layout.d / 2 : layout.d) + ", " + prefix +
+                std::to_string(layout.quad ? layout.n / 2 : layout.n) + ", " + prefix +
+                std::to_string(layout.quad ? layout.m / 2 : layout.m);
+            ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase, false, length) == expected_disasm);
+            ZLB_EXPECT_EQ(length, 4u);
+            f.cpu.reset(kCodeBase);
+            f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+            f.cpu.vfp.fpscr = 0xA1000015u;
+            f.cpu.cpsr |= 0xA0000000u;
+            const u32 cpsr_before = f.cpu.cpsr;
+            std::vector<u64> before;
+            for (int d = 0; d < 32; ++d) {
+                before.push_back(0xC53AF096E18D274Bull * (d + 1));
+                f.cpu.vfp.write_d32(d, before.back());
+            }
+            std::vector<u64> expected = before;
+            for (u32 lane = 0; lane < (layout.quad ? 2u : 1u); ++lane) {
+                u64 result = 0;
+                for (u32 bit = 0; bit < 64; ++bit) {
+                    const u32 index = static_cast<u32>(((before[layout.d + lane] >> bit) & 1u) << 2) |
+                                      static_cast<u32>(((before[layout.n + lane] >> bit) & 1u) << 1) |
+                                      static_cast<u32>((before[layout.m + lane] >> bit) & 1u);
+                    result |= static_cast<u64>((truth_tables[op] >> index) & 1u) << bit;
+                }
+                expected[layout.d + lane] = result;
+            }
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            if (result.faulted) continue;
+            for (int d = 0; d < 32; ++d) ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d), expected[d]);
+            ZLB_EXPECT_EQ(f.reg(15), kCodeBase + 4u);
+            ZLB_EXPECT_EQ(f.cpu.cpsr, cpsr_before);
+            ZLB_EXPECT_EQ(f.cpu.vfp.fpscr, 0xA1000015u);
+        }
+    }
+}
+
+ZLB_TEST(neon_logical_rejects_odd_q_fields_and_other_operation_encodings) {
+    struct Layout { u32 d, n, m; };
+    const Layout invalid_q[] = {{1, 16, 30}, {0, 17, 30}, {0, 16, 31}};
+    for (u32 op = 0; op < 8; ++op) {
+        for (const Layout& layout : invalid_q) {
+            Fixture f;
+            f.load(kCodeBase, {arm_neon_logical(op, true, layout.d, layout.n, layout.m)});
+            f.cpu.reset(kCodeBase);
+            f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+            for (int d = 0; d < 32; ++d) f.cpu.vfp.write_d32(d, 0x0123456789ABCDEFull + d);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_TRUE(result.faulted);
+            ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+            for (int d = 0; d < 32; ++d) {
+                ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d), 0x0123456789ABCDEFull + d);
+            }
+        }
+    }
+    // opc1=3 is a different operation family, not EOR/BSL/BIT/BIF. Until that
+    // family is implemented it must fault without a spurious logical write.
+    for (u32 size = 0; size < 4; ++size) {
+        Fixture f;
+        f.load(kCodeBase, {arm_neon_logical(size, false, 2, 4, 6) | 0x200u});
+        f.cpu.reset(kCodeBase);
+        f.cpu.vfp.fpexc = ArmVfp::kFpexcEn;
+        for (int d = 0; d < 32; ++d) f.cpu.vfp.write_d32(d, 0x0123456789ABCDEFull + d);
+        const StepResult result = f.cpu.step();
+        ZLB_EXPECT_TRUE(result.faulted);
+        ZLB_EXPECT_TRUE(f.cpu.undefined_instruction);
+        for (int d = 0; d < 32; ++d) {
+            ZLB_EXPECT_EQ(f.cpu.vfp.read_d32(d), 0x0123456789ABCDEFull + d);
+        }
+    }
 }
 
 ZLB_TEST(disasm_a32_branch_and_literal) {
@@ -1994,6 +3230,330 @@ ZLB_TEST(thumb32_t4_post_increment_still_has_writeback) {
     pre.cpu.step();
     ZLB_EXPECT_EQ(pre.bus.read32(kDataBase + 4u), 0x12345678u);
     ZLB_EXPECT_EQ(pre.reg(0), kDataBase + 4u);
+}
+
+ZLB_TEST(thumb32_native_deflate_header_uses_the_unaligned_postindex_address) {
+    Fixture f;
+    // Genuine inflater sequence at NSKBL 0x51024E9E/EA8/EBA. Reading +2
+    // from this valid zlib stream must identify dynamic DEFLATE block type 2.
+    f.load_halfwords(kCodeBase, {0xF858u, 0x9B02u, // LDR r9,[r8],#2
+                                0xFA69u, 0xF306u, // ROR.W r3,r9,r6
+                                0xF3C3u, 0x4381u}); // UBFX r3,r3,#18,#2
+    f.bus.write32(kDataBase, 0x93CD9C78u);
+    f.bus.write32(kDataBase + 4u, 0x5153485Fu);
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(8, kDataBase + 2u);
+    f.set_reg(6, static_cast<u32>(-17));
+    const u32 flags = arm::kFlagN | arm::kFlagC | arm::kFlagV;
+    f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | flags;
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(9), 0x485F93CDu);
+    ZLB_EXPECT_EQ(f.reg(8), kDataBase + 4u);
+    ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags);
+    f.cpu.step();
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(3), 2u);
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+}
+
+ZLB_TEST(thumb32_unaligned_word_load_store_addressing_forms) {
+    struct Case { u32 load; u32 store; u32 base; u32 address; u32 updated_base; };
+    const Case cases[] = {
+        {t32_t3(8, 9, 2, true), t32_t3(8, 9, 2, false),
+         kDataBase, kDataBase + 2u, kDataBase},
+        {t32_t2(8, 9, 12, 1, true), t32_t2(8, 9, 12, 1, false),
+         kDataBase, kDataBase + 2u, kDataBase},
+        {t32_t4(8, 9, 2, false, true, true, true), t32_t4(8, 9, 2, false, true, true),
+         kDataBase + 2u, kDataBase + 2u, kDataBase + 4u},
+        {t32_t4(8, 9, 2, true, false, true, true), t32_t4(8, 9, 2, true, false, true),
+         kDataBase + 4u, kDataBase + 2u, kDataBase + 2u},
+    };
+    for (const Case& test : cases) {
+        for (bool load : {false, true}) {
+            Fixture f;
+            f.load(kCodeBase, {load ? test.load : test.store});
+            f.bus.write32(kDataBase, 0xA5A5A5A5u);
+            f.bus.write32(kDataBase + 4u, 0xA5A5A5A5u);
+            if (load) f.bus.write32(test.address, 0x11223344u);
+            f.cpu.reset(kCodeBase | 1u);
+            f.set_reg(8, test.base);
+            f.set_reg(9, load ? 0xDEADBEEFu : 0x11223344u);
+            f.set_reg(12, 1u);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            ZLB_EXPECT_EQ(f.reg(8), test.updated_base);
+            if (load) ZLB_EXPECT_EQ(f.reg(9), 0x11223344u);
+            else {
+                ZLB_EXPECT_EQ(f.bus.read32(test.address), 0x11223344u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address - 1u), 0xA5u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address + 4u), 0xA5u);
+            }
+            ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        }
+    }
+    for (bool add : {false, true}) {
+        Fixture f;
+        const u32 pc = kCodeBase + 0x42u;
+        const u32 base = (pc + 4u) & ~3u;
+        const u32 address = add ? base + 0x21u : base - 0x21u;
+        f.load(pc, {t32_load_store(add ? 0xF8DFu : 0xF85Fu, 0x9021u)});
+        f.bus.write32(address, 0x11223344u);
+        f.cpu.reset(pc | 1u);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(9), 0x11223344u);
+        ZLB_EXPECT_EQ(f.cpu.get_pc(), pc + 4u);
+    }
+}
+
+ZLB_TEST(arm_single_word_respects_data_endianness_in_all_instruction_sets) {
+    for (bool big_endian : {false, true}) {
+        for (u32 alignment = 0; alignment < 4; ++alignment) {
+            for (unsigned isa = 0; isa < 3; ++isa) {
+                Fixture f;
+                if (isa == 0) f.load(kCodeBase, {arm_ldr_str_imm(14, true, false, 0, 3, 0),
+                                               arm_ldr_str_imm(14, false, false, 0, 3, 8)});
+                else if (isa == 1) f.load_halfwords(kCodeBase, {0x6803u, 0x6083u});
+                else f.load(kCodeBase, {t32_t3(0, 3, 0, true), t32_t3(0, 3, 8, false)});
+                f.bus.write32(kDataBase + alignment, 0x11223344u);
+                f.cpu.reset(kCodeBase | (isa == 0 ? 0u : 1u));
+                f.set_reg(0, kDataBase + alignment);
+                if (big_endian) f.cpu.cpsr |= arm::kFlagE;
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.reg(3), big_endian ? 0x44332211u : 0x11223344u);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.bus.read32(kDataBase + alignment + 8u), 0x11223344u);
+                ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+            }
+        }
+    }
+}
+
+ZLB_TEST(arm_single_word_crosses_noncontiguous_normal_pages) {
+    for (bool load : {false, true}) {
+        for (unsigned isa = 0; isa < 3; ++isa) {
+            Fixture f;
+            if (isa == 0) f.load(kCodeBase, {arm_ldr_str_imm(14, load, false, 0, 3, 2, false)});
+            else if (isa == 1) f.load_halfwords(kCodeBase, {load ? u16{0x6803} : u16{0x6003}});
+            else f.load(kCodeBase, {t32_t4(0, 3, 2, false, true, true, load)});
+            f.cpu.reset(kCodeBase | (isa == 0 ? 0u : 1u));
+            ArmMmu& mmu = f.cpu.mmu;
+            mmu.ttbr0 = kDataBase;
+            mmu.dacr = 1u;
+            mmu.sctlr |= 1u;
+            const u32 l2 = kDataBase + 0x8000u;
+            f.bus.write32(kDataBase + 0x800u * 4u, 0x80000C0Eu); // Normal code section
+            f.bus.write32(kDataBase + 0x810u * 4u, l2 | 1u);
+            f.bus.write32(l2, 0x8001A01Eu); // VA 81000000 -> PA 8001A000
+            f.bus.write32(l2 + 4u, 0x8001C01Eu); // next VA -> nonadjacent PA
+            const u32 address = 0x81000FFFu;
+            f.bus.write8(0x8001AFFFu, 0x44u);
+            f.bus.write32(0x8001B000u, 0xA5A5A5A5u); // adjacent physical page is a decoy
+            f.bus.write32(0x8001C000u, load ? 0xA5112233u : 0xA5A5A5A5u);
+            f.set_reg(0, address);
+            f.set_reg(3, load ? 0u : 0x11223344u);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            ZLB_EXPECT_EQ(f.reg(0), address + (isa == 1 ? 0u : 2u));
+            if (load) ZLB_EXPECT_EQ(f.reg(3), 0x11223344u);
+            else {
+                ZLB_EXPECT_EQ(f.bus.read8(0x8001AFFFu), 0x44u);
+                ZLB_EXPECT_EQ(f.bus.read32(0x8001C000u), 0xA5112233u);
+            }
+            ZLB_EXPECT_EQ(f.bus.read32(0x8001B000u), 0xA5A5A5A5u);
+            ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        }
+    }
+}
+
+ZLB_TEST(arm_single_word_cross_page_fault_preserves_destination_and_writeback) {
+    for (bool load : {false, true}) {
+        for (unsigned isa = 0; isa < 3; ++isa) {
+            Fixture f;
+            if (isa == 0) f.load(kCodeBase, {arm_ldr_str_imm(14, load, false, 0, 3, 4, false)});
+            else if (isa == 1) f.load_halfwords(kCodeBase, {load ? u16{0x6803} : u16{0x6003}});
+            else f.load(kCodeBase, {t32_t4(0, 3, 4, false, true, true, load)});
+            f.cpu.reset(kCodeBase | (isa == 0 ? 0u : 1u));
+            ArmMmu& mmu = f.cpu.mmu;
+            mmu.ttbr0 = kDataBase;
+            mmu.dacr = 1u;
+            mmu.sctlr |= 1u;
+            const u32 l2 = kDataBase + 0x8000u;
+            f.bus.write32(kDataBase + 0x800u * 4u, 0x80000C0Eu);
+            f.bus.write32(kDataBase + 0x810u * 4u, l2 | 1u);
+            f.bus.write32(l2, 0x8001A01Eu);
+            f.bus.write32(l2 + 4u, 0u); // next virtual page must fault
+            f.bus.write8(0x8001AFFFu, 0x77u);
+            f.bus.write32(0x8001B000u, 0xA5A5A5A5u); // adjacent PA is not the next VA
+            constexpr u32 address = 0x81000FFFu;
+            f.set_reg(0, address);
+            f.set_reg(3, load ? 0xDEADBEEFu : 0x11223344u);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_TRUE(result.faulted);
+            ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeAbort);
+            ZLB_EXPECT_EQ(mmu.dfar, address + 1u);
+            ZLB_EXPECT_EQ(mmu.dfsr, load ? 7u : 0x807u);
+            ZLB_EXPECT_EQ(f.reg(0), address);
+            ZLB_EXPECT_EQ(f.reg(3), load ? 0xDEADBEEFu : 0x11223344u);
+            ZLB_EXPECT_EQ(f.bus.read32(0x8001B000u), 0xA5A5A5A5u);
+        }
+    }
+}
+
+ZLB_TEST(arm_single_word_alignment_fault_preserves_writeback_and_memory) {
+    // A=1 faults regardless of M. With M=1, Device/Strongly-ordered mappings
+    // fault even when A=0. Neither the destination nor post-index base commits.
+    struct Case { bool mmu_enabled; bool alignment_check; u32 data_cb; };
+    const Case cases[] = {{false, true, 0xCu}, {true, true, 0xCu},
+                          {true, false, 4u}, {true, false, 0u}};
+    for (const Case& test : cases) {
+        for (bool load : {false, true}) {
+            for (unsigned isa = 0; isa < 3; ++isa) {
+                Fixture f;
+                if (isa == 0) f.load(kCodeBase, {arm_ldr_str_imm(14, load, false, 0, 3, 2, false)});
+                else if (isa == 1) f.load_halfwords(kCodeBase, {load ? u16{0x6803} : u16{0x6003}});
+                else f.load(kCodeBase, {t32_t4(0, 3, 2, false, true, true, load)});
+                f.bus.write32(0x8001A000u, 0x93CD9C78u);
+                f.bus.write32(0x8001A004u, 0x5153485Fu);
+                f.cpu.reset(kCodeBase | (isa == 0 ? 0u : 1u));
+                const u32 address = test.mmu_enabled ? 0x81000002u : 0x8001A002u;
+                ArmMmu& mmu = f.cpu.mmu;
+                if (test.mmu_enabled) {
+                    mmu.ttbr0 = kDataBase;
+                    mmu.dacr = 1u;
+                    const u32 l2 = kDataBase + 0x8000u;
+                    f.bus.write32(kDataBase + 0x800u * 4u, 0x80000C0Eu);
+                    f.bus.write32(kDataBase + 0x810u * 4u, l2 | 1u);
+                    f.bus.write32(l2, 0x8001A012u | test.data_cb);
+                    mmu.sctlr |= 1u;
+                }
+                if (test.alignment_check) mmu.sctlr |= 2u;
+                f.set_reg(0, address);
+                f.set_reg(3, 0xDEADBEEFu);
+                const StepResult result = f.cpu.step();
+                ZLB_EXPECT_TRUE(result.faulted);
+                ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeAbort);
+                ZLB_EXPECT_EQ(mmu.dfar, address);
+                ZLB_EXPECT_EQ(mmu.dfsr, load ? 1u : 0x801u);
+                ZLB_EXPECT_EQ(f.reg(0), address);
+                ZLB_EXPECT_EQ(f.reg(3), 0xDEADBEEFu);
+                ZLB_EXPECT_EQ(f.bus.read32(0x8001A000u), 0x93CD9C78u);
+                ZLB_EXPECT_EQ(f.bus.read32(0x8001A004u), 0x5153485Fu);
+            }
+        }
+    }
+}
+
+ZLB_TEST(thumb32_ldr_pc_dispatches_the_real_skbl_relocation_case) {
+    Fixture f;
+    f.bus.add_ram("skbl", 0x10000u, 0x40020000u, "test");
+    // Genuine SKBL jump-table load at 0x4002474E. Treating Rt == PC as PLD
+    // falls through into table data instead of reaching the MOVW relocation.
+    f.load_halfwords(0x4002474Eu, {0xF853u, 0xF02Cu, 0x2099u});
+    f.bus.write32(0x40024810u, 0x4002489Du);
+    f.load_halfwords(0x4002489Cu, {0x202Au});
+    f.cpu.reset(0x4002474Fu);
+    f.set_reg(3, 0x40024754u);
+    f.set_reg(12, 0x2Fu);
+    const u32 flags = arm::kFlagZ | arm::kFlagC | arm::kFlagV;
+    f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | flags;
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), 0x4002489Cu);
+    ZLB_EXPECT_TRUE(f.cpu.thumb);
+    ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(0), 0x2Au);
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+}
+
+ZLB_TEST(thumb32_word_loads_to_pc_interwork_and_preserve_writeback) {
+    struct Case { u32 instruction; u32 source; u32 base; u32 address; u32 updated_base; };
+    const Case cases[] = {
+        {t32_t3(3, 15, 0x20u, true), kCodeBase + 2u,
+         kDataBase, kDataBase + 0x20u, kDataBase},
+        {t32_t2(3, 15, 12, 2, true), kCodeBase + 2u,
+         kDataBase, kDataBase + 0x20u, kDataBase},
+        {t32_t4(3, 15, 0x20u, true, false, false, true), kCodeBase + 2u,
+         kDataBase + 0x40u, kDataBase + 0x20u, kDataBase + 0x40u},
+        {t32_t4(3, 15, 0x20u, true, true, true, true), kCodeBase + 2u,
+         kDataBase, kDataBase + 0x20u, kDataBase + 0x20u},
+        {t32_t4(3, 15, 0x20u, true, false, true, true), kCodeBase + 2u,
+         kDataBase + 0x40u, kDataBase + 0x20u, kDataBase + 0x20u},
+        {t32_t4(3, 15, 0x20u, false, true, true, true), kCodeBase + 2u,
+         kDataBase + 0x20u, kDataBase + 0x20u, kDataBase + 0x40u},
+        {t32_t4(3, 15, 0x20u, false, false, true, true), kCodeBase + 2u,
+         kDataBase + 0x20u, kDataBase + 0x20u, kDataBase},
+        // Halfword-aligned instruction addresses prove literal PC alignment.
+        {t32_load_store(0xF8DFu, 0xF020u), kCodeBase + 2u,
+         kDataBase, kCodeBase + 0x24u, kDataBase},
+        {t32_load_store(0xF85Fu, 0xF020u), kCodeBase + 0x42u,
+         kDataBase, kCodeBase + 0x24u, kDataBase},
+    };
+    for (const Case& test : cases) {
+        for (bool thumb_target : {false, true}) {
+            Fixture f;
+            f.load_halfwords(test.source, {
+                static_cast<u16>(test.instruction),
+                static_cast<u16>(test.instruction >> 16),
+                0x2099u, // a fallthrough must not execute this MOVS r0,#0x99
+            });
+            const u32 target = kCodeBase + (thumb_target ? 0x202u : 0x300u);
+            f.bus.write32(test.address, target | (thumb_target ? 1u : 0u));
+            if (thumb_target) f.load_halfwords(target - 2u, {0x2099u, 0x202Au});
+            else f.load(target, {arm_dp_imm(0xE, 0xD, false, 0, 0, 0x2Au)});
+            f.cpu.reset(test.source | 1u);
+            f.set_reg(3, test.base);
+            f.set_reg(12, 8u);
+            const u32 flags = arm::kFlagZ | arm::kFlagC | arm::kFlagV;
+            f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | flags;
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.cpu.get_pc(), target);
+            ZLB_EXPECT_EQ(f.cpu.thumb, thumb_target);
+            ZLB_EXPECT_EQ(f.reg(3), test.updated_base);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags);
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.reg(0), 0x2Au);
+            ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        }
+    }
+}
+
+ZLB_TEST(thumb32_preload_hints_do_not_load_pc_or_fault_on_the_hint_address) {
+    const u32 hints[] = {
+        t32_load_store(0xF893u, 0xF020u), // PLD [r3,#0x20]
+        t32_load_store(0xF813u, 0xF02Cu), // PLD [r3,r12,LSL#2]
+        t32_load_store(0xF813u, 0xFC20u), // PLD [r3,#-0x20]
+        t32_load_store(0xF8B3u, 0xF020u), // PLDW [r3,#0x20]
+        t32_load_store(0xF89Fu, 0xF020u), // PLD literal, positive
+        t32_load_store(0xF81Fu, 0xF020u), // PLD literal, negative
+        t32_load_store(0xF993u, 0xF020u), // PLI [r3,#0x20]
+        t32_load_store(0xF913u, 0xF02Cu), // PLI [r3,r12,LSL#2]
+        t32_load_store(0xF913u, 0xFC20u), // PLI [r3,#-0x20]
+        t32_load_store(0xF99Fu, 0xF020u), // PLI literal, positive
+    };
+    for (u32 hint : hints) {
+        Fixture f;
+        f.load(kCodeBase, {hint});
+        f.cpu.reset(kCodeBase | 1u);
+        // Only code is mapped. A data load through r3 would abort.
+        f.cpu.mmu.sctlr = 1u;
+        f.cpu.mmu.ttbr0 = kDataBase;
+        f.cpu.mmu.dacr = 3u;
+        f.bus.write32(kDataBase + 0x800u * 4u, 0x80000C02u);
+        f.set_reg(0, 0x12345678u);
+        f.set_reg(3, 0x30000000u);
+        f.set_reg(12, 0x2Fu);
+        const u32 flags = arm::kFlagZ | arm::kFlagC | arm::kFlagV;
+        f.cpu.cpsr = (f.cpu.cpsr & ~0xF0000000u) | flags;
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 4u);
+        ZLB_EXPECT_TRUE(f.cpu.thumb);
+        ZLB_EXPECT_EQ(f.reg(0), 0x12345678u);
+        ZLB_EXPECT_EQ(f.reg(3), 0x30000000u);
+        ZLB_EXPECT_EQ(f.reg(12), 0x2Fu);
+        ZLB_EXPECT_EQ(f.cpu.cpsr & 0xF0000000u, flags);
+        ZLB_EXPECT_EQ(f.cpu.mmu.total_faults, 0u);
+        ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    }
 }
 
 ZLB_TEST(arm_status_line_and_registers) {
@@ -2979,7 +4539,7 @@ constexpr u32 a32_ldm_stm_s(u32 cond, bool load, bool pre, bool up, bool wb, boo
 /// BLX (immediate): 1111 101H imm24, offset = imm24:H:'0' relative to PC + 8.
 constexpr u32 a32_blx_imm(u32 address, u32 target) {
     const u32 offset = target - (address + 8u);
-    return 0xFA000000u | ((offset >> 1) & 0x01000000u) | ((offset >> 2) & 0x00FFFFFFu);
+    return 0xFA000000u | ((offset & 2u) << 23) | ((offset >> 2) & 0x00FFFFFFu);
 }
 
 constexpr u32 a32_bx(u32 rm) { return 0xE12FFF10u | rm; }
@@ -3060,36 +4620,163 @@ ZLB_TEST(arm_ldr_str_register_offset) {
     ZLB_EXPECT_EQ(f.reg(4), 0x5Au);
 }
 
-ZLB_TEST(arm_ldr_unaligned_rotates_the_word) {
+ZLB_TEST(arm_ldr_unaligned_reads_the_addressed_bytes) {
     Fixture f;
-    // LDR from a non word aligned address is allowed when SCTLR.A is clear and
-    // returns the aligned word rotated right by 8 * (address & 3).
+    // ARMv7 MemU with SCTLR.A=0 reads four bytes at the address. Legacy
+    // pre-ARMv7 aligned-word rotation corrupts this value across the boundary.
     f.load(kCodeBase, {arm_ldr_str_imm(0xE, true, false, 0, 1, 0),
                        arm_ldr_str_imm(0xE, true, false, 0, 2, 1)});
     f.bus.write32(kDataBase, 0x11223344u);
+    f.bus.write8(kDataBase + 4u, 0x55u);
     f.cpu.reset(kCodeBase);
     f.set_reg(0, kDataBase);
     f.cpu.step();
     ZLB_EXPECT_EQ(f.reg(1), 0x11223344u);
     f.cpu.step();
-    ZLB_EXPECT_EQ(f.reg(2), 0x44112233u);  // rotated right by 8
+    ZLB_EXPECT_EQ(f.reg(2), 0x55112233u);
 }
 
-ZLB_TEST(arm_str_unaligned_keeps_the_aligned_word) {
+ZLB_TEST(arm_str_unaligned_writes_the_addressed_bytes) {
     Fixture f;
-    // STR to a non aligned address writes the word containing that address: the
-    // low bits of the address are ignored (ARM ARM A8.8.209 for ARMv7).
+    // ARMv7 STR uses MemU, preserving bytes on either side of the transfer.
     f.load(kCodeBase, {arm_ldr_str_imm(0xE, false, false, 0, 1, 0)});
     f.bus.write8(kDataBase, 0xAAu);
     f.bus.write8(kDataBase + 1, 0xBBu);
     f.bus.write8(kDataBase + 2, 0xCCu);
     f.bus.write8(kDataBase + 3, 0xDDu);
+    f.bus.write8(kDataBase + 6, 0xEEu);
     f.cpu.reset(kCodeBase);
     f.set_reg(0, kDataBase + 2u);
     f.set_reg(1, 0x11223344u);
     f.cpu.step();
-    ZLB_EXPECT_EQ(f.bus.read32(kDataBase), 0x11223344u);
-    ZLB_EXPECT_EQ(f.bus.read8(kDataBase + 4), 0u);
+    ZLB_EXPECT_EQ(f.bus.read32(kDataBase + 2u), 0x11223344u);
+    ZLB_EXPECT_EQ(f.bus.read16(kDataBase), 0xBBAAu);
+    ZLB_EXPECT_EQ(f.bus.read8(kDataBase + 6u), 0xEEu);
+}
+
+ZLB_TEST(arm_native_strncpy_preserves_os0_module_paths) {
+    // Unchanged A32 helper at NSKBL 51013730. The live path normalizer calls
+    // it with source 7FC53 containing /kd/sysmem.skprx. Legacy aligned+ROR
+    // loads copied /os0 and skd/eysmkm.s, so native FAT lookup failed.
+    const std::vector<u32> native_copy = {
+        0xE1A0C000u, 0xE3520000u, 0x0A000028u, 0xE3520004u, 0xBA00000Bu,
+        0xE4913004u, 0xE31300FFu, 0x0A000015u, 0xE3130CFFu, 0x0A000010u,
+        0xE31308FFu, 0x0A00000Bu, 0xE31304FFu, 0xE48C3004u, 0xE2422004u,
+        0x0A00000Fu, 0xEAFFFFEFu, 0xE4D13001u, 0xE4CC3001u, 0xE2522001u,
+        0x0A000016u, 0xE3530000u, 0x0A00000Au, 0xEAFFFFF8u, 0xE4CC3001u,
+        0xE2422001u, 0xE1A03463u, 0xE4CC3001u, 0xE2422001u, 0xE1A03463u,
+        0xE4CC3001u, 0xE2422001u, 0xE3520000u, 0x0A000009u, 0xE3A03000u,
+        0xE3520004u, 0xBA000003u, 0xE48C3004u, 0xE2522004u, 0x0A000003u,
+        0xEAFFFFF8u, 0xE4CC3001u, 0xE2522001u, 0x1AFFFFFCu, 0xE12FFF1Eu,
+    };
+    constexpr char path[] = "/kd/sysmem.skprx";
+    constexpr u32 capacity = 32u;
+    for (u32 source_alignment = 0; source_alignment < 4; ++source_alignment) {
+        for (u32 destination_alignment = 0; destination_alignment < 4; ++destination_alignment) {
+            Fixture f;
+            f.load(kCodeBase, native_copy);
+            const u32 source = kDataBase + source_alignment;
+            const u32 destination = kDataBase + 0x100u + destination_alignment;
+            for (u32 byte = 0; byte < source_alignment; ++byte) {
+                f.bus.write8(kDataBase + byte, static_cast<u8>("os0"[byte]));
+            }
+            for (u32 byte = 0; byte < sizeof(path); ++byte) f.bus.write8(source + byte, path[byte]);
+            for (u32 byte = 0; byte < capacity + 2u; ++byte) {
+                f.bus.write8(destination - 1u + byte, 0xA5u);
+            }
+            f.cpu.reset(kCodeBase);
+            f.set_reg(0, destination);
+            f.set_reg(1, source);
+            f.set_reg(2, capacity);
+            f.set_reg(14, kCodeBase + 0x100u);
+            unsigned count = 0;
+            while (f.cpu.get_pc() != kCodeBase + 0x100u && count++ < 500u) {
+                const StepResult result = f.cpu.step();
+                ZLB_EXPECT_FALSE(result.faulted);
+                if (result.faulted) break;
+            }
+            ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 0x100u);
+            ZLB_EXPECT_EQ(f.reg(0), destination);
+            for (u32 byte = 0; byte < capacity; ++byte) {
+                const u8 expected = byte < sizeof(path) ? static_cast<u8>(path[byte]) : 0u;
+                ZLB_EXPECT_EQ(f.bus.read8(destination + byte), expected);
+            }
+            ZLB_EXPECT_EQ(f.bus.read8(destination - 1u), 0xA5u);
+            ZLB_EXPECT_EQ(f.bus.read8(destination + capacity), 0xA5u);
+            ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+        }
+    }
+}
+
+ZLB_TEST(arm_unaligned_word_addressing_forms_preserve_actual_addresses) {
+    struct Case { u32 load; u32 store; u32 base; u32 address; u32 updated_base; };
+    const Case cases[] = {
+        {arm_ldr_str_imm(14, true, false, 0, 3, 2), arm_ldr_str_imm(14, false, false, 0, 3, 2),
+         kDataBase, kDataBase + 2u, kDataBase},
+        {a32_ldr_str_reg(14, true, false, 0, 3, 2, 0, 1),
+         a32_ldr_str_reg(14, false, false, 0, 3, 2, 0, 1),
+         kDataBase, kDataBase + 2u, kDataBase},
+        {arm_ldr_str_imm(14, true, false, 0, 3, 4, false),
+         arm_ldr_str_imm(14, false, false, 0, 3, 4, false),
+         kDataBase + 3u, kDataBase + 3u, kDataBase + 7u},
+        {arm_ldr_str_imm(14, true, false, 0, 3, 2, true, false, true),
+         arm_ldr_str_imm(14, false, false, 0, 3, 2, true, false, true),
+         kDataBase + 3u, kDataBase + 1u, kDataBase + 1u},
+    };
+    for (const Case& test : cases) {
+        for (const bool load : {false, true}) {
+            Fixture f;
+            f.load(kCodeBase, {load ? test.load : test.store});
+            f.bus.write32(kDataBase, 0xA5A5A5A5u);
+            f.bus.write32(kDataBase + 4u, 0xA5A5A5A5u);
+            if (load) f.bus.write32(test.address, 0x11223344u);
+            f.cpu.reset(kCodeBase);
+            f.set_reg(0, test.base);
+            f.set_reg(2, 1u);
+            f.set_reg(3, load ? 0xDEADBEEFu : 0x11223344u);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            ZLB_EXPECT_EQ(f.reg(0), test.updated_base);
+            if (load) ZLB_EXPECT_EQ(f.reg(3), 0x11223344u);
+            else {
+                ZLB_EXPECT_EQ(f.bus.read32(test.address), 0x11223344u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address - 1u), 0xA5u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address + 4u), 0xA5u);
+            }
+        }
+    }
+}
+
+ZLB_TEST(thumb16_single_word_register_immediate_and_sp_addressing) {
+    struct Case { u16 load; u16 store; u32 base; u32 offset; u32 address; };
+    const Case cases[] = {
+        {0x5883u, 0x5083u, kDataBase, 1u, kDataBase + 1u}, // [r0,r2]
+        {0x6843u, 0x6043u, kDataBase + 2u, 0u, kDataBase + 6u}, // [r0,#4]
+        {0x9B01u, 0x9301u, kDataBase + 3u, 0u, kDataBase + 7u}, // [sp,#4]
+    };
+    for (const Case& test : cases) {
+        for (const bool load : {false, true}) {
+            Fixture f;
+            f.load_halfwords(kCodeBase, {load ? test.load : test.store});
+            for (u32 byte = 0; byte < 12u; ++byte) f.bus.write8(kDataBase + byte, 0xA5u);
+            if (load) f.bus.write32(test.address, 0x11223344u);
+            f.cpu.reset(kCodeBase | 1u);
+            f.set_reg(0, test.base);
+            f.set_reg(13, test.base);
+            f.set_reg(2, test.offset);
+            f.set_reg(3, load ? 0xDEADBEEFu : 0x11223344u);
+            const StepResult result = f.cpu.step();
+            ZLB_EXPECT_FALSE(result.faulted);
+            if (load) ZLB_EXPECT_EQ(f.reg(3), 0x11223344u);
+            else {
+                ZLB_EXPECT_EQ(f.bus.read32(test.address), 0x11223344u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address - 1u), 0xA5u);
+                ZLB_EXPECT_EQ(f.bus.read8(test.address + 4u), 0xA5u);
+            }
+            ZLB_EXPECT_EQ(f.reg(0), test.base);
+            ZLB_EXPECT_EQ(f.reg(13), test.base);
+        }
+    }
 }
 
 ZLB_TEST(arm_ldrb_strb) {
@@ -3365,6 +5052,35 @@ ZLB_TEST(arm_blx_immediate_enters_thumb) {
     ZLB_EXPECT_EQ(f.reg(14), kCodeBase + 4u);
 }
 
+ZLB_TEST(arm_blx_immediate_h_bit_reaches_the_first_thumb_halfword) {
+    for (const u32 source : {kCodeBase, kCodeBase + 0x400u}) {
+        for (const u32 halfword_offset : {0u, 2u}) {
+            Fixture f;
+            const u32 target = kCodeBase + 0x100u + halfword_offset;
+            f.load(source, {
+                a32_blx_imm(source, target),
+                arm_dp_imm(14, 13, false, 0, 2, 7), // MOV r2,#7 on return to ARM
+            });
+            // H=1 targets the second halfword of a word. Landing two bytes too
+            // early executes MOVS r0,#0x99 instead of the intended MOVS r0,#42.
+            f.load_halfwords(target - 2u, {0x2099u, 0x202Au, 0x4770u}); // BX LR
+            f.cpu.reset(source);
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.cpu.get_pc(), target);
+            ZLB_EXPECT_TRUE(f.cpu.thumb);
+            ZLB_EXPECT_EQ(f.reg(14), source + 4u);
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.reg(0), 42u);
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.cpu.get_pc(), source + 4u);
+            ZLB_EXPECT_FALSE(f.cpu.thumb);
+            f.cpu.step();
+            ZLB_EXPECT_EQ(f.reg(2), 7u);
+            ZLB_EXPECT_FALSE(f.cpu.halted);
+        }
+    }
+}
+
 ZLB_TEST(arm_bx_blx_register) {
     Fixture f;
     // BX Rm does not touch LR; BLX Rm does.
@@ -3598,6 +5314,140 @@ ZLB_TEST(arm_rfe_restores_cpsr_and_pc) {
     ZLB_EXPECT_EQ(f.bus.read32(kDataBase + 0x100u), 0x11223344u);
 }
 
+ZLB_TEST(arm_exception_returns_use_restored_state_alignment) {
+    // RFE, LDM^ with PC, and MOVS PC all restore the ISA before BranchWritePC.
+    // Address bit 0 never chooses the ISA; bit 1 survives only in Thumb state.
+    for (const u32 instruction : {0xF8900A00u, 0xE8D08000u, 0xE1B0F00Eu}) {
+        for (const bool restored_thumb : {false, true}) {
+            for (u32 low_bits = 0; low_bits < 4; ++low_bits) {
+                Fixture f;
+                const u32 target = kCodeBase + 0x80u + low_bits;
+                const u32 saved_cpsr = arm::kModeSystem | arm::kFlagN | arm::kFlagC |
+                                       (restored_thumb ? arm::kFlagT : 0u);
+                f.load(kCodeBase, {instruction});
+                if (restored_thumb) f.load_halfwords(kCodeBase + 0x80u, {0x2500u, 0x255Au});
+                else f.load(kCodeBase + 0x80u, {0xE3A0505Au});
+                f.bus.write32(kDataBase, target);
+                f.bus.write32(kDataBase + 4u, saved_cpsr);
+                f.cpu.reset(kCodeBase);
+                f.cpu.set_spsr(saved_cpsr);
+                f.set_reg(0, kDataBase);
+                f.set_reg(14, target);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.cpu.get_pc(), target & (restored_thumb ? ~1u : ~3u));
+                ZLB_EXPECT_EQ(f.cpu.thumb, restored_thumb);
+                ZLB_EXPECT_EQ(f.cpu.cpsr, saved_cpsr);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.reg(5), restored_thumb && low_bits < 2u ? 0u : 0x5Au);
+                ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+            }
+        }
+    }
+}
+
+ZLB_TEST(arm_irq_rfe_preserves_halfword_oled_instruction_boundary) {
+    Fixture f;
+    const u32 interrupted_pc = kCodeBase + 0x86u;
+    const u32 vector_base = kCodeBase + 0x200u;
+    const u32 irq_sp = kDataBase + 0x100u;
+    const u32 system_sp = kDataBase + 0x200u;
+    // Genuine OLED 81000286..28C: LSL.W R0,R8,LR; CMP R5,#15; STR R5,[R4,#12].
+    // An IRQ after the LSL returns to the halfword-only CMP boundary. The old
+    // word-aligned RFE returned into F00E, the LSL's second halfword, and the
+    // resulting F00E2D0F instruction zeroed SP in the unchanged native helper.
+    f.load_halfwords(kCodeBase + 0x82u, {0xFA08u, 0xF00Eu, 0x2D0Fu, 0x60E5u});
+    // Native IntrMgr entry/exit instructions: subtract IRQ LR, save PC/CPSR,
+    // preserve R0, and return through its genuine A32 RFEIA SP! (F8BD0A00).
+    f.load(vector_base + arm::kVecIrq, {0xE24EE004u, 0xE24DD030u, 0xE58DE028u,
+             0xE58D0000u, 0xE14FE000u, 0xE58DE02Cu, 0xE59D0000u,
+             0xE28DD028u, 0xF8BD0A00u});
+    f.cpu.set_register("CPSR", arm::kModeIrq);
+    f.set_reg(13, irq_sp);
+    f.cpu.set_register("CPSR", arm::kModeSystem | arm::kFlagT | arm::kFlagC);
+    f.set_reg(13, system_sp);
+    f.set_reg(14, 7u);  // OLED deliberately uses LR as scratch during packing.
+    f.set_reg(0, 0x12345678u);
+    f.set_reg(4, kDataBase + 0x300u);
+    f.set_reg(5, 18u);
+    f.cpu.set_pc(interrupted_pc);
+    f.cpu.mmu.vbar = vector_base;
+    const u32 saved_cpsr = f.cpu.cpsr;
+    f.cpu.set_irq(0, true);
+    f.cpu.step();
+    f.cpu.set_irq(0, false);
+    ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeIrq);
+    for (unsigned i = 0; i < 9; ++i) f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), interrupted_pc);
+    ZLB_EXPECT_EQ(f.cpu.cpsr, saved_cpsr);
+    ZLB_EXPECT_EQ(f.reg(13), system_sp);
+    ZLB_EXPECT_EQ(f.reg(14), 7u);
+    ZLB_EXPECT_EQ(f.reg(0), 0x12345678u);
+    f.cpu.step();  // The intended CMP, not an instruction made of two tails.
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), interrupted_pc + 2u);
+    ZLB_EXPECT_EQ(f.reg(13), system_sp);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.bus.read32(kDataBase + 0x30Cu), 18u);
+    f.cpu.set_register("CPSR", arm::kModeIrq);
+    ZLB_EXPECT_EQ(f.reg(13), irq_sp);  // RFE writeback applies to the IRQ bank.
+}
+
+ZLB_TEST(arm_user_system_share_sp_lr_across_privileged_transfers) {
+    // Both Security states share the same core register banks (only Monitor
+    // has an additional bank). CPSR.M distinguishes privilege, not SYS SP/LR.
+    for (const bool nonsecure : {false, true}) {
+        Fixture f;
+        f.load(kCodeBase, {a32_msr_reg(0xE, false, 1u, 0)});
+        f.load(kCodeBase + 0x40u, {
+            a32_ldm_stm_s(0xE, false, false, true, false, true, 0, 0x6000),
+            a32_ldm_stm_s(0xE, true, false, true, false, true, 1, 0x6000),
+            0xE1B0F00Eu});
+        f.cpu.set_register("SCR", nonsecure ? 5u : 4u);
+        f.cpu.set_register("CPSR", arm::kModeIrq);
+        f.set_reg(13, 0x11110000u);
+        f.cpu.set_register("CPSR", arm::kModeFiq);
+        f.set_reg(13, 0x22220000u);
+        f.set_reg(14, 0x22220004u);
+        f.cpu.set_register("CPSR", arm::kModeSystem);
+        f.set_reg(13, 0x33330000u);
+        f.set_reg(14, 0x33330004u);
+        f.set_reg(0, arm::kModeUser);
+        f.cpu.set_pc(kCodeBase);
+        f.cpu.step();  // Actual MSR SYS -> USR preserves the shared registers.
+        ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeUser);
+        ZLB_EXPECT_EQ(f.reg(13), 0x33330000u);
+        ZLB_EXPECT_EQ(f.reg(14), 0x33330004u);
+        f.set_reg(13, 0x44440000u);
+        f.set_reg(14, 0x44440004u);
+        f.cpu.take_exception(arm::kVecIrq, arm::kModeIrq, kCodeBase + 0x80u);
+        f.cpu.set_pc(kCodeBase + 0x40u);
+        f.set_reg(0, kDataBase);
+        f.set_reg(1, kDataBase + 0x20u);
+        f.bus.write32(kDataBase + 0x20u, 0x55550000u);
+        f.bus.write32(kDataBase + 0x24u, 0x55550004u);
+        f.cpu.step();  // STM^ captures the shared User/System bank from IRQ.
+        ZLB_EXPECT_EQ(f.bus.read32(kDataBase), 0x44440000u);
+        ZLB_EXPECT_EQ(f.bus.read32(kDataBase + 4u), 0x44440004u);
+        f.cpu.step();  // LDM^ replaces it without modifying the IRQ SP.
+        ZLB_EXPECT_EQ(f.reg(13), 0x11110000u);
+        f.cpu.set_spsr(arm::kModeSystem);
+        f.cpu.step();  // Exception return accesses those values as System.
+        ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeSystem);
+        ZLB_EXPECT_EQ(f.reg(13), 0x55550000u);
+        ZLB_EXPECT_EQ(f.reg(14), 0x55550004u);
+        f.cpu.set_register("CPSR", arm::kModeFiq);
+        ZLB_EXPECT_EQ(f.reg(13), 0x22220000u);
+        ZLB_EXPECT_EQ(f.reg(14), 0x22220004u);
+        f.cpu.set_register("CPSR", arm::kModeIrq);
+        ZLB_EXPECT_EQ(f.reg(13), 0x11110000u);
+        f.cpu.set_register("CPSR", arm::kModeSystem);
+        ZLB_EXPECT_EQ(f.reg(13), 0x55550000u);
+        f.cpu.reset(kCodeBase);
+        f.cpu.set_register("CPSR", arm::kModeSystem);
+        ZLB_EXPECT_EQ(f.reg(13), 0u);
+        ZLB_EXPECT_EQ(f.reg(14), 0u);
+    }
+}
+
 ZLB_TEST(arm_smc_and_hvc) {
     Fixture f;
     // SMC #0 enters monitor mode through MVBAR + 8.
@@ -3616,6 +5466,489 @@ ZLB_TEST(arm_smc_and_hvc) {
     g.cpu.step();
     ZLB_EXPECT_EQ(g.cpu.mode(), arm::kModeHyp);
     ZLB_EXPECT_EQ(g.cpu.get_pc(), arm::kVecHyp);
+}
+
+ZLB_TEST(arm_trustzone_smc_uses_secure_translation_and_round_trips_nonsecure_bank) {
+    // Monitor remains Secure when SCR.NS=1, but MRC/MCR select the NS CP15
+    // bank. Exercise both the genuine Secure-MMU-off/NS-MMU-on case and two
+    // enabled translation regimes mapping the same VA to different RAM.
+    for (const bool secure_mmu_on : {false, true}) {
+        Fixture f;
+        constexpr u32 ns_ram = 0x80100000u;
+        constexpr u32 secure_table = 0x80010000u;
+        constexpr u32 ns_table = 0x80014000u;
+        constexpr u32 monitor = kCodeBase + 0x400u;
+        constexpr u32 secure_control = 0x00C50078u;
+        constexpr u32 ns_control = secure_control | (1u << 29) | 1u;
+        f.bus.add_ram("nonsecure", 0x2000u, ns_ram, "test");
+        f.bus.write32(secure_table + 0x800u * 4u, kCodeBase | (2u << 10) | 2u);
+        f.bus.write32(ns_table + 0x800u * 4u, ns_ram | (3u << 10) | (3u << 5) | 2u);
+        f.bus.write32(kCodeBase + 0x1000u, 0xA55AA55Au);
+        f.bus.write32(ns_ram + 0x1000u, 0x5AA55AA5u);
+        f.load(kCodeBase, {
+            arm_cp15(false, 0, 2, 0, 0, 0),  // Secure TTBR0
+            arm_cp15(false, 0, 3, 1, 0, 0),  // Secure DACR
+            arm_cp15(false, 0, 1, 2, 0, 0),  // Secure SCTLR
+            0xE1600070u,                    // SMC enters Secure Monitor
+        });
+        f.load(monitor + 8u, {
+            arm_cp15(false, 0, 1, 3, 1, 0),  // SCR.NS=1; execution stays Secure
+            arm_cp15(false, 0, 2, 4, 0, 0),  // Nonsecure TTBR0
+            arm_cp15(false, 0, 3, 5, 0, 0),  // Nonsecure DACR
+            arm_cp15(false, 0, 12, 6, 0, 0), // Nonsecure VBAR
+            arm_cp15(false, 0, 1, 7, 0, 0),  // Nonsecure SCTLR, AFE=1
+            0xE1B0F00Eu,                    // MOVS PC,LR -> Nonsecure SVC
+        });
+        f.load(ns_ram + 0x10u, {
+            arm_ldr_str_imm(14, true, false, 9, 8, 0), // Nonsecure data
+            0xE1600070u,                              // SMC from NS with MMU on
+            arm_ldr_str_imm(14, true, false, 9, 7, 0), // NS data after return
+        });
+        f.cpu.reset(kCodeBase);
+        f.cpu.mvbar = monitor;
+        f.set_reg(0, secure_table);
+        f.set_reg(1, 1u);
+        f.set_reg(2, secure_control | (secure_mmu_on ? 1u : 0u));
+        f.set_reg(3, 1u);
+        f.set_reg(4, ns_table);
+        f.set_reg(5, 1u << 6);
+        f.set_reg(6, kCodeBase + 0x800u);
+        f.set_reg(7, ns_control);
+        f.set_reg(9, kCodeBase + 0x1000u);
+        for (int i = 0; i < 4; ++i) f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeMonitor);
+        for (int i = 0; i < 5; ++i) {
+            const StepResult step = f.cpu.step();
+            ZLB_EXPECT_FALSE(step.faulted);
+            ZLB_EXPECT_TRUE(f.cpu.secure_state());
+        }
+        f.cpu.step();
+        ZLB_EXPECT_FALSE(f.cpu.secure_state());
+        ZLB_EXPECT_EQ(f.cpu.mmu.ttbr0, ns_table);
+        ZLB_EXPECT_EQ(f.cpu.mmu.sctlr, ns_control);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(8), 0x5AA55AA5u);
+        f.cpu.mmu.par = 0x22200000u; // NS PAR is not overwritten by Monitor operations
+
+        // The second SMC probes NS registers while reading Secure memory. The
+        // Secure descriptor deliberately has AP=010, AF=0: it is legal because
+        // Secure SCTLR.AFE=0, independent of Nonsecure SCTLR.AFE=1.
+        f.load(monitor + 8u, {
+            arm_cp15(true, 0, 1, 0, 0, 0),  // NS SCTLR
+            arm_cp15(true, 0, 2, 1, 0, 0),  // NS TTBR0
+            arm_ldr_str_imm(14, true, false, 9, 2, 0),
+            arm_cp15(true, 0, 12, 3, 0, 0), // NS VBAR
+            arm_cp15(false, 0, 7, 9, 8, 0), // ATS1CPR uses Secure translation
+            arm_cp15(true, 0, 7, 12, 4, 0), // NS PAR retains its previous value
+            arm_cp15(false, 0, 1, 10, 1, 0), // select Secure CP15 registers
+            arm_cp15(true, 0, 7, 8, 4, 0),  // ATS1CPR result from Secure PAR
+            arm_cp15(false, 0, 1, 11, 1, 0), // select NS registers
+            arm_cp15(false, 0, 7, 9, 8, 4), // ATS12NSOPR uses NS translation
+            arm_cp15(true, 0, 7, 6, 4, 0),  // NS PAR again remains unchanged
+            arm_cp15(false, 0, 1, 10, 1, 0), // SCR.NS=0 is legal in Monitor
+            arm_cp15(true, 0, 2, 4, 0, 0),  // Secure TTBR0
+            arm_cp15(true, 0, 7, 5, 4, 0),  // NS translation result in Secure PAR
+            arm_cp15(false, 0, 1, 11, 1, 0), // SCR.NS=1, execution still Secure
+            0xE1B0F00Eu,                    // MOVS PC,LR back to NS
+        });
+        f.set_reg(10, 0u);
+        f.set_reg(11, 1u);
+        f.cpu.cpsr |= arm::kFlagC | arm::kFlagZ;
+        const u32 ns_cpsr = f.cpu.cpsr;
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeMonitor);
+        ZLB_EXPECT_TRUE(f.cpu.secure_state());
+        ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagC | arm::kFlagZ), arm::kFlagC | arm::kFlagZ);
+        ZLB_EXPECT_EQ(f.cpu.mmu.ttbr0, secure_table);
+        ZLB_EXPECT_EQ(f.cpu.mmu.enabled(), secure_mmu_on);
+        for (int i = 0; i < 16; ++i) {
+            const StepResult step = f.cpu.step();
+            ZLB_EXPECT_FALSE(step.faulted);
+        }
+        ZLB_EXPECT_EQ(f.reg(0), ns_control);
+        ZLB_EXPECT_EQ(f.reg(1), ns_table);
+        ZLB_EXPECT_EQ(f.reg(2), 0xA55AA55Au);
+        ZLB_EXPECT_EQ(f.reg(3), kCodeBase + 0x800u);
+        ZLB_EXPECT_EQ(f.reg(4), secure_table);
+        ZLB_EXPECT_EQ(f.reg(12), 0x22200000u);
+        ZLB_EXPECT_EQ(f.reg(6), 0x22200000u);
+        ZLB_EXPECT_EQ(f.reg(8), kCodeBase + 0x1000u);
+        ZLB_EXPECT_EQ(f.reg(5), ns_ram + 0x1000u);
+        ZLB_EXPECT_EQ(f.cpu.cpsr, ns_cpsr);
+        ZLB_EXPECT_FALSE(f.cpu.secure_state());
+        ZLB_EXPECT_EQ(f.cpu.mmu.ttbr0, ns_table);
+        ZLB_EXPECT_EQ(f.cpu.mmu.dacr, 1u << 6);
+        ZLB_EXPECT_EQ(f.cpu.mmu.par, 0x22200000u);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(7), 0x5AA55AA5u);
+        ZLB_EXPECT_EQ(f.cpu.mmu.ifsr, 0u);
+        ZLB_EXPECT_FALSE(f.cpu.halted);
+    }
+}
+
+ZLB_TEST(arm_trustzone_exception_from_monitor_clears_scr_ns_and_uses_secure_vectors) {
+    Fixture f;
+    f.load(kCodeBase, {arm_cp15(false, 0, 1, 0, 1, 0)});
+    f.cpu.reset(kCodeBase);
+    f.cpu.set_register("CPSR", arm::kModeMonitor | arm::kFlagI | arm::kFlagF);
+    f.cpu.mmu.vbar = kCodeBase + 0x200u;
+    f.set_reg(0, 1u);
+    f.cpu.step();
+    ZLB_EXPECT_TRUE(f.cpu.secure_state());
+    ZLB_EXPECT_EQ(f.cpu.scr & arm::kScrNs, 1u);
+    f.cpu.take_exception(arm::kVecDataAbort, arm::kModeAbort, kCodeBase + 8u);
+    ZLB_EXPECT_TRUE(f.cpu.secure_state());
+    ZLB_EXPECT_EQ(f.cpu.scr & arm::kScrNs, 0u);
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), kCodeBase + 0x200u + arm::kVecDataAbort);
+}
+
+ZLB_TEST(arm_trustzone_cp15_register_banks_remain_independent) {
+    struct Register {
+        u32 crn, crm, opc2, secure, nonsecure;
+    };
+    const Register registers[] = {
+        {1, 0, 0, 0x00C50078u, 0x20C50078u}, // SCTLR (MMU stays off)
+        {2, 0, 0, 0x80010000u, 0x80014000u}, // TTBR0
+        {2, 0, 1, 0x8001004Au, 0x8001404Au}, // TTBR1
+        {2, 0, 2, 1u, 2u},                 // TTBCR
+        {3, 0, 0, 1u, 0x40u},              // DACR
+        {5, 0, 0, 0x805u, 0x80Du},         // DFSR
+        {5, 1, 0, 5u, 7u},                 // IFSR
+        {6, 0, 0, 0xDEAD0000u, 0xBEEF0000u}, // DFAR
+        {6, 0, 2, 0xDEAD0004u, 0xBEEF0004u}, // IFAR
+        {7, 4, 0, 0x80001000u, 0x80101000u}, // PAR
+        {10, 2, 0, 0x98E8E8E8u, 0x98E0E0E0u}, // PRRR
+        {10, 2, 1, 0x00009898u, 0x00008888u}, // NMRR
+        {12, 0, 0, kCodeBase + 0x400u, kCodeBase + 0x800u}, // VBAR
+        {13, 0, 1, 0x123401u, 0x567802u},   // CONTEXTIDR
+    };
+    for (const Register& reg : registers) {
+        Fixture f;
+        f.load(kCodeBase, {
+            arm_cp15(false, 0, reg.crn, 1, reg.crm, reg.opc2),
+            arm_cp15(false, 0, 1, 2, 1, 0), // SCR.NS=1
+            arm_cp15(false, 0, reg.crn, 3, reg.crm, reg.opc2),
+            arm_cp15(true, 0, reg.crn, 4, reg.crm, reg.opc2),
+            arm_cp15(false, 0, 1, 5, 1, 0), // SCR.NS=0
+            arm_cp15(true, 0, reg.crn, 6, reg.crm, reg.opc2),
+        });
+        f.cpu.reset(kCodeBase);
+        f.cpu.set_register("CPSR", arm::kModeMonitor | arm::kFlagI | arm::kFlagF);
+        f.set_reg(1, reg.secure);
+        f.set_reg(2, 1u);
+        f.set_reg(3, reg.nonsecure);
+        f.set_reg(5, 0u);
+        for (int i = 0; i < 6; ++i) {
+            const StepResult step = f.cpu.step();
+            ZLB_EXPECT_FALSE(step.faulted);
+            ZLB_EXPECT_TRUE(f.cpu.secure_state());
+        }
+        ZLB_EXPECT_EQ(f.reg(4), reg.nonsecure);
+        ZLB_EXPECT_EQ(f.reg(6), reg.secure);
+    }
+}
+
+ZLB_TEST(arm_exception_entry_preserves_flags_and_applies_architectural_masks) {
+    constexpr u32 flags = arm::kFlagN | arm::kFlagZ | arm::kFlagC | arm::kFlagV |
+                          arm::kFlagQ | arm::kFlagGE;
+    constexpr u32 it_mask = (3u << 25) | (0x3Fu << 10);
+    struct Exception {
+        u32 mode;
+        u32 masks;
+    };
+    const Exception exceptions[] = {
+        {arm::kModeMonitor, arm::kFlagA | arm::kFlagI | arm::kFlagF},
+        {arm::kModeIrq, arm::kFlagA | arm::kFlagI},
+        {arm::kModeFiq, arm::kFlagA | arm::kFlagI | arm::kFlagF},
+        {arm::kModeAbort, arm::kFlagA | arm::kFlagI},
+        {arm::kModeSupervisor, arm::kFlagI},
+        {arm::kModeUndefined, arm::kFlagI},
+    };
+    for (const Exception& exception : exceptions) {
+        for (const bool thumb_vectors : {false, true}) {
+            Fixture f;
+            f.cpu.reset(kCodeBase);
+            f.cpu.cpsr = arm::kModeSystem | flags | it_mask | arm::kFlagJ | arm::kFlagT |
+                         arm::kFlagE;
+            f.cpu.mmu.sctlr = thumb_vectors ? ((1u << 30) | (1u << 25)) : 0u;
+            const u32 saved = f.cpu.cpsr;
+            f.cpu.take_exception(arm::kVecSupervisor, exception.mode, kCodeBase + 4u);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & flags, flags);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagJ | it_mask), 0u);
+            ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF), exception.masks);
+            ZLB_EXPECT_EQ(f.cpu.thumb, thumb_vectors);
+            ZLB_EXPECT_EQ((f.cpu.cpsr & arm::kFlagE) != 0u, thumb_vectors);
+            ZLB_EXPECT_EQ(f.cpu.banked_spsr(exception.mode), saved);
+        }
+    }
+    // NS handlers cannot set CPSR.A unless SCR.AW permits it, and preserve F.
+    for (const bool allow_abort_mask : {false, true}) {
+        Fixture f;
+        f.cpu.reset(kCodeBase);
+        f.cpu.set_register("SCR", arm::kScrNs | (allow_abort_mask ? arm::kScrAw : 0u));
+        f.cpu.cpsr = arm::kModeSystem | flags | arm::kFlagF;
+        f.cpu.take_exception(arm::kVecIrq, arm::kModeIrq, kCodeBase + 4u);
+        ZLB_EXPECT_FALSE(f.cpu.secure_state());
+        ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF),
+                      arm::kFlagI | arm::kFlagF | (allow_abort_mask ? arm::kFlagA : 0u));
+    }
+    for (const bool allow_fiq_mask : {false, true}) {
+        Fixture f;
+        f.cpu.reset(kCodeBase);
+        f.cpu.set_register("SCR", arm::kScrNs | (allow_fiq_mask ? arm::kScrFw : 0u));
+        f.cpu.cpsr = arm::kModeSystem | flags;
+        f.cpu.take_exception(arm::kVecFiq, arm::kModeFiq, kCodeBase + 4u);
+        ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF),
+                      arm::kFlagI | (allow_fiq_mask ? arm::kFlagF : 0u));
+    }
+}
+
+ZLB_TEST(arm_trustzone_physical_interrupts_follow_scr_routing) {
+    for (const bool nonsecure : {false, true}) {
+        for (const bool fiq : {false, true}) {
+            for (const bool routed : {false, true}) {
+                Fixture f;
+                const u32 offset = fiq ? arm::kVecFiq : arm::kVecIrq;
+                const u32 normal_mode = fiq ? arm::kModeFiq : arm::kModeIrq;
+                const u32 target_mode = routed ? arm::kModeMonitor : normal_mode;
+                const u32 route_bit = fiq ? arm::kScrFiq : arm::kScrIrq;
+                constexpr u32 secure_vectors = kCodeBase + 0x400u;
+                constexpr u32 ns_vectors = kCodeBase + 0x800u;
+                constexpr u32 monitor_vectors = kCodeBase + 0xC00u;
+                f.cpu.reset(kCodeBase);
+                f.cpu.mmu.vbar = secure_vectors;
+                f.cpu.vbar_nonsecure = ns_vectors;
+                f.cpu.mvbar = monitor_vectors;
+                f.cpu.set_register("SCR", (nonsecure ? arm::kScrNs : 0u) |
+                                         (routed ? route_bit : 0u));
+                f.cpu.cpsr = arm::kModeSystem | arm::kFlagZ | arm::kFlagQ;
+                const u32 saved = f.cpu.cpsr;
+                f.cpu.set_irq(fiq ? 1 : 0, true);
+                f.cpu.step();
+                const u32 vectors = routed ? monitor_vectors : (nonsecure ? ns_vectors : secure_vectors);
+                ZLB_EXPECT_EQ(f.cpu.mode(), target_mode);
+                ZLB_EXPECT_EQ(f.cpu.get_pc(), vectors + offset);
+                ZLB_EXPECT_EQ(f.cpu.banked_spsr(target_mode), saved);
+                ZLB_EXPECT_EQ(f.reg(14), kCodeBase + 4u);
+                ZLB_EXPECT_EQ(f.cpu.secure_state(), routed || !nonsecure);
+                ZLB_EXPECT_EQ(f.cpu.scr & arm::kScrNs, nonsecure ? arm::kScrNs : 0u);
+                ZLB_EXPECT_EQ(f.cpu.exception_count, 1u);
+                f.cpu.set_irq(fiq ? 1 : 0, false);
+                f.bus.write32(vectors + offset, arm_dp_imm(14, 13, false, 0, 7, 0x42));
+                ZLB_EXPECT_FALSE(f.cpu.step().faulted);
+                ZLB_EXPECT_EQ(f.reg(7), 0x42u);
+            }
+        }
+    }
+}
+
+ZLB_TEST(arm_trustzone_routed_interrupts_still_obey_cpsr_masks) {
+    for (const bool fiq : {false, true}) {
+        Fixture f;
+        f.load(kCodeBase, {arm_dp_imm(14, 13, false, 0, 0, 0x42)});
+        f.cpu.reset(kCodeBase);
+        f.cpu.set_register("SCR", arm::kScrNs | (fiq ? arm::kScrFiq : arm::kScrIrq));
+        f.cpu.cpsr = arm::kModeSystem | (fiq ? arm::kFlagF : arm::kFlagI);
+        unsigned wakeups = 0;
+        f.cpu.irq_hook = [&]() { ++wakeups; };
+        f.cpu.set_irq(fiq ? 1 : 0, true);
+        ZLB_EXPECT_FALSE(f.cpu.interrupt_pending());
+        if (fiq) ZLB_EXPECT_EQ(wakeups, 0u);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeSystem);
+        ZLB_EXPECT_EQ(f.cpu.exception_count, 0u);
+        ZLB_EXPECT_EQ(f.reg(0), 0x42u);
+        if (fiq) {
+            f.cpu.set_irq(1, false);
+            f.cpu.cpsr &= ~arm::kFlagF;
+            f.cpu.set_irq(1, true);
+            ZLB_EXPECT_EQ(wakeups, 1u);
+            f.cpu.set_irq(1, true);
+            ZLB_EXPECT_EQ(wakeups, 1u);
+            ZLB_EXPECT_TRUE(f.cpu.interrupt_pending());
+        }
+    }
+}
+
+ZLB_TEST(arm_trustzone_nskbl_cpsid_if_preserves_secure_fiq_enable) {
+    Fixture f;
+    // Native handoff: SCR=5 and CPSR=0x93. The actual first NSKBL instruction
+    // is CPSID IF; SCR.FW=0 forbids its Nonsecure F update.
+    f.load(kCodeBase, {0xF10C00C0u, 0xF10800C0u});
+    f.cpu.reset(kCodeBase);
+    f.cpu.set_register("SCR", 5u);
+    f.cpu.cpsr = 0x93u;
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.cpsr, 0x93u);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.cpsr, 0x13u);
+}
+
+ZLB_TEST(arm_trustzone_cps_filters_a_and_f_in_all_encodings) {
+    for (unsigned world = 0; world < 3; ++world) {
+        for (unsigned permissions = 0; permissions < 4; ++permissions) {
+            for (const bool initially_masked : {false, true}) {
+                for (unsigned encoding = 0; encoding < 3; ++encoding) {
+                    Fixture f;
+                    if (encoding == 0) f.load(kCodeBase, {0xF10C01C0u, 0xF10801C0u});
+                    if (encoding == 1) f.load_halfwords(kCodeBase, {0xB677u, 0xB667u});
+                    if (encoding == 2) f.load_halfwords(kCodeBase, {0xF3AFu, 0x86E0u, 0xF3AFu, 0x84E0u});
+                    f.cpu.reset(kCodeBase | (encoding != 0 ? 1u : 0u));
+                    f.cpu.cpsr = (f.cpu.cpsr & arm::kFlagT) | arm::kModeSystem | arm::kFlagN;
+                    if (world == 2) f.cpu.set_register("CPSR", (f.cpu.cpsr & ~arm::kModeMask) | arm::kModeMonitor);
+                    f.cpu.set_register("SCR", (world != 0 ? arm::kScrNs : 0u) |
+                                              ((permissions & 1u) ? arm::kScrFw : 0u) |
+                                              ((permissions & 2u) ? arm::kScrAw : 0u));
+                    const u32 initial = initially_masked ? arm::kFlagA | arm::kFlagF : 0u;
+                    f.cpu.cpsr |= initial;
+                    const u32 allowed = (world != 1 || (permissions & 1u) ? arm::kFlagF : 0u) |
+                                        (world != 1 || (permissions & 2u) ? arm::kFlagA : 0u);
+                    f.cpu.step();
+                    ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF),
+                                  initial | allowed | arm::kFlagI);
+                    ZLB_EXPECT_EQ(f.cpu.cpsr & arm::kFlagN, arm::kFlagN);
+                    f.cpu.step();
+                    ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF), initial & ~allowed);
+                    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+                }
+            }
+        }
+    }
+}
+
+ZLB_TEST(arm_trustzone_msr_filters_masks_and_decodes_thumb_source_register) {
+    for (const bool thumb_code : {false, true}) {
+        for (unsigned permissions = 0; permissions < 4; ++permissions) {
+            for (const bool initially_masked : {false, true}) {
+                Fixture f;
+                if (thumb_code) f.load_halfwords(kCodeBase, {0xF385u, 0x8300u, 0xF386u, 0x8300u});
+                else f.load(kCodeBase, {a32_msr_reg(14, false, 3u, 5u), a32_msr_reg(14, false, 3u, 6u)});
+                f.cpu.reset(kCodeBase | (thumb_code ? 1u : 0u));
+                f.cpu.set_register("SCR", arm::kScrNs |
+                                          ((permissions & 1u) ? arm::kScrFw : 0u) |
+                                          ((permissions & 2u) ? arm::kScrAw : 0u));
+                const u32 state = arm::kModeSupervisor | (thumb_code ? arm::kFlagT : 0u);
+                const u32 initial = initially_masked ? arm::kFlagA | arm::kFlagF : 0u;
+                f.cpu.cpsr = state | initial | arm::kFlagZ;
+                f.set_reg(0, state); // The old T32 decoder incorrectly reads this.
+                f.set_reg(5, state | arm::kFlagA | arm::kFlagI | arm::kFlagF);
+                f.set_reg(6, state);
+                const u32 allowed = ((permissions & 1u) ? arm::kFlagF : 0u) |
+                                    ((permissions & 2u) ? arm::kFlagA : 0u);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF), initial | allowed | arm::kFlagI);
+                ZLB_EXPECT_EQ(f.cpu.cpsr & arm::kFlagZ, arm::kFlagZ);
+                f.cpu.step();
+                ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagI | arm::kFlagF), initial & ~allowed);
+                ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+            }
+        }
+    }
+    // The same Rn and R fields select a non-r0 SPSR write in Thumb state.
+    Fixture f;
+    f.load_halfwords(kCodeBase, {0xF397u, 0x8F00u}); // MSR SPSR_fsxc,r7
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(0, 0xAAAAAAAAu);
+    f.set_reg(7, arm::kModeSystem | arm::kFlagN | arm::kFlagF);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.spsr(), f.reg(7));
+    ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+}
+
+ZLB_TEST(arm_trustzone_exception_return_filters_masks_in_source_world) {
+    for (unsigned world = 0; world < 3; ++world) {
+        for (unsigned permissions = 0; permissions < 4; ++permissions) {
+            for (const bool initially_masked : {false, true}) {
+                for (const bool rfe : {false, true}) {
+                    Fixture f;
+                    constexpr u32 target = kCodeBase + 0x80u;
+                    f.load(kCodeBase, {rfe ? 0xF8900A00u : 0xE1B0F00Eu});
+                    f.cpu.reset(kCodeBase);
+                    if (world == 2) f.cpu.set_register("CPSR", arm::kModeMonitor);
+                    f.cpu.set_register("SCR", (world != 0 ? arm::kScrNs : 0u) |
+                                              ((permissions & 1u) ? arm::kScrFw : 0u) |
+                                              ((permissions & 2u) ? arm::kScrAw : 0u));
+                    const u32 initial = initially_masked ? arm::kFlagA | arm::kFlagF : 0u;
+                    f.cpu.cpsr = f.cpu.mode() | initial;
+                    const u32 return_psr = arm::kModeSystem | arm::kFlagT | arm::kFlagZ |
+                                          (initially_masked ? 0u : arm::kFlagA | arm::kFlagF);
+                    f.cpu.set_spsr(return_psr);
+                    f.set_reg(14, target);
+                    f.set_reg(0, kDataBase);
+                    f.bus.write32(kDataBase, target);
+                    f.bus.write32(kDataBase + 4u, return_psr);
+                    const u32 allowed = (world != 1 || (permissions & 1u) ? arm::kFlagF : 0u) |
+                                        (world != 1 || (permissions & 2u) ? arm::kFlagA : 0u);
+                    f.cpu.step();
+                    ZLB_EXPECT_EQ(f.cpu.get_pc(), target);
+                    ZLB_EXPECT_EQ(f.cpu.mode(), arm::kModeSystem);
+                    ZLB_EXPECT_TRUE(f.cpu.thumb);
+                    ZLB_EXPECT_EQ(f.cpu.cpsr & (arm::kFlagA | arm::kFlagF),
+                                  (initial & ~allowed) | (return_psr & allowed));
+                    ZLB_EXPECT_EQ(f.cpu.cpsr & arm::kFlagZ, arm::kFlagZ);
+                    ZLB_EXPECT_EQ(f.cpu.secure_state(), world == 0);
+                }
+            }
+        }
+    }
+}
+
+ZLB_TEST(arm_thumb_mov_pc_branches_without_exchanging_instruction_set) {
+    for (const bool tagged_target : {false, true}) {
+        Fixture f;
+        // Actual panic helper sequence at VA C1C20: MOV PC,R3; NOP; NOP.W.
+        // The computed Thumb target is even; its bit zero is not an ISA tag.
+        f.load_halfwords(kCodeBase, {0x469Fu, 0xBF00u, 0xF3AFu, 0x8000u});
+        constexpr u32 target = kCodeBase + 0x42u; // Halfword-only alignment.
+        f.load_halfwords(target, {0x2542u}); // MOVS r5,#0x42
+        f.cpu.reset(kCodeBase | 1u);
+        f.cpu.cpsr |= arm::kFlagN | arm::kFlagC | arm::kFlagQ;
+        const u32 saved = f.cpu.cpsr;
+        f.set_reg(3, target | (tagged_target ? 1u : 0u));
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.cpu.get_pc(), target);
+        ZLB_EXPECT_EQ(f.cpu.cpsr, saved);
+        ZLB_EXPECT_TRUE(f.cpu.thumb);
+        f.cpu.step();
+        ZLB_EXPECT_EQ(f.reg(5), 0x42u);
+        ZLB_EXPECT_EQ(f.cpu.get_pc(), target + 2u);
+        ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
+    }
+}
+
+ZLB_TEST(arm_thumb_bx_still_exchanges_to_arm_for_an_even_target) {
+    Fixture f;
+    f.load_halfwords(kCodeBase, {0x4718u}); // BX r3
+    constexpr u32 target = kCodeBase + 0x40u;
+    f.load(target, {arm_dp_imm(14, 13, false, 0, 5, 0x42)});
+    f.cpu.reset(kCodeBase | 1u);
+    f.set_reg(3, target);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), target);
+    ZLB_EXPECT_FALSE(f.cpu.thumb);
+    f.cpu.step();
+    ZLB_EXPECT_EQ(f.reg(5), 0x42u);
+    ZLB_EXPECT_EQ(f.cpu.get_pc(), target + 4u);
+}
+
+ZLB_TEST(arm_memory_context_marks_monitor_secure_and_identifies_core) {
+    Fixture f;
+    f.cpu.core_id_ = 3;
+    f.load(kCodeBase, {arm_ldr_str_imm(14, true, false, 0, 1, 0), 0xE1600070u});
+    constexpr u32 monitor = kCodeBase + 0x400u;
+    f.load(monitor + 8u, {arm_ldr_str_imm(14, false, false, 0, 1, 0)});
+    f.cpu.reset(kCodeBase);
+    f.cpu.mvbar = monitor;
+    f.cpu.set_register("SCR", arm::kScrNs);
+    f.set_reg(0, kDataBase);
+    f.cpu.step();
+    ZLB_EXPECT_TRUE(f.bus.context.nonsecure);
+    ZLB_EXPECT_EQ(f.bus.context.core_id, 3u);
+    f.cpu.step(); // SMC enters Secure Monitor while preserving SCR.NS.
+    f.cpu.step(); // The Monitor store must carry a Secure access attribute.
+    ZLB_EXPECT_FALSE(f.bus.context.nonsecure);
+    ZLB_EXPECT_EQ(f.bus.context.core_id, 3u);
+    ZLB_EXPECT_EQ(f.cpu.scr & arm::kScrNs, arm::kScrNs);
 }
 
 ZLB_TEST(arm_coprocessor_space) {

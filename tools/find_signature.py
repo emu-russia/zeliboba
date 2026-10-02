@@ -1,6 +1,6 @@
 import os, sys
 
-roots = [r'C:\Work\PSVita\Vita_104_Firmware', r'C:\Work\PSVita\dumps', r'C:\Work\PSVita\_scratch']
+roots = [r'..\Vita_104_Firmware', r'..\dumps', r'..\_scratch']
 pats = {
     'sig_le (49 66 CE 61)': bytes([0x49, 0x66, 0xCE, 0x61]),
     'sig_be (61 CE 66 49)': bytes([0x61, 0xCE, 0x66, 0x49]),
@@ -23,4 +23,4 @@ for root in roots:
                 if idx >= 0:
                     hits.append('%s@0x%X' % (label, idx))
             if hits:
-                print(os.path.relpath(path, r'C:\Work\PSVita'), '->', ', '.join(hits))
+                print(os.path.relpath(path, r'..'), '->', ', '.join(hits))

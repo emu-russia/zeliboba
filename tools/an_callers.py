@@ -6,7 +6,7 @@ import sys
 
 import capstone
 
-sys.path.insert(0, r'C:\Work\PSVita\_scratch_soc')
+sys.path.insert(0, r'..\_scratch_soc')
 import kdis
 
 path = sys.argv[1]

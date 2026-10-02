@@ -31,9 +31,9 @@ constexpr double kArmClockHz = 333.0e6;
 class L2CacheController : public RegisterFile {
 public:
     explicit L2CacheController(u32 base)
-        : RegisterFile(format("Kermit.L2CC@%08X", base), base, 0x10000) {
-        define(base + 0x100, "L2CC_FILTERING_START", 0);
-        define(base + 0x104, "L2CC_FILTERING_END", 0);
+        : RegisterFile(format("Kermit.L2CC@%08X", base), base, 0x1000) {
+        define(base + 0x100, "L2CC_CONTROL", 0);
+        define(base + 0x104, "L2CC_AUX_CONTROL", 0);
         define(base + 0x730, "L2CC_CACHE_SYNC", 0);
         define(base + 0x77C, "L2CC_MAINTENANCE", 0);
         define(base + 0x7FC, "L2CC_CLEAN_INVALIDATE_WAY", 0);
@@ -49,6 +49,14 @@ public:
     }
 
     void write(u32 address, unsigned size, u64 value) override {
+        const u32 offset = (address - base()) & ~3u;
+        if (offset == 0x730u || offset == 0x77Cu || offset == 0x7FCu) {
+            // These maintenance commands complete synchronously in the cache
+            // model. Their way/busy bits must clear even though the debugger
+            // exposes them as named registers.
+            RegisterFile::write(base() + offset, 4, 0);
+            return;
+        }
         if (values_.count(address) != 0) {
             RegisterFile::write(address, size, value);
             return;
@@ -165,7 +173,7 @@ void Vita::build(const VitaConfig& config) {
 
     if (config_.first_loader.empty()) config_.first_loader = "dumps/vita_prototype_bootrom.bin";
     if (config_.syscon_firmware.empty()) config_.syscon_firmware = "ernie-master/USS-1001.bin";
-    if (config_.emmc_image.empty()) config_.emmc_image = "zeliboba/build/emmc.img";
+    if (config_.emmc_image.empty()) config_.emmc_image = path_join(ZLB_ROOT_DIR, "build/emmc.img");
     if (config_.fs_root.empty()) config_.fs_root = "Vita_104_Firmware/Out";
 
     build_buses();
@@ -252,6 +260,13 @@ void Vita::build_buses() {
     // its byte-copy/bignum loop reads zeroes back and never advances.
     arm_bus_->add_ram("arm_scratchpad", kermit::kScratchpadSramSize, kermit::kScratchpadSramBase,
                       "Scratchpad SRAM (SLSK image, display/camera, PSP eDRAM, BSOD)");
+    // CDRAM is a separate memory device, shared by ARM and display/GPU DMA
+    // through this physical bus. Controller commands at E8200000 establish
+    // its native enable state; electrical power gating is not modelled here.
+    // Keep the existing board reset policy (zero RAM), without a guessed
+    // CMeP alias or an alias of main DRAM / the logo's SRAM work buffer.
+    arm_bus_->add_ram("arm_cdram", board::kCdramSize, board::kCdramBase,
+                      "CDRAM (128 MiB independent graphics memory)");
     // 0x50000000 is inside the 512 MiB DRAM window (the wiki puts the ARZL-compressed
     // NSKBL at 0x50000000 and the uncompressed one at 0x51000000), so no separate
     // staging block is mapped there any more.
@@ -355,14 +370,14 @@ void Vita::build_cores() {
     }
     arm_ = arm_cores_[0].get();
 
-    // Round 342: give the GIC its CPU.  `kermit_set_cpu` had no callers anywhere, so
-    // `Gic::cpu_` stayed null and every interrupt the controller asserted was dropped
-    // on the floor - measured as "GIC line assert: ... id=58 (cpu=null)" in
-    // Gic::refresh_line, with ArmCore::set_irq never firing even when the SDIF
-    // asserted its line 188 times in a run.  The model implements CPU0's interface
-    // (see gic.cpp), so core 0 is the one to attach; a run that never enables the
-    // controller is unaffected.
-    if (arm_ != nullptr) kermit_set_cpu(*arm_bus_, arm_);
+    // Each A9 core has its own GIC CPU interface. Attach the whole cluster so
+    // the firmware's target bytes select the actual receiving core (native
+    // Smsched routes mailbox interrupts 200..203 to core 3).
+    for (u32 core_id = 0; core_id < kArmCoreCount; ++core_id) {
+        if (Cpu* core = arm_cores_[core_id].get()) {
+            kermit_set_cpu(*arm_bus_, core, core_id);
+        }
+    }
 
     // Round 354 (opt-in, ZLB_NSKBL_VBAR=1): the non-secure VBAR is never written by
     // the guest - the debug log shows only the model's SKBL vector-page mirroring for
@@ -403,13 +418,21 @@ void Vita::build_cores() {
 }
 
 void Vita::wire_bridges() {
-    // The ARM sees the CMeP mailboxes: that is how the boot chain and the
-    // "secure world" services talk to each other.
-    for (Device* device : cmep_block_->devices()) {
-        if (device->name() == "CMeP.Mailbox") {
-            arm_bus_->add_device(std::make_unique<DeviceMirror>(*device, cmep::kMailboxBase, 0x100));
-        }
-    }
+    // The ARM sees the shared mailbox state through its own sender/ack port.
+    // A generic mirror would give its writes the opposite CMeP-side semantics.
+    cmep_block_->install_arm_mailbox(*arm_bus_);
+    // Secure_kernel handles command channel 0 on INTC source 8 and registers
+    // the auxiliary handlers on sources 9..11 (0x8023E0..0x8023F4). Native ARM
+    // Smsched registers the reverse direction on GIC interrupts 200..203.
+    cmep_block_->set_mailbox_irq_callbacks(
+        [this](unsigned channel, bool asserted) {
+            if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+                mep->set_irq_level(8u + channel, asserted);
+            }
+        },
+        [this](unsigned channel, bool asserted) {
+            kermit_->raise_irq(200u + channel, asserted);
+        });
 
     // The ARM also sees the syscon. The kernel boot loader writes the SC doorbell
     // at 0xE310005C and polls it back (0x4003C01E..0x4003C026), reads the SC status
@@ -451,6 +474,7 @@ void Vita::wire_bridges() {
     for (Device* device : cmep_block_->devices()) {
         const u32 base = device->base();
         if (base < 0xE0000000u || base >= 0xF0000000u) continue;   // RAM/keyring stays CMeP-only
+        if (base == cmep::kMailboxBase) continue;                 // explicit ARM endpoint above
         if (base == cmep::kScBase) continue;                       // answered by Ernie.SC
         arm_bus_->add_device(std::make_unique<DeviceMirror>(*device, base, device->size()));
     }
@@ -473,7 +497,10 @@ void Vita::wire_bridges() {
     //   0x4003A4E4  ldr r0,[0x4005C03C] ; str r1,[r0,#0x730] ; poll bit 0    -> the
     //               PL310 L2 cache "Cache Sync" register (+0x730) and the filtering
     //               start address (+0x100); the base is read from a firmware table.
-    for (u32 base : {0x1A000000u, 0x34000000u, 0x36000000u}) {
+    // PERIPHBASE 0x1A000000 is the SCU/GIC region. PL310 starts at
+    // 0x1A002000, also used directly by KBL at 0x400200A0. A broad cache
+    // window at PERIPHBASE intercepted the native GIC CPU-interface writes.
+    for (u32 base : {0x1A002000u, 0x34000000u, 0x36000000u}) {
         arm_bus_->add_device(std::make_unique<L2CacheController>(base));
     }
 }
@@ -512,13 +539,13 @@ bool Vita::rebuild_emmc_if_missing() {
     return attach_emmc(config_.emmc_image);
 }
 
-// Substitution (round 396): put the ELF form of os0's modules on the card.
-//
-// Measured in rounds 394/395: the workspace holds the os0 modules only in their *decrypted*
-// form - `fs/os0/psp2bootconfig.skprx` starts with 53 43 45 00 ("SCE\0") - while NSKBL's
-// format validator (0x5101A4B0) accepts only 7F 45 4C 46 ("\x7FELF") and returns 0 for
-// "SCE\0" (the both-movs `iteq` at 0x5101A4D2-0x5101A4D6).  The same extraction provides the
-// ELF form in `fs_dec/os0/<name>.elf`, so write it into the file's clusters, keyed on the
+// Historical opt-in experiment (round 396): replace os0 module bytes with ELF.
+// The old "SCE rejected" diagnosis was caused by the emulator's Thumb IT flag
+// bug. With correct flags the genuine validator returns 2 for SCE and 1 for ELF;
+// fs/os0/*.skprx are encrypted/compressed SELF containers. This experiment is
+// not a firmware repair and must remain disabled for an ordinary boot. It also
+// replaces psp2config with psp2bootconfig below, so it cannot validate module
+// loading or original image integrity. The fixed-cluster writes use the
 // layout measured from the volume: psp2bootconfig.skprx ("PSP2BO~1") sits at cluster 903,
 // i.e. LBA 72816, in a volume whose data area starts at LBA 65608 with 8 sectors/cluster.
 // Gated by ZLB_OS0_ELF=1; by default the card is untouched.
@@ -620,9 +647,22 @@ bool Vita::fit_parts() {
 void Vita::reset(bool cold) {
     if (!built_) build();
     configure_arm_pc_trace();
+    // Restore the boot-phase low SRAM backing before either cold or warm RAM
+    // reset. Bus::reset() clears region.bytes(); leaving the secure-kernel alias
+    // installed would clear private SRAM twice and retain stale boot storage.
+    // Its cached page pointers must change before fitted loader bytes are loaded.
+    if (auto* low_sram = cmep_bus_->region_at(board::kCmepRamBase, board::kCmepRamSize)) {
+        low_sram->external = nullptr;
+        cmep_bus_->rebuild_map();
+    }
     arm_bus_->reset();
     cmep_bus_->reset();
     syscon_bus_->reset();
+    secure_modules_staged_ = false;
+    secure_kernel_active_ = false;
+    cmep_service_pending_ = false;
+    cmep_context_done_ = false;
+    arm_wait_slices_ = 0;
 
     if (cold) {
         std::fill(shared_sram_.begin(), shared_sram_.end(), 0);
@@ -631,6 +671,9 @@ void Vita::reset(bool cold) {
 
     if (cmep_) {
         cmep_->reset(config_.first_loader_base);
+        if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+            mep->set_boot_vector_base(board::kSecondLoaderStaging);
+        }
         cmep_->prepare_reset_context(board::kCmepStackTop, board::kSecondLoaderStaging, 0, 0);
         cmep_->halted = false;
     }
@@ -642,7 +685,7 @@ void Vita::reset(bool cold) {
         Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
         if (!core) continue;
         core->reset(kermit::kDramBase);
-        core->halted = boot_.stage >= BootStage::ArmKernelBootLoader ? false : true;
+        core->halted = true;
     }
 
     if (syscon_) syscon_->reset(ernie_->reset_vector());
@@ -762,13 +805,9 @@ void Vita::run_slice() {
     // faithful model - a coarser one lets a core race several instructions ahead
     // of a spin loop that hardware would have seen instantly.
     //
-    // Round 160: WFE sleeps until SEV (round 140), but the loader's barrier spins
-    // also wait on the *timer interrupt*, which wakes a WFE on hardware and which
-    // this model does not deliver to a halted core.  When every core is asleep in
-    // WFE, nothing can produce the event any more, so wake the cluster and let
-    // the loops re-check their condition - that is the progress the next timer
-    // tick makes on hardware.  (Without this the four cores park at 0x4003A01C,
-    // the WFE inside the leave wait at 0x4003B3D2, and the boot stops there.)
+    // Historical WFE experiments remain opt-in. Native SEV and interrupt delivery
+    // now wake the cores; the full boot reaches bootconfig start with both the
+    // artificial timer and the legacy counter/wake watchdog disabled.
     {
         // Only a core the boot chain has released can be asleep in a WFE loop; before
         // that the cores sit halted at their reset PC (0x80000000) with no reason and
@@ -804,15 +843,12 @@ void Vita::run_slice() {
                 const char* value = std::getenv("ZLB_KBL_WFE_TICK");
                 return value != nullptr && value[0] != '0';
             }();
-            // The default is the engine the boot chain has always used (the counter
-            // patch below), because measuring showed the timer tick alone is not
-            // enough: with only the tick the cluster wakes, re-checks and sleeps
-            // again, and the run ends at checkpoint 0x88 instead of reaching NSKBL
-            // (docs/KBL.md 7.1.9).  ZLB_KBL_WFE_TICK=1 selects the tick path.
+            // Keep the old barrier-counter and unconditional cluster-wake engine
+            // only for comparisons with historical runs. It must not manufacture
+            // events during ordinary boot or a later guest display wait.
             static const bool legacy_watchdog = [] {
                 const char* value = std::getenv("ZLB_KBL_WFE_WATCHDOG");
-                if (value != nullptr && value[0] == '0') return false;
-                return std::getenv("ZLB_KBL_WFE_TICK") == nullptr;
+                return value != nullptr && value[0] != '0';
             }();
             u64 retired = 0;
             for (const auto& core : arm_cores_) {

@@ -18,7 +18,9 @@ namespace zlb {
 namespace {
 
 constexpr u32 kPswInterruptEnable = 1u << 0;
-constexpr u32 kPswException = 1u << 9;
+constexpr u32 kPswNmi = 1u << 9;
+constexpr u32 kPswHardwareInterruptEnable = 1u << 8;
+constexpr u32 kExcHardwarePending = 1u << 8;
 constexpr u32 kPswHalt = 1u << 11;
 constexpr u32 kPswOperatingMode = 1u << 12;
 
@@ -77,6 +79,7 @@ u32 modulo_update(u32 base, u32 mb, u32 me, u32 displacement) {
 
 void MePCore::ControlBus::reset() {
     regs.fill(0);
+    irq_levels = irq_edges = 0;
     count = 0;
     remaining = 0;
     running = false;
@@ -88,26 +91,37 @@ bool MePCore::ControlBus::busy() const { return running && !force_expired; }
 
 u32 MePCore::ControlBus::read(unsigned address) const {
     if (address >= regs.size()) return 0;
-    u8 value = regs[address];
+    if (address == 1) return (irq_levels & ~regs[3]) | (irq_edges & regs[3]);
+    u32 value = regs[address];
     if (address == kCbTimerStatus) {
         // Bit 0 is the "the count reached zero" latch, *not* a busy flag.  Both
         // poll loops in the boot chain wait for it to become 1:
         //   first loader  0x5E686: ldcb / and $0,$2 / beqz  -> loop while bit0 == 0
         //   second loader 0x45516: ldcb / and3 $3,$3,1 / bnez -> escape when bit0 != 0
         // Reading the status never changes it; software clears it by writing 0.
-        value = static_cast<u8>((value & 0xFEu) | ((done || force_expired) ? 1u : 0u));
+        value = (value & ~1u) | ((done || force_expired) ? 1u : 0u);
     }
     return value;
 }
 
 void MePCore::ControlBus::write(unsigned address, u32 value) {
     if (address >= regs.size()) return;
-    regs[address] = static_cast<u8>(value & 0xFF);
+    if (address == 0) {
+        // IVR.ICN and ILV describe the last vector fetch; only IML is writable.
+        regs[0] = (regs[0] & ~0xF00u) | (value & 0xF00u);
+        return;
+    }
+    if (address == 1) {
+        // ISR is write-zero-to-clear for edge inputs and read-only for levels.
+        irq_edges &= value;
+        return;
+    }
+    regs[address] = value;
     if (address == kCbTimerCount || address == kCbTimerCount + 1) {
         // The reload value is 16 bit at 0x400..0x401, big endian: the first
         // loader writes the low byte to 0x401 (0x5E67A) while the second loader
         // writes the high byte to 0x400 (0x45502).
-        count = (static_cast<u32>(regs[kCbTimerCount]) << 8) | regs[kCbTimerCount + 1];
+        count = ((regs[kCbTimerCount] & 0xFFu) << 8) | (regs[kCbTimerCount + 1] & 0xFFu);
     } else if (address == kCbTimerStatus) {
         // Writing the status clears/sets the completion latch (0x5E67E and
         // 0x45508 both write zero before starting the next delay).
@@ -138,6 +152,37 @@ void MePCore::ControlBus::advance() {
     }
 }
 
+void MePCore::ControlBus::set_irq_level(unsigned source, bool asserted) {
+    if (source >= 32) return;
+    const u32 bit = 1u << source;
+    if (asserted) {
+        if ((irq_levels & bit) == 0 && (regs[3] & bit) != 0) irq_edges |= bit;
+        irq_levels |= bit;
+    } else {
+        irq_levels &= ~bit;
+    }
+}
+
+int MePCore::ControlBus::pending_irq() const {
+    const u32 pending = read(1) & regs[2];
+    unsigned highest = (regs[0] >> 8) & 0xFu;
+    int source = -1;
+    for (unsigned channel = 0; channel < 32; ++channel) {
+        if ((pending & (1u << channel)) == 0) continue;
+        const unsigned level = (regs[4 + channel / 8] >> ((channel % 8) * 4)) & 0xFu;
+        if (level > highest || (level == highest && source >= 0)) {
+            highest = level;
+            source = static_cast<int>(channel);
+        }
+    }
+    return source;
+}
+
+void MePCore::ControlBus::acknowledge_irq(unsigned source) {
+    const u32 level = (regs[4 + source / 8] >> ((source % 8) * 4)) & 0xFu;
+    regs[0] = (regs[0] & 0xF00u) | (level << 12) | (source << 3);
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -152,6 +197,7 @@ void MePCore::reset(u32 entry) {
 
     hi = lo = sar = lp = epc = npc = tmp = 0;
     psw = exc = cfg = vid = id = dbg = depc = opt = rcfg = ccfg = 0;
+    cfg = 1u << 3; // CFG.IVM resets to separate vectors (MeP architecture p42).
     cr0 = 0;
     rpb = rpe = rpc = 0;
     mb0 = me0 = mb1 = me1 = 0;
@@ -311,14 +357,18 @@ void MePCore::set_csr(int index, u32 value) {
         case 2: sar = value; break;
         case 4:
             rpb = value;
-            // Writing an empty loop begin register disarms the loop unit.
-            if (value == 0) {
-                rep_active_ = false;
-                rep_endless_ = false;
-            }
+            rep_endless_ = (rpe & 1u) != 0;
+            rep_active_ = rpb != 0 && (rep_endless_ || rpc != 0);
             break;
-        case 5: rpe = value; break;
-        case 6: rpc = value; break;
+        case 5:
+            rpe = value;
+            rep_endless_ = (rpe & 1u) != 0;
+            rep_active_ = rpb != 0 && (rep_endless_ || rpc != 0);
+            break;
+        case 6:
+            rpc = value;
+            rep_active_ = rpb != 0 && ((rpe & 1u) != 0 || rpc != 0);
+            break;
         case 7: hi = value; break;
         case 8: lo = value; break;
         case 12: mb0 = value; break;
@@ -596,6 +646,37 @@ StepResult MePCore::step() {
     StepResult out;
     const u32 address = pc;
     out.address = address;
+    refresh_irq_line();
+    // Architecture 3.6.6/7.13: SWI or STC requests a pending interrupt, which
+    // enters before the next instruction once IEC and its SIE bit are set.
+    // Table 17 gives software interrupts priority over hardware interrupts.
+    // Keep SIP pending until the native handler clears it with STC EXC.
+    if ((psw & kPswInterruptEnable) != 0 && (psw & kPswNmi) == 0 &&
+        (exc & psw & 0xF0u) != 0) {
+        u32 vector_base = boot_vector_base_;
+        if ((cfg & (1u << 4)) != 0) {
+            vector_base = (cfg & (1u << 23)) != 0 ? 0x00800000u : 0x00200000u;
+        }
+        epc = (pc & ~1u) | (vliw_mode ? 1u : 0u);
+        const u32 previous = psw;
+        psw = (previous & ~0x100Fu) | ((previous & 5u) << 1);
+        vliw_mode = false;
+        exc = (exc & ~0xFu) | 5u;
+        // RPB/RPE/RPC remain available for the handler's native context save.
+        // SWI in either of the last two repeat slots is prohibited by 7.13.
+        rep_pending_back_ = false;
+        set_pc(vector_base + 0x14u);
+        out.was_branch = true;
+        out.text = "software interrupt";
+        ++cycles;
+        return out;
+    }
+    if (take_pending_irq()) {
+        out.was_branch = true;
+        out.text = "hardware interrupt";
+        ++cycles;
+        return out;
+    }
 
     // Machine hook (see MePCore::pc_hook): stop before executing this PC so the
     // caller can act on it.  The PC is left untouched and the reason is recorded
@@ -641,9 +722,61 @@ StepResult MePCore::step() {
     // repeat_step_end): the caller reports it because a branch to the *next*
     // instruction leaves no trace in the PC.
     repeat_step_end(address, branch_taken_);
+    refresh_irq_line();
 
     out.was_branch = pc != address + insn->len;
     return out;
+}
+
+void MePCore::set_irq_level(unsigned source, bool asserted) {
+    cbus.set_irq_level(source, asserted);
+    refresh_irq_line();
+}
+
+void MePCore::refresh_irq_line() {
+    const bool requested = cbus.pending_irq() >= 0;
+    exc = requested ? exc | kExcHardwarePending : exc & ~kExcHardwarePending;
+    // The INTC wakes HALT/SLEEP regardless of the core's IEC/HIE masks. A
+    // debugger or machine-hook stop is not an architectural sleep state.
+    if (requested && halted &&
+        (halt_reason == "sleep instruction" || halt_reason == "halt instruction")) {
+        psw &= ~kPswHalt;
+        halted = false;
+        halt_reason.clear();
+    }
+}
+
+bool MePCore::take_pending_irq() {
+    refresh_irq_line();
+    const int source = cbus.pending_irq();
+    if (source < 0 || (psw & (kPswInterruptEnable | kPswHardwareInterruptEnable)) !=
+                          (kPswInterruptEnable | kPswHardwareInterruptEnable) ||
+        (psw & kPswNmi) != 0) return false;
+    // The final repeat slot cannot be interrupted while another iteration
+    // remains (Architecture 7.12). Its branch-back retires before IRQ entry.
+    if (rep_active_ && rep_pending_back_ && (rep_endless_ || rpc != 0)) return false;
+
+    // MeP Core Architecture 3.6.2/3.6.5: CFG controls ROM/RAM vector banks,
+    // independently of the image entry address used by the loader.
+    u32 vector = boot_vector_base_ + 0x30u;
+    if ((cfg & (1u << 4)) != 0) {
+        const bool eva = (cfg & (1u << 23)) != 0;
+        const bool iva = (cfg & (1u << 22)) != 0;
+        vector = iva ? 0x00800000u : 0x00200000u;
+        if (eva == iva) vector += 0x30u;
+    }
+    if ((cfg & (1u << 3)) != 0) vector += static_cast<u32>(source) * 4u;
+    epc = (pc & ~1u) | (vliw_mode ? 1u : 0u);
+    const u32 previous = psw;
+    psw = (previous & ~0x100Fu) | ((previous & 5u) << 1);
+    vliw_mode = false;
+    exc &= ~0xFu; // EXC.EXC=0 identifies a hardware interrupt.
+    cbus.acknowledge_irq(static_cast<unsigned>(source));
+    // The loop registers are preserved, and a handler can save/restore them
+    // with STC/LDC. No pending trailing slot remains at an interrupt boundary.
+    rep_pending_back_ = false;
+    set_pc(vector);
+    return true;
 }
 
 /// The MeP hardware loop unit repeats the block [RPB, RPE] once per RPC count.
@@ -1037,7 +1170,7 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
             break;
         case Op::Erepeat:
             rpb = address + 4;
-            rpe = (mep::field_value(Field::F17s16a2, word, address) & 0xFFFFFFFEu);
+            rpe = (mep::field_value(Field::F17s16a2, word, address) & 0xFFFFFFFEu) | 1u;
             rpc = 0;
             rep_active_ = true;
             rep_pending_back_ = false;
@@ -1067,11 +1200,13 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
         case Op::Di: psw &= ~kPswInterruptEnable; break;
         case Op::Ei: psw |= kPswInterruptEnable; break;
         case Op::Reti:
-            if ((psw & kPswException) != 0) {
+            if ((psw & kPswNmi) != 0) {
                 set_pc(npc & 0xFFFFFFFEu);
-                psw &= ~kPswException;
+                psw &= ~kPswNmi;
             } else {
                 set_pc(epc & 0xFFFFFFFEu);
+                // IEC<-IEP and UMC<-UMP; previous bits remain unchanged.
+                psw = (psw & ~5u) | ((psw >> 1) & 5u);
             }
             break;
         case Op::Halt:
@@ -1096,19 +1231,19 @@ void MePCore::execute(const mep::Insn& insn, u32 word, u32 address) {
         // -------------------------------------------------------- control bus
         case Op::Stcb: {
             const u32 a = mep::raw(word, 16, 16);
-            cop_access("stcb", 1, a, R[static_cast<size_t>(rn)], false);
+            cbus.write(a, R[static_cast<size_t>(rn)]);
             break;
         }
         case Op::Ldcb: {
             const u32 a = mep::raw(word, 16, 16);
-            R[static_cast<size_t>(rn)] = cop_access("ldcb", 1, a, 0, true);
+            R[static_cast<size_t>(rn)] = cbus.read(a);
             break;
         }
         case Op::StcbR:
-            cop_access("stcb", 1, R[static_cast<size_t>(rm)] & 0xFFFFu, R[static_cast<size_t>(rn)], false);
+            cbus.write(R[static_cast<size_t>(rm)] & 0xFFFFu, R[static_cast<size_t>(rn)]);
             break;
         case Op::LdcbR:
-            R[static_cast<size_t>(rn)] = cop_access("ldcb", 1, R[static_cast<size_t>(rm)] & 0xFFFFu, 0, true);
+            R[static_cast<size_t>(rn)] = cbus.read(R[static_cast<size_t>(rm)] & 0xFFFFu);
             break;
 
         // ------------------------------------------------------------- bit ops

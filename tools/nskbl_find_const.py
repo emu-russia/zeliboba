@@ -11,7 +11,7 @@ Usage: python tools/nskbl_find_const.py 0x4300 0x8002 [--image FILE] [--base 0x.
 import argparse
 import sys
 
-DEFAULT_IMAGE = r"C:\Work\PSVita\_scratch\nskbl_mem.bin"
+DEFAULT_IMAGE = r"..\_scratch\nskbl_mem.bin"
 DEFAULT_BASE = 0x51000000
 
 

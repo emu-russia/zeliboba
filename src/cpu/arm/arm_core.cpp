@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "common/log.h"
 #include "common/util.h"
@@ -20,6 +21,13 @@
 namespace zlb {
 
 namespace {
+
+// ARM ARM B1.3.2: System mode accesses SP_usr and LR_usr. The mode
+// encodings still remain distinct for privilege and SPSR handling.
+constexpr u32 sp_lr_bank(u32 mode) {
+    mode &= arm::kModeMask;
+    return mode == arm::kModeSystem ? arm::kModeUser : mode;
+}
 
 /// Conservative per-instruction cycle costs; the machine layer only uses these
 /// for scheduling and for the debugger's throughput display.
@@ -35,7 +43,7 @@ u64 cycles_for(u32 instr, bool thumb, bool branch) {
 // Construction / reset
 // ===========================================================================
 
-ArmCore::ArmCore(Bus& bus) : Cpu(bus), mmu(bus) {
+ArmCore::ArmCore(Bus& bus) : Cpu(bus), mmu(bus), inactive_mmu_(bus) {
     name = "cpu0";
     reset(0);
 }
@@ -72,6 +80,12 @@ void ArmCore::reset() {
     cur_instr_ = 0;
     cur_instr_len_ = 4;
     mmu.reset();
+    inactive_mmu_.reset();
+    active_mmu_nonsecure_ = false;
+    // The architectural reset value is UNKNOWN. Use zero in both banks for
+    // deterministic emulation; guest software supplies every thread pointer.
+    thread_ids_[0] = {};
+    thread_ids_[1] = {};
     vfp.reset();
     write_r15(0);
 }
@@ -106,18 +120,42 @@ void ArmCore::bank_switch(u32 old_mode, u32 new_mode) {
     const int o = static_cast<int>(old_mode & arm::kModeMask);
     const int n = static_cast<int>(new_mode & arm::kModeMask);
 
-    bank_sp_[o] = r[13];
-    bank_lr_[o] = r[14];
+    bank_sp_[sp_lr_bank(o)] = r[13];
+    bank_lr_[sp_lr_bank(o)] = r[14];
     if (o == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) bank_r8_[o][j] = r[8 + j];
     }
 
     cpsr = (cpsr & ~arm::kModeMask) | (new_mode & arm::kModeMask);
-    r[13] = bank_sp_[n];
-    r[14] = bank_lr_[n];
+    r[13] = bank_sp_[sp_lr_bank(n)];
+    r[14] = bank_lr_[sp_lr_bank(n)];
     if (n == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) r[8 + j] = bank_r8_[n][j];
     }
+    sync_mmu_bank();
+}
+
+void ArmCore::sync_mmu_bank() {
+    const bool nonsecure = !secure_state();
+    if (active_mmu_nonsecure_ != nonsecure) {
+        std::swap(mmu, inactive_mmu_);
+        active_mmu_nonsecure_ = nonsecure;
+    }
+    // Preserve the public NS VBAR used by machine/debugger initialization.
+    mmu_bank(true).vbar = vbar_nonsecure;
+}
+
+ArmMmu& ArmCore::mmu_bank(bool nonsecure) {
+    return nonsecure == active_mmu_nonsecure_ ? mmu : inactive_mmu_;
+}
+
+const ArmMmu& ArmCore::mmu_bank(bool nonsecure) const {
+    return nonsecure == active_mmu_nonsecure_ ? mmu : inactive_mmu_;
+}
+
+ArmMmu& ArmCore::cp15_mmu() {
+    sync_mmu_bank();
+    return mmu_bank((scr & arm::kScrNs) != 0u);
 }
 
 void ArmCore::set_nz(u32 result) {
@@ -291,10 +329,22 @@ void ArmCore::write_reg(int n, u32 value) {
     else r[n] = value;
 }
 
-void ArmCore::write_cpsr_masked(u32 value, u32 mask) {
+u32 ArmCore::cpsr_instruction_mask(u32 mask) const {
+    // Cortex-A9 has Security Extensions without Virtualization Extensions.
+    // CPSRWriteByInstr applies these restrictions in the source world, even
+    // on an exception return. Monitor is Secure while SCR.NS is set.
+    if (!secure_state()) {
+        if ((scr & arm::kScrFw) == 0u) mask &= ~arm::kFlagF;
+        if ((scr & arm::kScrAw) == 0u) mask &= ~arm::kFlagA;
+    }
+    return mask;
+}
+
+void ArmCore::write_cpsr_masked(u32 value, u32 mask, bool instruction) {
     const u32 old_mode = mode();
     const bool privileged = old_mode != arm::kModeUser;
-    const u32 user_mask = privileged ? mask : (mask & 0xF0000000u);
+    const u32 user_mask = privileged ? (instruction ? cpsr_instruction_mask(mask) : mask)
+                                     : (mask & 0xF0000000u);
     u32 new_cpsr = (cpsr & ~user_mask) | (value & user_mask);
     new_cpsr &= ~arm::kFlagJ;
 
@@ -311,6 +361,7 @@ void ArmCore::write_cpsr_masked(u32 value, u32 mask) {
     }
 
     thumb = (cpsr & arm::kFlagT) != 0;
+    sync_mmu_bank();
 }
 
 // ===========================================================================
@@ -320,6 +371,8 @@ void ArmCore::write_cpsr_masked(u32 value, u32 mask) {
 void ArmCore::set_access_pc() {
     bus->context.pc = cur_instr_addr_;
     bus->context.core = name.c_str();
+    bus->context.nonsecure = !secure_state();
+    bus->context.core_id = core_id_;
 }
 
 arm::MmResult ArmCore::translate_or_fix(u32 va, bool write, bool fetch) {
@@ -360,10 +413,76 @@ u32 ArmCore::mem_read_word(u32 va, bool fetch) {
     return fetch ? bus->fetch32(va) : bus->read32(va);
 }
 
+void ArmCore::single_word_alignment_fault(u32 va, bool write) {
+    arm::MmResult fault;
+    fault.fault = arm::MmFaultKind::Alignment;
+    fault.fsr_full = fault.fsr_status = 1u;
+    pending_mm_fault_ = fault;
+    pending_fault_ = arm::FaultKind::Data;
+    mmu.report_data_abort(fault, va, write);
+}
+
+bool ArmCore::unaligned_single_byte_allowed(u32 va, u32 byte_va, bool write) {
+    if (!mmu.enabled()) return true;
+    set_access_pc();
+    const arm::MmResult result = translate_or_fix(byte_va, write, false);
+    if (!result.ok) {
+        pending_mm_fault_ = result;
+        pending_fault_ = arm::FaultKind::Data;
+        mmu.report_data_abort(result, byte_va, write);
+        return false;
+    }
+    // Device and Strongly-ordered words cannot be split, even with A=0.
+    if (!result.normal) {
+        single_word_alignment_fault(va, write);
+        return false;
+    }
+    return true;
+}
+
+u32 ArmCore::mem_read_single_word(u32 va) {
+    // ARMv7 LDR/STR use MemU (ARM ARM A8.8.63, B2.4.5). Unaligned
+    // Normal-memory words read their actual bytes, with no legacy rotation.
+    // Each byte translates independently, including across nonadjacent pages.
+    u32 value = 0;
+    if ((va & 3u) == 0u) {
+        value = mem_read_word(va, false);
+    } else {
+        if (mmu.strict_alignment()) {
+            single_word_alignment_fault(va, false);
+            return 0xFFFFFFFFu;
+        }
+        for (u32 byte = 0; byte < 4u; ++byte) {
+            if (!unaligned_single_byte_allowed(va, va + byte, false)) return 0xFFFFFFFFu;
+            const u32 part = mem_read_byte(va + byte);
+            if (pending_fault_ != arm::FaultKind::None) return 0xFFFFFFFFu;
+            value |= (part & 0xFFu) << (byte * 8u);
+        }
+    }
+    return (cpsr & arm::kFlagE) != 0u ? arm::reverse_bytes(value) : value;
+}
+
+void ArmCore::mem_write_single_word(u32 va, u32 value) {
+    if ((va & 3u) != 0u && mmu.strict_alignment()) {
+        single_word_alignment_fault(va, true);
+        return;
+    }
+    if ((cpsr & arm::kFlagE) != 0u) value = arm::reverse_bytes(value);
+    if ((va & 3u) == 0u) {
+        mem_write_word(va, value);
+        return;
+    }
+    for (u32 byte = 0; byte < 4u; ++byte) {
+        if (!unaligned_single_byte_allowed(va, va + byte, true)) return;
+        mem_write_byte(va + byte, (value >> (byte * 8u)) & 0xFFu);
+        if (pending_fault_ != arm::FaultKind::None) return;
+    }
+}
+
 u32 ArmCore::mem_read_half(u32 va) {
     // Unaligned halfword access (SCTLR.A == 0, which is how this guest runs) is a
     // plain read of the two bytes *at* the address - no rounding down and no
-    // rotation (rotation is an LDR/LDM rule, not an LDRH one).
+    // rotation. ARMv7 single-word transfers use the same byte addressing.
     //
     // Measured (round 320): NSKBL reads the BPB's bytes-per-sector with
     // `ldrh.w r7,[r6,#0xb]` (0x51023D9A) from a boot-sector copy whose bytes at
@@ -508,31 +627,57 @@ void ArmCore::take_exception(u32 vector_offset, u32 new_mode, u32 return_address
     const u32 old_mode = mode();
     ++exception_count;
 
+    // Exceptions originating in Monitor enter Secure handlers. An SMC from
+    // Nonsecure changes mode, leaving SCR.NS set for Monitor's CP15 accesses.
+    if (old_mode == arm::kModeMonitor) {
+        scr &= ~arm::kScrNs;
+        ns_ = false;
+    }
+    sync_mmu_bank();
+
     // Pick the vector table *before* the world can change: monitor entries live
     // at MVBAR, everything else uses the VBAR of the world the exception is
     // taken from (the non-secure world has its own bank of VBAR).
     const bool to_monitor = (new_mode & arm::kModeMask) == arm::kModeMonitor;
-    const u32 vector_base = to_monitor && mvbar != 0u ? mvbar : effective_vector_base();
+    const u32 vector_base = to_monitor ? mvbar : effective_vector_base();
 
     const u32 saved_cpsr = cpsr;
 
-    u32 new_cpsr = new_mode & arm::kModeMask;
-    new_cpsr |= arm::kFlagF;
-    if (new_mode != arm::kModeFiq) new_cpsr |= arm::kFlagI;
-    if (new_mode != arm::kModeHyp) new_cpsr |= arm::kFlagA;
-    new_cpsr |= (cpsr & 0x0F000000u);  // keep NZCV
-    new_cpsr |= (cpsr & arm::kFlagE);  // keep E
-    new_cpsr &= ~arm::kFlagT;          // ARM state on entry
+    // Exception pseudocode changes only the mode, interrupt masks, J/IT and
+    // SCTLR-selected instruction set/endianness. NZCV, Q and GE survive.
+    constexpr u32 it_mask = (3u << 25) | (0x3Fu << 10);
+    u32 new_cpsr = saved_cpsr & ~(arm::kModeMask | arm::kFlagJ | arm::kFlagT |
+                                arm::kFlagE | it_mask);
+    new_cpsr |= new_mode & arm::kModeMask;
+    if (to_monitor) {
+        new_cpsr |= arm::kFlagA | arm::kFlagI | arm::kFlagF;
+    } else if (new_mode == arm::kModeHyp) {
+        if ((scr & arm::kScrEa) == 0u) new_cpsr |= arm::kFlagA;
+        if ((scr & arm::kScrIrq) == 0u) new_cpsr |= arm::kFlagI;
+        if ((scr & arm::kScrFiq) == 0u) new_cpsr |= arm::kFlagF;
+    } else {
+        new_cpsr |= arm::kFlagI;
+        if (new_mode == arm::kModeFiq &&
+            (secure_state() || (scr & arm::kScrFw) != 0u)) new_cpsr |= arm::kFlagF;
+        if ((new_mode == arm::kModeAbort || new_mode == arm::kModeIrq ||
+             new_mode == arm::kModeFiq) &&
+            (secure_state() || (scr & arm::kScrAw) != 0u)) {
+            new_cpsr |= arm::kFlagA;
+        }
+    }
+    const u32 control = mmu_bank(to_monitor ? false : !secure_state()).sctlr;
+    if ((control & (1u << 30)) != 0u) new_cpsr |= arm::kFlagT;
+    if ((control & (1u << 25)) != 0u) new_cpsr |= arm::kFlagE;
 
     const int o = static_cast<int>(old_mode & arm::kModeMask);
-    bank_sp_[o] = r[13];
-    bank_lr_[o] = r[14];
+    bank_sp_[sp_lr_bank(o)] = r[13];
+    bank_lr_[sp_lr_bank(o)] = r[14];
     if (o == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) bank_r8_[o][j] = r[8 + j];
     }
 
     cpsr = new_cpsr;
-    thumb = false;
+    thumb = (new_cpsr & arm::kFlagT) != 0u;
     it_state_valid_ = false;
     it_state_ = 0;
 
@@ -542,28 +687,31 @@ void ArmCore::take_exception(u32 vector_offset, u32 new_mode, u32 return_address
     // exception return (RFE / `movs pc, lr`) restored the wrong PSR - evidence:
     // arm_mode_banking_switches_sp.
     bank_spsr_[n] = saved_cpsr;
-    r[13] = bank_sp_[n];
+    r[13] = bank_sp_[sp_lr_bank(n)];
     r[14] = return_address;
     if (n == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) r[8 + j] = bank_r8_[n][j];
     }
 
+    sync_mmu_bank();
     write_r15(vector_base + vector_offset);
 }
 
 u32 ArmCore::effective_vector_base() const {
-    if (secure_state()) return mmu.vector_base();
-    return vbar_nonsecure != 0u ? vbar_nonsecure : mmu.vector_base();
+    const ArmMmu& bank = mmu_bank(!secure_state());
+    if (!secure_state() && !bank.high_vectors()) return vbar_nonsecure & ~0x1Fu;
+    return bank.vector_base();
 }
 
 void ArmCore::exception_return(u32 target) {
-    const u32 spsr_value = spsr();
+    const u32 writable = cpsr_instruction_mask(0xFFFFFFFFu);
+    const u32 spsr_value = (cpsr & ~writable) | (spsr() & writable);
     const u32 old_mode = mode();
     const u32 new_mode = spsr_value & arm::kModeMask;
 
     const int o = static_cast<int>(old_mode & arm::kModeMask);
-    bank_sp_[o] = r[13];
-    bank_lr_[o] = r[14];
+    bank_sp_[sp_lr_bank(o)] = r[13];
+    bank_lr_[sp_lr_bank(o)] = r[14];
     if (o == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) bank_r8_[o][j] = r[8 + j];
     }
@@ -574,22 +722,26 @@ void ArmCore::exception_return(u32 target) {
     it_state_ = 0;
 
     const int n = static_cast<int>(new_mode & arm::kModeMask);
-    r[13] = bank_sp_[n];
-    r[14] = bank_lr_[n];
+    r[13] = bank_sp_[sp_lr_bank(n)];
+    r[14] = bank_lr_[sp_lr_bank(n)];
     if (n == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) r[8 + j] = bank_r8_[n][j];
     }
 
-    // The instruction set on return comes from SPSR.T, never the branch address.
-    write_r15(target & ~1u);
+    // BranchWritePC follows the restored CPSR.T: Thumb preserves bit 1,
+    // ARM clears both low bits. The address itself does not select the ISA.
+    sync_mmu_bank();
+    write_r15(target & (thumb ? ~1u : ~3u));
     pending_fault_ = arm::FaultKind::None;
 }
 
 void ArmCore::exception_return_with_cpsr(u32 target, u32 new_cpsr) {
+    const u32 writable = cpsr_instruction_mask(0xFFFFFFFFu);
+    new_cpsr = (cpsr & ~writable) | (new_cpsr & writable);
     const u32 old_mode = mode();
     const int o = static_cast<int>(old_mode & arm::kModeMask);
-    bank_sp_[o] = r[13];
-    bank_lr_[o] = r[14];
+    bank_sp_[sp_lr_bank(o)] = r[13];
+    bank_lr_[sp_lr_bank(o)] = r[14];
     if (o == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) bank_r8_[o][j] = r[8 + j];
     }
@@ -600,12 +752,14 @@ void ArmCore::exception_return_with_cpsr(u32 target, u32 new_cpsr) {
     it_state_ = 0;
 
     const int n = static_cast<int>(cpsr & arm::kModeMask);
-    r[13] = bank_sp_[n];
-    r[14] = bank_lr_[n];
+    r[13] = bank_sp_[sp_lr_bank(n)];
+    r[14] = bank_lr_[sp_lr_bank(n)];
     if (n == static_cast<int>(arm::kModeFiq)) {
         for (int j = 0; j < 5; ++j) r[8 + j] = bank_r8_[n][j];
     }
-    write_r15(target & ~1u);
+    // RFE uses BranchWritePC after restoring CPSR (ARM ARM B9.3.13).
+    sync_mmu_bank();
+    write_r15(target & (thumb ? ~1u : ~3u));
     pending_fault_ = arm::FaultKind::None;
 }
 
@@ -695,7 +849,10 @@ void ArmCore::set_irq(int line, bool asserted) {
         // whose only wake-up source is a timer tick stays asleep forever.
         if (rising && irq_hook) irq_hook();
     } else if (line == static_cast<int>(IrqLine::FiQ)) {
+        const bool rising = asserted && !fiq_line_;
         fiq_line_ = asserted;
+        // An unmasked physical FIQ is an architectural WFE wake-up event.
+        if (rising && (cpsr & arm::kFlagF) == 0u && irq_hook) irq_hook();
     }
 }
 
@@ -710,6 +867,8 @@ bool ArmCore::interrupt_pending() const {
 // ===========================================================================
 
 StepResult ArmCore::step() {
+    // Public reset/staging helpers can set SCR.NS and CPSR before stepping.
+    sync_mmu_bank();
     StepResult result;
     result.address = r[15];
     cur_instr_addr_ = r[15];
@@ -720,7 +879,8 @@ StepResult ArmCore::step() {
 
     // Interrupts are only taken at an instruction boundary.
     if (fiq_line_ && (cpsr & arm::kFlagF) == 0) {
-        take_exception(arm::kVecFiq, arm::kModeFiq, cur_instr_addr_ + (thumb ? 4u : 4u));
+        const u32 target_mode = (scr & arm::kScrFiq) != 0u ? arm::kModeMonitor : arm::kModeFiq;
+        take_exception(arm::kVecFiq, target_mode, cur_instr_addr_ + 4u);
         ++instructions;
         ++cycles;
         result.address = cur_instr_addr_;
@@ -729,7 +889,8 @@ StepResult ArmCore::step() {
         return result;
     }
     if (irq_line_ && (cpsr & arm::kFlagI) == 0) {
-        take_exception(arm::kVecIrq, arm::kModeIrq, cur_instr_addr_ + (thumb ? 4u : 4u));
+        const u32 target_mode = (scr & arm::kScrIrq) != 0u ? arm::kModeMonitor : arm::kModeIrq;
+        take_exception(arm::kVecIrq, target_mode, cur_instr_addr_ + 4u);
         ++instructions;
         ++cycles;
         result.address = cur_instr_addr_;
@@ -760,7 +921,7 @@ StepResult ArmCore::step() {
             if (in_it && !arm::condition_passed(tcond, cpsr)) {
                 write_r15(cur_instr_addr_ + 2u);
             } else {
-                execute_thumb16();
+                execute_thumb16(in_it);
             }
         }
     } else {
@@ -2059,23 +2220,8 @@ void ArmCore::execute_arm_load_store(u32 instr, bool immediate) {
             if (pending_fault_ != arm::FaultKind::None) return;
             write_reg(rd, value & 0xFFu);
         } else {
-            const bool unaligned = (addr & 3u) != 0;
-            if (unaligned && mmu.enabled() && mmu.strict_alignment()) {
-                arm::MmResult mm;
-                mm.fault = arm::MmFaultKind::Alignment;
-                mm.fsr_full = 1u;
-                mm.fsr_status = 1u;
-                mmu.report_data_abort(mm, addr, false);
-                pending_mm_fault_ = mm;
-                pending_fault_ = arm::FaultKind::Data;
-                return;
-            }
-            u32 value = mem_read_word(addr & ~3u, false);
+            const u32 value = mem_read_single_word(addr);
             if (pending_fault_ != arm::FaultKind::None) return;
-            if (unaligned) {
-                const int rot = static_cast<int>(addr & 3u) * 8;
-                value = (value >> rot) | (value << (32 - rot));
-            }
             write_reg(rd, value);
         }
         if (rd == 15) {
@@ -2084,7 +2230,7 @@ void ArmCore::execute_arm_load_store(u32 instr, bool immediate) {
         }
     } else {
         if (b) mem_write_byte(addr, r[rd] & 0xFFu);
-        else mem_write_word(addr & ~3u, r[rd]);
+        else mem_write_single_word(addr, r[rd]);
         if (pending_fault_ != arm::FaultKind::None) return;
     }
 
@@ -2228,7 +2374,8 @@ void ArmCore::execute_arm_unconditional(u32 instr) {
     }
 
     // 1111 101H: BLX (immediate). H is *bit 24* and contributes bit 1 of the
-    // offset: target = PC + 8 + SignExtend(imm24:H:'0', 26), then word aligned.
+    // offset: target = PC + 8 + SignExtend(imm24:H:'0', 26). A Thumb target is
+    // halfword aligned; H selects bit 1 and must survive the PC write.
     // (The reference core tested bit 4 as if it were H and dropped H from the
     // offset entirely, which rejects every BLX whose imm24 has bit 4 set --
     // including the one the kernel boot loader uses at 0x40020340.)
@@ -2241,7 +2388,7 @@ void ArmCore::execute_arm_unconditional(u32 instr) {
         r[14] = cur_instr_addr_ + 4u;
         thumb = true;
         cpsr |= arm::kFlagT;
-        write_r15(target & ~3u);
+        write_r15(target & ~1u);
         return;
     }
 
@@ -2403,7 +2550,7 @@ void ArmCore::decode_arm_rfe_srs(u32 instr) {
         const u32 new_cpsr = mem_read_word(addr + 4u, false);
         if (pending_fault_ != arm::FaultKind::None) return;
         if (w && rn != 15) r[rn] = u ? base_addr + 8u : base_addr - 8u;
-        exception_return_with_cpsr(new_pc & ~3u, new_cpsr);
+        exception_return_with_cpsr(new_pc, new_cpsr);
         return;
     }
 
@@ -2457,6 +2604,7 @@ void ArmCore::decode_arm_cps_setend(u32 instr) {
         const u32 imod = (instr >> 18) & 3u;
         const u32 m = (instr >> 17) & 1u;
         const u32 aif = (instr >> 6) & 7u;
+        const u32 writable = cpsr_instruction_mask(aif << 6);
         const u32 new_mode = instr & 0x1Fu;
         if (mode() == arm::kModeUser) {
             undefined("CPS from User mode");
@@ -2469,13 +2617,9 @@ void ArmCore::decode_arm_cps_setend(u32 instr) {
             thumb = (cpsr & arm::kFlagT) != 0;
         }
         if (imod == 2u) {
-            if ((aif & 4u) != 0) cpsr &= ~arm::kFlagA;
-            if ((aif & 2u) != 0) cpsr &= ~arm::kFlagI;
-            if ((aif & 1u) != 0) cpsr &= ~arm::kFlagF;
+            cpsr &= ~writable;
         } else if (imod == 3u) {
-            if ((aif & 4u) != 0) cpsr |= arm::kFlagA;
-            if ((aif & 2u) != 0) cpsr |= arm::kFlagI;
-            if ((aif & 1u) != 0) cpsr |= arm::kFlagF;
+            cpsr |= writable;
         }
         write_r15(cur_instr_addr_ + 4u);
         return;
@@ -2544,6 +2688,7 @@ void ArmCore::execute_arm_coprocessor(u32 instr) {
     if ((instr & 0x10u) != 0u) {
         if (cpnum == 15u) {
             const bool load = (instr & (1u << 20)) != 0;
+            if (!cp15_thread_id_access_allowed(load, opc1v, crn, crm, opc2v)) return;
             if (load) {
                 const u32 value = cp15_read(opc1v, crn, crm, opc2v, rd);
                 if (rd != 15) r[rd] = value;
@@ -2580,8 +2725,18 @@ void ArmCore::execute_arm_coprocessor(u32 instr) {
     write_r15(cur_instr_addr_ + 4u);
 }
 
+bool ArmCore::cp15_thread_id_access_allowed(bool read, u32 opc1, u32 crn, u32 crm, u32 opc2) {
+    if (opc1 == 0u && crn == 13u && crm == 0u && mode() == arm::kModeUser &&
+        (opc2 == 4u || (opc2 == 3u && !read))) {
+        undefined("unprivileged access to a privileged thread ID register");
+        return false;
+    }
+    return true;
+}
+
 u32 ArmCore::cp15_read(u32 opc1v, u32 crn, u32 crm, u32 opc2v, int rt) {
     (void)rt;
+    ArmMmu& bank = cp15_mmu();
     if (opc1v != 0u) {
         // Opc1 selects the cache-level space (CCSIDR/CLIDR/CSSELR). Nothing reads
         // it yet, but silently answering 0 there would look like "no caches" to a
@@ -2636,50 +2791,53 @@ u32 ArmCore::cp15_read(u32 opc1v, u32 crn, u32 crm, u32 opc2v, int rt) {
                 default: return 0u;
             }
         case 1u:
-            if (crm == 0u && opc2v == 0u) return mmu.sctlr;
+            if (crm == 0u && opc2v == 0u) return bank.sctlr;
             if (crm == 0u && opc2v == 2u) return 0u;  // CPACR
             if (crm == 1u && opc2v == 0u) return scr;  // SCR (TrustZone)
             if (crm == 1u && opc2v == 1u) return 0u;   // Secure Debug Enable Register
             if (crm == 1u && opc2v == 2u) return 0u;   // Non-secure Access Control Register
             return 0u;
         case 2u:
-            if (crm == 0u && opc2v == 0u) return mmu.ttbr0;
-            if (crm == 0u && opc2v == 1u) return mmu.ttbr1;
-            if (crm == 0u && opc2v == 2u) return mmu.ttbcr;
+            if (crm == 0u && opc2v == 0u) return bank.ttbr0;
+            if (crm == 0u && opc2v == 1u) return bank.ttbr1;
+            if (crm == 0u && opc2v == 2u) return bank.ttbcr;
             return 0u;
         case 3u:
             // DACR. The kernel boot loader brackets its VA->PA probing with a
             // save/restore of this register, so a read that answers 0 silently
             // disables every domain on the restore and aborts the boot.
-            if (crm == 0u && opc2v == 0u) return mmu.dacr;
+            if (crm == 0u && opc2v == 0u) return bank.dacr;
             return 0u;
         case 5u:
-            if (crm == 0u && opc2v == 0u) return mmu.dfsr;
-            if (crm == 0u && opc2v == 1u) return mmu.dfar;
-            if (crm == 1u && opc2v == 0u) return mmu.ifsr;
-            if (crm == 1u && opc2v == 1u) return mmu.ifar;
-            if (crm == 1u && opc2v == 2u) return mmu.adfsr;
-            if (crm == 1u && opc2v == 3u) return mmu.aifsr;
+            if (crm == 0u && opc2v == 0u) return bank.dfsr;
+            if (crm == 0u && opc2v == 1u) return bank.dfar;
+            if (crm == 1u && opc2v == 0u) return bank.ifsr;
+            if (crm == 1u && opc2v == 1u) return bank.ifar;
+            if (crm == 1u && opc2v == 2u) return bank.adfsr;
+            if (crm == 1u && opc2v == 3u) return bank.aifsr;
             return 0u;
         case 6u:
-            if (crm == 0u && opc2v == 0u) return mmu.dfar;
-            if (crm == 0u && opc2v == 2u) return mmu.ifar;
+            if (crm == 0u && opc2v == 0u) return bank.dfar;
+            if (crm == 0u && opc2v == 2u) return bank.ifar;
             return 0u;
         case 7u:
             // PAR holds the result of the last V2P (VA->PA) operation below.
-            if (crm == 4u && opc2v == 0u) return mmu.par;
+            if (crm == 4u && opc2v == 0u) return bank.par;
             return 0u;
         case 10u:
-            if (crm == 2u && opc2v == 0u) return mmu.prrr;
-            if (crm == 2u && opc2v == 1u) return mmu.nmrr;
+            if (crm == 2u && opc2v == 0u) return bank.prrr;
+            if (crm == 2u && opc2v == 1u) return bank.nmrr;
             return 0u;
         case 12u:
             // VBAR is banked per world; MVBAR (secure only) is the monitor's.
-            if (crm == 0u && opc2v == 0u) return secure_state() ? mmu.vbar : vbar_nonsecure;
+            if (crm == 0u && opc2v == 0u) return bank.vbar;
             if (crm == 0u && opc2v == 1u) return mvbar;
             return 0u;
         case 13u:
-            if (crm == 0u && opc2v == 1u) return mmu.context_idr;
+            if (crm == 0u && opc2v == 1u) return bank.context_idr;
+            if (crm == 0u && opc2v == 2u) return cp15_thread_ids().user_rw;
+            if (crm == 0u && opc2v == 3u) return cp15_thread_ids().user_ro;
+            if (crm == 0u && opc2v == 4u) return cp15_thread_ids().privileged_rw;
             return 0u;
         default:
             return 0u;
@@ -2687,15 +2845,16 @@ u32 ArmCore::cp15_read(u32 opc1v, u32 crn, u32 crm, u32 opc2v, int rt) {
 }
 
 void ArmCore::cp15_write(u32 opc1v, u32 crn, u32 crm, u32 opc2v, u32 value) {
+    ArmMmu& bank = cp15_mmu();
     switch (crn) {
         case 1u:
             if (crm == 0u && opc2v == 0u) {
-                mmu.sctlr = value;
+                bank.sctlr = value;
                 ZLB_LOG_DBG("cpu", "%s SCTLR = 0x%08X (MMU %s) at %08X", name.c_str(), value,
-                            mmu.enabled() ? "on" : "off", cur_instr_addr_);
+                            bank.enabled() ? "on" : "off", cur_instr_addr_);
             } else if (crm == 1u && opc2v == 0u) {
-                // SCR: writing NS switches the world. Only secure privileged code
-                // may write it (else the write is ignored).
+                // SCR.NS selects the execution world outside Monitor. Monitor
+                // always stays Secure and may switch its banked CP15 access.
                 if (!secure_state()) {
                     ZLB_LOG_WARN("cpu", "%s SCR write 0x%08X ignored in non-secure world at %08X", name.c_str(),
                                  value, cur_instr_addr_);
@@ -2703,41 +2862,46 @@ void ArmCore::cp15_write(u32 opc1v, u32 crn, u32 crm, u32 opc2v, u32 value) {
                 }
                 scr = value;
                 ns_ = (value & arm::kScrNs) != 0u;
+                sync_mmu_bank();
                 ZLB_LOG_INFO("cpu", "%s SCR = 0x%08X -> %s world at %08X", name.c_str(), value,
                              secure_state() ? "secure" : "non-secure", cur_instr_addr_);
             }
             break;
         case 2u:
             if (crm == 0u && opc2v == 0u) {
-                mmu.ttbr0 = value & 0xFFFFC000u;
-                ZLB_LOG_DBG("cpu", "%s TTBR0 = 0x%08X (base 0x%08X) at %08X", name.c_str(), value, mmu.ttbr0,
+                bank.ttbr0 = value & 0xFFFFC000u;
+                ZLB_LOG_DBG("cpu", "%s TTBR0 = 0x%08X (base 0x%08X) at %08X", name.c_str(), value, bank.ttbr0,
                             cur_instr_addr_);
             } else if (crm == 0u && opc2v == 1u) {
-                mmu.ttbr1 = value;
+                bank.ttbr1 = value;
                 int num = 0;
                 ZLB_LOG_DBG("cpu", "%s TTBR1 = 0x%08X (base 0x%08X for TTBCR.N=%u) at %08X", name.c_str(),
-                            value, mmu.ttbr_base_for(0xFFFFFFFFu, num), mmu.ttbcr & 7u, cur_instr_addr_);
+                            value, bank.ttbr_base_for(0xFFFFFFFFu, num), bank.ttbcr & 7u, cur_instr_addr_);
             } else if (crm == 0u && opc2v == 2u) {
-                mmu.ttbcr = value & 7u;
+                bank.ttbcr = value & 7u;
                 ZLB_LOG_DBG("cpu", "%s TTBCR = 0x%08X (N=%u, split at 0x%08X) at %08X", name.c_str(), value,
-                            mmu.ttbcr, mmu.ttbcr == 0 ? 0u : (1u << (32 - mmu.ttbcr)), cur_instr_addr_);
+                            bank.ttbcr, bank.ttbcr == 0 ? 0u : (1u << (32 - bank.ttbcr)), cur_instr_addr_);
             }
             break;
         case 3u:
-            mmu.dacr = value;
+            bank.dacr = value;
             ZLB_LOG_DBG("cpu", "%s DACR = 0x%08X at %08X", name.c_str(), value, cur_instr_addr_);
             break;
         case 5u:
-            if (crm == 0u && opc2v == 0u) mmu.dfsr = value & 0xFFFu;
-            else if (crm == 0u && opc2v == 1u) mmu.dfar = value;
-            else if (crm == 1u && opc2v == 0u) mmu.ifsr = value & 0xFFFu;
-            else if (crm == 1u && opc2v == 1u) mmu.ifar = value;
+            if (crm == 0u && opc2v == 0u) bank.dfsr = value & 0xFFFu;
+            else if (crm == 0u && opc2v == 1u) bank.dfar = value;
+            else if (crm == 1u && opc2v == 0u) bank.ifsr = value & 0xFFFu;
+            else if (crm == 1u && opc2v == 1u) bank.ifar = value;
             break;
         case 6u:
-            if (crm == 0u && opc2v == 0u) mmu.dfar = value;
-            else if (crm == 0u && opc2v == 2u) mmu.ifar = value;
+            if (crm == 0u && opc2v == 0u) bank.dfar = value;
+            else if (crm == 0u && opc2v == 2u) bank.ifar = value;
             break;
         case 7u:
+            if (crm == 4u && opc2v == 0u) {
+                bank.par = value;
+                break;
+            }
             // CRm=8 with CRn=7 selects the VA-to-PA translation operations
             // (V2PCWPR/V2PCWUR/V2POWPR/V2POWUR); Rt holds the virtual address
             // and the answer comes back through PAR (c7, c4, 0).
@@ -2751,22 +2915,16 @@ void ArmCore::cp15_write(u32 opc1v, u32 crn, u32 crm, u32 opc2v, u32 value) {
             cp15_tlb_op(opc1v, crm, opc2v, value);
             break;
         case 10u:
-            if (crm == 2u && opc2v == 0u) mmu.prrr = value;
-            else if (crm == 2u && opc2v == 1u) mmu.nmrr = value;
+            if (crm == 2u && opc2v == 0u) bank.prrr = value;
+            else if (crm == 2u && opc2v == 1u) bank.nmrr = value;
             break;
         case 12u:
             if (crm == 0u && opc2v == 0u) {
-                // VBAR is banked: the secure world and the non-secure world each
-                // keep their own vector base.
-                if (secure_state()) {
-                    mmu.vbar = value;
-                    ZLB_LOG_DBG("cpu", "%s VBAR(secure) = 0x%08X (vectors at 0x%08X) at %08X", name.c_str(),
-                                value, mmu.vector_base(), cur_instr_addr_);
-                } else {
-                    vbar_nonsecure = value;
-                    ZLB_LOG_DBG("cpu", "%s VBAR(non-secure) = 0x%08X at %08X", name.c_str(), value,
-                                cur_instr_addr_);
-                }
+                bank.vbar = value & ~0x1Fu;
+                if ((scr & arm::kScrNs) != 0u) vbar_nonsecure = bank.vbar;
+                ZLB_LOG_DBG("cpu", "%s VBAR(%s) = 0x%08X at %08X", name.c_str(),
+                            (scr & arm::kScrNs) != 0u ? "non-secure" : "secure", bank.vbar,
+                            cur_instr_addr_);
                 break;
             }
             if (crm == 0u && opc2v == 1u) {
@@ -2778,8 +2936,12 @@ void ArmCore::cp15_write(u32 opc1v, u32 crn, u32 crm, u32 opc2v, u32 value) {
             break;
         case 13u:
             if (crm == 0u && opc2v == 1u) {
-                mmu.context_idr = value;
+                bank.context_idr = value;
                 ZLB_LOG_DBG("cpu", "%s CONTEXTIDR = 0x%08X at %08X", name.c_str(), value, cur_instr_addr_);
+            } else if (opc1v == 0u && crm == 0u) {
+                if (opc2v == 2u) cp15_thread_ids().user_rw = value;
+                else if (opc2v == 3u) cp15_thread_ids().user_ro = value;
+                else if (opc2v == 4u) cp15_thread_ids().privileged_rw = value;
             }
             break;
         default:
@@ -2857,23 +3019,37 @@ void ArmCore::cp15_tlb_op(u32 opc1v, u32 crm, u32 opc2v, u32 value) {
 }
 
 void ArmCore::cp15_va_to_pa(u32 opc1v, u32 opc2v, u32 va) {
-    // V2PCWPR/V2PCWUR/V2POWPR/V2POWUR: ask the MMU to translate `va` as a
-    // privileged (opc2 bit 0 clear) or user (bit 0 set) access, reading (bit 1
-    // clear) or writing (bit 1 set), and publish the answer in PAR. A fault is
-    // reported through PAR instead of raising an exception, which is exactly why
-    // the boot loader can use these to probe a mapping.
-    const bool user = (opc2v & 1u) != 0u;
-    const bool write = (opc2v & 2u) != 0u;
-    const u32 mode = user ? arm::kModeUser : arm::kModeSupervisor;
-    const arm::MmResult result = mmu.translate(va, write, false, mode);
-    if (result.ok) {
-        mmu.par = (result.phys_addr & 0xFFFFF000u) | 1u;  // PAR[0] = 1: translated
-    } else {
-        mmu.par = (result.fsr_status << 1) & 0xFFEu;  // PAR[11:1] = fault status
+    if (opc1v != 0u) {
+        undefined("Unsupported address translation operation");
+        return;
     }
-    (void)opc1v;
+    // ATS1Cxx translates the execution world's regime (Secure in Monitor);
+    // ATS12NSOxx selects Nonsecure independently of SCR.NS. CP15 operations
+    // use the execution Security state for their resources (ARM ARM B3.15),
+    // so Monitor updates Secure PAR even when SCR.NS selects NS MRC/MCR.
+    const bool user = (opc2v & 2u) != 0u;
+    const bool write = (opc2v & 1u) != 0u;
+    const bool nonsecure_only = (opc2v & 4u) != 0u;
+    if (nonsecure_only && !secure_state()) {
+        undefined("Nonsecure-only address translation requires Secure privilege");
+        return;
+    }
+    const u32 mode = user ? arm::kModeUser : arm::kModeSupervisor;
+    ArmMmu& regime = nonsecure_only ? mmu_bank(true) : mmu;
+    ArmMmu& result_bank = mmu;
+    const arm::MmResult result = regime.translate(va, write, false, mode);
+    if (result.ok) {
+        // Short-descriptor PAR.SS changes the physical-address layout for a
+        // supersection. The Cortex-A9 model implements 32-bit physical memory.
+        result_bank.par = result.supersection ? (result.phys_addr & 0xFF000000u) | 2u
+                                             : result.phys_addr & 0xFFFFF000u;
+    } else {
+        const u32 fs = (result.fsr_full & 0xFu) | ((result.fsr_full >> 6) & 0x10u) |
+                       ((result.fsr_full >> 7) & 0x20u);
+        result_bank.par = (fs << 1) | 1u;  // PAR.F=1; FS contains no domain/WnR
+    }
     ZLB_LOG_TRACE("cpu", "%s V2P %s%s VA=0x%08X -> PAR=0x%08X%s", name.c_str(),
-                  write ? "write " : "read ", user ? "user" : "priv", va, mmu.par,
+                  write ? "write " : "read ", user ? "user" : "priv", va, result_bank.par,
                   result.ok ? "" : " (fault)");
 }
 
@@ -2881,16 +3057,21 @@ void ArmCore::cp15_va_to_pa(u32 opc1v, u32 opc2v, u32 va) {
 // Thumb-16
 // ===========================================================================
 
-void ArmCore::execute_thumb16() {
+void ArmCore::execute_thumb16(bool in_it_block) {
     const u32 i = cur_instr_;
     const u32 top = (i >> 11) & 0x1Fu;
+    // The narrow data-processing encodings implicitly set flags only outside
+    // IT (ARM ARM A8.8, e.g. MOV immediate T1: setflags = !InITBlock()). Use
+    // the current instruction's membership: thumb_condition() has already
+    // advanced ITSTATE, including clearing it before the block's final slot.
+    const bool setflags = !in_it_block;
     switch (top) {
-        case 0u: case 1u: case 2u: thumb_shift_imm(i); return;
-        case 3u: thumb_add_sub(i); return;
-        case 4u: case 5u: case 6u: case 7u: thumb_mov_cmp_imm(i); return;
+        case 0u: case 1u: case 2u: thumb_shift_imm(i, setflags); return;
+        case 3u: thumb_add_sub(i, setflags); return;
+        case 4u: case 5u: case 6u: case 7u: thumb_mov_cmp_imm(i, setflags); return;
         case 8u:
             if ((i & 0x400u) != 0u) thumb_special_data(i);
-            else thumb_alu_ops(i);
+            else thumb_alu_ops(i, setflags);
             return;
         case 9u: thumb_literal_load(i); return;
         case 10u: case 11u: thumb_load_store_reg(i); return;
@@ -2906,7 +3087,7 @@ void ArmCore::execute_thumb16() {
     }
 }
 
-void ArmCore::thumb_shift_imm(u32 i) {
+void ArmCore::thumb_shift_imm(u32 i, bool setflags) {
     const u32 op = (i >> 11) & 3u;
     const u32 imm5 = (i >> 6) & 0x1Fu;
     const int rm = static_cast<int>((i >> 3) & 7u);
@@ -2916,25 +3097,16 @@ void ArmCore::thumb_shift_imm(u32 i) {
         return;
     }
 
-    const u32 src = r[rm];
-    u32 value;
-    bool carry;
-    if (op == 0u && imm5 == 0u) {
-        value = src;
-        carry = flag_c();
-    } else {
-        const int amount = (op == 0u) ? static_cast<int>(imm5) : (imm5 == 0u ? 32 : static_cast<int>(imm5));
-        carry = ((src >> (amount - 1)) & 1u) != 0u;
-        value = shift_imm(src, static_cast<int>(op), amount, false);
-    }
+    const int amount = (op == 0u) ? static_cast<int>(imm5) : (imm5 == 0u ? 32 : static_cast<int>(imm5));
+    // Share the shifter's carry rules: LSL shifts out bit (32 - amount),
+    // whereas right shifts shift out bit (amount - 1). LSL #0 preserves C.
+    const u32 value = shift_imm(r[rm], static_cast<int>(op), amount, setflags);
     r[rd] = value;
-    set_nz(value);
-    if (carry) cpsr |= arm::kFlagC;
-    else cpsr &= ~arm::kFlagC;
+    if (setflags) set_nz(value);
     write_r15(cur_instr_addr_ + 2u);
 }
 
-void ArmCore::thumb_add_sub(u32 i) {
+void ArmCore::thumb_add_sub(u32 i, bool setflags) {
     const bool immediate = (i & 0x400u) != 0u;
     const bool sub = (i & 0x200u) != 0u;
     // Encoding (ARM ARM A7.2, ADD/SUB register T1): `0001 100 Rm Rn Rd`, i.e. the
@@ -2954,11 +3126,11 @@ void ArmCore::thumb_add_sub(u32 i) {
     const u32 result = sub ? sub_with_carry(r[rn], op2v, true, carry, overflow)
                            : add_with_carry(r[rn], op2v, false, carry, overflow);
     r[rd] = result;
-    set_nzcv(result, carry, overflow);
+    if (setflags) set_nzcv(result, carry, overflow);
     write_r15(cur_instr_addr_ + 2u);
 }
 
-void ArmCore::thumb_mov_cmp_imm(u32 i) {
+void ArmCore::thumb_mov_cmp_imm(u32 i, bool setflags) {
     const u32 op = (i >> 11) & 3u;
     const int rd = static_cast<int>((i >> 8) & 7u);
     const u32 imm8 = i & 0xFFu;
@@ -2968,7 +3140,7 @@ void ArmCore::thumb_mov_cmp_imm(u32 i) {
     switch (op) {
         case 0u:
             r[rd] = imm8;
-            set_nz(imm8);
+            if (setflags) set_nz(imm8);
             break;
         case 1u:
             // CMP (immediate): the flags come from Rn - imm8.  The operands were
@@ -2983,18 +3155,18 @@ void ArmCore::thumb_mov_cmp_imm(u32 i) {
         case 2u:
             result = add_with_carry(r[rd], imm8, false, carry, overflow);
             r[rd] = result;
-            set_nzcv(result, carry, overflow);
+            if (setflags) set_nzcv(result, carry, overflow);
             break;
         default:
             result = sub_with_carry(r[rd], imm8, true, carry, overflow);
             r[rd] = result;
-            set_nzcv(result, carry, overflow);
+            if (setflags) set_nzcv(result, carry, overflow);
             break;
     }
     write_r15(cur_instr_addr_ + 2u);
 }
 
-void ArmCore::thumb_alu_ops(u32 i) {
+void ArmCore::thumb_alu_ops(u32 i, bool setflags) {
     const u32 op = (i >> 6) & 0xFu;
     const int rm = static_cast<int>((i >> 3) & 7u);
     const int rd = static_cast<int>(i & 7u);
@@ -3004,27 +3176,27 @@ void ArmCore::thumb_alu_ops(u32 i) {
     bool overflow = flag_v();
     u32 result;
     switch (op) {
-        case 0x0u: result = a & b; r[rd] = result; set_nz(result); break;
-        case 0x1u: result = a ^ b; r[rd] = result; set_nz(result); break;
-        case 0x2u: result = shift_reg(a, 0, b & 0xFFu); r[rd] = result; set_nz(result); break;
-        case 0x3u: result = shift_reg(a, 1, b & 0xFFu); r[rd] = result; set_nz(result); break;
-        case 0x4u: result = shift_reg(a, 2, b & 0xFFu); r[rd] = result; set_nz(result); break;
+        case 0x0u: result = a & b; r[rd] = result; if (setflags) set_nz(result); break;
+        case 0x1u: result = a ^ b; r[rd] = result; if (setflags) set_nz(result); break;
+        case 0x2u: result = shift_reg(a, 0, b & 0xFFu, setflags); r[rd] = result; if (setflags) set_nz(result); break;
+        case 0x3u: result = shift_reg(a, 1, b & 0xFFu, setflags); r[rd] = result; if (setflags) set_nz(result); break;
+        case 0x4u: result = shift_reg(a, 2, b & 0xFFu, setflags); r[rd] = result; if (setflags) set_nz(result); break;
         case 0x5u:
             result = add_with_carry(a, b, carry, carry, overflow);
             r[rd] = result;
-            set_nzcv(result, carry, overflow);
+            if (setflags) set_nzcv(result, carry, overflow);
             break;
         case 0x6u:
             result = sub_with_carry(a, b, carry, carry, overflow);
             r[rd] = result;
-            set_nzcv(result, carry, overflow);
+            if (setflags) set_nzcv(result, carry, overflow);
             break;
-        case 0x7u: result = shift_reg(a, 3, b & 0xFFu); r[rd] = result; set_nz(result); break;
+        case 0x7u: result = shift_reg(a, 3, b & 0xFFu, setflags); r[rd] = result; if (setflags) set_nz(result); break;
         case 0x8u: result = a & b; set_nz(result); break;
         case 0x9u:
             result = sub_with_carry(0u, b, true, carry, overflow);
             r[rd] = result;
-            set_nzcv(result, carry, overflow);
+            if (setflags) set_nzcv(result, carry, overflow);
             break;
         case 0xAu:
             result = sub_with_carry(a, b, true, carry, overflow);
@@ -3034,10 +3206,10 @@ void ArmCore::thumb_alu_ops(u32 i) {
             result = add_with_carry(a, b, false, carry, overflow);
             set_nzcv(result, carry, overflow);
             break;
-        case 0xCu: result = a | b; r[rd] = result; set_nz(result); break;
-        case 0xDu: result = a * b; r[rd] = result; set_nz(result); break;
-        case 0xEu: result = a & ~b; r[rd] = result; set_nz(result); break;
-        default: result = ~b; r[rd] = result; set_nz(result); break;
+        case 0xCu: result = a | b; r[rd] = result; if (setflags) set_nz(result); break;
+        case 0xDu: result = a * b; r[rd] = result; if (setflags) set_nz(result); break;
+        case 0xEu: result = a & ~b; r[rd] = result; if (setflags) set_nz(result); break;
+        default: result = ~b; r[rd] = result; if (setflags) set_nz(result); break;
     }
     write_r15(cur_instr_addr_ + 2u);
 }
@@ -3067,8 +3239,13 @@ void ArmCore::thumb_special_data(u32 i) {
             break;
         }
         case 2u:
-            if (rd == 15) branch_to(b);
-            else r[rd] = b;
+            if (rd == 15) {
+                // MOV PC,Rm uses ALUWritePC: in Thumb this is a simple
+                // branch, retaining the instruction set and discarding bit 0.
+                write_r15(b & ~1u);
+                return;
+            }
+            r[rd] = b;
             break;
         default:
             if ((i & 0x0080u) != 0u) r[14] = (cur_instr_addr_ + 2u) | 1u;
@@ -3082,7 +3259,7 @@ void ArmCore::thumb_literal_load(u32 i) {
     const int rd = static_cast<int>((i >> 8) & 7u);
     const u32 imm8 = static_cast<u32>(i & 0xFFu) * 4u;
     const u32 addr = ((cur_instr_addr_ + 4u) & ~3u) + imm8;
-    const u32 value = mem_read_word(addr, false);
+    const u32 value = mem_read_single_word(addr);
     if (pending_fault_ != arm::FaultKind::None) return;
     r[rd] = value;
     write_r15(cur_instr_addr_ + 2u);
@@ -3095,7 +3272,7 @@ void ArmCore::thumb_load_store_reg(u32 i) {
     const int rd = static_cast<int>(i & 7u);
     const u32 addr = r[rn] + r[rm];
     switch (op) {
-        case 0u: mem_write_word(addr & ~3u, r[rd]); break;
+        case 0u: mem_write_single_word(addr, r[rd]); break;
         case 1u: mem_write_half(addr, r[rd] & 0xFFFFu); break;
         case 2u: mem_write_byte(addr, r[rd] & 0xFFu); break;
         case 3u: {
@@ -3106,7 +3283,7 @@ void ArmCore::thumb_load_store_reg(u32 i) {
             break;
         }
         case 4u: {
-            const u32 value = mem_read_word(addr & ~3u, false);
+            const u32 value = mem_read_single_word(addr);
             if (pending_fault_ == arm::FaultKind::None) r[rd] = value;
             break;
         }
@@ -3141,12 +3318,12 @@ void ArmCore::thumb_load_store_imm(u32 i) {
     const u32 offset = byte_op ? imm5 : imm5 * 4u;
     const u32 addr = r[rn] + offset;
     if (load) {
-        const u32 value = byte_op ? mem_read_byte(addr) : mem_read_word(addr & ~3u, false);
+        const u32 value = byte_op ? mem_read_byte(addr) : mem_read_single_word(addr);
         if (pending_fault_ != arm::FaultKind::None) return;
         r[rd] = byte_op ? (value & 0xFFu) : value;
     } else {
         if (byte_op) mem_write_byte(addr, r[rd] & 0xFFu);
-        else mem_write_word(addr & ~3u, r[rd]);
+        else mem_write_single_word(addr, r[rd]);
         if (pending_fault_ != arm::FaultKind::None) return;
     }
     write_r15(cur_instr_addr_ + 2u);
@@ -3174,10 +3351,10 @@ void ArmCore::thumb_sp_relative(u32 i) {
     const u32 imm8 = static_cast<u32>(i & 0xFFu) * 4u;
     const u32 addr = r[13] + imm8;
     if (load) {
-        const u32 value = mem_read_word(addr & ~3u, false);
+        const u32 value = mem_read_single_word(addr);
         if (pending_fault_ == arm::FaultKind::None) r[rd] = value;
     } else {
-        mem_write_word(addr & ~3u, r[rd]);
+        mem_write_single_word(addr, r[rd]);
     }
     if (pending_fault_ != arm::FaultKind::None) return;
     write_r15(cur_instr_addr_ + 2u);
@@ -3302,15 +3479,12 @@ void ArmCore::thumb_misc16(u32 i) {
     if ((i & 0xFFE0u) == 0xB660u) {
         const u32 imod = (i >> 4) & 3u;
         const u32 aif = i & 7u;
+        const u32 writable = cpsr_instruction_mask(aif << 6);
         if (mode() != arm::kModeUser) {
             if (imod == 2u) {
-                if ((aif & 4u) != 0u) cpsr &= ~arm::kFlagA;
-                if ((aif & 2u) != 0u) cpsr &= ~arm::kFlagI;
-                if ((aif & 1u) != 0u) cpsr &= ~arm::kFlagF;
+                cpsr &= ~writable;
             } else if (imod == 3u) {
-                if ((aif & 4u) != 0u) cpsr |= arm::kFlagA;
-                if ((aif & 2u) != 0u) cpsr |= arm::kFlagI;
-                if ((aif & 1u) != 0u) cpsr |= arm::kFlagF;
+                cpsr |= writable;
             }
         }
         write_r15(cur_instr_addr_ + 2u);
@@ -3486,6 +3660,18 @@ void ArmCore::execute_thumb32() {
     }
 
     const u32 hw1 = cur_instr_ >> 16;
+    // ARM ARM A7.4/A7.7: Thumb Advanced SIMD uses EF/FF for data
+    // processing and F9x0 for element/structure transfers. Normalize only
+    // their fixed encoding bits; the variable fields match the A32 form.
+    if ((hw1 & 0xEF00u) == 0xEF00u) {
+        execute_neon(0xF2000000u | (cur_instr_ & 0x00FFFFFFu) |
+                     ((cur_instr_ & 0x10000000u) >> 4));
+        return;
+    }
+    if ((hw1 & 0xFF10u) == 0xF900u) {
+        execute_neon(0xF4000000u | (cur_instr_ & 0x00FFFFFFu));
+        return;
+    }
     const u32 t1 = (hw1 >> 11) & 3u;
     const u32 top = (hw1 >> 4) & 0x7Fu;
 
@@ -3591,21 +3777,10 @@ void ArmCore::thumb32_data_processing_modified() {
     const int rd = static_cast<int>((hw2 >> 8) & 0xFu);
     const u32 imm12v = (i << 11) | (((hw2 >> 12) & 7u) << 8) | (hw2 & 0xFFu);
     const u32 imm = arm::thumb_expand_imm(imm12v);
-    // Carry out of ThumbExpandImm_C (ARM ARM A7.4.3): for the logical opcodes
-    // with S == 1 this - not the old value of C - is what the instruction must
-    // write. With a rotate of 0 nothing is shifted out and C is preserved.
-    const bool imm_carry = [&]() {
-        const u32 top8 = (imm12v >> 8) & 0xFu;
-        if ((imm12v & 0xC00u) == 0u) {
-            if (top8 == 0u) return flag_c();
-            if (top8 < 8u) return (imm12v & 0x80u) != 0u;  // replicated bytes
-            const u32 v = 0x80u | (imm12v & 0x7Fu);
-            const int rot = static_cast<int>(top8 - 8u);
-            return rot == 0 ? flag_c() : ((v >> (rot - 1)) & 1u) != 0u;
-        }
-        const int r = static_cast<int>((imm12v >> 7) & 0x1Fu);
-        return r == 0 ? flag_c() : ((imm >> 31) & 1u) != 0u;
-    }();
+    // ThumbExpandImm_C preserves C for all four unrotated forms, including
+    // replicated bytes. Rotated forms set C to the expanded immediate's bit 31
+    // (ARM ARM A6-231).
+    const bool imm_carry = (imm12v & 0xC00u) == 0u ? flag_c() : (imm >> 31) != 0u;
 
     // The "Rd == 1111" forms of AND/EOR/ADD/SUB are the TST/TEQ/CMN/CMP aliases.
     if (rd == 15 && (opc == 0x0u || opc == 0x4u || opc == 0x8u || opc == 0xDu)) {
@@ -4424,6 +4599,13 @@ void ArmCore::thumb32_load_store_single() {
         return r[rm] << ((hw2 >> 4) & 3u);
     };
 
+    // Rt == PC selects memory hints in the byte/halfword spaces (including
+    // signed PLI encodings). Word LDR to PC is an interworking branch.
+    if (l && rt == 15 && !is_word) {
+        write_r15(cur_instr_addr_ + 4u);
+        return;
+    }
+
     if (signed_space) {
         const u32 size_sel = hw1 & 0x30u;
         if (size_sel != 0x10u && size_sel != 0x30u) {
@@ -4461,13 +4643,26 @@ void ArmCore::thumb32_load_store_single() {
         return;
     }
 
-    // A load with Rt == 1111 is the PLD/PLI preload hint (no effect).
-    if (l && rt == 15) {
-        write_r15(cur_instr_addr_ + 4u);
+    const int size = is_word ? 2 : (is_half ? 1 : 0);
+
+    const auto read_word = [&](u32 addr) { return mem_read_single_word(addr); };
+    const auto write_word = [&](u32 addr, u32 value) { mem_write_single_word(addr, value); };
+
+    if (l && is_word && rn == 15) {
+        // LDR literal uses an aligned PC and a signed 12-bit offset, including
+        // the U == 0 encoding that otherwise resembles indexed/register loads.
+        const u32 base = (cur_instr_addr_ + 4u) & ~3u;
+        const u32 offset = hw2 & 0xFFFu;
+        const u32 addr = imm12_form ? base + offset : base - offset;
+        const u32 value = read_word(addr);
+        if (pending_fault_ != arm::FaultKind::None) return;
+        if (rt == 15) branch_to(value);
+        else {
+            r[rt] = value;
+            write_r15(cur_instr_addr_ + 4u);
+        }
         return;
     }
-
-    const int size = is_word ? 2 : (is_half ? 1 : 0);
 
     if (imm12_form) {
         const u32 imm12 = hw2 & 0xFFFu;
@@ -4476,13 +4671,17 @@ void ArmCore::thumb32_load_store_single() {
             u32 value;
             if (size == 0) value = mem_read_byte(addr) & 0xFFu;
             else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
-            else value = mem_read_word(addr & ~3u, false);
+            else value = read_word(addr);
             if (pending_fault_ != arm::FaultKind::None) return;
+            if (rt == 15) {
+                branch_to(value);
+                return;
+            }
             r[rt] = value;
         } else {
             if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
             else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
-            else mem_write_word(addr & ~3u, r[rt]);
+            else write_word(addr, r[rt]);
             if (pending_fault_ != arm::FaultKind::None) return;
         }
         write_r15(cur_instr_addr_ + 4u);
@@ -4496,13 +4695,17 @@ void ArmCore::thumb32_load_store_single() {
             u32 value;
             if (size == 0) value = mem_read_byte(addr) & 0xFFu;
             else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
-            else value = mem_read_word(addr & ~3u, false);
+            else value = read_word(addr);
             if (pending_fault_ != arm::FaultKind::None) return;
+            if (rt == 15) {
+                branch_to(value);
+                return;
+            }
             r[rt] = value;
         } else {
             if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
             else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
-            else mem_write_word(addr & ~3u, r[rt]);
+            else write_word(addr, r[rt]);
             if (pending_fault_ != arm::FaultKind::None) return;
         }
         write_r15(cur_instr_addr_ + 4u);
@@ -4520,17 +4723,18 @@ void ArmCore::thumb32_load_store_single() {
         u32 value;
         if (size == 0) value = mem_read_byte(addr) & 0xFFu;
         else if (size == 1) value = mem_read_half(addr) & 0xFFFFu;
-        else value = mem_read_word(addr & ~3u, false);
+        else value = read_word(addr);
         if (pending_fault_ != arm::FaultKind::None) return;
         r[rt] = value;
     } else {
         if (size == 0) mem_write_byte(addr, r[rt] & 0xFFu);
         else if (size == 1) mem_write_half(addr, r[rt] & 0xFFFFu);
-        else mem_write_word(addr & ~3u, r[rt]);
+        else write_word(addr, r[rt]);
         if (pending_fault_ != arm::FaultKind::None) return;
     }
     if (w && rn != 15) r[rn] = u ? base_addr + imm8 : base_addr - imm8;
-    write_r15(cur_instr_addr_ + 4u);
+    if (l && rt == 15) branch_to(r[15]);
+    else write_r15(cur_instr_addr_ + 4u);
 }
 
 void ArmCore::thumb32_coprocessor() {
@@ -4569,6 +4773,7 @@ void ArmCore::thumb32_coprocessor() {
         const u32 crn = (cur_instr_ >> 16) & 0xFu;
         const u32 crm = cur_instr_ & 0xFu;
         const u32 o2 = (cur_instr_ >> 5) & 7u;
+        if (!cp15_thread_id_access_allowed(load, o1, crn, crm, o2)) return;
         if (load) {
             const u32 value = cp15_read(o1, crn, crm, o2, rd);
             if (rd != 15) r[rd] = value;
@@ -4659,7 +4864,6 @@ void ArmCore::thumb32_misc() {
     const u32 hw1 = cur_instr_ >> 16;
     const u32 hw2 = cur_instr_ & 0xFFFFu;
     const int rd = static_cast<int>((hw2 >> 8) & 0xFu);
-    const int rm = static_cast<int>(hw2 & 0xFu);
 
     // Hints: 1111 0011 1010 ....  The CPS instruction (ARM ARM A7.7.24) shares
     // this prefix: 1111 0011 1010 1111 : 1 0 imod(2) M(1) 0 AIF(3) 0 0 0 0 mode(5),
@@ -4673,6 +4877,7 @@ void ArmCore::thumb32_misc() {
         const u32 imod = (hw2 >> 9) & 3u;
         const u32 m = (hw2 >> 8) & 1u;
         const u32 aif = (hw2 >> 5) & 7u;
+        const u32 writable = cpsr_instruction_mask(aif << 6);
         const u32 new_mode = hw2 & 0x1Fu;
         if (mode() == arm::kModeUser) {
             undefined("T32 CPS from User mode");
@@ -4684,13 +4889,9 @@ void ArmCore::thumb32_misc() {
             thumb = (cpsr & arm::kFlagT) != 0;
         }
         if (imod == 2u) {
-            if ((aif & 4u) != 0u) cpsr &= ~arm::kFlagA;
-            if ((aif & 2u) != 0u) cpsr &= ~arm::kFlagI;
-            if ((aif & 1u) != 0u) cpsr &= ~arm::kFlagF;
+            cpsr &= ~writable;
         } else if (imod == 3u) {
-            if ((aif & 4u) != 0u) cpsr |= arm::kFlagA;
-            if ((aif & 2u) != 0u) cpsr |= arm::kFlagI;
-            if ((aif & 1u) != 0u) cpsr |= arm::kFlagF;
+            cpsr |= writable;
         }
         write_r15(cur_instr_addr_ + 4u);
         return;
@@ -4715,16 +4916,16 @@ void ArmCore::thumb32_misc() {
         write_r15(cur_instr_addr_ + 4u);
         return;
     }
-    // MSR (register): 1111 0011 1000 1111 1000 Rd 0000 Rm (CPSR) and
-    // 1111 0011 1001 1111 ... (SPSR). The sysm field is hw2<11:8> and is the
+    // MSR (register): 1111 0011 100 R Rn : 1000 mask 0000 0000.
+    // R selects CPSR/SPSR, and Rn is hw1<3:0>. The sysm field hw2<11:8> is the
     // same 4 bit field mask as the A32 MSR: bit3 = f, bit2 = s, bit1 = x,
     // bit0 = c (ARM ARM A7.7.85). The code used to treat it as a 2 bit field,
     // so the usual `msr cpsr_f, r0` (sysm = 1000) fell through with a mask of
     // 0xFFFFFFFF and rewrote the mode and T bit.
-    if ((hw1 & 0xFFF0u) == 0xF380u && (hw2 & 0xF000u) == 0x8000u) {
+    if ((hw1 & 0xFFE0u) == 0xF380u && (hw2 & 0xF000u) == 0x8000u) {
         const u32 sysm = (hw2 >> 8) & 0xFu;
         const bool use_spsr = (hw1 & 0x10u) != 0u;
-        const u32 value = r[rm];
+        const u32 value = r[hw1 & 0xFu];
         u32 mask = 0u;
         if ((sysm & 8u) != 0u) mask |= 0xFF000000u;
         if ((sysm & 4u) != 0u) mask |= 0x00FF0000u;
@@ -5015,18 +5216,90 @@ void ArmCore::execute_vfp_op(bool dbl, u32 instr, u32 opcv1, u32 opcv2, int vd, 
 //     vdup.32 q0, r0       ; 0xEEA00B10, r0 == 0
 //     vorr    q1, q0, q0   ; 0xF22x x150   (x15 of them)
 //
-// -- and reports every other Advanced SIMD encoding as an *undefined
-// instruction* (which the caller surfaces as StepResult::faulted) rather than
-// letting it silently do nothing and corrupt state. The two implemented forms
-// are exact, not approximations: VDUP.32 replicates a core register into all
-// four 32-bit lanes, and VORR (register) is a bitwise OR of two vectors.
+// -- plus the register logical family used by native modules. Other Advanced
+// SIMD encodings report an undefined instruction (StepResult::faulted).
 //
-// Encodings (ARM ARM A8.8.395 VDUP, A8.8.336 VORR):
+// Encodings (ARM ARM VDUP; A8.8.361 VORR):
 //   VDUP.32 Qd, Rt : cond 1110 1 D 10 imm4 Vd 1011 00 opc Q M 0
 //                    (must be `(instr & 0x0FB00FF0) == 0x0EA00B10`)
-//   VORR   Qd,Qn,Qm: 1111 0010 0 D 0 Vn Vd 0001 N Q M 1 Vm  (bit 6 = Q)
+//   VORR   Qd,Qn,Qm: 1111 0010 0 D 10 Vn Vd 0001 N Q M 1 Vm (bit 6 = Q)
 // ---------------------------------------------------------------------------
 void ArmCore::execute_neon(u32 instr) {
+    // VMOVL, A8.8.347: widen a snapshot of the source D register into Qd.
+    // Nonzero VSHLL shifts and the related immediate encodings are distinct.
+    if ((instr & 0xFE870FD0u) == 0xF2800A10u) {
+        const u32 imm3 = (instr >> 19) & 7u;
+        if (imm3 == 1u || imm3 == 2u || imm3 == 4u) {
+            const int d = static_cast<int>(((instr >> 22) & 1u) * 16u + ((instr >> 12) & 15u));
+            const int m = static_cast<int>(((instr >> 5) & 1u) * 16u + (instr & 15u));
+            if (d & 1) {
+                undefined("NEON VMOVL with an odd quadword register index");
+                return;
+            }
+            const u32 width = 8u * imm3;
+            const u32 widened = 2u * width;
+            const u64 mask = (1ull << width) - 1u;
+            const u64 out_mask = widened == 64u ? ~0ull : (1ull << widened) - 1u;
+            const u64 source = vfp.read_d32(m);
+            u64 result[2] = {};
+            for (u32 element = 0; element < 64u / width; ++element) {
+                u64 value = (source >> (element * width)) & mask;
+                if ((instr & 0x01000000u) == 0u && (value & (1ull << (width - 1u))))
+                    value |= ~mask;
+                const u32 offset = element * widened;
+                result[offset / 64u] |= (value & out_mask) << (offset % 64u);
+            }
+            vfp.write_d32(d, result[0]);
+            vfp.write_d32(d + 1, result[1]);
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+    }
+    // VMOV (immediate), A8.8.340 / AdvSIMDExpandImm A7.4.6. Related
+    // VORR/VBIC/VMVN immediate encodings stay explicitly unsupported.
+    if ((instr & 0xFEB80090u) == 0xF2800010u) {
+        const u32 cmode = (instr >> 8) & 15u;
+        const bool op = (instr & 0x20u) != 0u;
+        const bool quad = (instr & 0x40u) != 0u;
+        const int d = static_cast<int>(((instr >> 22) & 1u) * 16u + ((instr >> 12) & 15u));
+        if ((op && cmode != 14u) || (!op && cmode < 12u && (cmode & 1u))) {
+            undefined("Advanced SIMD related modified-immediate instruction not implemented");
+            return;
+        }
+        if (quad && (d & 1)) {
+            undefined("NEON VMOV immediate with an odd quadword register index");
+            return;
+        }
+        const u32 imm8 = ((instr >> 17) & 0x80u) | ((instr >> 12) & 0x70u) | (instr & 15u);
+        if (imm8 == 0u && (cmode == 2u || cmode == 4u || cmode == 6u ||
+                          cmode == 10u || cmode == 12u || cmode == 13u)) {
+            undefined("NEON VMOV unpredictable zero modified immediate");
+            return;
+        }
+        u64 value = 0;
+        if (cmode < 8u) {
+            const u32 part = imm8 << ((cmode >> 1) * 8u);
+            value = static_cast<u64>(part) | (static_cast<u64>(part) << 32);
+        } else if (cmode < 12u) {
+            const u64 part = imm8 << ((cmode == 10u) ? 8u : 0u);
+            value = part | (part << 16) | (part << 32) | (part << 48);
+        } else if (cmode < 14u) {
+            const u32 part = cmode == 12u ? (imm8 << 8) | 0xFFu : (imm8 << 16) | 0xFFFFu;
+            value = static_cast<u64>(part) | (static_cast<u64>(part) << 32);
+        } else if (cmode == 14u) {
+            for (u32 byte = 0; byte < 8u; ++byte) {
+                const u64 part = op ? ((imm8 & (1u << byte)) ? 0xFFu : 0u) : imm8;
+                value |= part << (byte * 8u);
+            }
+        } else {
+            const u32 part = ArmVfp::expand_immediate(imm8);
+            value = static_cast<u64>(part) | (static_cast<u64>(part) << 32);
+        }
+        for (int reg = 0; reg < (quad ? 2 : 1); ++reg) vfp.write_d32(d + reg, value);
+        write_r15(cur_instr_addr_ + 4u);
+        return;
+    }
+
     // ---- VDUP (ARM core register to all lanes) ----------------------------
     // `cond 1110 1 D 10 imm4 Vd 1011 00 opc Q M 0`, size .32 when opc == 00.
     if ((instr & 0x0FB00FF0u) == 0x0EA00B10u) {
@@ -5066,8 +5339,8 @@ void ArmCore::execute_neon(u32 instr) {
     // ---- Advanced SIMD data processing (register) -------------------------
     // `1111 001 U 0 D size Vn Vd opc1 N Q M opc2 Vm`. U is bit 24, size is bits
     // [21:20], opc1 is bits [11:8], opc2 is bit 4. For opc1 == 0001 with
-    // opc2 == 1 the size field selects the *logical* ops, which ignore the
-    // element size; opc1 == 0011 selects the bitwise select family.
+    // opc2 == 1 the size field selects the logical ops, which ignore element
+    // size. U selects AND/BIC/ORR/ORN or EOR/BSL/BIT/BIF (ARM ARM Table A7-9).
     if ((instr & 0xFE800000u) == 0xF2000000u) {
         const u32 opc1 = (instr >> 8) & 0xFu;
         const bool opc2 = (instr & 0x10u) != 0u;
@@ -5079,6 +5352,55 @@ void ArmCore::execute_neon(u32 instr) {
         const bool quad = (instr & 0x40u) != 0u;
         const int lanes = quad ? 2 : 1;
 
+        // VADD (integer), A8.8.283. Each lane wraps at its own width;
+        // unsigned host addition also gives the required 64-bit wrap.
+        if (opc1 == 8u && !opc2 && !u_bit) {
+            if (quad && ((d | n | m) & 1)) {
+                undefined("NEON VADD with an odd quadword register index");
+                return;
+            }
+            const u32 width = 8u << size;
+            const u64 mask = width == 64u ? ~0ull : (1ull << width) - 1u;
+            const u64 src_n[2] = {vfp.read_d32(n), quad ? vfp.read_d32(n + 1) : 0u};
+            const u64 src_m[2] = {vfp.read_d32(m), quad ? vfp.read_d32(m + 1) : 0u};
+            for (int reg = 0; reg < lanes; ++reg) {
+                u64 result = 0;
+                for (u32 offset = 0; offset < 64u; offset += width) {
+                    const u64 value = ((src_n[reg] >> offset) & mask) +
+                                      ((src_m[reg] >> offset) & mask);
+                    result |= (value & mask) << offset;
+                }
+                vfp.write_d32(d + reg, result);
+            }
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+
+        // VPADD (integer), A8.8.363: pairwise reduction is a D-register
+        // operation. Read both vectors before writing an overlapping Dd.
+        if (opc1 == 11u && opc2 && !u_bit) {
+            if (quad || size == 3u) {
+                undefined("NEON VPADD invalid size or quadword encoding");
+                return;
+            }
+            const u32 width = 8u << size;
+            const u64 mask = (1ull << width) - 1u;
+            const u64 source[2] = {vfp.read_d32(n), vfp.read_d32(m)};
+            u64 result = 0;
+            const u32 half = 32u / width;
+            for (u32 reg = 0; reg < 2u; ++reg) {
+                for (u32 element = 0; element < half; ++element) {
+                    const u32 offset = element * width * 2u;
+                    const u64 value = ((source[reg] >> offset) & mask) +
+                                      ((source[reg] >> (offset + width)) & mask);
+                    result |= (value & mask) << ((reg * half + element) * width);
+                }
+            }
+            vfp.write_d32(d, result);
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
+
         enum class LogicOp { None, And, Bic, Orr, Orn, Eor, Bsl, Bit, Bif };
         LogicOp op = LogicOp::None;
         if (opc1 == 0x1u && opc2 && !u_bit) {
@@ -5088,7 +5410,7 @@ void ArmCore::execute_neon(u32 instr) {
                 case 2u: op = LogicOp::Orr; break;
                 default: op = LogicOp::Orn; break;
             }
-        } else if (opc1 == 0x3u && opc2 && !u_bit) {
+        } else if (opc1 == 0x1u && opc2 && u_bit) {
             switch (size) {
                 case 0u: op = LogicOp::Eor; break;
                 case 1u: op = LogicOp::Bsl; break;
@@ -5098,14 +5420,16 @@ void ArmCore::execute_neon(u32 instr) {
         }
 
         if (op != LogicOp::None) {
-            if (!quad && ((d & 1) != 0 || (n & 1) != 0 || (m & 1) != 0)) {
-                undefined("NEON logical op with a misaligned double register");
+            // Q registers require an even D index. Doubleword operations use
+            // the exact D index, including odd registers and D31 (A8.8.361).
+            if (quad && ((d & 1) != 0 || (n & 1) != 0 || (m & 1) != 0)) {
+                undefined("NEON logical op with an odd quadword register index");
                 return;
             }
             for (int k = 0; k < lanes; ++k) {
-                const int da = (d & ~1) + k;
-                const int na = (n & ~1) + k;
-                const int ma = (m & ~1) + k;
+                const int da = d + k;
+                const int na = n + k;
+                const int ma = m + k;
                 const u64 src_n = vfp.read_d32(na);
                 const u64 src_m = vfp.read_d32(ma);
                 const u64 src_d = vfp.read_d32(da);
@@ -5116,7 +5440,7 @@ void ArmCore::execute_neon(u32 instr) {
                     case LogicOp::Orr: result = src_n | src_m; break;
                     case LogicOp::Orn: result = src_n | ~src_m; break;
                     case LogicOp::Eor: result = src_n ^ src_m; break;
-                    case LogicOp::Bsl: result = src_d ^ ((src_d ^ src_m) & src_n); break;
+                    case LogicOp::Bsl: result = (src_n & src_d) | (src_m & ~src_d); break;
                     case LogicOp::Bit: result = src_d ^ ((src_d ^ src_n) & src_m); break;
                     default: result = src_d ^ ((src_d ^ src_n) & ~src_m); break;
                 }
@@ -5137,6 +5461,86 @@ void ArmCore::execute_neon(u32 instr) {
 
     // ---- Advanced SIMD element / structure load-store ---------------------
     if ((instr & 0x0F000000u) == 0x04000000u) {
+        // VLD1/VST1 (multiple single elements), A8.8.321 / A8.8.405:
+        // transfer each element with its endian interpretation and independent
+        // translation. Other structure/lane forms remain unsupported.
+        const u32 type = (instr >> 8) & 15u;
+        const int regs = type == 7u ? 1 : type == 10u ? 2 : type == 6u ? 3 : type == 2u ? 4 : 0;
+        if ((instr & 0x00900000u) == 0u && regs != 0) {
+            const bool load = (instr & 0x00200000u) != 0u;
+            const int d = static_cast<int>(((instr >> 22) & 1u) * 16u + ((instr >> 12) & 15u));
+            const int n = static_cast<int>((instr >> 16) & 15u);
+            const int m = static_cast<int>(instr & 15u);
+            const u32 align = (instr >> 4) & 3u;
+            const u32 ebytes = 1u << ((instr >> 6) & 3u);
+            if (n == 15 || d + regs > 32 || ((regs == 1 || regs == 3) && align > 1u) ||
+                (regs == 2 && align == 3u)) {
+                undefined("NEON VLD1/VST1 invalid register list or alignment encoding");
+                return;
+            }
+            const u32 base = r[n];
+            const u32 increment = m == 13 ? static_cast<u32>(8 * regs) : r[m];
+            const u32 alignment = align == 0u ? 1u : 4u << align;
+            if ((base & (alignment - 1u)) != 0u ||
+                (mmu.strict_alignment() && (base & (ebytes - 1u)) != 0u)) {
+                single_word_alignment_fault(base, !load);
+                return;
+            }
+            const bool big_endian = (cpsr & arm::kFlagE) != 0u;
+            u32 address = base;
+            for (int reg = 0; reg < regs; ++reg) {
+                u64 value = vfp.read_d32(d + reg);
+                for (u32 element = 0; element < 8u / ebytes; ++element) {
+                    const u64 part = value >> (element * ebytes * 8u);
+                    if (load) {
+                        u64 data;
+                        if (ebytes == 1u) {
+                            data = mem_read_byte(address);
+                        } else if (ebytes == 2u) {
+                            if ((address & 1u) != 0u &&
+                                (!unaligned_single_byte_allowed(address, address, false) ||
+                                 !unaligned_single_byte_allowed(address, address + 1u, false))) return;
+                            const u32 half = mem_read_half(address);
+                            data = big_endian ? ((half >> 8) | ((half & 0xFFu) << 8)) : half;
+                        } else if (ebytes == 4u) {
+                            data = mem_read_single_word(address);
+                        } else {
+                            // A8.8.321 reads the low result word first. In
+                            // big-endian mode that word is at address + 4.
+                            const u64 first = mem_read_single_word(big_endian ? address + 4u : address);
+                            if (pending_fault_ != arm::FaultKind::None) return;
+                            const u64 second = mem_read_single_word(big_endian ? address : address + 4u);
+                            data = first | (second << 32);
+                        }
+                        if (pending_fault_ != arm::FaultKind::None) return;
+                        const u32 shift = element * ebytes * 8u;
+                        const u64 mask = ebytes == 8u ? ~0ull : (1ull << (ebytes * 8u)) - 1u;
+                        value = (value & ~(mask << shift)) | ((data & mask) << shift);
+                        vfp.write_d32(d + reg, value);
+                    } else if (ebytes == 1u) {
+                        mem_write_byte(address, static_cast<u32>(part));
+                    } else if (ebytes == 2u) {
+                        if ((address & 1u) != 0u &&
+                            (!unaligned_single_byte_allowed(address, address, true) ||
+                             !unaligned_single_byte_allowed(address, address + 1u, true))) return;
+                        const u32 half = static_cast<u32>(part) & 0xFFFFu;
+                        mem_write_half(address, big_endian ? ((half >> 8) | (half << 8)) : half);
+                    } else if (ebytes == 4u) {
+                        mem_write_single_word(address, static_cast<u32>(part));
+                    } else {
+                        // A8.8.405 stores 64-bit elements as two MemU words.
+                        mem_write_single_word(address, static_cast<u32>(big_endian ? part >> 32 : part));
+                        if (pending_fault_ != arm::FaultKind::None) return;
+                        mem_write_single_word(address + 4u, static_cast<u32>(big_endian ? part : part >> 32));
+                    }
+                    if (pending_fault_ != arm::FaultKind::None) return;
+                    address += ebytes;
+                }
+            }
+            if (m != 15) r[n] = base + increment;
+            write_r15(cur_instr_addr_ + 4u);
+            return;
+        }
         undefined("Advanced SIMD element/structure load-store not implemented");
         return;
     }
@@ -5188,20 +5592,26 @@ void ArmCore::execute_vfp_two_register(u32 instr, bool cp10) {
     const int sn_reg = static_cast<int>((idx << 1) | (high ? 1u : 0u));
     const int dn_reg = static_cast<int>(idx | (high ? 16u : 0u));
 
-    // VMOV between a core register and a single/double register.
-    if ((instr & 0x0F800E1Fu) == 0x0E000A10u) {
+    // VMOV between a core register and a single register or 32-bit D scalar
+    // (A8.8.342/343). Byte/halfword scalar encodings are separate operations.
+    if ((instr & 0x0F800E1Fu) == 0x0E000A10u &&
+        (cp10 || (instr & 0x00400060u) == 0u)) {
         const bool to_core = (instr & (1u << 20)) != 0;
         if (cp10) {
             if (to_core) r[rd] = vfp.read_s(sn_reg);
             else vfp.write_s(sn_reg, r[rd]);
         } else {
+            if (rd == 15 || (thumb && rd == 13)) {
+                undefined("VMOV scalar with an invalid ARM core register");
+                return;
+            }
             const int lane = static_cast<int>((instr >> 21) & 1u);
-            const u64 value = vfp.read_d(dn_reg);
+            const u64 value = vfp.read_d32(dn_reg);
             if (to_core) {
                 r[rd] = static_cast<u32>((value >> (lane * 32)) & 0xFFFFFFFFull);
             } else {
                 const u64 mask = 0xFFFFFFFFull << (lane * 32);
-                vfp.write_d(dn_reg, (value & ~mask) | ((static_cast<u64>(r[rd]) << (lane * 32)) & mask));
+                vfp.write_d32(dn_reg, (value & ~mask) | ((static_cast<u64>(r[rd]) << (lane * 32)) & mask));
             }
         }
         write_r15(cur_instr_addr_ + 4u);
@@ -5357,6 +5767,7 @@ std::string ArmCore::disassemble(u32 address, unsigned& length) {
 }
 
 bool ArmCore::translate(u32 va, bool write, bool fetch, u32& pa, std::string& fault) {
+    sync_mmu_bank();
     const arm::MmResult result = mmu.translate(va, write, fetch, mode());
     pa = result.ok ? result.phys_addr : 0u;
     if (result.ok) {
@@ -5401,6 +5812,9 @@ void ArmCore::registers(std::vector<RegValue>& out) const {
     out.emplace_back("CP15", "MVBAR", mvbar);
     out.emplace_back("CP15", "SCR", scr, secure_state() ? "secure world" : "non-secure world");
     out.emplace_back("CP15", "CONTEXTIDR", mmu.context_idr);
+    out.emplace_back("CP15", "TPIDRURW", cp15_thread_ids().user_rw);
+    out.emplace_back("CP15", "TPIDRURO", cp15_thread_ids().user_ro);
+    out.emplace_back("CP15", "TPIDRPRW", cp15_thread_ids().privileged_rw);
     out.emplace_back("CP15", "walks", mmu.walks);
     out.emplace_back("CP15", "faults", mmu.total_faults);
 
@@ -5416,6 +5830,7 @@ void ArmCore::registers(std::vector<RegValue>& out) const {
 
 bool ArmCore::set_register(const std::string& name, u64 value) {
     if (name.empty()) return false;
+    sync_mmu_bank();
     std::string key;
     key.reserve(name.size());
     for (char c : name) key.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -5434,7 +5849,7 @@ bool ArmCore::set_register(const std::string& name, u64 value) {
         return true;
     }
     if (key == "CPSR") {
-        write_cpsr_masked(v, 0xFFFFFFFFu);
+        write_cpsr_masked(v, 0xFFFFFFFFu, false);
         return true;
     }
     if (key == "SPSR") {
@@ -5464,15 +5879,28 @@ bool ArmCore::set_register(const std::string& name, u64 value) {
     if (key == "TTBR1") { mmu.ttbr1 = v; return true; }
     if (key == "TTBCR") { mmu.ttbcr = v; return true; }
     if (key == "DACR") { mmu.dacr = v; return true; }
-    if (key == "VBAR" || key == "VBAR_S") { mmu.vbar = v; return true; }
-    if (key == "VBAR_NS") { vbar_nonsecure = v; return true; }
+    if (key == "VBAR_S") { mmu_bank(false).vbar = v & ~0x1Fu; return true; }
+    if (key == "VBAR") {
+        mmu.vbar = v & ~0x1Fu;
+        if (!secure_state()) vbar_nonsecure = mmu.vbar;
+        return true;
+    }
+    if (key == "VBAR_NS") {
+        vbar_nonsecure = v & ~0x1Fu;
+        mmu_bank(true).vbar = vbar_nonsecure;
+        return true;
+    }
     if (key == "MVBAR") { mvbar = v; return true; }
     if (key == "SCR") {
         scr = v;
         ns_ = (v & arm::kScrNs) != 0u;
+        sync_mmu_bank();
         return true;
     }
     if (key == "CONTEXTIDR") { mmu.context_idr = v; return true; }
+    if (key == "TPIDRURW") { cp15_thread_ids().user_rw = v; return true; }
+    if (key == "TPIDRURO") { cp15_thread_ids().user_ro = v; return true; }
+    if (key == "TPIDRPRW") { cp15_thread_ids().privileged_rw = v; return true; }
     if (key == "SCTLR") {
         mmu.sctlr = v;
         return true;
@@ -5518,10 +5946,14 @@ bool ArmCore::get_register(const std::string& name, u64& value) const {
     if (key == "TTBCR") { value = mmu.ttbcr; return true; }
     if (key == "DACR") { value = mmu.dacr; return true; }
     if (key == "VBAR") { value = mmu.vbar; return true; }
+    if (key == "VBAR_S") { value = mmu_bank(false).vbar; return true; }
     if (key == "VBAR_NS") { value = vbar_nonsecure; return true; }
     if (key == "MVBAR") { value = mvbar; return true; }
     if (key == "SCR") { value = scr; return true; }
     if (key == "CONTEXTIDR") { value = mmu.context_idr; return true; }
+    if (key == "TPIDRURW") { value = cp15_thread_ids().user_rw; return true; }
+    if (key == "TPIDRURO") { value = cp15_thread_ids().user_ro; return true; }
+    if (key == "TPIDRPRW") { value = cp15_thread_ids().privileged_rw; return true; }
 
     if (key.size() >= 2 && (key[0] == 'R' || key[0] == 'S' || key[0] == 'D')) {
         char* end = nullptr;
@@ -5566,7 +5998,14 @@ void ArmCore::describe_state(std::vector<std::string>& lines) const {
     lines.push_back(format("vectors=0x%08X core=%u exclusive=%s", effective_vector_base(), core_id_,
                            exclusive_held ? "valid" : "none"));
     lines.push_back(format("trustzone: %s world, SCR=0x%08X MVBAR=0x%08X VBAR=0x%08X VBAR_NS=0x%08X",
-                           secure_state() ? "secure" : "non-secure", scr, mvbar, mmu.vbar, vbar_nonsecure));
+                           secure_state() ? "secure" : "non-secure", scr, mvbar,
+                           mmu_bank(false).vbar, vbar_nonsecure));
+    const ArmMmu& secure = mmu_bank(false);
+    const ArmMmu& nonsecure = mmu_bank(true);
+    lines.push_back(format("trustzone CP15: Secure SCTLR=0x%08X TTBR0=0x%08X TTBR1=0x%08X DACR=0x%08X; "
+                           "Nonsecure SCTLR=0x%08X TTBR0=0x%08X TTBR1=0x%08X DACR=0x%08X",
+                           secure.sctlr, secure.ttbr0, secure.ttbr1, secure.dacr,
+                           nonsecure.sctlr, nonsecure.ttbr0, nonsecure.ttbr1, nonsecure.dacr));
 }
 
 // ===========================================================================
