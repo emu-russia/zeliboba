@@ -1114,20 +1114,38 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // The abandoned thread's stack is 0x7D000..0x80000 (TCB+0xDC/+0xE0).
+                    // Any execution with SP inside it means that thread is running, so a
+                    // coarse timeline of such samples answers "did it ever come back".
+                    static double stack_last = -1.0;
+                    static u32 stack_logged = 0;
+                    if (starts_seen >= 22u && stack_logged < 40u) {
+                        const ArmCore* st_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 sp = st_arm != nullptr ? st_arm->r[13] : 0u;
+                        if (sp >= 0x0007D000u && sp < 0x00080000u) {
+                            const double now = emulated_seconds();
+                            if (stack_last < 0.0 || now - stack_last >= 0.05) {
+                                stack_last = now;
+                                ++stack_logged;
+                                ZLB_LOG_INFO("machine", "module: thread-stack sample #%u t=%.6f pc=0x%08X sp=0x%08X core=%d",
+                                             stack_logged, now, arm_pc, sp, i);
+                            }
+                        }
+                    }
                     // The park site itself: 0x4A93F0 is the call into the kernel thread
                     // switcher (0x4A3D94 -> 0xEC8AC) with r4 = TPIDRPRW, the current
                     // thread structure, and [r4+12]/[r4+16] as the wait arguments.
                     // Logging r4 names the object the abandoned thread waits on.
                     static u32 park_logged = 0;
-                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A93F0u && park_logged < 12u) {
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A93F0u && park_logged < 60u) {
                         ++park_logged;
                         const ArmCore* park_arm = dynamic_cast<const ArmCore*>(core);
                         const u32 tcb = park_arm != nullptr ? park_arm->r[4] : 0u;
                         ZLB_LOG_INFO("machine",
-                                     "module: core 0 park #%u TCB=0x%08X sp=0x%08X obj=0x%08X aux=0x%08X",
-                                     park_logged, tcb, park_arm != nullptr ? park_arm->r[13] : 0u,
-                                     park_arm != nullptr ? park_arm->r[0] : 0u,
-                                     park_arm != nullptr ? park_arm->r[1] : 0u);
+                                     "module: core 0 park #%u t=%.6f TCB=0x%08X sp=0x%08X obj=0x%08X",
+                                     park_logged, emulated_seconds(), tcb,
+                                     park_arm != nullptr ? park_arm->r[13] : 0u,
+                                     park_arm != nullptr ? park_arm->r[0] : 0u);
                     }
                     // What the waiting thread asked for: 0x4A9384 is the entry of the
                     // kernel wait function; r0/r1 are its arguments and LR names the
