@@ -976,6 +976,76 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
         eng_win->define(0x404, "CFG_404");
         d.bus.add_device(std::move(eng_win));
     }
+    // Windows the guest really writes but the model left unmapped. They come from
+    // the kernel's own device table (PA 0x40102E48: 0x28024000 -> 0xE20BE000,
+    // 0x28025000 -> 0xE3000000, 0x28026000 -> 0xE3010000, 0x28027000 -> 0xE5000000,
+    // 0x28028000 -> 0xE5010000, 0x28029000 -> 0xE0400000, 0x2802A000 -> 0xE0410000,
+    // 0x2802B000 -> 0xE04E0000, 0x2802C000 -> 0xE50C0000) plus the timer blocks the
+    // kernel programs at 0xE20B1000 and 0xE20BC000/0xE20BD000. Before this, ZLB_WTRAP
+    // showed them as <UNMAPPED>: 70 writes to E20B, 10 to E040, 5 to E010 and 4 to
+    // E300/E301 in a single boot. Storage only - the semantics are not recovered.
+    struct ExtraWindow {
+        const char* name;
+        u32 base;
+        u32 size;
+    };
+    static const ExtraWindow extra_windows[] = {
+        {"Kermit.Engine0400", 0xE0400000u, 0x1000u}, {"Kermit.Engine300", 0xE3000000u, 0x1000u},
+        {"Kermit.Engine301", 0xE3010000u, 0x1000u},  {"Kermit.Engine500", 0xE5000000u, 0x1000u},
+        {"Kermit.Engine501", 0xE5010000u, 0x1000u},  {"Kermit.EngineBE0", 0xE20BE000u, 0x1000u},
+        {"Kermit.Engine50C", 0xE50C0000u, 0x1000u},  {"Kermit.TimerB1", 0xE20B1000u, 0x1000u},
+        {"Kermit.TimerBC", 0xE20BC000u, 0x1000u},    {"Kermit.TimerBD", 0xE20BD000u, 0x1000u},
+        {"Kermit.Reg010", 0xE0100000u, 0x1000u},
+    };
+    for (const ExtraWindow& w : extra_windows) {
+        auto window = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
+        window->define(0x000, "W_000");
+        window->define(0x004, "W_004");
+        window->define(0x008, "W_008");
+        window->define(0x00C, "W_00C");
+        window->define(0x010, "W_010");
+        window->define(0x014, "W_014");
+        window->define(0x038, "W_038");
+        window->define(0x03C, "W_03C");
+        window->define(0x040, "W_040");
+        window->define(0x044, "W_044");
+        window->define(0x048, "W_048");
+        window->define(0x100, "W_100");
+        window->define(0x104, "W_104");
+        window->define(0x800, "W_800");
+        window->define(0x804, "W_804");
+        window->define(0x904, "W_904");
+        window->define(0x90C, "W_90C");
+        window->define(0x914, "W_914");
+        window->define(0x91C, "W_91C");
+        window->define(0x924, "W_924");
+        window->define(0x92C, "W_92C");
+        window->define(0x934, "W_934");
+        window->define(0x93C, "W_93C");
+        d.bus.add_device(std::move(window));
+    }
+
+    // The guest programs timer channels all over 0xE20B0000..0xE20BFFFF (it wrote
+    // 0xE20B1000, 0xE20B2000, 0xE20B3000, 0xE20B4000, 0xE20B5000, 0xE20B8000 and the
+    // 0xE20BC000/0xE20BD000 pair, each at +0x000..+0x01C). Kermit.TimerB covers
+    // 0xE20B7000, so two banks cover the remainder; every 0x20-byte block's first
+    // eight words are defined, which is what the guest touches.
+    for (const ExtraWindow& w : {ExtraWindow{"Kermit.TimerBankLo", 0xE20B0000u, 0x7000u},
+                                 ExtraWindow{"Kermit.TimerBankHi", 0xE20B8000u, 0x8000u}}) {
+        auto bank = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
+        for (u32 block = 0; block < w.size; block += 0x20u) {
+            bank->define(block + 0x000u, "T_000");
+            bank->define(block + 0x004u, "T_004");
+            bank->define(block + 0x008u, "T_008");
+            bank->define(block + 0x00Cu, "T_00C");
+            bank->define(block + 0x010u, "T_010");
+            bank->define(block + 0x014u, "T_014");
+            bank->define(block + 0x018u, "T_018");
+            bank->define(block + 0x01Cu, "T_01C");
+        }
+        d.bus.add_device(std::move(bank));
+    }
+
     // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
     // was missing, so the guest's programming fell into unmapped space - measured
     // with ZLB_WTRAP, the kernel writes +0x00/+0x04/+0x08/+0x0C = 0 and +0x14 = 3

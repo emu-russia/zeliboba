@@ -1,5 +1,7 @@
 #include "bus/bus.h"
 
+#include <string>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +86,12 @@ bool bus_read_trap_contains(u32 address) {
 /// Cheap "is a read trap configured" test for the hot read paths.
 static bool read_trap_enabled() { return read_trap().enabled; }
 
+std::string Bus::trap_target_name(u32 address) const {
+    if (const MemRegion* region = region_at(address, 1)) return region->name;
+    if (const Device* device = find_device(address)) return "<dev:" + device->name() + ">";
+    return "<UNMAPPED>";
+}
+
 void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
     if (!bus_write_trap_contains(address)) return;
     const MemRegion* region = region_at(address, 1);
@@ -94,8 +102,9 @@ void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
 #else
     void* caller = nullptr;
 #endif
-    std::fprintf(stderr, "[wtrap] %-14s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
-                 region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
+    const std::string target = trap_target_name(address);
+    std::fprintf(stderr, "[wtrap] %-24s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
+                 target.c_str(), region ? address - region->base : address, size,
                  static_cast<unsigned long long>(value), context.pc, context.core,
                  caller);
 }
@@ -103,8 +112,9 @@ void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
 void Bus::note_read_trap(u32 address, unsigned size, u64 value) {
     if (!bus_read_trap_contains(address)) return;
     const MemRegion* region = region_at(address, 1);
-    std::fprintf(stderr, "[rtrap] %-14s +0x%05X r%u = 0x%llX pc=%08X core=%s\n",
-                 region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
+    const std::string target = trap_target_name(address);
+    std::fprintf(stderr, "[rtrap] %-24s +0x%05X r%u = 0x%llX pc=%08X core=%s\n",
+                 target.c_str(), region ? address - region->base : address, size,
                  static_cast<unsigned long long>(value), context.pc, context.core);
 }
 
