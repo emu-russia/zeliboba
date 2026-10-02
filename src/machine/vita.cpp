@@ -1167,6 +1167,49 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // The other three sites that build 0x8002D003 are in the KBL's loader
+                    // (VA 0x40024CF8, 0x40024D82, 0x40024DC2), which NSKBL reuses when it
+                    // resolves a module's imports. Probing them catches the failing lookup.
+                    static u32 kbl_logged = 0;
+                    if ((arm_pc == 0x40024CF8u || arm_pc == 0x40024D82u || arm_pc == 0x40024DC2u) &&
+                        kbl_logged < 8u) {
+                        ++kbl_logged;
+                        ArmCore* kb = dynamic_cast<ArmCore*>(core);
+                        if (kb != nullptr) {
+                            // r0 names the structure the lookup is working on (a bootconfig
+                            // library record, later consumed and zeroed). Dump its first
+                            // words and, if one points at a name string, the string itself.
+                            u32 words[4] = {0, 0, 0, 0};
+                            std::string text;
+                            for (u32 k = 0; k < 4u; ++k) {
+                                const arm::MmResult r =
+                                    kb->mmu.translate(kb->r[0] + k * 4u, false, false, kb->mode());
+                                if (r.ok) words[k] = arm_bus_->read32(r.phys_addr);
+                            }
+                            for (u32 k = 0; k < 4u; ++k) {
+                                const u32 candidate = words[k];
+                                if (candidate < 0x1000u || candidate > 0x0FFFFFFFu) continue;
+                                const arm::MmResult r =
+                                    kb->mmu.translate(candidate, false, false, kb->mode());
+                                if (!r.ok) continue;
+                                char buf[48] = {};
+                                for (u32 c = 0; c < sizeof(buf) - 1u; ++c) {
+                                    const char ch = static_cast<char>(arm_bus_->read32(r.phys_addr + c) & 0xFFu);
+                                    if (ch < 32 || ch > 126) break;
+                                    buf[c] = ch;
+                                }
+                                if (buf[0] != '\0') {
+                                    text = buf;
+                                    break;
+                                }
+                            }
+                            ZLB_LOG_INFO("machine",
+                                         "module: NO_LIB(KBL) at 0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X "
+                                         "words=[0x%08X 0x%08X 0x%08X 0x%08X] text=\"%s\"",
+                                         arm_pc, kb->r[0], kb->r[1], kb->r[2], kb->r[3], kb->r[14],
+                                         words[0], words[1], words[2], words[3], text.c_str());
+                        }
+                    }
                     // The code that builds SCE_KERNEL_ERROR_MODULEMGR_NO_LIB (0x8002D003)
                     // lives at PA 0x407252F0/0x40725378, which maps to VA ~0x5992F0 in the
                     // module loaded at 0x590000. Probing it shows what the failing lookup
