@@ -754,6 +754,10 @@ void MePCore::refresh_irq_line() {
 bool MePCore::take_pending_irq() {
     refresh_irq_line();
     const int source = cbus.pending_irq();
+    if (source >= 0) {
+        ++irq_sources_seen;
+        irq_last_source = source;
+    }
     if (source < 0 || (psw & (kPswInterruptEnable | kPswHardwareInterruptEnable)) !=
                           (kPswInterruptEnable | kPswHardwareInterruptEnable) ||
         (psw & kPswNmi) != 0) return false;
@@ -780,6 +784,7 @@ bool MePCore::take_pending_irq() {
     // The loop registers are preserved, and a handler can save/restore them
     // with STC/LDC. No pending trailing slot remains at an interrupt boundary.
     rep_pending_back_ = false;
+    ++irq_sources_taken;
     set_pc(vector);
     return true;
 }

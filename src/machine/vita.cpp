@@ -475,9 +475,12 @@ void Vita::wire_bridges() {
             if (asserted && irq_logged < 40u) {
                 ++irq_logged;
                 if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
-                    ZLB_LOG_INFO("machine", "secure: mailbox irq to CMeP channel=%u isr=0x%08X imr=0x%08X psw=0x%X",
+                    ZLB_LOG_INFO("machine",
+                                 "secure: mailbox irq to CMeP channel=%u isr=0x%08X imr=0x%08X psw=0x%X "
+                                 "seen=%llu taken=%llu last=%d",
                                  channel, mep->interrupt_flag_register(), mep->interrupt_mask_register(),
-                                 mep->psw);
+                                 mep->psw, static_cast<unsigned long long>(mep->irq_sources_seen),
+                                 static_cast<unsigned long long>(mep->irq_sources_taken), mep->irq_last_source);
                 }
             }
             if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {

@@ -91,6 +91,12 @@ public:
     /// for diagnostics (the secure kernel polls software flags its handlers set).
     u32 interrupt_flag_register() const;
     u32 interrupt_mask_register() const;
+    /// Diagnostics for the secure kernel's missing interrupts: how often the INTC
+    /// had an eligible source and how often the core actually took one, plus the
+    /// last source it saw. Reset with the machine.
+    u64 irq_sources_seen = 0;
+    u64 irq_sources_taken = 0;
+    int irq_last_source = -1;
     /// Board-selected boot vector bank used while CFG.EVM=0. Ordinary MeP
     /// systems use zero; the CMeP boot stages remap this bank through hardware
     /// whose register interface is not yet modeled.
