@@ -2008,20 +2008,33 @@ void t32_data_processing_plain(DState& s, u32 instr) {
             s.s("ssat16 "); s.reg(rd); s.s(", #"); s.u(hw1 & 0xFu); s.s(", "); s.reg(rn);
             return;
         case 0x14u:
+            // ARM ARM A7.7.10: hw2<4:0> is widthm1 - the *execution* side already
+            // reads it there (see the comment in arm_core.cpp), but this printer kept
+            // the old hw2<15:12> decode, which is part of imm3 (the lsb). That made
+            // `dis` disagree with what the CPU actually did and sent one analysis
+            // round down the wrong path (measured: bytes C1 F3 4E 01 really mean
+            // ubfx r1,r1,#1,#15, while dis printed #1,#1).
             s.s("sbfx "); s.reg(rd); s.s(", "); s.reg(rn);
             s.s(", #"); s.u(static_cast<u32>(lsb));
-            s.s(", #"); s.u((hw2 >> 12) + 1u);
+            s.s(", #"); s.u((hw2 & 0x1Fu) + 1u);
             return;
-        case 0x16u:
+        case 0x16u: {
+            // ARM ARM A7.7.5: hw2<4:0> is *msb* (the execution side computes
+            // width = msb - lsb + 1). The printer used hw2<15:12> here as well.
+            const u32 msb = hw2 & 0x1Fu;
+            const u32 width = msb >= static_cast<u32>(lsb)
+                                  ? msb - static_cast<u32>(lsb) + 1u
+                                  : 1u;
             if (rn == 15) {
                 s.s("bfc "); s.reg(rd); s.s(", #"); s.u(static_cast<u32>(lsb));
-                s.s(", #"); s.u((hw2 >> 12) + 1u);
+                s.s(", #"); s.u(width);
             } else {
                 s.s("bfi "); s.reg(rd); s.s(", "); s.reg(rn);
                 s.s(", #"); s.u(static_cast<u32>(lsb));
-                s.s(", #"); s.u((hw2 >> 12) + 1u);
+                s.s(", #"); s.u(width);
             }
             return;
+        }
         case 0x18u:
             s.s("usat "); s.reg(rd); s.s(", #"); s.u(hw1 & 0xFu); s.s(", "); s.reg(rn);
             if (lsb != 0) { s.s(shift_type == 2 ? ", asr #" : ", lsl #"); s.u(static_cast<u32>(lsb)); }
@@ -2032,7 +2045,7 @@ void t32_data_processing_plain(DState& s, u32 instr) {
         case 0x1Cu:
             s.s("ubfx "); s.reg(rd); s.s(", "); s.reg(rn);
             s.s(", #"); s.u(static_cast<u32>(lsb));
-            s.s(", #"); s.u((hw2 >> 12) + 1u);
+            s.s(", #"); s.u((hw2 & 0x1Fu) + 1u);
             return;
         default: {
             char tmp[16];

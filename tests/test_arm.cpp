@@ -3104,6 +3104,32 @@ ZLB_TEST(arm_thumb2_movw_ubfx_and_bfi) {
     ZLB_EXPECT_EQ(f.reg(1), 0xBDu);   // low nibble replaced with 0xD
     ZLB_EXPECT_FALSE(f.cpu.undefined_instruction);
 }
+ZLB_TEST(arm_thumb2_bitfield_disassembly_matches_execution) {
+    Fixture f;
+    // The bytes "C1 F3 4E 01" really are `ubfx r1, r1, #1, #15`: hw2<4:0> = 14 is
+    // widthm1 and hw2<14:12>|hw2<7:6> = 1 is the lsb. The CPU executed this
+    // correctly all along, but the printer read the width from hw2<15:12> - which is
+    // part of imm3, i.e. the lsb - and printed "#1, #1". That disagreement sent an
+    // analysis round down the wrong path, so it is pinned here together with the two
+    // neighbouring cases that had the same bug.
+    f.load(kCodeBase, {0x014EF3C1u});            // ubfx r1, r1, #1, #15
+    unsigned length = 0;
+    ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase, true, length) == "ubfx r1, r1, #1, #15");
+    ZLB_EXPECT_EQ(length, 4u);
+
+    Fixture g;
+    g.load(kCodeBase, {0x014EF341u});            // sbfx r1, r1, #1, #15
+    unsigned length2 = 0;
+    ZLB_EXPECT_TRUE(arm_disassemble(g.bus, kCodeBase, true, length2) == "sbfx r1, r1, #1, #15");
+    ZLB_EXPECT_EQ(length2, 4u);
+
+    Fixture h;
+    h.load(kCodeBase, {0x014FF36Fu});            // bfc r1, #1, #15 (Rn = 1111)
+    unsigned length3 = 0;
+    ZLB_EXPECT_TRUE(arm_disassemble(h.bus, kCodeBase, true, length3) == "bfc r1, #1, #15");
+    ZLB_EXPECT_EQ(length3, 4u);
+}
+
 // ---------------------------------------------------------------------------
 // Thumb-2 "load/store single data item" addressing forms (ARM ARM A6.3.9).
 //
