@@ -2846,6 +2846,7 @@ ZLB_TEST(mep_simulator_syscall_is_a_noop) {
     // simulator hook only logs, architectural state is untouched.
     Fixture f;
     f.word(kCode, 0x7800u);
+    f.cpu.step_text = true;   // this case asserts on the listing (see Cpu::step_text)
     const StepResult result = f.cpu.step();
     ZLB_EXPECT_FALSE(result.faulted);
     ZLB_EXPECT_EQ(f.cpu.pc, kCode + 4u);

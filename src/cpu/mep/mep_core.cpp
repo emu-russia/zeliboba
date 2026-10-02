@@ -694,7 +694,9 @@ StepResult MePCore::step() {
 
     const mep::Insn* insn = mep::decode(word);
     out.length = insn->len;
-    out.text = mep::format(*insn, word, address);
+    // See Cpu::step_text: formatting the listing for every instruction is pure
+    // per-instruction overhead when nothing reads StepResult::text.
+    if (step_text) out.text = mep::format(*insn, word, address);
 
     if (insn->op == mep::Op::None || mep::is_reserved(insn->op)) {
         out.faulted = true;

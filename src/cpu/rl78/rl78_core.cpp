@@ -675,7 +675,9 @@ StepResult Rl78Core::step() {
     }
 
     result.length = insn.length;
-    result.text = rl78_format_instruction(insn);
+    // See Cpu::step_text: the listing is not read by the machine or the debugger,
+    // so it is only formatted when a tool asks for it.
+    if (step_text) result.text = rl78_format_instruction(insn);
     result.was_branch = insn.id == Rl78Id::Branch || insn.id == Rl78Id::BranchCond ||
                         insn.id == Rl78Id::BranchCondClear || insn.id == Rl78Id::Call ||
                         insn.id == Rl78Id::Ret || insn.id == Rl78Id::Reti ||

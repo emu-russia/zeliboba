@@ -8,6 +8,7 @@
 // cover firmware 1.04's kernel boot loader.
 #include "cpu/arm/arm_core.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -878,6 +879,7 @@ StepResult ArmCore::step() {
     bool branch_taken = false;
 
     // Interrupts are only taken at an instruction boundary.
+    const bool want_text = step_text || trace_instructions;
     if (fiq_line_ && (cpsr & arm::kFlagF) == 0) {
         const u32 target_mode = (scr & arm::kScrFiq) != 0u ? arm::kModeMonitor : arm::kModeFiq;
         take_exception(arm::kVecFiq, target_mode, cur_instr_addr_ + 4u);
@@ -885,7 +887,9 @@ StepResult ArmCore::step() {
         ++cycles;
         result.address = cur_instr_addr_;
         result.length = cur_instr_len_;
-        result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, cur_instr_len_);
+        if (want_text) {
+            result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, cur_instr_len_);
+        }
         return result;
     }
     if (irq_line_ && (cpsr & arm::kFlagI) == 0) {
@@ -895,7 +899,9 @@ StepResult ArmCore::step() {
         ++cycles;
         result.address = cur_instr_addr_;
         result.length = cur_instr_len_;
-        result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, cur_instr_len_);
+        if (want_text) {
+            result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, cur_instr_len_);
+        }
         return result;
     }
 
@@ -990,8 +996,15 @@ StepResult ArmCore::step() {
     result.length = cur_instr_len_;
     result.was_branch = branch_taken;
 
-    unsigned disasm_length = 0;
-    result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, disasm_length);
+    // The listing is only needed by the trace log and by the undefined-instruction
+    // message.  Doing it for every instruction meant one extra bus read of the
+    // *virtual* address (unmapped for any kernel instruction whose PA differs from
+    // its VA, and the bus resolves an unmapped byte by scanning every device) plus
+    // a full decode - per instruction.
+    if (want_text || undefined_instruction) {
+        unsigned disasm_length = 0;
+        result.text = arm_disassemble(*bus, cur_instr_addr_, thumb_at_entry, disasm_length);
+    }
     if (undefined_instruction) {
         result.faulted = true;
         if (result.fault.empty()) result.fault = halt_reason;
@@ -5763,7 +5776,29 @@ void ArmCore::execute_vfp_load_store_multiple(u32 instr, bool single) {
 // ===========================================================================
 
 std::string ArmCore::disassemble(u32 address, unsigned& length) {
-    return arm_disassemble(*bus, address, thumb, length);
+    // The Bus is physical, but every caller passes a *virtual* address (the PC, or
+    // an address out of a trace).  `arm_disassemble` reads straight through the bus,
+    // so a kernel VA decoded with the MMU on came back as the unmapped byte pattern
+    // (`neon.dp 0xF3FFFFFF` / `.word 0xFFFFFFFF` in the machine's range trace).
+    // Fetch the instruction bytes through the core's own translation instead and
+    // decode them with the byte-level entry point.  The debugger's `dis` command
+    // does its own per-byte translation for fault reporting and is unaffected.
+    std::array<u8, 4> bytes{};
+    unsigned want = thumb ? 2u : 4u;
+    std::string fault;
+    for (unsigned i = 0; i < want; ++i) {
+        u32 pa = 0;
+        if (!translate(address + i, false, true, pa, fault)) {
+            length = thumb ? 2u : 4u;
+            return format("<unavailable: %s @ VA 0x%08X>", fault.c_str(), address);
+        }
+        bytes[i] = bus->read8(pa);
+        if (thumb && i == 1u) {
+            const u32 hw1 = static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8);
+            if ((hw1 & 0xF800u) >= 0xE800u) want = 4u;   // Thumb-2: two halfwords
+        }
+    }
+    return arm_disassemble_bytes(bytes.data(), address, thumb, length);
 }
 
 bool ArmCore::translate(u32 va, bool write, bool fetch, u32& pa, std::string& fault) {

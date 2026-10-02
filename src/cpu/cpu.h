@@ -94,6 +94,18 @@ public:
 
     virtual StepResult step() = 0;
 
+    /// Fill `StepResult::text` with the disassembly of the executed instruction.
+    ///
+    /// Off by default.  Nothing outside the core reads it - the debugger, the
+    /// machine and the UI all discard the `StepResult` of a step/run - so filling
+    /// it unconditionally was pure per-instruction overhead: the ARM core did a
+    /// **bus read of the virtual address** (with the MMU on that is an unmapped
+    /// access for every kernel instruction, and the bus resolves an unmapped byte
+    /// by scanning all 83 devices) plus a full decode, on every instruction.  It
+    /// is also *wrong* whenever VA != PA, so the old text was garbage on kernel
+    /// code.  Turn it on only for a tool that really wants the listing.
+    bool step_text = false;
+
     virtual std::string disassemble(u32 address, unsigned& length) = 0;
     virtual void registers(std::vector<RegValue>& out) const = 0;
     virtual bool set_register(const std::string& name, u64 value) { (void)name; (void)value; return false; }
@@ -131,7 +143,17 @@ public:
     void halt(const std::string& reason) {
         halted = true;
         halt_reason = reason;
-        ZLB_LOG_WARN("cpu", "%s halted: %s", name.c_str(), reason.c_str());
+        // An architectural sleep (`sleep`/`halt` on the MeP, WFI/WFE elsewhere) is
+        // the core's normal idle state and wakes on the next interrupt - the CMeP
+        // enters it dozens of times per boot, and logging each one at WARN buried
+        // the real warnings.  A halt that a *model hook* or an unexpected condition
+        // caused stays a warning.
+        const bool idle_sleep = reason == "sleep instruction" || reason == "halt instruction";
+        if (idle_sleep) {
+            ZLB_LOG_DBG("cpu", "%s halted: %s", name.c_str(), reason.c_str());
+        } else {
+            ZLB_LOG_WARN("cpu", "%s halted: %s", name.c_str(), reason.c_str());
+        }
     }
 
     /// Run up to `max_steps` instructions. Stops on halt, fault, breakpoint or

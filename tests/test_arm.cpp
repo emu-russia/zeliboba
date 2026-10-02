@@ -6271,3 +6271,28 @@ ZLB_TEST(disasm_thumb2_data_processing_register) {
     ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 24, true, length).find("usub8 r3, r5, r6") != std::string::npos);
     ZLB_EXPECT_TRUE(arm_disassemble(f.bus, kCodeBase + 28, true, length).find("sadd16 r3, r5, r6") != std::string::npos);
 }
+
+// `step()` used to disassemble every instruction into StepResult::text. Nothing
+// outside the core reads it, and for any code whose PA differs from its VA the
+// listing was produced from an unmapped read of the *virtual* address (the bus
+// resolves an unmapped byte by scanning every device) - so it was both garbage
+// and the single most expensive thing per guest instruction. It is opt-in now.
+ZLB_TEST(arm_step_only_disassembles_when_a_tool_asks_for_it) {
+    Fixture f;
+    f.load(kCodeBase, {arm_dp_imm(0xEu, 0x4u, true, 1u, 0u, 1u)});   // add r0, r1, #1
+    f.cpu.reset(kCodeBase);
+
+    f.cpu.step_text = false;
+    StepResult plain = f.cpu.step();
+    ZLB_EXPECT_TRUE(plain.text.empty());
+    ZLB_EXPECT_EQ(plain.address, kCodeBase);
+    ZLB_EXPECT_EQ(plain.length, 4u);
+
+    f.cpu.reset(kCodeBase);
+    f.cpu.step_text = true;
+    StepResult listed = f.cpu.step();
+    unsigned length = 0;
+    const std::string expected = arm_disassemble(f.bus, kCodeBase, false, length);
+    ZLB_EXPECT_TRUE(!listed.text.empty());
+    ZLB_EXPECT_TRUE(listed.text == expected);
+}
