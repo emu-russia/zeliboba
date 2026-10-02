@@ -19,3 +19,6 @@ third_party/SDL3-devel-VC.zip
 
 # local scratch: save states, screenshots, coverage bitmaps
 scratch/
+
+# Python bytecode from the tools/ helpers
+__pycache__/
