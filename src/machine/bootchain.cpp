@@ -476,6 +476,18 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
     if (!arm || !arm->mmu.enabled()) return false;
 
+    // Every repair below is for the *privileged* boot stages: they exist because the
+    // missing ARM boot ROM / second-loader reset vector never left the inherited low
+    // window in the KBL's tables.  A user-mode address space is a different thing
+    // entirely - it is per process, it is randomised on the Vita (user-mode ASLR),
+    // and its faults belong to the guest's own demand-paging and guard-page logic.
+    // Handing a user process a mapping invented from the boot rule would alias
+    // unrelated physical memory into a randomised VA and hide the fault the guest
+    // wanted to see.  (In an ordinary cold boot this gate changes nothing: the
+    // substitutions do not fire at all - measured, `boot_fault_fixes_ == 0` for the
+    // whole run - it is here so they cannot misfire once userland starts.)
+    if (arm->mode() == arm::kModeUser) return false;
+
     // Diagnostic (ZLB_SECURE_FAULT_LOG=1): the secure stage's repairs below are
     // skipped for the *unsubstituted* run, so a fault there is invisible - and when
     // the secure low window is left to the guest it is exactly what has to be seen.

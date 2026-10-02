@@ -835,3 +835,40 @@ ZLB_TEST(machine_boot_stage_follows_the_normal_chain_into_nskbl_and_kernel) {
     vita.reset(true);
     ZLB_EXPECT_TRUE(vita.stage() == BootStage::ArmBootRom);
 }
+
+// The boot-stage fault substitutions repair the low window the missing ARM boot ROM
+// would have left in the KBL's tables.  They must never run for a user-mode context:
+// a user address space is per process and randomised (user-mode ASLR), so a mapping
+// built from the boot rule would alias an unrelated physical page into a random VA
+// and swallow the fault the guest's own demand paging wanted.  The gate is installed
+// while userland is still out of reach, so this pins it before it can matter.
+ZLB_TEST(machine_boot_fault_substitution_refuses_user_mode) {
+    Vita& vita = shared_machine();
+    vita.reset(true);
+    auto& arm = *dynamic_cast<ArmCore*>(vita.arm_core(0));
+    ZLB_EXPECT_TRUE(arm.fault_hook != nullptr);
+    if (!arm.fault_hook) return;
+
+    Bus& bus = vita.arm_bus();
+    // A coarse table whose entries all fault, so the only thing that can satisfy an
+    // access is the substitution itself.  VA 0x00200000 is inside the range the boot
+    // rule maps (0x00100000..0x40000000, PA = 0x40000000 + VA).
+    constexpr u32 l1 = 0x42000000u;
+    constexpr u32 l2 = 0x42008000u;
+    constexpr u32 kernel_va = 0x00200000u;   // patched by the privileged call
+    constexpr u32 user_va = 0x00201000u;     // same 1 MiB section, different page
+    bus.memset_bytes(l1, 0, 0x4000u);
+    bus.memset_bytes(l2, 0, 0x400u);
+    bus.write32(l1 + (kernel_va >> 20) * 4u, l2 | 1u);
+    arm.mmu.ttbr0 = l1;
+    arm.mmu.ttbcr = 0;
+    arm.mmu.dacr = 1;
+    arm.mmu.sctlr = 1;
+
+    arm.set_register("CPSR", arm::kModeSystem);
+    ZLB_EXPECT_TRUE(arm.fault_hook(0, kernel_va, false, false));   // privileged: repaired
+
+    arm.set_register("CPSR", arm::kModeUser);
+    ZLB_EXPECT_FALSE(arm.fault_hook(0, user_va, false, false));    // user: refused
+    ZLB_EXPECT_EQ(bus.read32(l2 + ((user_va >> 12) & 0xFFu) * 4u), 0u);
+}
