@@ -78,7 +78,9 @@ u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
 constexpr unsigned kUidRingSize = 64;
 u32 g_uid_ring_site[kUidRingSize];
 u32 g_uid_ring_value[kUidRingSize];
+u32 g_uid_ring_result[kUidRingSize];
 u32 g_uid_ring_pos = 0;
+void uid_ring_result(u32 pos, u32 value) { g_uid_ring_result[pos & (kUidRingSize - 1u)] = value; }
 void uid_ring_add(u32 site, u32 uid) {
     const u32 slot = g_uid_ring_pos++ & (kUidRingSize - 1u);
     g_uid_ring_site[slot] = site;
@@ -1239,6 +1241,15 @@ void Vita::run_slice() {
             // 0x80024501 = SCE_KERNEL_ERROR_INVALID_UID (SDK kernel/error.h line 310).
             // r6 was loaded from [r10+8] at 0x51005162 and is the UID being rejected:
             // its bits 0x500000 and 0xA00000 are clear on the failing path.
+            // 0x51004A0E is the "cmp r0,#0" right after the UID lookup at 0x51004A0A:
+            // r0 is the lookup result and r4 the UID being validated. Recording both
+            // shows which UID fails, which is the object the model never created.
+            if (arm_pc == 0x51004A0Eu) {
+                if (const ArmCore* lk = dynamic_cast<const ArmCore*>(core)) {
+                    uid_ring_add(0x51004A0Eu, lk->r[4]);
+                    uid_ring_result(g_uid_ring_pos - 1u, lk->r[0]);
+                }
+            }
             if (arm_pc == 0x51005172u) {
                 static u32 uid_logged = 0;
                 if (uid_logged < 12u) {
@@ -1815,8 +1826,9 @@ void Vita::run_slice() {
                             for (u32 back = kUidRingSize; back > 0u; --back) {
                                 const u32 slot = (g_uid_ring_pos - back) & (kUidRingSize - 1u);
                                 if (g_uid_ring_site[slot] != 0u) {
-                                    ZLB_LOG_INFO("machine", "module fail uid 0x%08X at site 0x%08X",
-                                                 g_uid_ring_value[slot], g_uid_ring_site[slot]);
+                                    ZLB_LOG_INFO("machine", "module fail uid 0x%08X at site 0x%08X -> 0x%08X",
+                                                 g_uid_ring_value[slot], g_uid_ring_site[slot],
+                                                 g_uid_ring_result[slot]);
                                 }
                             }
                             ZLB_LOG_INFO("machine", "module fail seq (core %u, oldest to newest):",
