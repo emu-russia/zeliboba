@@ -1167,6 +1167,20 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // The code that builds SCE_KERNEL_ERROR_MODULEMGR_NO_LIB (0x8002D003)
+                    // lives at PA 0x407252F0/0x40725378, which maps to VA ~0x5992F0 in the
+                    // module loaded at 0x590000. Probing it shows what the failing lookup
+                    // was holding - the library name pointer in particular.
+                    static u32 nolib_logged = 0;
+                    if ((arm_pc == 0x0058D2F0u || arm_pc == 0x0058D378u) && nolib_logged < 8u) {
+                        ++nolib_logged;
+                        const ArmCore* nb = dynamic_cast<const ArmCore*>(core);
+                        if (nb != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: NO_LIB site 0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X core=%d",
+                                         arm_pc, nb->r[0], nb->r[1], nb->r[2], nb->r[3], nb->r[14], i);
+                        }
+                    }
                     // Trace a module start end to end: from the helper's call (0x510194FE)
                     // to its return (0x51019502). Start #23 (sdif.skprx) fails with
                     // MODULEMGR_NO_LIB inside this window, so the distinct code addresses
