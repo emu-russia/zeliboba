@@ -31,6 +31,28 @@ u32 g_pc_set[kPcSetSlots];
 unsigned char g_pc_set_used[kPcSetSlots];
 u32 g_pc_set_count = 0;
 
+/// Ordered ring of NSKBL addresses, excluding the cache-flush table at
+/// 0x510143xx-0x510144xx and the start helper at 0x510194xx-0x510196xx, which
+/// otherwise flood it. Dumped in order on a failed start so the branch that
+/// produced the error is the tail of the list.
+/// Ordered, per-core ring of every executed address during the current module start,
+/// excluding only the loops known to flood it: the loader's cache-flush table
+/// (0x510143xx-0x510144xx), the start helper (0x510194xx-0x510196xx) and the kernel's
+/// delay loop (0x4F9DB8-0x4F9DD0). Widened from NSKBL-only because the loader calls
+/// shared code outside 0x510xxxxx, which is where the failing branch may live.
+constexpr unsigned kNskblRingSize = 4096;
+constexpr unsigned kNskblRingCores = 4;
+u32 g_nskbl_ring[kNskblRingCores][kNskblRingSize];
+u32 g_nskbl_pos[kNskblRingCores] = {0, 0, 0, 0};
+
+void nskbl_ring_add(unsigned core, u32 pc) {
+    if (core >= kNskblRingCores) return;
+    if (pc >= 0x51014300u && pc < 0x51014500u) return;
+    if (pc >= 0x51019400u && pc < 0x51019600u) return;
+    if (pc >= 0x004F9DB8u && pc < 0x004F9DD0u) return;
+    g_nskbl_ring[core][(g_nskbl_pos[core]++) & (kNskblRingSize - 1u)] = pc;
+}
+
 void pc_set_reset() {
     std::memset(g_pc_set_used, 0, sizeof(g_pc_set_used));
     g_pc_set_count = 0;
@@ -1179,6 +1201,22 @@ void Vita::run_slice() {
                 g_arm_trace_ring[i][(g_arm_trace_pos[i]++) & (kArmTraceSize - 1u)] = arm_pc;
             }
             if (arm_pc >= 0x51000000u && arm_pc < 0x51100000u) pc_set_add(arm_pc);
+            nskbl_ring_add(i, arm_pc);
+            // The module-start failure ends at 0x51005172, which returns
+            // 0x80024501 = SCE_KERNEL_ERROR_INVALID_UID (SDK kernel/error.h line 310).
+            // r6 was loaded from [r10+8] at 0x51005162 and is the UID being rejected:
+            // its bits 0x500000 and 0xA00000 are clear on the failing path.
+            if (arm_pc == 0x51005172u) {
+                static u32 uid_logged = 0;
+                if (uid_logged < 12u) {
+                    ++uid_logged;
+                    if (const ArmCore* uid_core = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine",
+                                     "module: INVALID_UID at 0x51005172 r6(uid)=0x%08X r10=0x%08X r5=0x%08X r7=0x%08X",
+                                     uid_core->r[6], uid_core->r[10], uid_core->r[5], uid_core->r[7]);
+                    }
+                }
+            }
             // Secure World question: does anything ever hand the ARM over to its
             // TrustZone side? Count instructions per mode and report the first time
             // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
@@ -1739,6 +1777,18 @@ void Vita::run_slice() {
                             }
                             // Every NSKBL address executed during this start, so the
                             // resolution path is visible even when a flush loop runs.
+                            const unsigned tail_core = i < kNskblRingCores ? i : 0u;
+                            ZLB_LOG_INFO("machine", "module fail seq (core %u, oldest to newest):",
+                                         tail_core);
+                            for (u32 back = kNskblRingSize; back > 0u; --back) {
+                                const u32 pc_value =
+                                    g_nskbl_ring[tail_core]
+                                                [(g_nskbl_pos[tail_core] - back) &
+                                                 (kNskblRingSize - 1u)];
+                                if (pc_value != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail seq 0x%08X", pc_value);
+                                }
+                            }
                             ZLB_LOG_INFO("machine", "module fail set: %u NSKBL addresses", g_pc_set_count);
                             for (u32 k = 0; k < kPcSetSlots; ++k) {
                                 if (g_pc_set_used[k] != 0u) {
@@ -1751,6 +1801,7 @@ void Vita::run_slice() {
                         any_module_start = true;
                         starts_seen = module_starts;
                         pc_set_reset();
+                        for (unsigned c = 0; c < kNskblRingCores; ++c) g_nskbl_pos[c] = 0;
                         ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
                                      log_arm != nullptr ? log_arm->r[0] : 0u, i);
                     }
