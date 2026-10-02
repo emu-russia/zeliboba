@@ -314,6 +314,33 @@ void Vita::build_cores() {
     if (MePCore* mep = dynamic_cast<MePCore*>(cmep_.get())) {
         mep->pc_hook = [this](u32 pc) {
             mep_cov_mark(pc);
+            // Secure-runtime state machine: 0x801D54 is the setter for the CMeP's
+            // state word at 0x8076AC (gp-32748). Logging the written value together
+            // with the caller's return address shows who drives the transitions and
+            // where the 3 -> 4 -> 5 -> 8 retry cycle comes from.
+            if (pc == 0x801D54u) {
+                static u32 state_logged = 0;
+                if (state_logged < 24u) {
+                    ++state_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: state <- 0x%X (caller lp=0x%08X)",
+                                     st->r[1], st->lp);
+                    }
+                }
+            }
+            // 0x800C2E is the command dispatcher: it loads 0x806FD8 + $3*4 and jumps
+            // through it, so $3 is the command id. Logging it shows which commands the
+            // secure kernel processes and whether the 3->4->5->8 cycle repeats one.
+            if (pc == 0x800C2Eu) {
+                static u32 cmd_logged = 0;
+                if (cmd_logged < 40u) {
+                    ++cmd_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: dispatch cmd=%u (0x%X) r1=0x%X r2=0x%X lp=0x%08X",
+                                     st->r[3], st->r[3], st->r[1], st->r[2], st->lp);
+                    }
+                }
+            }
             return cmep_pc_hook(pc);
         };
     }
