@@ -1211,6 +1211,22 @@ void Vita::run_slice() {
             if (i < kArmTraceCores) {
                 g_arm_trace_ring[i][(g_arm_trace_pos[i]++) & (kArmTraceSize - 1u)] = arm_pc;
             }
+            // The core records undefined opcodes in last_undefined_instruction, but
+            // nothing in src/machine or src/debug ever looks at it - a guest hitting an
+            // opcode the model does not implement would fail silently. Report every new
+            // one: this is the direct test of "some instruction is handled wrongly".
+            if (i < kArmTraceCores) {
+                static u32 seen_undef[kArmTraceCores] = {};
+                if (const ArmCore* uc = dynamic_cast<const ArmCore*>(core)) {
+                    const u32 undef = uc->last_undefined_instruction;
+                    if (undef != 0u && undef != seen_undef[i]) {
+                        seen_undef[i] = undef;
+                        ZLB_LOG_INFO("machine",
+                                     "UNDEFINED opcode 0x%08X at pc=0x%08X core=%u (cpsr=0x%08X)",
+                                     undef, arm_pc, i, uc->cpsr);
+                    }
+                }
+            }
             if (arm_pc >= 0x51000000u && arm_pc < 0x51100000u) pc_set_add(arm_pc);
             nskbl_ring_add(i, arm_pc);
             // All 25 NSKBL sites that build 0x80024501 (SCE_KERNEL_ERROR_INVALID_UID,
