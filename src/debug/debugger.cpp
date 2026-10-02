@@ -877,6 +877,14 @@ bool Debugger::execute(const std::string& line) {
             return true;
         }
         const u32 va = arg_address(args, 0, cpu->get_pc());
+        // Optional third form: `vpa <va> <ttbr0>` translates in another address
+        // space.  A user-mode thread has its own TTBR0 (user-mode ASLR, and the
+        // switcher stores the value in the thread's context), so once such a thread
+        // is parked its memory is unreachable through the active tables - which is
+        // exactly the state the boot investigation kept running into.
+        const bool override_ttbr0 = args.size() >= 2u;
+        const u32 saved_ttbr0 = arm->mmu.ttbr0;
+        if (override_ttbr0) arm->mmu.ttbr0 = arg_address(args, 1, saved_ttbr0);
         // Turn the walk recording on just for this query: the walk itself keeps
         // last_walk up to date, but the hot path only publishes it when asked.
         const bool saved_walks = arm->mmu.record_walks;
@@ -884,6 +892,7 @@ bool Debugger::execute(const std::string& line) {
         const arm::MmResult result = arm->mmu.translate(va, false, false, arm->mode());
         const ArmMmu::WalkRecord walk = arm->mmu.last_walk;
         arm->mmu.record_walks = saved_walks;
+        if (override_ttbr0) arm->mmu.ttbr0 = saved_ttbr0;
 
         if (!result.ok) {
             emit(format("VA 0x%08X -> %s (fsr 0x%X)  L1[0x%03X]@0x%08X=0x%08X", va,
@@ -1280,7 +1289,8 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  regs | reg <name> <v>  registers of the active core\n"
         "  dis [addr] [count]     disassemble\n"
         "  mem [addr] [rows]      hex dump (physical address)\n"
-        "  vpa <va>               translate a VA through the active core's MMU and show the walk\n"
+        "  vpa <va> [ttbr0]       translate a VA through the active core's MMU (or the\n"
+        "                         given TTBR0, e.g. a parked user thread's) and show the walk\n"
         "  vmem <va> [rows]       like vpa, then hex dump the bytes at the resulting PA\n"
         "  poke <addr> <val> [s]  write physical memory (s = 8|16|32)\n"
         "  vpoke <va> <val> [s]   translate a VA through the active core's MMU, then write\n"

@@ -1114,6 +1114,16 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // 0x5BE95A is the instruction right after the display module's
+                    // ksceKernelDmaOpEnQueue call, so r0 there is that call's return
+                    // value: it decides whether the operation was really queued.
+                    static u32 enq_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x005BE95Au && enq_logged < 6u) {
+                        ++enq_logged;
+                        const ArmCore* eq = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine", "module: DmaOpEnQueue returned 0x%08X (t=%.6f)",
+                                     eq != nullptr ? eq->r[0] : 0u, emulated_seconds());
+                    }
                     // 0x4399CA is the import wrapper the display module reaches before the
                     // syscall trampoline (0x43AD28) and the kernel. Its r0 names the import
                     // slot and its LR names the module's call site, which is what identifies
