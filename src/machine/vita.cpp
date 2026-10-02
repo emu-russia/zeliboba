@@ -1114,6 +1114,36 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // What the kernel actually does between "the DMA operation was
+                    // queued" (0x5BE95A) and "the thread parks": collect the distinct
+                    // code addresses of that window.  1 ms of guest time is thousands
+                    // of instructions, but the distinct set stays small and names the
+                    // functions involved.
+                    static bool trace_window = false;
+                    static u32 window_seen[400];
+                    static u32 window_count = 0;
+                    static u32 window_logged = 0;
+                    if (arm_pc == 0x005BE95Au && starts_seen >= 22u && i == 0) {
+                        trace_window = true;
+                        window_count = 0;
+                    }
+                    if (trace_window && i == 0) {
+                        bool known = false;
+                        for (u32 k = 0; k < window_count; ++k) {
+                            if (window_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known && window_count < 400u) {
+                            window_seen[window_count++] = arm_pc;
+                            if (window_logged < 400u) {
+                                ++window_logged;
+                                ZLB_LOG_INFO("machine", "module: post-enqueue pc #%u 0x%08X t=%.6f",
+                                             window_logged, arm_pc, emulated_seconds());
+                            }
+                        }
+                    }
                     // 0x5BE95A is the instruction right after the display module's
                     // ksceKernelDmaOpEnQueue call, so r0 there is that call's return
                     // value: it decides whether the operation was really queued.
