@@ -40,8 +40,51 @@
 //   0x18 SC_RESPONSE1    response word 1
 //   0x1C SC_IRQ_ENABLE   bit0 raise the syscon SPI when a response arrives
 //   0x20 SC_DOORBELL     alternative trigger (same as writing SC_COMMAND)
+#include "common/log.h"
 #include "hw/soc/soc_internal.h"
+
+#include <cstdlib>
+#include <functional>
 #include "hw/cmep/cmep_internal.h"
+
+namespace {
+
+// The guest's DMA window (0xE0410000) receives a descriptor and then a doorbell
+// write at +0x020 that carries the physical address of the descriptor chain.  The
+// engine's transfer itself is not implemented, but the doorbell is the point where
+// the hardware would complete and interrupt, so this subclass exists to test that:
+// with ZLB_DMA_IRQ=<n> it asserts interrupt <n> (a pulse) on the doorbell.  The
+// DMA library registered handlers 0x70..0x7F, one per channel, so 0x7D is the
+// natural default for the channel-13 operation the display module submits.
+class DmaWindow : public zlb::kermit::RegisterBlock {
+public:
+    DmaWindow(std::string name, zlb::u32 base, zlb::u32 size, std::function<void(zlb::u32)> raise)
+        : RegisterBlock(std::move(name), base, size), raise_(std::move(raise)) {}
+
+    void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
+        RegisterBlock::write(address, size, value);
+        if (enabled_ && address - base() == 0x020u && value != 0 && raise_) {
+            // The completion routine 0x438400 reads [window+0x24] and [window+0x28]
+            // and bails out at 0x438432 when ([+0x28] & 3) == 0, so those two are the
+            // hardware's "transfer finished" status. The guest never writes them.
+            RegisterBlock::write(base() + 0x024u, 4u, 1u);
+            RegisterBlock::write(base() + 0x028u, 4u, 3u);
+            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> status +0x24/+0x28, pulse irq 0x%X",
+                         static_cast<unsigned>(value), irq_);
+            raise_(irq_);
+        }
+    }
+
+    void set_irq(zlb::u32 irq) { irq_ = irq; }
+    void set_enabled(bool on) { enabled_ = on; }
+
+private:
+    std::function<void(zlb::u32)> raise_;
+    zlb::u32 irq_ = 0x7Du;
+    bool enabled_ = false;
+};
+
+}  // namespace
 
 namespace zlb::kermit {
 
@@ -846,7 +889,14 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     // Kermit.DMA block stays at 0xE2060000, where the KBL's console table and
     // docs/HARDWARE.md place it.
     {
-        auto dma_win = std::make_unique<kermit::RegisterBlock>("Kermit.DmaWin", 0xE0410000u, 0x1000u);
+        auto dma_win = std::make_unique<DmaWindow>(
+            "Kermit.DmaWin", 0xE0410000u, 0x1000u, [this](u32 id) { pulse_irq(id, 2000000); });
+        // The completion experiment is opt-in: without ZLB_DMA_IRQ the window is pure
+        // storage, exactly as measured (the guest's DMA engine is not implemented yet).
+        if (const char* irq_env = std::getenv("ZLB_DMA_IRQ")) {
+            dma_win->set_irq(static_cast<u32>(std::strtoul(irq_env, nullptr, 0)));
+            dma_win->set_enabled(true);
+        }
         dma_win->define(0x010, "CTRL_010");
         dma_win->define(0x014, "CALLBACK_014");
         dma_win->define(0x020, "FIELD_020");

@@ -1167,6 +1167,29 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // The DMA library registered handler 0x438791 for the channel IRQs
+                    // (0x70..0x7F). Whether the guest actually takes the interrupt the
+                    // model pulses is what the completion experiment turns on.
+                    static u32 dmairq_logged = 0;
+                    if (arm_pc == 0x00438790u && dmairq_logged < 8u) {
+                        ++dmairq_logged;
+                        ZLB_LOG_INFO("machine", "module: DMA irq handler 0x438790 ran #%u core=%d t=%.6f",
+                                     dmairq_logged, i, emulated_seconds());
+                    }
+                    // ksceKernelRegisterIntrHandler is implemented at 0xED29C (the stub
+                    // 0x43ACF8 jumps there). Its arguments name the interrupt a driver
+                    // wants - the DMA library's own registration is what says which IRQ
+                    // its completion handler runs on.
+                    static u32 intr_logged = 0;
+                    if (arm_pc == 0x000ED29Cu && intr_logged < 64u) {
+                        ++intr_logged;
+                        const ArmCore* ic = dynamic_cast<const ArmCore*>(core);
+                        if (ic != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: RegisterIntrHandler #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X core=%d",
+                                         intr_logged, ic->r[0], ic->r[1], ic->r[2], ic->r[3], ic->r[14], i);
+                        }
+                    }
                     // 0x4ADD88 is where the library's syscall trampoline (0x43AD28) lands in
                     // the kernel. Its arguments name the service the DMA library asks for -
                     // and therefore what the parked thread is really waiting on.
