@@ -75,6 +75,15 @@ void pc_set_add(u32 pc) {
 constexpr unsigned kArmTraceCores = 4;
 constexpr unsigned kArmTraceSize = 512;
 u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
+constexpr unsigned kUidRingSize = 64;
+u32 g_uid_ring_site[kUidRingSize];
+u32 g_uid_ring_value[kUidRingSize];
+u32 g_uid_ring_pos = 0;
+void uid_ring_add(u32 site, u32 uid) {
+    const u32 slot = g_uid_ring_pos++ & (kUidRingSize - 1u);
+    g_uid_ring_site[slot] = site;
+    g_uid_ring_value[slot] = uid;
+}
 u32 g_arm_trace_pos[kArmTraceCores] = {0, 0, 0, 0};
 }  // namespace
 
@@ -1202,6 +1211,30 @@ void Vita::run_slice() {
             }
             if (arm_pc >= 0x51000000u && arm_pc < 0x51100000u) pc_set_add(arm_pc);
             nskbl_ring_add(i, arm_pc);
+            // All 25 NSKBL sites that build 0x80024501 (SCE_KERNEL_ERROR_INVALID_UID,
+            // SDK kernel/error.h:310). The failing module start returns that code, so
+            // whichever of them executes is the check that rejects a UID - in this
+            // branch the value is r6 = [r10+8].
+            {
+                static const u32 invalid_uid_sites[] = {
+                    0x51004A12u, 0x51004A2Au, 0x51004B26u, 0x51004B9Eu, 0x51004BC4u,
+                    0x51004C5Eu, 0x51004FBCu, 0x51004FCEu, 0x5100509Au, 0x51005172u,
+                    0x510052A2u, 0x510052ACu, 0x510052CEu, 0x510052D8u, 0x510052F8u,
+                    0x510053B4u, 0x51005420u, 0x510055BAu, 0x510055DEu, 0x510055E8u,
+                    0x5100560Au, 0x51005646u, 0x51005650u, 0x510056C0u, 0x51016CFAu,
+                };
+                for (u32 site : invalid_uid_sites) {
+                    if (arm_pc != site) continue;
+                    static u32 site_logged = 0;
+                    if (site_logged < 20u) {
+                        ++site_logged;
+                        if (const ArmCore* uid_core = dynamic_cast<const ArmCore*>(core)) {
+                            uid_ring_add(arm_pc, uid_core->r[6]);
+                        }
+                    }
+                    break;
+                }
+            }
             // The module-start failure ends at 0x51005172, which returns
             // 0x80024501 = SCE_KERNEL_ERROR_INVALID_UID (SDK kernel/error.h line 310).
             // r6 was loaded from [r10+8] at 0x51005162 and is the UID being rejected:
@@ -1778,6 +1811,14 @@ void Vita::run_slice() {
                             // Every NSKBL address executed during this start, so the
                             // resolution path is visible even when a flush loop runs.
                             const unsigned tail_core = i < kNskblRingCores ? i : 0u;
+                            ZLB_LOG_INFO("machine", "module fail uid ring (oldest to newest):");
+                            for (u32 back = kUidRingSize; back > 0u; --back) {
+                                const u32 slot = (g_uid_ring_pos - back) & (kUidRingSize - 1u);
+                                if (g_uid_ring_site[slot] != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail uid 0x%08X at site 0x%08X",
+                                                 g_uid_ring_value[slot], g_uid_ring_site[slot]);
+                                }
+                            }
                             ZLB_LOG_INFO("machine", "module fail seq (core %u, oldest to newest):",
                                          tail_core);
                             for (u32 back = kNskblRingSize; back > 0u; --back) {
