@@ -1268,32 +1268,6 @@ void Vita::run_slice() {
                     }
                 }
             }
-            // 0x5100B82C is the UID table lookup: r0 = table base, r1 = the class
-            // index derived from the UID, r2 = the out pointer. The table layout read
-            // there is +0x1C base, +0x20 count, +0x32 count2, +0x34 array, and the
-            // index is bounded by count2 (return "not found" when it is too large).
-            if (arm_pc == 0x5100B82Cu) {
-                static u32 tbl_logged = 0;
-                if (tbl_logged < 30u) {
-                    if (ArmCore* tb = dynamic_cast<ArmCore*>(core)) {
-                    // The routine table walks use classes 0..8; sdif.skprx's UID
-                    // 0x200F3 yields class (0x200F3 >> 1) & 0x7FFF = 0x10079, so only
-                    // report the large-class lookups.
-                    if (tb->r[1] < 0x40u) return;
-                    ++tbl_logged;
-                        const u32 base = tb->r[0];
-                        u32 count = 0, count2 = 0;
-                        if (const arm::MmResult r1 = tb->mmu.translate(base + 0x20u, false, false, tb->mode()); r1.ok) {
-                            count = arm_bus_->read32(r1.phys_addr) & 0xFFFFu;
-                        }
-                        if (const arm::MmResult r2 = tb->mmu.translate(base + 0x32u, false, false, tb->mode()); r2.ok) {
-                            count2 = arm_bus_->read32(r2.phys_addr) & 0xFFFFu;
-                        }
-                        ZLB_LOG_INFO("machine", "uid table: base=0x%08X index=0x%X count=0x%X count2=0x%X",
-                                     base, tb->r[1], count, count2);
-                    }
-                }
-            }
             // 0x51004A04 is "ubfx r1,r1,#1,#1": log r1 on entry and on the next
             // instruction, so the extracted value can be compared with the expected
             // (uid >> 1) & 1.
@@ -1892,6 +1866,39 @@ void Vita::run_slice() {
                         const u32 result_value = log_arm != nullptr ? log_arm->r[0] : 0u;
                         ZLB_LOG_INFO("machine", "module result 0x%08X at 0x%08X core=%d (uids=0x%08X)",
                                      result_value, arm_pc, i, log_arm != nullptr ? log_arm->r[5] : 0u);
+                        // Dump the ordered ring for the last few module results regardless
+                        // of sign, so a successful start and a failing one can be diffed -
+                        // the first divergence between them is the answer.
+                        static u32 result_dumps = 0;
+                        // Only the tail of the loop matters: #21, #22 (success) and #23
+                        // (the failure). Dumping the first four results only captured the
+                        // early modules.
+                        if (result_dumps < 4u && module_starts >= 21u) {
+                            ++result_dumps;
+                            const unsigned dump_core = i < kArmTraceCores ? i : 0u;
+                            ZLB_LOG_INFO("machine", "result seq begin result=0x%08X starts=%u",
+                                         result_value, module_starts);
+                            for (u32 back = kArmTraceSize; back > 0u; --back) {
+                                const u32 pc_value =
+                                    g_arm_trace_ring[dump_core]
+                                                    [(g_arm_trace_pos[dump_core] - back) &
+                                                     (kArmTraceSize - 1u)];
+                                if (pc_value != 0u) {
+                                    ZLB_LOG_INFO("machine", "result seq 0x%08X", pc_value);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "result seq end result=0x%08X", result_value);
+                            // The whole-start address set, which is order independent and
+                            // covers everything (the 512-entry ring only covers the tail).
+                            ZLB_LOG_INFO("machine", "result set begin result=0x%08X count=%u",
+                                         result_value, g_pc_set_count);
+                            for (u32 k = 0; k < kPcSetSlots; ++k) {
+                                if (g_pc_set_used[k] != 0u) {
+                                    ZLB_LOG_INFO("machine", "result set 0x%08X", g_pc_set[k]);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "result set end result=0x%08X", result_value);
+                        }
                         if ((result_value & 0x80000000u) != 0u) {
                             // Dump the recent PC path (deduplicated, newest first) so the
                             // code that produced the error is identifiable.
