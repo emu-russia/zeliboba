@@ -63,17 +63,18 @@ public:
 
     void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
         RegisterBlock::write(address, size, value);
-        if (enabled_ && address - base() == 0x020u && value != 0 && raise_) {
-            // The completion routine 0x438400 reads [window+0x24] and [window+0x28]
-            // and bails out at 0x438432 when ([+0x28] & 3) == 0, so those two are the
-            // hardware's "transfer finished" status. The guest never writes them.
-            // +0x24 bit 0 is the engine's BUSY flag, not a done bit: the guest spins
-            // at 0x438046 ("tst.w r3,#1; bne") until it clears, and only then checks
-            // [+0x28] at 0x438432 for the finished channels. The transfer is instant
-            // here, so busy stays clear and +0x28 reports two channels done.
+        if (enabled_ && address - base() == 0x020u && value != 0) {
+            // +0x24 bit 0 is BUSY, not done: the guest spins at 0x438046
+            // ("tst.w r3,#1; bne") until it clears, then checks [+0x28] at 0x438432
+            // for the finished channels. The engine completes as soon as it is armed.
+            // A poll-driven variant - finish on the first read of +0x24 - was tried
+            // and is *worse*: the thread sleeps on the completion event rather than
+            // polling (start #22 then hangs again, 22 starts / 21 results), so the
+            // engine has to complete unprompted. What is still not modelled is the
+            // transfer itself: the bytes never move.
             RegisterBlock::write(base() + 0x024u, 4u, 0u);
             RegisterBlock::write(base() + 0x028u, 4u, 3u);
-            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> status +0x24/+0x28, pulse irq 0x%X",
+            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> +0x24=0 +0x28=3, pulse irq 0x%X",
                          static_cast<unsigned>(value), irq_);
             raise_(irq_);
         }
