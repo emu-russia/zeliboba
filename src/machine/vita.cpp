@@ -1167,6 +1167,35 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // Trace a module start end to end: from the helper's call (0x510194FE)
+                    // to its return (0x51019502). Start #23 (sdif.skprx) fails with
+                    // MODULEMGR_NO_LIB inside this window, so the distinct code addresses
+                    // are what shows where the import resolution gives up.
+                    static bool start_trace = false;
+                    static u32 start_seen[300];
+                    static u32 start_count = 0;
+                    static u32 start_logged = 0;
+                    if (arm_pc == 0x510194FEu && !start_trace) {
+                        start_trace = true;
+                        start_count = 0;
+                    } else if (start_trace && arm_pc == 0x51019502u) {
+                        start_trace = false;
+                    } else if (start_trace && start_count < 300u) {
+                        bool known = false;
+                        for (u32 k = 0; k < start_count; ++k) {
+                            if (start_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            start_seen[start_count++] = arm_pc;
+                            if (start_logged < 300u) {
+                                ++start_logged;
+                                ZLB_LOG_INFO("machine", "module: start pc #%u 0x%08X", start_logged, arm_pc);
+                            }
+                        }
+                    }
                     // 0x510194C0 is NSKBL's module-start helper; its arguments carry the
                     // entry point of the module being started, which is how a failing
                     // module (sdif.skprx at start #23) can be located.
