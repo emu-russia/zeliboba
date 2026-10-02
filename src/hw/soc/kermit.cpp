@@ -67,7 +67,11 @@ public:
             // The completion routine 0x438400 reads [window+0x24] and [window+0x28]
             // and bails out at 0x438432 when ([+0x28] & 3) == 0, so those two are the
             // hardware's "transfer finished" status. The guest never writes them.
-            RegisterBlock::write(base() + 0x024u, 4u, 1u);
+            // +0x24 bit 0 is the engine's BUSY flag, not a done bit: the guest spins
+            // at 0x438046 ("tst.w r3,#1; bne") until it clears, and only then checks
+            // [+0x28] at 0x438432 for the finished channels. The transfer is instant
+            // here, so busy stays clear and +0x28 reports two channels done.
+            RegisterBlock::write(base() + 0x024u, 4u, 0u);
             RegisterBlock::write(base() + 0x028u, 4u, 3u);
             ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> status +0x24/+0x28, pulse irq 0x%X",
                          static_cast<unsigned>(value), irq_);
@@ -80,7 +84,7 @@ public:
 
 private:
     std::function<void(zlb::u32)> raise_;
-    zlb::u32 irq_ = 0x7Du;
+    zlb::u32 irq_ = 0x7Cu;
     bool enabled_ = false;
 };
 
@@ -891,11 +895,16 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     {
         auto dma_win = std::make_unique<DmaWindow>(
             "Kermit.DmaWin", 0xE0410000u, 0x1000u, [this](u32 id) { pulse_irq(id, 2000000); });
-        // The completion experiment is opt-in: without ZLB_DMA_IRQ the window is pure
-        // storage, exactly as measured (the guest's DMA engine is not implemented yet).
+        // The engine is modelled as an instant completion: the doorbell clears the
+        // busy bit, reports the finished channels and raises the channel interrupt.
+        // That is what takes the guest from "ksceKernelDmaOpSync waits forever" to
+        // "the twenty-second module start returns 0 and the loop moves on" - see
+        // docs/STATUS.md, round 26. What is *not* modelled is the transfer itself:
+        // the bytes never move, so a module that reads the transferred buffer sees
+        // whatever was there before. ZLB_DMA_IRQ only overrides the interrupt number.
+        dma_win->set_enabled(true);
         if (const char* irq_env = std::getenv("ZLB_DMA_IRQ")) {
             dma_win->set_irq(static_cast<u32>(std::strtoul(irq_env, nullptr, 0)));
-            dma_win->set_enabled(true);
         }
         dma_win->define(0x010, "CTRL_010");
         dma_win->define(0x014, "CALLBACK_014");

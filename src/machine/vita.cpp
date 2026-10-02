@@ -1167,6 +1167,18 @@ void Vita::run_slice() {
                                          sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
                         }
                     }
+                    // ksceKernelSetEventFlag is implemented at 0x4ADEA8 (the stub 0x43AD88
+                    // jumps there). If the DMA completion really signals the flag the
+                    // parked thread waits on, this call must carry r0 = 0x10AB9.
+                    static u32 sef_logged = 0;
+                    if (arm_pc == 0x004ADEA8u && sef_logged < 8u) {
+                        ++sef_logged;
+                        const ArmCore* sf = dynamic_cast<const ArmCore*>(core);
+                        if (sf != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: SetEventFlag #%u uid=0x%08X bits=0x%08X core=%d t=%.6f",
+                                         sef_logged, sf->r[0], sf->r[1], i, emulated_seconds());
+                        }
+                    }
                     // Trace the guest's DMA interrupt handler: from its entry (0x438790)
                     // to its tail (0x43879C), collecting the distinct code addresses and
                     // the argument the kernel passes in r0.
