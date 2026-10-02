@@ -832,6 +832,26 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     wt7->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.bus.add_device(std::move(lt5));
     d.bus.add_device(std::move(wt7));
+    // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
+    // was missing, so the guest's programming fell into unmapped space - measured
+    // with ZLB_WTRAP, the kernel writes +0x00/+0x04/+0x08/+0x0C = 0 and +0x14 = 3
+    // from pc 0xEA074..0xEA07C during boot, i.e. exactly LT5's counter/deadline/aux
+    // offsets.  The guest then never reads it back and never writes CONFIG, so it is
+    // modelled as storage with the timer's register names rather than as a second
+    // ticking timer: the interrupt it would raise is not known, and inventing one
+    // would be a guess (docs/STATUS.md).
+    {
+        auto timer_b = std::make_unique<kermit::RegisterBlock>("Kermit.TimerB", 0xE20B7000u, 0x1000u);
+        timer_b->define(0x00, "COUNTER_LO");
+        timer_b->define(0x04, "COUNTER_HI");
+        timer_b->define(0x08, "DEADLINE_LO");
+        timer_b->define(0x0C, "DEADLINE_HI");
+        timer_b->define(0x10, "AUX_LO");
+        timer_b->define(0x14, "AUX_HI");
+        timer_b->define(0x18, "CONFIG");
+        timer_b->define(0x1C, "STATUS");
+        d.bus.add_device(std::move(timer_b));
+    }
     // Round 142: 0x1D000000 is the hardware /dev/null window (wiki Physical_Memory):
     // SceMsif drains its data stream here.  An empty RegisterBlock is exactly that -
     // reads return 0 (no defined register) and writes are dropped.
