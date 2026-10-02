@@ -1114,6 +1114,18 @@ void Vita::run_slice() {
                                      ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
                                      ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
                     }
+                    // 0x4ADD88 is where the library's syscall trampoline (0x43AD28) lands in
+                    // the kernel. Its arguments name the service the DMA library asks for -
+                    // and therefore what the parked thread is really waiting on.
+                    static u32 sys_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004ADD88u && sys_logged < 16u) {
+                        ++sys_logged;
+                        const ArmCore* sc = dynamic_cast<const ArmCore*>(core);
+                        if (sc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: syscall 0x4ADD88 #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X",
+                                         sys_logged, sc->r[0], sc->r[1], sc->r[2], sc->r[3], sc->r[14]);
+                        }
+                    }
                     // What the kernel actually does between "the DMA operation was
                     // queued" (0x5BE95A) and "the thread parks": collect the distinct
                     // code addresses of that window.  1 ms of guest time is thousands
