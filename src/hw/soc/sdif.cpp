@@ -794,7 +794,7 @@ void Sdif::execute_command() {
     }
     if (command_ok_) {
         poke(kNormalIntStatus, peek(kNormalIntStatus) | status);
-    } else if (!command_no_response_) {
+    } else {
         // Defer the error the way the data phase is deferred: on hardware the
         // interrupt arrives after the driver has posted the request it belongs to,
         // and the driver's completion path (0x5101EBE4) only maps the error status
