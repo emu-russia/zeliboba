@@ -18,6 +18,7 @@
 #include "common/util.h"
 #include "cpu/arm/arm_disasm.h"
 #include "cpu/factory.h"
+#include "event/providers.h"
 
 namespace zlb {
 
@@ -98,6 +99,12 @@ void ArmCore::reset(u32 entry) {
     if (thumb) cpsr |= arm::kFlagT;
     else cpsr &= ~arm::kFlagT;
     write_r15(entry & ~1u);
+
+    events().event(EventProvider::Cpu, ev::cpu::kCoreReset)
+        .field("core", static_cast<u64>(core_id_))
+        .field("name", std::string(core_name()))
+        .address("entry", entry)
+        .emit();
 }
 
 // ===========================================================================
@@ -628,6 +635,30 @@ void ArmCore::take_exception(u32 vector_offset, u32 new_mode, u32 return_address
     const u32 old_mode = mode();
     ++exception_count;
 
+    // Event tracing: guest SVCs are the syscall path and would drown the trace,
+    // so the supervisor-call vector is skipped. IRQ/FIQ are recorded as interrupt
+    // deliveries; every other vector is a real exception.
+    const bool supervisor_call = (new_mode & arm::kModeMask) == arm::kModeSupervisor;
+    if (!supervisor_call) {
+        if (vector_offset == arm::kVecIrq || vector_offset == arm::kVecFiq) {
+            if (events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                                       event_keyword::kInterrupt)) {
+                events().event(EventProvider::Interrupt, ev::interrupt::kDeliver)
+                    .field("core", static_cast<u64>(core_id_))
+                    .field("line", static_cast<u64>(vector_offset == arm::kVecIrq ? 0 : 1))
+                    .field("vector", static_cast<u64>(vector_offset))
+                    .emit();
+            }
+        } else {
+            events().event(EventProvider::Cpu, ev::cpu::kException)
+                .field("core", static_cast<u64>(core_id_))
+                .field("vector", static_cast<u64>(vector_offset))
+                .field("cause", static_cast<u64>(old_mode))
+                .address("return", return_address)
+                .emit();
+        }
+    }
+
     // Exceptions originating in Monitor enter Secure handlers. An SMC from
     // Nonsecure changes mode, leaving SCR.NS set for Monitor's CP15 accesses.
     if (old_mode == arm::kModeMonitor) {
@@ -778,6 +809,12 @@ void ArmCore::undefined(const char* why) {
     char buffer[192];
     std::snprintf(buffer, sizeof(buffer), "undefined instruction 0x%08X at 0x%08X (%s)", cur_instr_,
                   cur_instr_addr_, why);
+    events().event(EventProvider::Cpu, ev::cpu::kUndefined)
+        .field("core", static_cast<u64>(core_id_))
+        .address("pc", cur_instr_addr_)
+        .field("reason", std::string(why))
+        .field("insn", static_cast<u64>(cur_instr_), 4)
+        .emit();
     halt(buffer);
 }
 

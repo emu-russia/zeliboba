@@ -12,6 +12,7 @@
 
 #include "common/log.h"
 #include "common/util.h"
+#include "event/providers.h"
 
 namespace zlb {
 
@@ -418,6 +419,44 @@ void Bus::note(AccessKind kind, u32 address, unsigned size, u64 value, Device* d
     record.unmapped = unmapped;
     record.sequence = trace.total();
     trace.push(record);
+
+    // Event tracing (src/event). Unmapped accesses are warnings that are on by
+    // default; raw MMIO/RAM accesses are the high-volume kBusAccess keyword and
+    // stay off until a session asks for them.
+    if (unmapped) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Warning, event_keyword::kMemory)) {
+            const char* kind_name = to_string(kind);
+            events().event(EventProvider::Bus, ev::bus::kUnmapped)
+                .field("kind", std::string(kind_name))
+                .address("address", address)
+                .field("size", static_cast<u64>(size))
+                .field("device", device ? device->name() : std::string("(ram)"))
+                .emit();
+            events().event(EventProvider::Memory, ev::memory::kUnmapped)
+                .field("kind", std::string(kind_name))
+                .address("address", address)
+                .address("pc", context.pc)
+                .emit();
+        }
+    } else if (device != nullptr) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Verbose, event_keyword::kBusAccess)) {
+            events().event(EventProvider::Bus, kind == AccessKind::Write ? ev::bus::kMmioWrite : ev::bus::kMmioRead)
+                .address("address", address)
+                .field("value", value, static_cast<u8>(size))
+                .field("device", device->name())
+                .address("pc", context.pc)
+                .emit();
+        }
+    } else if (trace.trace_ram()) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Verbose, event_keyword::kBusAccess)) {
+            events().event(EventProvider::Bus, ev::bus::kRamAccess)
+                .field("kind", std::string(to_string(kind)))
+                .address("address", address)
+                .field("size", static_cast<u64>(size))
+                .address("pc", context.pc)
+                .emit();
+        }
+    }
 }
 
 bool Bus::slow_read(u32 address, unsigned size, u64& out, Device*& device, bool fetch) {

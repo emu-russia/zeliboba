@@ -10,6 +10,7 @@
 #include "cpu/factory.h"
 #include "cpu/arm/arm_core.h"
 #include "cpu/mep/mep_core.h"
+#include "event/providers.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc/soc_internal.h"
@@ -164,7 +165,10 @@ std::string resolve_workspace_path(const std::string& path) {
 }
 
 Vita::Vita() = default;
-Vita::~Vita() = default;
+Vita::~Vita() {
+    // Never leave the process-wide event pointer dangling.
+    if (active_events() == &event_log_) set_active_events(nullptr);
+}
 
 // ---------------------------------------------------------------------------
 // Tooling: PC coverage (ZLB_ARM_COV=1 / ZLB_MEP_COV=1, printed by `cov`)
@@ -263,9 +267,20 @@ void Vita::build(const VitaConfig& config) {
     build_cores();
     wire_bridges();
 
+    // The machine owns the event session; from here on, `events()` across the bus,
+    // the devices and the cores resolves to this log.
+    event_log_.set_clock([this] { return emulated_nanoseconds(); });
+    set_active_events(&event_log_);
+
     built_ = true;
     ZLB_LOG_INFO("machine", "board built: 3 processors, %zu MMIO devices",
                  cmep_bus_->devices().size() + arm_bus_->devices().size() + syscon_bus_->devices().size());
+    event_log_.event(EventProvider::Machine, ev::machine::kBuild)
+        .field("detail", std::string("3 processors, ") +
+                             std::to_string(cmep_bus_->devices().size() + arm_bus_->devices().size() +
+                                            syscon_bus_->devices().size()) +
+                             " MMIO devices")
+        .emit();
 }
 
 void Vita::build_buses() {
@@ -835,11 +850,26 @@ bool Vita::fit_parts() {
     cmep_block_->set_keyring_flags(3);
 
     boot_.stage = BootStage::ArmBootRom;
+    event_log_.event(EventProvider::Machine, ev::machine::kPartsFitted)
+        .field("emmc", emmc_ && emmc_->attached() ? path_filename(emmc_->path()) : std::string("none"))
+        .field("syscon", path_filename(firmware))
+        .field("first_loader", path_filename(first_loader))
+        .field("ok", ok)
+        .emit();
     return ok;
 }
 
 void Vita::reset(bool cold) {
     if (!built_) build();
+
+    // A reset starts a fresh trace, and the trace has to begin *here*: the core
+    // resets, the fitted parts and the first boot stage all happen below.
+    event_log_.clear();
+    event_log_.reset_activities();
+    event_stage_activity_ = 0;
+    event_stage_ = BootStage::PowerOn;
+    event_log_.event(EventProvider::Machine, ev::machine::kReset).field("cold", cold).emit();
+
     configure_arm_pc_trace();
     // Restore the boot-phase low SRAM backing before either cold or warm RAM
     // reset. Bus::reset() clears region.bytes(); leaving the secure-kernel alias
@@ -891,6 +921,8 @@ void Vita::reset(bool cold) {
     nskbl_seen_ = false;
     milestones_.clear();
     events_.clear();
+
+    note_stage_change();
 
     // GPU/display self-test (round 191, ZLB_GPU_SELFTEST=1, off by default).
     // It is not part of the boot: it fills a scratch framebuffer with colour bars,
@@ -987,6 +1019,16 @@ double Vita::emulated_seconds() const {
     }
     if (!arm_) return 0.0;
     return static_cast<double>(arm_->cycles) / kArmClockHz;
+}
+
+u64 Vita::emulated_nanoseconds() const {
+    // Same clock as emulated_seconds(), integer and overflow safe: the split form
+    // keeps cycles * 1e9 from overflowing for multi-hour runs.
+    constexpr u64 kClockHz = 333000000ull;
+    u64 cycles = 0;
+    if (kermit_) cycles = kermit_->total_cycles();
+    if (cycles == 0 && arm_) cycles = arm_->cycles;
+    return (cycles / kClockHz) * 1000000000ull + ((cycles % kClockHz) * 1000000000ull) / kClockHz;
 }
 
 namespace {
@@ -2304,11 +2346,58 @@ void Vita::add_milestone(const std::string& text) {
     if (std::find(milestones_.begin(), milestones_.end(), text) != milestones_.end()) return;
     milestones_.push_back(text);
     ZLB_LOG_INFO("boot", "%s", text.c_str());
+    // Every boot-chain milestone is also a structured event, so the Events panel
+    // and the CSV export see the same story the console log tells.
+    event_log_.event(EventProvider::Boot, ev::boot::kMilestone)
+        .field("text", text)
+        .field("stage", std::string(to_string(boot_.stage)))
+        .emit();
 }
 
 void Vita::log_event(const std::string& text) {
     events_.push_back(text);
     ZLB_LOG_INFO("boot", "%s", text.c_str());
+    event_log_.event(EventProvider::Boot, ev::boot::kMilestone).field("text", text).emit();
+}
+
+void Vita::note_stage_change() {
+    // Close the stage that was running and open the new one. Called from reset()
+    // and from the end of every poll_boot_chain() slice, which is where every
+    // stage transition in the boot chain happens, so one hook covers them all.
+    const BootStage stage = boot_.stage;
+    if (event_stage_activity_ != 0 && stage == event_stage_) return;
+
+    if (event_stage_activity_ != 0) {
+        event_log_.end_event(event_stage_activity_, EventProvider::Boot, ev::boot::kStageEnd)
+            .field("stage", std::string(to_string(event_stage_)))
+            .field("result", std::string(to_string(stage)))
+            .emit();
+        event_stage_activity_ = 0;
+    }
+
+    event_stage_ = stage;
+    EventLog::Builder begin = event_log_.begin_event(EventProvider::Boot, ev::boot::kStageBegin);
+    begin.field("stage", std::string(to_string(stage)));
+    begin.field("index", static_cast<u64>(stage));
+    event_stage_activity_ = begin.emit().activity;
+
+    event_log_.event(EventProvider::Boot, ev::boot::kStage)
+        .field("stage", std::string(to_string(stage)))
+        .field("index", static_cast<u64>(stage))
+        .emit();
+
+    // Terminal stages also get their own event: "the boot chain finished" and
+    // "the boot chain failed" are the two lines everyone looks for in a trace.
+    if (stage == BootStage::KernelRunning) {
+        event_log_.event(EventProvider::Boot, ev::boot::kComplete)
+            .field("stage", std::string(to_string(stage)))
+            .emit();
+    } else if (stage == BootStage::Failed) {
+        event_log_.event(EventProvider::Boot, ev::boot::kFailure)
+            .field("stage", std::string(to_string(event_stage_)))
+            .field("reason", boot_.detail)
+            .emit();
+    }
 }
 
 }  // namespace zlb

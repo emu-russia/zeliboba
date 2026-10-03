@@ -87,6 +87,10 @@ void UiApp::refresh_views() {
             memory_.lines = debugger_.memory_dump(memory_.address, memory_.rows, memory_.bytes_per_row);
             break;
         }
+        case UiTab::Events: {
+            refresh_events();
+            break;
+        }
         case UiTab::Trace: {
             Cpu* cpu = debugger_.active_core();
             if (!cpu) break;
@@ -189,8 +193,12 @@ void UiApp::draw_disassembly_panel(const UiRect& area) {
     if (cpu) {
         const std::string state = cpu->status_line();
         if (!state.empty()) {
-            canvas_.draw_text_clip(area, area.right() - Canvas::text_width(state) - 8, area.y + 4, state,
-                                   ui_theme::kTextDim);
+            // The machine-wide Run/Pause buttons own the right end of the header,
+            // so right-align the core state inside the space left of them.
+            const int button_space = 156;
+            const UiRect state_clip{area.x + 6, area.y, area.w - button_space - 6, 18};
+            const int x = std::max(area.x + 6, area.right() - button_space - Canvas::text_width(state) - 4);
+            canvas_.draw_text_clip(state_clip, x, area.y + 4, state, ui_theme::kTextDim);
         }
     }
 

@@ -130,6 +130,20 @@ public:
     std::vector<RegValue> registers() { return registers_of(*active_core()); }
 
     // ------------------------------------------------------------------
+    // Event tracing (ETW-style)
+    // ------------------------------------------------------------------
+    //
+    // The `event` commands control both the recording session (what the machine
+    // records, owned by Vita::events()) and this view filter (what a dump/stat/
+    // graph shows). The UI's Events panel reads the same filter object, so a
+    // filter typed on the command line is the one the graph draws.
+
+    EventFilter& event_filter() { return event_filter_; }
+    const EventFilter& event_filter() const { return event_filter_; }
+    EventLog& event_log() { return vita_.events(); }
+    const EventLog& event_log() const { return vita_.events(); }
+
+    // ------------------------------------------------------------------
     // Logging / tracing
     // ------------------------------------------------------------------
 
@@ -152,6 +166,8 @@ public:
 private:
     void hook_log();
     void check_watchpoints(u64 trace_from);
+    /// Record a breakpoint stop in the event trace (the UI shows it as a marker).
+    void note_breakpoint(Arch arch, int core, u32 address);
 
     std::string cmd_help(const std::vector<std::string>& args);
     std::string cmd_info(const std::vector<std::string>& args);
@@ -172,6 +188,7 @@ private:
     std::string cmd_nid(const std::vector<std::string>& args);
     std::string cmd_image(const std::vector<std::string>& args);
     std::string cmd_log(const std::vector<std::string>& args);
+    std::string cmd_event(const std::vector<std::string>& args);
 
     Vita& vita_;
     Output output_;
@@ -188,6 +205,7 @@ private:
     StopInfo last_stop_;
     std::vector<LogRecord> log_records_;
     u64 log_hook_installed_ = 0;
+    EventFilter event_filter_;
 
     bool history_enabled_ = false;
     /// One ring per core, so a busy core cannot evict a quiet one's history.

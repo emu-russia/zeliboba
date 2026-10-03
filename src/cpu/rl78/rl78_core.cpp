@@ -10,6 +10,7 @@
 #include "common/util.h"
 #include "cpu/factory.h"
 #include "cpu/rl78/rl78_disasm.h"
+#include "event/providers.h"
 
 namespace zlb {
 namespace {
@@ -221,6 +222,12 @@ void Rl78Core::reset() {
 void Rl78Core::reset(u32 entry) {
     reset();
     pc = entry & 0xFFFFFu;
+
+    events().event(EventProvider::Cpu, ev::cpu::kCoreReset)
+        .field("core", static_cast<u64>(0))
+        .field("name", std::string(core_name()))
+        .address("entry", pc)
+        .emit();
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +547,12 @@ void Rl78Core::take_pending() {
     psw = static_cast<u16>(psw & ~kRl78FlagIe);
     pc = bus->read16(static_cast<u32>(vector) * 2) & 0xFFFFu;
     ZLB_LOG_DBG("cpu", "RL78 interrupt vector %d -> PC=0x%05X", vector, pc);
+    events().event(EventProvider::Interrupt, ev::interrupt::kDeliver)
+        .field("core", static_cast<u64>(0))
+        .field("line", static_cast<u64>(vector))
+        .address("vector", pc)
+        .field("name", std::string(core_name()))
+        .emit();
 }
 
 void Rl78Core::do_mov(const Rl78Decoded& insn) {

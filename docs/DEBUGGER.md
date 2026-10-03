@@ -87,6 +87,15 @@ PC (сначала старые, затем новые) — и для `run`, и 
 | `boot` | отчёт по цепочке загрузки + план |
 | `faults [all]` | кольцо отказов MMU ARM-ядер: `VA`, `pc`, `read/write/fetch`, вид отказа, дескрипторы L1/L2, домен, счётчик повторов (без `all` — только активное ядро) |
 | `info` | активное ядро, статистика шины, состояние |
+| `event` | состояние сессии событий (ETW-стиль) и фильтра вида |
+| `event on\|off` / `event clear` | запись событий включить/выключить; очистить записи и счётчики |
+| `event level <lvl>` / `event keyword <mask>` | уровень сессии и подписка по ключевым словам (`boot`, `storage`, ..., `all`, `default`, hex) |
+| `event enable\|disable <провайдер\|область\|all>` | подписка сессии на провайдера или область |
+| `event providers` | манифест: область, состояние, счётчики, GUID |
+| `event dump [n]` / `event stat [n]` | последние записи / сводка Count, Weight, %Weight, min/max |
+| `event activities [n]` / `event timeline [buckets]` | пары Begin/End с длительностями / гистограмма по областям |
+| `event filter ...` | фильтр вида (`level`, `keyword`, `provider`, `area`, `text`, `time`, `kind`, `clear`), общий с панелью Events |
+| `event save <file.csv>` | экспорт отфильтрованных записей в CSV |
 | `load <file> [addr]` | загрузить образ в шину активного ядра |
 | `savestate <file>` | записать полный снапшот машины: RAM, все устройства, ядра, ключи и цепочка загрузки |
 | `loadstate <file>` | восстановить снапшот и продолжить прогон ровно с этой точки |
@@ -226,6 +235,17 @@ run 100000
 core arm
 emmc info
 bpl
+
+# трассировка событий: что заняло время на старте загрузки
+event level verbose
+event keyword default
+runm 40000
+event stat 12           # Count / Weight / %Weight по провайдерам и задачам
+event activities 10     # этапы загрузки и транзакции с длительностями
+event timeline 16       # гистограмма событий по областям
+event filter area storage
+event dump 20           # только Storage — в консоли и в панели Events
+event save build/events.csv
 ```
 
 ## Что показывает SDL3-фронтенд
@@ -234,17 +254,24 @@ bpl
   точку останова на выбранной строке, есть переход по адресу;
 * **Registers** — регистры с подсветкой изменившихся;
 * **Memory** — дамп памяти с перелистыванием;
+* **Events (F4)** — трассировка событий в стиле ETW: Graph Explorer по областям
+  и провайдерам (клик фильтрует вид, чекбокс — подписку сессии), стековая
+  гистограмма «Utilization by area», полоса «Trace Rundown», дорожки
+  Begin/End-активностей и маркеров одиночных событий, таблица записей
+  (со сводкой Count/Weight по `s`) и экспорт CSV по `e`
 * **Trace** — последние обращения к шине с именами устройств;
 * **Devices** — список устройств и регистры выбранного;
 * **Boot** — отчёт по стадиям и быстрые кнопки `stage ...`;
-* **Display / Panel (F7)** — guest framebuffer, выбранный настоящими IFTU
+* **Display / Panel (F8)** — guest framebuffer, выбранный настоящими IFTU
   registers; для поддержанного RGBA8888 subset frontend показывает RGB
   как непрозрачное изображение;
 * **Console** — строка ввода, привязанная к `Debugger::execute`, с историей и
   автодополнением по `Tab`.
 
 Горячие клавиши: `Space` — пауза/пуск, `F10` — шаг, `F11` — шаг с заходом,
-`F1..F7` — вкладки, `Esc` — закрыть строку ввода.
+`F1..F8` — вкладки, `Esc` — закрыть строку ввода. В шапке любой вкладки есть
+кнопки **Run**/**Pause**: они запускают и приостанавливают все ядра
+(тот же путь, что `runm`).
 
 В текущей сборке **617 tests / 0 failures** обычный cold boot исполняет
 настоящий Display producer, gzip и SetFrameBuf. Native DSI frame/IFTU IRQ204

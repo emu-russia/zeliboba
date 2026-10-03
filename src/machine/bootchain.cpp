@@ -9,6 +9,7 @@
 #include "cpu/arm/arm_core.h"
 #include "cpu/mep/mep_core.h"
 #include "cpu/factory.h"
+#include "event/providers.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc.h"
@@ -4531,6 +4532,10 @@ bool Vita::start_arm_kernel_boot_loader() {
     boot_.arm_released = true;
     boot_.detail = "ARM released on the kernel boot loader";
     add_milestone("ARM started on kernel_boot_loader at 0x" + hex(kbl_entry_, 8) + " (" + source + ")");
+    event_log_.event(EventProvider::Boot, ev::boot::kArmReleased)
+        .address("entry", arm_entry)
+        .field("cores", static_cast<u64>(kArmCoreCount))
+        .emit();
     return true;
 }
 
@@ -4682,6 +4687,10 @@ bool Vita::start_nskbl() {
     boot_.detail = "ARM in the non-secure world on NSKBL";
     add_milestone("NSKBL decoded to 0x" + hex(kNskblEntry, 8) + " by the KBL's own sceArlzDecode (" +
                   source + ")");
+    event_log_.event(EventProvider::Boot, ev::boot::kArmReleased)
+        .address("entry", kNskblEntry)
+        .field("cores", static_cast<u64>(kArmCoreCount))
+        .emit();
     return true;
 }
 
@@ -4885,6 +4894,10 @@ void Vita::poll_boot_chain() {
             cmep_block_->set_cmep_status(0);
             boot_.cmep_status = 0;
             add_milestone("ARM boot ROM acknowledged the second-loader status 0x009");
+            event_log_.event(EventProvider::Boot, ev::boot::kHandshake)
+                .field("status", static_cast<u64>(9))
+                .field("side", std::string("cmep"))
+                .emit();
         } else if ((status & 0xFFFFu) == 0x101u && !cmep_context_done_) {
             // The missing reset/ROM path is still modelled here. Preserve the
             // pending status and the live CMeP so genuine Smsched can ACK it,
@@ -4893,6 +4906,14 @@ void Vita::poll_boot_chain() {
             cmep_context_done_ = true;
             ZLB_LOG_INFO("boot", "CMeP published 0x101: releasing ARM for the native scheduler handshake");
             add_milestone("CMeP ready for native scheduler -> syscon SoC release (development substitution)");
+            event_log_.event(EventProvider::Boot, ev::boot::kHandshake)
+                .field("status", static_cast<u64>(status & 0xFFFFu))
+                .field("side", std::string("cmep"))
+                .emit();
+            event_log_.event(EventProvider::Mailbox, ev::mailbox::kHandshake)
+                .field("status", static_cast<u64>(status & 0xFFFFu))
+                .field("side", std::string("cmep"))
+                .emit();
         }
     }
 
@@ -4942,6 +4963,11 @@ void Vita::poll_boot_chain() {
         boot_.detail = "kernel executing";
         add_milestone("kernel is executing instructions");
     }
+
+    // Every stage transition in the boot chain funnels through this function, so
+    // this single call keeps the event log's Begin/End stage activities in sync
+    // (see Vita::note_stage_change).
+    note_stage_change();
 }
 
 bool Vita::kernel_started() const { return kernel_started_; }

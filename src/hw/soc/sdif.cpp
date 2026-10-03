@@ -26,6 +26,8 @@
 // image file directly.
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -526,6 +528,22 @@ void Sdif::execute_command() {
     last_lba_ = current_lba();
     last_count_ = blocks;
 
+    if (events().should_record(EventProvider::Sdif, EventLevel::Verbose, event_keyword::kStorage)) {
+        events().event(EventProvider::Sdif, ev::sdif::kCommand)
+            .field("cmd", (u64)index)
+            .field("arg", (u64)argument)
+            .emit();
+    }
+    const bool data_command = index == 17u || index == 18u || index == 24u || index == 25u;
+    if (has_data && data_command &&
+        events().should_record(EventProvider::Sdif, EventLevel::Informational, event_keyword::kStorage)) {
+        EventLog::Builder begin = events().begin_event(EventProvider::Sdif, ev::sdif::kTransferBegin);
+        begin.field("lba", current_lba())
+            .field("blocks", (u64)blocks)
+            .field("dir", (u64)(read ? 1 : 0));
+        event_activity = begin.emit().activity;
+    }
+
     if (app_cmd_) {
         last_command_ = acmd_name(index);
     } else {
@@ -972,6 +990,20 @@ void Sdif::finish_transfer(bool ok) {
     poke(kNormalIntStatus, peek(kNormalIntStatus) |
                                 (ok ? (kIntTransferComplete | kIntDma) : 0));
     update_irq();
+    if (!ok && events().should_record(EventProvider::Sdif, EventLevel::Error, event_keyword::kStorage)) {
+        events().event(EventProvider::Sdif, ev::sdif::kError)
+            .field("op", std::string("transfer"))
+            .field("detail", std::string("data transfer failed"))
+            .emit();
+    }
+    if (event_activity != 0) {
+        const u64 activity = event_activity;
+        event_activity = 0;
+        events().end_event(activity, EventProvider::Sdif, ev::sdif::kTransferEnd)
+            .field("bytes", (u64)data_.size())
+            .field("result", ok)
+            .emit();
+    }
 }
 
 void Sdif::tick(u64 cycles) {

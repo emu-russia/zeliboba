@@ -57,16 +57,17 @@ u32 color_for_log(LogLevel level) {
     }
 }
 
-/// `--tab` accepts a name ("disassembly", "display", ...) or 1..7.
+/// `--tab` accepts a name ("disassembly", "events", ...) or 1..8.
 UiTab parse_tab(const std::string& text) {
     const std::string name = to_lower(trim(text));
     if (name == "disasm" || name == "disassembly" || name == "code" || name == "1") return UiTab::Disassembly;
     if (name == "registers" || name == "regs" || name == "2") return UiTab::Registers;
     if (name == "memory" || name == "mem" || name == "3") return UiTab::Memory;
-    if (name == "trace" || name == "4") return UiTab::Trace;
-    if (name == "devices" || name == "dev" || name == "5") return UiTab::Devices;
-    if (name == "boot" || name == "6") return UiTab::Boot;
-    if (name == "panel" || name == "display" || name == "7") return UiTab::Display;
+    if (name == "events" || name == "event" || name == "trace-events" || name == "4") return UiTab::Events;
+    if (name == "trace" || name == "bus" || name == "5") return UiTab::Trace;
+    if (name == "devices" || name == "dev" || name == "6") return UiTab::Devices;
+    if (name == "boot" || name == "7") return UiTab::Boot;
+    if (name == "panel" || name == "display" || name == "8") return UiTab::Display;
     return UiTab::Disassembly;
 }
 
@@ -81,6 +82,7 @@ const char* tab_name(UiTab tab) {
         case UiTab::Disassembly: return "Disassembly";
         case UiTab::Registers: return "Registers";
         case UiTab::Memory: return "Memory";
+        case UiTab::Events: return "Events";
         case UiTab::Trace: return "Trace";
         case UiTab::Devices: return "Devices";
         case UiTab::Boot: return "Boot";
@@ -429,11 +431,11 @@ bool UiApp::init_machine(int argc, char** argv) {
                 "screenshot mode (works with no display at all):\n"
                 "  --screenshot <file.bmp>     write the rendered frame to a BMP and exit\n"
                 "  --screenshot-frames <n>     frames to render first (default 2)\n"
-                "  --screenshot-tab <name>     disasm|registers|memory|trace|devices|boot|panel|console\n"
+                "  --screenshot-tab <name>     disasm|registers|memory|events|trace|devices|boot|panel|console\n"
                 "  --run <n>                   machine steps before the first frame (default 200000)\n"
                 "\n"
                 "  --frames <n>           draw n frames then exit (same as --screenshot-frames)\n"
-                "  --tab <name|1..7>      start on that panel\n"
+                "  --tab <name|1..8>      start on that panel\n"
                 "  --stage <name>         start at first|second|kbl|kernel\n"
                 "  --core <name>          active core at startup: mep|arm|rl78\n"
                 "  -ex <command>          run a debugger command before the first frame\n"
@@ -441,7 +443,7 @@ bool UiApp::init_machine(int argc, char** argv) {
                 "  --no-syscon --no-rebuild --log <level> --verbose -q\n"
                 "  -h, --help             this text\n"
                 "\n"
-                "keys: F1..F6 panels, F7 display, F8/SPACE pause, F9 audio test tone,\n"
+                "keys: F1..F8 panels, SPACE pause, F9 audio test tone,\n"
                 "      F10 step over, F11 step into, F12 reset, n step, g go,\n"
                 "      Enter breakpoint (disassembly) / console, ` console, Esc quit\n");
             std::exit(0);
@@ -746,15 +748,13 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
     };
 
     // 1. Function keys and the console toggle are never text: they work whatever
-    //    has the focus.
-    if (key >= SDLK_F1 && key <= SDLK_F7) {
+    //    has the focus. F1..F8 select the eight panels; pause is SPACE.
+    if (key >= SDLK_F1 && key <= SDLK_F8) {
         tab_ = static_cast<UiTab>(static_cast<int>(key - SDLK_F1));
+        if (tab_ == UiTab::Events) rebuild_event_graphs(true);
         return;
     }
     switch (key) {
-        case SDLK_F8:
-            toggle_pause();
-            return;
         case SDLK_F9:
             audio_.set_test_tone(!audio_.test_tone());
             console_print(audio_.test_tone() ? "audio test tone on (440 Hz)" : "audio test tone off",
@@ -806,12 +806,17 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
             toggle_pause();
             consumed();
             return;
+        case SDLK_PAUSE:
+            toggle_pause();
+            return;
         case SDLK_TAB:
             tab_ = static_cast<UiTab>((static_cast<int>(tab_) + 1) % static_cast<int>(UiTab::Count));
+            if (tab_ == UiTab::Events) rebuild_event_graphs(true);
             return;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
             if (tab_ == UiTab::Disassembly) toggle_breakpoint_at_selection();
+            else if (tab_ == UiTab::Events) events_toggle_selected(mod & SDL_KMOD_SHIFT);
             else console_.set_focused(true);
             return;
         default:
@@ -857,6 +862,8 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
                 select_device(devices_.selected - 1);
             } else if (tab_ == UiTab::Registers) {
                 registers_.scroll = std::max(0, registers_.scroll - 1);
+            } else if (tab_ == UiTab::Events) {
+                events_scroll(1);
             }
             return;
         case SDLK_DOWN:
@@ -872,6 +879,8 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
                 select_device(devices_.selected + 1);
             } else if (tab_ == UiTab::Registers) {
                 registers_.scroll += 1;
+            } else if (tab_ == UiTab::Events) {
+                events_scroll(-1);
             }
             return;
         case SDLK_PAGEUP:
@@ -880,6 +889,8 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
                                                                     trace_.scroll + page);
             else if (tab_ == UiTab::Devices) {
                 devices_.register_scroll = std::max(0, devices_.register_scroll - page);
+            } else if (tab_ == UiTab::Events) {
+                events_scroll(page);
             } else {
                 disasm_.address -= static_cast<u32>(page * 4);
                 disasm_.follow_pc = false;
@@ -889,6 +900,7 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
             if (tab_ == UiTab::Memory) memory_.address += static_cast<u32>(page * memory_.bytes_per_row);
             else if (tab_ == UiTab::Trace) trace_.scroll = std::max(0, trace_.scroll - page);
             else if (tab_ == UiTab::Devices) devices_.register_scroll += page;
+            else if (tab_ == UiTab::Events) events_scroll(-page);
             else {
                 disasm_.address += static_cast<u32>(page * 4);
                 disasm_.follow_pc = false;
@@ -903,13 +915,23 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
                 if (cpu) memory_.address = cpu->get_pc();
             } else if (tab_ == UiTab::Trace) {
                 trace_.scroll = 0;
+            } else if (tab_ == UiTab::Events) {
+                events_ui_.tree_selected = 0;
+                events_ui_.tree_scroll = 0;
             }
             return;
         default:
             break;
     }
 
-    // 5. Boot stage shortcuts.
+    // 5. The Events panel's own keys (they consume the key so the console does
+    //    not open with the same letter).
+    if (tab_ == UiTab::Events && events_key(key)) {
+        consumed();
+        return;
+    }
+
+    // 6. Boot stage shortcuts.
     if (tab_ == UiTab::Boot && key >= SDLK_1 && key <= SDLK_4) {
         static const char* stages[4] = {"first", "second", "kbl", "kernel"};
         execute_command(format("stage %s", stages[key - SDLK_1]));
@@ -917,7 +939,7 @@ void UiApp::handle_key(SDL_Keycode key, SDL_Scancode scancode, bool down, SDL_Ke
         return;
     }
 
-    // 6. Anything else that belongs to the emulated pad.
+    // 7. Anything else that belongs to the emulated pad.
     if (vita_input_from_key(scancode, true, input_)) consumed();
 }
 
@@ -965,6 +987,22 @@ void UiApp::handle_mouse_button(const SDL_MouseButtonEvent& button, bool down) {
 
     const UiRect panel = panel_rect();
     if (!panel.contains(x, y)) return;
+
+    // The machine-wide Run/Pause buttons live in the panel header on every tab,
+    // so they are checked before the panel-specific hit testing.
+    if (run_button_rect_.contains(x, y)) {
+        run_all_cores();
+        return;
+    }
+    if (pause_button_rect_.contains(x, y)) {
+        pause_all_cores();
+        return;
+    }
+
+    if (tab_ == UiTab::Events) {
+        events_click(x, y);
+        return;
+    }
 
     switch (tab_) {
         case UiTab::Disassembly: {
@@ -1020,6 +1058,10 @@ void UiApp::handle_mouse_wheel(const SDL_MouseWheelEvent& wheel) {
         return;
     }
     if (!panel_rect().contains(x, y)) return;
+    if (tab_ == UiTab::Events) {
+        events_scroll(lines);
+        return;
+    }
     switch (tab_) {
         case UiTab::Disassembly:
             disasm_.address += static_cast<u32>(lines * 4);
@@ -1135,6 +1177,21 @@ void UiApp::set_running(bool running) {
 void UiApp::toggle_pause() {
     paused_ = !paused_;
     console_print(paused_ ? "paused" : "running", ui_theme::kTextDim);
+}
+
+void UiApp::run_all_cores() {
+    // The frame loop drives `vita_.run_slice()`, which gives every core its
+    // instruction budget - this is the whole-machine `runm` path, not a
+    // single-core `run`.
+    if (!paused_) return;
+    set_running(true);
+    console_print("run: all cores (runm slices)", ui_theme::kOk);
+}
+
+void UiApp::pause_all_cores() {
+    if (paused_) return;
+    set_running(false);
+    console_print("pause: all cores halted at the next slice boundary", ui_theme::kWarn);
 }
 
 void UiApp::step_into() {
@@ -1306,17 +1363,43 @@ void UiApp::draw_panel() {
         case UiTab::Disassembly: draw_disassembly_panel(area); break;
         case UiTab::Registers: draw_registers_panel(area); break;
         case UiTab::Memory: draw_memory_panel(area); break;
+        case UiTab::Events: draw_events_panel(area); break;
         case UiTab::Trace: draw_trace_panel(area); break;
         case UiTab::Devices: draw_devices_panel(area); break;
         case UiTab::Boot: draw_boot_panel(area); break;
         case UiTab::Display: draw_display_panel(area); break;
         default: break;
     }
+    draw_run_pause_buttons(area);
     if (edit_target_ != EditTarget::None) {
         draw_edit_field(area, edit_target_ == EditTarget::GotoMemory ? "goto address (memory)"
                                                                     : "goto address (disassembly)");
     }
     draw_help_line(area);
+}
+
+void UiApp::draw_run_pause_buttons(const UiRect& area) {
+    // Machine-wide Run/Pause, top-right of the panel header on every tab. The
+    // active side is highlighted; both are clickable (see handle_mouse_button).
+    const int height = 16;
+    const int width = 68;
+    run_button_rect_ = UiRect{area.right() - width * 2 - 6, area.y + 1, width, height};
+    pause_button_rect_ = UiRect{area.right() - width - 2, area.y + 1, width, height};
+
+    struct Button {
+        const UiRect& rect;
+        const char* label;
+        bool active;
+    };
+    const Button buttons[2] = {{run_button_rect_, "> RUN", paused_}, {pause_button_rect_, "|| PAUSE", !paused_}};
+    for (const Button& button : buttons) {
+        const bool hover = button.rect.contains(mouse_x_, mouse_y_);
+        u32 color = button.active ? ui_theme::kAccent : ui_theme::kTabIdle;
+        if (hover) color = button.active ? ui_theme::kTabActive : ui_theme::kSelection;
+        canvas_.fill(button.rect, color);
+        canvas_.outline(button.rect, ui_theme::kRule);
+        canvas_.draw_text(button.rect.x + 10, button.rect.y + 4, button.label, ui_theme::kTextBright);
+    }
 }
 
 void UiApp::draw_help_line(const UiRect& area) {
@@ -1325,6 +1408,8 @@ void UiApp::draw_help_line(const UiRect& area) {
         "` console",
         "registers: up/down scroll  PgUp/PgDn page  values changed since the last step are green",
         "memory: up/down row  PgUp/PgDn page  j goto address  Hex + ASCII  ` console",
+        "events: up/down list  Enter toggle  click filters  r record  c clear  l level  k keyword  a area  "
+        "t text  b/o kind  s summary  e export  x reset",
         "trace: up/down scroll  wheel scroll  newest access at the bottom  ` console",
         "devices: up/down select device  PgUp/PgDn registers  values read live from the device",
         "boot: 1 first  2 second  3 kbl  4 kernel  (click the buttons or press 1..4)",

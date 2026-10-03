@@ -276,6 +276,7 @@ enum class UiTab : int {
     Disassembly = 0,
     Registers,
     Memory,
+    Events,
     Trace,
     Devices,
     Boot,
@@ -365,6 +366,81 @@ struct DisplayState {
     u64 last_change = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Events panel (ETW-style trace)
+// ---------------------------------------------------------------------------
+
+struct EventsState {
+    /// One row of the Graph Explorer tree: an area header, the System Activity
+    /// aggregate, or a provider under an area.
+    struct Row {
+        enum class Kind { System, Area, Provider };
+        Kind kind = Kind::Provider;        EventArea area = EventArea::Other;
+        EventProvider provider = EventProvider::Test;
+        std::string label;
+        u64 count = 0;
+        bool recording = true;  ///< session: is the provider recorded at all
+        bool visible = true;    ///< view filter: is it shown
+    };
+
+    std::vector<Row> rows;
+    int tree_selected = 0;
+    int tree_scroll = 0;
+
+    /// Bottom table: the newest matching records (oldest first).
+    struct TableRow {
+        u64 sequence = 0;
+        u64 time_ns = 0;
+        EventProvider provider = EventProvider::Test;
+        u16 task = 0;
+        const char* name = "";
+        EventOpcode opcode = EventOpcode::Info;
+        u64 duration_ns = 0;
+        bool has_duration = false;
+        u8 level = 4;
+        std::string payload;
+    };
+    std::vector<TableRow> table;
+    int table_rows = 0;
+    int table_scroll = 0;
+
+    /// Cached graph data. Recomputed when the log or the filter changes, at most
+    /// a few times per second while the machine runs, so drawing stays cheap.
+    std::vector<EventActivitySpan> activities;
+    std::vector<EventTimelineBucket> timeline;
+    std::vector<EventSummaryRow> summary;
+    std::vector<EventProvider> lane_providers;    ///< activity lanes, top providers
+    std::vector<EventProvider> marker_providers;  ///< one-shot marker lanes
+    /// Sampled one-shot events, positioned on the marker lanes.
+    struct Marker {
+        u64 time_ns = 0;
+        EventProvider provider = EventProvider::Test;
+    };
+    std::vector<Marker> markers;
+    int timeline_buckets = 96;
+    u64 cache_total = 0;
+    u64 cache_revision = 0;
+    u64 cache_wall_ns = 0;
+    /// Records matching the view filter, from the throttled rebuild.
+    u64 matched_records = 0;
+    u64 range_lo_ns = 0;
+    u64 range_hi_ns = 0;
+    u64 rundown_ns = 0;   ///< events stop here; the tail is the rundown region
+    /// Guest time after the last event. The graph maps the event range to the
+    /// axis and shows this as a "Trace Rundown" band on the right, so the events
+    /// stay readable while the untraced tail is still visible.
+    u64 rundown_duration_ns = 0;
+
+    /// Summary-table mode instead of the record table.
+    bool summary_mode = false;
+    int selected_row = 0;
+    /// Which pane the keyboard/wheel act on: 0 = the tree, 1 = the table.
+    int focus = 0;
+    /// The node the mouse hovers, or -1.
+    int hover_row = -1;
+    std::string note;
+};
+
 enum class EditTarget { None, GotoDisassembly, GotoMemory };
 
 /// Parse an address the way the panels show them: hex by default, with "0x"/"$"
@@ -415,6 +491,9 @@ private:
     void step_over();
     void set_running(bool running);
     Arch breakpoint_hit();
+    /// Run / Pause every core (the whole-machine `runm` path the buttons drive).
+    void run_all_cores();
+    void pause_all_cores();
 
     // -- input helpers (ui_main.cpp) -----------------------------------
     void sync_input_from_keyboard(SDL_Scancode scancode, bool down);
@@ -424,6 +503,7 @@ private:
     void draw_tab_bar();
     void draw_status_bar();
     void draw_panel();
+    void draw_run_pause_buttons(const UiRect& area);
     void draw_help_line(const UiRect& area);
     void draw_display_panel(const UiRect& area);
     void blit_display(const UiRect& area, const u8* pixels, int width, int height, int stride, int bpp);
@@ -439,6 +519,22 @@ private:
     void draw_boot_panel(const UiRect& area);
     void rebuild_device_list();
     void select_device(int index);
+
+    // -- events panel (ui_events.cpp) ----------------------------------
+    void refresh_events();
+    void draw_events_panel(const UiRect& area);
+    void refresh_events_tree();
+    /// Recompute the graph caches (activities/timeline/summary). Throttled by the
+    /// caller; `force` ignores the throttle (used on tab entry and filter edits).
+    void rebuild_event_graphs(bool force);
+    /// Keyboard/mouse interaction for the Events tab.
+    bool events_key(SDL_Keycode key);
+    void events_click(int x, int y);
+    void events_scroll(int lines);
+    /// Toggle the selected tree node in the view filter (and, with `record`, in
+    /// the session's provider set).
+    void events_toggle_selected(bool record);
+    void events_filter_revision();
 
     // -- console plumbing (ui_console.cpp) -----------------------------
     void console_print(const std::string& text);
@@ -482,6 +578,13 @@ private:
     DevicesState devices_;
     BootState boot_;
     DisplayState display_;
+    EventsState events_ui_;
+    /// The filter revision the graph caches were built with; an edit bumps it.
+    u64 event_filter_revision_ = 1;
+
+    /// Machine-wide Run/Pause buttons, drawn in the panel header of every tab.
+    UiRect run_button_rect_;
+    UiRect pause_button_rect_;
 
     VitaInput input_;
     std::string input_note_;

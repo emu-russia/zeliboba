@@ -16,6 +16,8 @@
 // pending object, descriptor validity or pixels participate in event timing.
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 #include <limits>
 
 namespace zlb::kermit {
@@ -105,8 +107,15 @@ void IftuController::write(u32 address, unsigned size, u64 value) {
         store(local + kPlaneState, (peek(local + kPlaneState) & ~2ull) |
               (static_cast<u64>(active_bank_[plane]) << 1));
         store(local + kPlaneAck, 0);
-        if (address == base_ + local + kPlaneAck && size == 4 && value == 0)
+        if (address == base_ + local + kPlaneAck && size == 4 && value == 0) {
             pending_[plane] = false;
+            if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                       event_keyword::kDisplay)) {
+                events().event(EventProvider::Display, ev::display::kTurnoverEnd)
+                    .field("bank", (u64)active_bank_[plane])
+                    .emit();
+            }
+        }
         if (overlaps(local + kPlaneArm) && peek(local + kPlaneArm) != 1) armed_[plane] = false;
         if (address == base_ + local + kPlaneArm && size == 4 && value == 1) {
             // Arm before the rest of Enable has been programmed; qualification
@@ -179,6 +188,12 @@ void IftuController::frame_boundary(u64 frames) {
         const u32 state = plane * kPlaneStep + kPlaneState;
         store(state, (peek(state) & ~2ull) | (static_cast<u64>(active_bank_[plane]) << 1));
         ++turnovers_[plane];
+        if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                   event_keyword::kDisplay)) {
+            events().event(EventProvider::Display, ev::display::kTurnoverBegin)
+                .field("bank", (u64)active_bank_[plane])
+                .emit();
+        }
         pending_[plane] = true;
         update_irq(plane);
     }
@@ -189,6 +204,13 @@ void IftuController::update_irq(unsigned plane) {
     if (level == irq_[plane]) return;
     irq_[plane] = level;
     if (irq_callback_) irq_callback_(204 + plane, level);
+    if (level && events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                                        event_keyword::kInterrupt)) {
+        events().event(EventProvider::Interrupt, ev::interrupt::kRaise)
+            .field("line", (u64)(204 + plane))
+            .field("source", (u64)plane)
+            .emit();
+    }
 }
 
 void IftuController::set_irq_callback(std::function<void(u32, bool)> callback) {

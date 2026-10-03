@@ -13,6 +13,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "cpu/factory.h"
+#include "event/providers.h"
 
 namespace zlb {
 namespace {
@@ -246,6 +247,12 @@ void MePCore::reset(u32 entry) {
 
     set_pc(entry);
     set_context(entry);
+
+    events().event(EventProvider::Cpu, ev::cpu::kCoreReset)
+        .field("core", static_cast<u64>(0))
+        .field("name", std::string(core_name()))
+        .address("entry", entry)
+        .emit();
     // NOTE: a core reset must not power-cycle the board. The machine layer calls
     // Bus::reset_devices() itself; resetting them here wipes state that the boot
     // chain has already programmed (the ARM->CMeP mailbox, for instance).
@@ -844,6 +851,13 @@ bool MePCore::take_pending_irq() {
     rep_pending_back_ = false;
     ++irq_sources_taken;
     set_pc(vector);
+
+    events().event(EventProvider::Interrupt, ev::interrupt::kDeliver)
+        .field("core", static_cast<u64>(0))
+        .field("line", static_cast<u64>(source))
+        .address("vector", vector)
+        .field("name", std::string(core_name()))
+        .emit();
     return true;
 }
 

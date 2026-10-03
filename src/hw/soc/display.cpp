@@ -29,6 +29,8 @@
 //   0x34 DMA_CONTROL       bit0 start a fill/copy from DMA_SOURCE
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 namespace zlb::kermit {
 namespace {
 
@@ -150,6 +152,14 @@ void DisplayController::write(u32 address, unsigned size, u64 value) {
             Buffer& buffer = buffers_[offset == kBuffer0 ? 0 : 1];
             buffer.address = value32;
             update_layout();
+            if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                       event_keyword::kDisplay)) {
+                events().event(EventProvider::Display, ev::display::kFrameBuffer)
+                    .address("address", (u64)buffer.address)
+                    .field("stride", (u64)buffer.stride)
+                    .field("format", (u64)buffer.format)
+                    .emit();
+            }
             return;
         }
         case kStride: {
@@ -165,6 +175,13 @@ void DisplayController::write(u32 address, unsigned size, u64 value) {
             buffer.width = width > 0 ? width : panel_width_;
             buffer.height = height > 0 ? height : panel_height_;
             update_layout();
+            if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                       event_keyword::kDisplay)) {
+                events().event(EventProvider::Display, ev::display::kModeSet)
+                    .field("width", (u64)buffer.width)
+                    .field("height", (u64)buffer.height)
+                    .emit();
+            }
             return;
         }
         case kFormat:
@@ -173,10 +190,22 @@ void DisplayController::write(u32 address, unsigned size, u64 value) {
             return;
         case kActive:
             active_ = value32 & 1u;
+            if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                       event_keyword::kDisplay)) {
+                events().event(EventProvider::Display, ev::display::kFramePresent)
+                    .field("frames", frame_counter_)
+                    .emit();
+            }
             return;
         case kFlip:
             active_ = value32 & 1u;
             status_ |= kStFlipped;
+            if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                       event_keyword::kDisplay)) {
+                events().event(EventProvider::Display, ev::display::kFramePresent)
+                    .field("frames", frame_counter_)
+                    .emit();
+            }
             return;
         case kVsyncPeriod:
             vsync_period_ = value32 == 0 ? 16667u : value32;
@@ -232,6 +261,13 @@ void DisplayController::tick(u64 cycles) {
         ++frame_counter_;
         ++frames_;
         status_ |= kStVsync;
+        if (events().should_record(EventProvider::Display, EventLevel::Informational,
+                                   event_keyword::kDisplay)) {
+            events().event(EventProvider::Display, ev::display::kFramePresent)
+                .field("frames", frame_counter_)
+                .address("address", (u64)buffers_[active_].address)
+                .emit();
+        }
         if (frame_callback_) frame_callback_();
     }
 }

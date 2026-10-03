@@ -14,7 +14,7 @@ Ernie (RL78 syscon)  -> питание/сброс/RTC/SC-канал/eMMC-хос�
 
 ![Белый логотип PlayStation на экране загрузки](screenshots/boot-logo.png)
 
-*Холодная загрузка прошивки 1.04: гостевой белый логотип PlayStation (панель Display, F7).
+*Холодная загрузка прошивки 1.04: гостевой белый логотип PlayStation (панель Display, F8).
 Framebuffer 960×544, RGBA8888, 10 753 чтения eMMC, 0 записей.*
 
 Текущее состояние (подробности, адреса и метрики — `docs/STATUS.md`):
@@ -72,13 +72,22 @@ Framebuffer 960×544, RGBA8888, 10 753 чтения eMMC, 0 записей.*
   распакован самим обычным гостем, без копирования offline asset в RAM.
   DSI0 vblank/IRQ213, IFTU turnover/IRQ204 и настоящий callback работают.
   Blending и полное физическое поведение контроллера ещё не реализованы.
+* Система событий в стиле ETW (`src/event/`): 20 провайдеров с манифестами и GUID,
+  уровни/ключевые слова/задачи/opcode, одиночные события и активности Begin/End с
+  вложенностью, кольцевой буфер на 65 536 записей с независимыми счётчиками по
+  провайдерам, фильтры, сводка Count/Weight/%Weight, гистограмма по областям и
+  экспорт в CSV. Инструментированы цепочка загрузки (этапы — активности), ядра,
+  GIC/таймеры, шина, eMMC/SDIF/DMA, дисплей/IFTU/DSI, Syscon, CMeP/Bigmac,
+  mailbox, загрузчик и отладчик. В SDL3-фронтенде — вкладка **Events** (F4) с
+  Graph Explorer, графиками, таблицей и фильтрами, а также кнопки **Run/Pause**
+  для всех ядер в шапке любой вкладки. Подробности — [docs/EVENTS.md](docs/EVENTS.md).
 
-Последняя полная проверка macOS: **617 тестов, 0 отказов**. Настоящие os0 kernel
+Последняя полная проверка macOS: **655 тестов, 0 отказов**. Настоящие os0 kernel
 modules загружены; native SDL3 показывает белый PlayStation logo на чёрном фоне.
 Скриншот — [screenshots/boot-logo.png](screenshots/boot-logo.png);
 [проверка native producer/IRQ/presentation](build/goal-native-iftu-arm-integrated-evidence.md)
 сохранена. Тот же холодный прогон воспроизведён на Windows (MSVC Release x64):
-**617/0**, framebuffer 960×544 RGBA8888, 10 753 чтения eMMC, 0 записей.
+**655/0**, framebuffer 960×544 RGBA8888, 10 753 чтения eMMC, 0 записей.
 Полная загрузка ядра, LiveArea и SGX rendering ещё не подтверждены;
 IFTU timing/rearm/status используют явно ограниченную модель.
 
@@ -97,8 +106,9 @@ IFTU timing/rearm/status используют явно ограниченную 
 | eMMC: карта + сборка образа из 1.04 | `src/hw/emmc/` | образ собирается, SLB2 читается с образа |
 | Загрузчики: PUP/SLB2/SELF/ELF/ключи | `src/loader/` | 42/42 модулей, SELF→ELF проверено |
 | Машина и цепочка загрузки | `src/machine/` | готово |
+| События ETW-стиля (провайдеры, активности) | `src/event/` | готово |
 | Отладчик (CLI + API) | `src/debug/` | готово |
-| SDL3-фронтенд | `src/ui/` | готово, оффскрин-скриншоты |
+| SDL3-фронтенд (вкладка Events, Run/Pause) | `src/ui/` | готово, оффскрин-скриншоты |
 | Арт: иконка, логотип, талисман | `artwork/` | генерируется скриптом |
 
 ## Сборка
@@ -185,7 +195,7 @@ zeliboba/
 cd zeliboba-main
 ./build-macos.sh                       # CLI, инструменты, тесты и SDL3
 ./run-macos.sh                         # SDL3, SPACE запускает/приостанавливает
-./run-macos.sh --run 0 -ex "runm 1000000" # cold boot до гостевого PS logo; F7 — Display
+./run-macos.sh --run 0 -ex "runm 1000000" # cold boot до гостевого PS logo; F8 — Display
 ./run-macos.sh --cli                   # интерактивный отладчик
 ./run-macos.sh --cli --info            # карта памяти и устройств
 ./run-macos.sh --cli -ex "boot" -ex "runm 300000" -ex "boot" -ex "gpo" -ex "quit"
@@ -285,6 +295,8 @@ emmc info | emmc read ...  карта eMMC
 keyring                    состояние keyring-контроллера CMeP
 boot | stage <...>         цепочка загрузки
 bp / watch / bpl / wpl     точки останова и наблюдения
+event on|off|level|keyword|enable|providers|dump|stat|activities|timeline|filter|save
+                           трассировка событий (ETW-стиль); см. docs/EVENTS.md
 log <level>
 ```
 
@@ -337,6 +349,7 @@ python3 artwork/make_artwork.py     # fonttools + cairosvg + Pillow
 * `docs/HARDWARE.md` — карты памяти и регистров, что подтверждено, а что гипотеза
 * `docs/EMMC.md` — раскладка реконструированного образа
 * `docs/DEBUGGER.md` — отладчик
+* `docs/EVENTS.md` — система событий в стиле ETW и панель Events
 * `docs/CPU_ARM_AUDIT.md` — аудит декодера ARM
 * `docs/VENEZIA.md` — план по движку Venezia (MPE, IVC2)
 * `docs/GPU.md` — план по PowerVR SGX543 и выводу Live Area
@@ -350,7 +363,10 @@ python3 artwork/make_artwork.py     # fonttools + cairosvg + Pillow
 
 ```powershell
 build\bin\zeliboba_ui.exe --screenshot out.bmp --screenshot-tab disasm --run 200000
+build\bin\zeliboba_ui.exe --screenshot events.bmp --screenshot-tab events --run 1200000 ^
+    -ex "event filter area storage"
 python tools\bmp2png.py out.bmp out.png
 ```
 
-Готовые кадры лежат в `screenshots/`.
+Готовые кадры лежат в `screenshots/`; скриншоты панели Events — в `docs/design/`
+(их использует `docs/EVENTS.md`).

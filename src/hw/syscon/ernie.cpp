@@ -14,6 +14,7 @@
 #include "cpu/cpu.h"
 #include "cpu/factory.h"
 #include "cpu/rl78/rl78_core.h"
+#include "event/providers.h"
 #include "hw/emmc.h"
 #include "hw/syscon/ernie_internal.h"
 #include "hw/syscon/ernie_power.h"
@@ -854,6 +855,12 @@ bool ErnieBlock::read_nvs(u16 offset, size_t length, std::vector<u8>& out) const
 
 std::vector<u8> ErnieBlock::dispatch_command(u32 command, const std::vector<u8>& payload) {
     Impl& impl = *impl_;
+    if (events().should_record(EventProvider::Syscon, EventLevel::Verbose, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kScCommand)
+            .field("cmd", (u64)command)
+            .field("payload", (u64)payload.size())
+            .emit();
+    }
     // The fuel gauge / panel / RTC values are mirrored in ErnieBlock's own
     // members (the public API's setters are inline there), so fold them back
     // into the power model before it answers.
@@ -862,6 +869,12 @@ std::vector<u8> ErnieBlock::dispatch_command(u32 command, const std::vector<u8>&
     impl.power.rtc_seconds = rtc_seconds_;
 
     std::vector<u8> reply = impl.dispatch(command, payload);
+    if (events().should_record(EventProvider::Syscon, EventLevel::Verbose, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kScReply)
+            .field("cmd", (u64)command)
+            .field("result", (u64)reply.size())
+            .emit();
+    }
     ++commands_served_;
     impl.note_command(command, reply.size());
     impl.channel.publish_reply(command, reply);
@@ -935,7 +948,14 @@ void ErnieBlock::tick(u64 cycles) {
 
 void ErnieBlock::set_power_button(bool pressed) {
     impl_->power.set_power_button(pressed);
-    if (pressed) impl_->power.release_soc();
+    if (pressed) {
+        impl_->power.release_soc();
+        if (events().should_record(EventProvider::Syscon, EventLevel::Warning, event_keyword::kPower)) {
+            events().event(EventProvider::Syscon, ev::syscon::kReset)
+                .field("reason", std::string("power-button"))
+                .emit();
+        }
+    }
     soc_released_ = impl_->power.soc_released;
 }
 
@@ -947,6 +967,12 @@ void ErnieBlock::release_soc() {
     impl_->power.release_soc();
     if (impl_->soc_gate != nullptr) impl_->soc_gate->set_released(true);
     soc_released_ = true;
+    if (events().should_record(EventProvider::Syscon, EventLevel::Informational, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kPowerState)
+            .field("from", (u64)0)
+            .field("to", (u64)1)
+            .emit();
+    }
 }
 
 // ---------------------------------------------------------------------------

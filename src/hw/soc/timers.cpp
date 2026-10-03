@@ -23,6 +23,8 @@
 // PPI 30 and the global timer comparator raises PPI 27 (TRM 4.3, page 4-70).
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 #include <limits>
 
 namespace zlb::kermit {
@@ -130,10 +132,22 @@ void GlobalTimer::write_word(u32 offset, u64 value) {
             return;
         case kGlobalComparatorLow:
             comparator_ = (comparator_ & 0xFFFFFFFF00000000ull) | (value & 0xFFFFFFFFull);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)0)
+                    .field("ticks", (u64)value)
+                    .emit();
+            }
             refresh_irq();
             return;
         case kGlobalComparatorHigh:
             comparator_ = (comparator_ & 0xFFFFFFFFull) | ((value & 0xFFFFFFFFull) << 32);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)0)
+                    .field("ticks", (u64)value)
+                    .emit();
+            }
             refresh_irq();
             return;
         default:
@@ -156,6 +170,12 @@ void GlobalTimer::refresh_irq() {
         armed_ = false;
         fired_ = true;
         poke(kGlobalStatus, 1);
+        if (events().should_record(EventProvider::Timer, EventLevel::Informational, event_keyword::kTimer)) {
+            events().event(EventProvider::Timer, ev::timer::kExpire)
+                .field("timer", (u64)0)
+                .field("count", (u64)counter_)
+                .emit();
+        }
     }
     const bool want = fired_ || (peek(kGlobalStatus) & 1u) != 0;
     if (want == irq_state_) return;
@@ -267,6 +287,12 @@ void PrivateTimer::step(Counter& counter, u32 id, u64 periph_ticks) {
             counter.event = true;
             ++expiries_;
             refresh(counter, id);
+            if (events().should_record(EventProvider::Timer, EventLevel::Informational, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kExpire)
+                    .field("timer", (u64)id)
+                    .field("count", (u64)counter.value)
+                    .emit();
+            }
             if (counter.auto_reload) {
                 counter.value = counter.load;
             } else {
@@ -311,6 +337,12 @@ void PrivateTimer::write_word(u32 offset, u64 value) {
             timer_.load = value32;
             timer_.value = value32;
             poke(kTimerLoad, value32);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)timer_irq_)
+                    .field("ticks", (u64)value32)
+                    .emit();
+            }
             return;
         case kTimerCounter:
             timer_.value = value32;
@@ -323,6 +355,12 @@ void PrivateTimer::write_word(u32 offset, u64 value) {
             timer_.running = (value32 & kTimerEnable) != 0;
             timer_.prescale_left = 0;
             poke(kTimerControl, value32);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)timer_irq_)
+                    .field("ticks", (u64)value32)
+                    .emit();
+            }
             refresh(timer_, timer_irq_);
             return;
         case kTimerStatus:
@@ -336,6 +374,12 @@ void PrivateTimer::write_word(u32 offset, u64 value) {
             watchdog_.load = value32;
             watchdog_.value = value32;
             poke(kWatchdogLoad, value32);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)watchdog_irq_)
+                    .field("ticks", (u64)value32)
+                    .emit();
+            }
             return;
         case kWatchdogCounter:
             watchdog_.value = value32;
@@ -348,6 +392,12 @@ void PrivateTimer::write_word(u32 offset, u64 value) {
             watchdog_.running = (value32 & kTimerEnable) != 0;
             watchdog_.prescale_left = 0;
             poke(kWatchdogControl, value32);
+            if (events().should_record(EventProvider::Timer, EventLevel::Verbose, event_keyword::kTimer)) {
+                events().event(EventProvider::Timer, ev::timer::kArm)
+                    .field("timer", (u64)watchdog_irq_)
+                    .field("ticks", (u64)value32)
+                    .emit();
+            }
             refresh(watchdog_, watchdog_irq_);
             return;
         case kWatchdogStatus:
@@ -611,6 +661,12 @@ void VitaSystemTimer::tick(u64 periph_ticks) {
         armed_ = false;
         registers_[status_offset() / 4] |= 2u;
         ++comparisons_;
+        if (events().should_record(EventProvider::Timer, EventLevel::Informational, event_keyword::kTimer)) {
+            events().event(EventProvider::Timer, ev::timer::kExpire)
+                .field("timer", (u64)0)
+                .field("count", (u64)comparisons_)
+                .emit();
+        }
     }
     const u64 after = before + counts; // modular64/32 arithmetic
     const u32 slot = counter_offset() / 4;
