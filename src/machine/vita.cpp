@@ -588,6 +588,44 @@ void Vita::wire_bridges() {
         },
         [this](unsigned channel, bool asserted) {
             kermit_->raise_irq(200u + channel, asserted);
+            // Does the CMeP's post actually reach the ARM: is the GIC output line
+            // asserted, and is any core able to take it (CPSR.I clear)?
+            static u32 to_arm_logged = 0;
+            if (asserted && to_arm_logged < 40u) {
+                ++to_arm_logged;
+                ZLB_LOG_INFO("machine", "mailbox irq to ARM channel=%u gic_line=%d", channel,
+                             kermit_irq_line(*arm_bus_) ? 1 : 0);
+                for (size_t c = 0; c < arm_cores_.size(); ++c) {
+                    if (const ArmCore* ac = dynamic_cast<const ArmCore*>(arm_cores_[c].get())) {
+                        ZLB_LOG_INFO("machine", "   arm%zu pc=0x%08X cpsr=0x%08X IrqEnabled=%d halted=%d",
+                                     c, ac->get_pc(), ac->cpsr, (ac->cpsr & 0x80u) ? 0 : 1,
+                                     ac->halted ? 1 : 0);
+                    }
+                }
+                // The GIC decides whether the raised line can actually be taken.
+                kermit::Gic* gic = nullptr;
+                for (auto& dev : arm_bus_->devices()) {
+                    if (auto* candidate = dynamic_cast<kermit::Gic*>(dev.get())) {
+                        gic = candidate;
+                        break;
+                    }
+                }
+                if (gic != nullptr) {
+                    ZLB_LOG_INFO("machine", "   gic: line=%d cpuif0_enabled=%d pending_count=%u",
+                                 gic->line() ? 1 : 0, gic->cpu_interface(0).enabled() ? 1 : 0,
+                                 gic->distributor().pending_count());
+                    for (unsigned id = 200u; id < 204u; ++id) {
+                        ZLB_LOG_INFO("machine",
+                                     "   gic irq %u: en0=%d pend0=%d | en1=%d pend1=%d | en2=%d pend2=%d",
+                                     id, gic->distributor().enabled(id, 0) ? 1 : 0,
+                                     gic->distributor().pending(id, 0) ? 1 : 0,
+                                     gic->distributor().enabled(id, 1) ? 1 : 0,
+                                     gic->distributor().pending(id, 1) ? 1 : 0,
+                                     gic->distributor().enabled(id, 2) ? 1 : 0,
+                                     gic->distributor().pending(id, 2) ? 1 : 0);
+                    }
+                }
+            }
         });
 
     // The ARM also sees the syscon. The kernel boot loader writes the SC doorbell
@@ -1014,10 +1052,30 @@ void Vita::run_slice() {
             char when[48];
             std::snprintf(when, sizeof(when), "at slice %llu", static_cast<unsigned long long>(slice_no));
             if (MePCore* mcp = dynamic_cast<MePCore*>(cmep_.get())) {
-                ZLB_LOG_INFO("machine", "CMeP IRQ counters %s: seen=%llu taken=%llu last=%d",
+                // Full interrupt picture on the secure side: is anything pending, is it
+                // unmasked, and is the CPU actually allowed to take it (PSW.IEC)?
+                ZLB_LOG_INFO("machine",
+                             "CMeP IRQ counters %s: seen=%llu taken=%llu last=%d psw=0x%X "
+                             "isr=0x%08X imr=0x%08X pending=%d",
                              when, static_cast<unsigned long long>(mcp->irq_sources_seen),
                              static_cast<unsigned long long>(mcp->irq_sources_taken),
-                             mcp->irq_last_source);
+                             mcp->irq_last_source, mcp->psw, mcp->interrupt_flag_register(),
+                             mcp->interrupt_mask_register(), mcp->cbus.pending_irq());
+            }
+            {
+                // ARM side: is the GIC output line asserted, and can each core take it?
+                const bool line = kermit_irq_line(*arm_bus_);
+                ZLB_LOG_INFO("machine", "ARM IRQ line %s: asserted=%d", when, line ? 1 : 0);
+                for (size_t c = 0; c < arm_cores_.size(); ++c) {
+                    if (arm_cores_[c] == nullptr) continue;
+                    if (const ArmCore* ac = dynamic_cast<const ArmCore*>(arm_cores_[c].get())) {
+                        ZLB_LOG_INFO("machine",
+                                     "ARM core %zu %s: pc=0x%08X cpsr=0x%08X Irq=%d Fiq=%d halted=%d",
+                                     c, when, ac->get_pc(), ac->cpsr,
+                                     (ac->cpsr & 0x80u) ? 0 : 1, (ac->cpsr & 0x40u) ? 0 : 1,
+                                     ac->halted ? 1 : 0);
+                    }
+                }
             }
             dump_pc_histogram_now(when);
         }
