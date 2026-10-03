@@ -712,6 +712,15 @@ void Vita::wire_bridges() {
     for (u32 base : {0x1A002000u, 0x34000000u, 0x36000000u}) {
         arm_bus_->add_device(std::make_unique<L2CacheController>(base));
     }
+
+    // Absolutely last: cover the windows the guest kernel's own device table declares
+    // and the model has no device for. It has to run after every real device and
+    // mirror above - a storage window is smaller than the block it would cover and
+    // Bus::find_device prefers the smallest window, so installing it earlier silently
+    // shadowed the shared SC window (Ernie.SC@mirror) and the CMeP secure kernel
+    // stopped advancing; and an earlier position also missed the PL310 blocks added
+    // just above.
+    kermit_->install_kernel_windows();
 }
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,10 @@ public:
     KermitBlock& operator=(const KermitBlock&) = delete;
 
     void install();
+    /// Cover the windows the guest kernel's own device table declares but the model
+    /// has no device for, as plain storage. Must run after every real device and
+    /// mirror is on the bus (Vita::wire_bridges), so a window can never shadow one.
+    void install_kernel_windows();
     void reset();
 
     /// Advance time based devices (timers, DMA) by `cycles` CPU cycles.
