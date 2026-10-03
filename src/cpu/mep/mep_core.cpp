@@ -681,6 +681,17 @@ StepResult MePCore::step() {
             const char* v = std::getenv("ZLB_STATE_LOG");
             return v != nullptr && v[0] != '0';
         }();
+        // 0x800A56 is "lw $5,($3)" with $3 = 0xE0000010 (the ARM->CMeP mailbox), so $5 on
+        // the next instruction is the command the ARM sent. Logging it shows which
+        // commands actually arrive - in particular whether 0x101 (the one that sets
+        // state 9) ever does.
+        if (st_log && (pc & ~1u) == 0x800A58u) {
+            static u32 m = 0;
+            if (m < 60u) {
+                ++m;
+                ZLB_LOG_INFO("mep", "mailbox cmd: $5=0x%X (%u)", r[5], r[5]);
+            }
+        }
         if (st_log && (pc & ~1u) == 0x801D54u) {
             static u32 n = 0;
             if (n < 80u) {
