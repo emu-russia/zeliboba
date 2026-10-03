@@ -244,6 +244,7 @@ ZLB_TEST(rl78_status_line) {
 ZLB_TEST(rl78_step_result_reports_length_and_text) {
     Bench bench;
     bench.code("CBF820FE");
+    bench.cpu.step_text = true;   // this case asserts on the listing (see Cpu::step_text)
     const StepResult result = bench.cpu.step();
     ZLB_EXPECT_EQ(kBase, result.address);
     ZLB_EXPECT_EQ(4u, result.length);

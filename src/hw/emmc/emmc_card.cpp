@@ -14,6 +14,8 @@
 // value carries the CSD/EXT_CSD slice it was taken from in a comment.
 #include "hw/emmc/emmc.h"
 
+#include "event/providers.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -279,14 +281,29 @@ bool EmmcCard::region_offset(EmmcPartition partition, u64& offset, u64& blocks) 
 }
 
 bool EmmcCard::read_blocks(EmmcPartition partition, u64 lba, u32 count, u8* out) {
-    if (!file_ || !out || count == 0) return false;
+    const auto fail = [](const char* detail) {
+        events().event(EventProvider::Emmc, ev::emmc::kError)
+            .field("op", std::string("read"))
+            .field("detail", std::string(detail))
+            .emit();
+        return false;
+    };
+    if (!file_ || !out || count == 0) return fail("invalid argument");
+
+    events().event(EventProvider::Emmc, ev::emmc::kTransferBegin)
+        .opcode(EventOpcode::Info)
+        .field("dir", (u64)0)
+        .field("lba", lba)
+        .field("blocks", (u64)count)
+        .field("bytes", (u64)count * 512)
+        .emit();
 
     u64 base = 0;
     u64 blocks = 0;
-    if (!region_offset(partition, base, blocks)) return false;
-    if (lba >= blocks || (lba + count) > blocks) return false;
+    if (!region_offset(partition, base, blocks)) return fail("partition not mapped");
+    if (lba >= blocks || (lba + count) > blocks) return fail("out of range");
 
-    if (!seek64(file_, base + lba * emmc::kBlockSize)) return false;
+    if (!seek64(file_, base + lba * emmc::kBlockSize)) return fail("seek failed");
     const size_t wanted = static_cast<size_t>(count) * emmc::kBlockSize;
     const size_t got = std::fread(out, 1, wanted, file_);
     if (got != wanted) {
@@ -298,16 +315,31 @@ bool EmmcCard::read_blocks(EmmcPartition partition, u64 lba, u32 count, u8* out)
 }
 
 bool EmmcCard::write_blocks(EmmcPartition partition, u64 lba, u32 count, const u8* data) {
-    if (!file_ || !data || count == 0 || readonly_) return false;
+    const auto fail = [](const char* detail) {
+        events().event(EventProvider::Emmc, ev::emmc::kError)
+            .field("op", std::string("write"))
+            .field("detail", std::string(detail))
+            .emit();
+        return false;
+    };
+    if (!file_ || !data || count == 0 || readonly_) return fail("invalid argument");
+
+    events().event(EventProvider::Emmc, ev::emmc::kTransferBegin)
+        .opcode(EventOpcode::Info)
+        .field("dir", (u64)1)
+        .field("lba", lba)
+        .field("blocks", (u64)count)
+        .field("bytes", (u64)count * 512)
+        .emit();
 
     u64 base = 0;
     u64 blocks = 0;
-    if (!region_offset(partition, base, blocks)) return false;
-    if (lba >= blocks || (lba + count) > blocks) return false;
+    if (!region_offset(partition, base, blocks)) return fail("partition not mapped");
+    if (lba >= blocks || (lba + count) > blocks) return fail("out of range");
 
-    if (!seek64(file_, base + lba * emmc::kBlockSize)) return false;
+    if (!seek64(file_, base + lba * emmc::kBlockSize)) return fail("seek failed");
     const size_t wanted = static_cast<size_t>(count) * emmc::kBlockSize;
-    if (std::fwrite(data, 1, wanted, file_) != wanted) return false;
+    if (std::fwrite(data, 1, wanted, file_) != wanted) return fail("write failed");
     writes_ += count;
     dirty_ = true;
     return true;

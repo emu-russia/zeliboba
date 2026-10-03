@@ -10,12 +10,95 @@
 #include "cpu/factory.h"
 #include "cpu/arm/arm_core.h"
 #include "cpu/mep/mep_core.h"
+#include "event/providers.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc/soc_internal.h"
 #include "hw/syscon.h"
 
 namespace zlb {
+
+namespace {
+/// Per-core rings of the most recent ARM PCs, used to show the path that produced a
+/// module-start failure (see the MODULEMGR_NO_LIB dump below). They are per core
+/// because the four cores interleave - a single ring made the path look scrambled
+/// (a delay loop from core 2 appeared between core 0's instructions).
+/// Deduplicated set of the NSKBL code addresses executed since the current module
+/// start began. A ring was not enough: the loader's cache-flush loop at 0x510143xx
+/// fills it and evicts the history that matters. Reset on each module start and
+/// dumped when the start fails.
+constexpr unsigned kPcSetSlots = 4096;
+u32 g_pc_set[kPcSetSlots];
+unsigned char g_pc_set_used[kPcSetSlots];
+u32 g_pc_set_count = 0;
+
+/// Ordered ring of NSKBL addresses, excluding the cache-flush table at
+/// 0x510143xx-0x510144xx and the start helper at 0x510194xx-0x510196xx, which
+/// otherwise flood it. Dumped in order on a failed start so the branch that
+/// produced the error is the tail of the list.
+/// Ordered, per-core ring of every executed address during the current module start,
+/// excluding only the loops known to flood it: the loader's cache-flush table
+/// (0x510143xx-0x510144xx), the start helper (0x510194xx-0x510196xx) and the kernel's
+/// delay loop (0x4F9DB8-0x4F9DD0). Widened from NSKBL-only because the loader calls
+/// shared code outside 0x510xxxxx, which is where the failing branch may live.
+constexpr unsigned kNskblRingSize = 4096;
+constexpr unsigned kNskblRingCores = 4;
+u32 g_nskbl_ring[kNskblRingCores][kNskblRingSize];
+u32 g_nskbl_pos[kNskblRingCores] = {0, 0, 0, 0};
+
+void nskbl_ring_add(unsigned core, u32 pc) {
+    if (core >= kNskblRingCores) return;
+    if (pc >= 0x51014300u && pc < 0x51014500u) return;
+    if (pc >= 0x51019400u && pc < 0x51019600u) return;
+    if (pc >= 0x004F9DB8u && pc < 0x004F9DD0u) return;
+    g_nskbl_ring[core][(g_nskbl_pos[core]++) & (kNskblRingSize - 1u)] = pc;
+}
+
+void pc_set_reset() {
+    std::memset(g_pc_set_used, 0, sizeof(g_pc_set_used));
+    g_pc_set_count = 0;
+}
+
+void pc_set_add(u32 pc) {
+    u32 slot = (pc * 2654435761u) & (kPcSetSlots - 1u);
+    for (unsigned probe = 0; probe < kPcSetSlots; ++probe) {
+        const u32 index = (slot + probe) & (kPcSetSlots - 1u);
+        if (g_pc_set_used[index] == 0u) {
+            g_pc_set_used[index] = 1u;
+            g_pc_set[index] = pc;
+            ++g_pc_set_count;
+            return;
+        }
+        if (g_pc_set[index] == pc) return;
+    }
+}
+
+constexpr unsigned kArmTraceCores = 4;
+constexpr unsigned kArmTraceSize = 512;
+u32 g_arm_trace_ring[kArmTraceCores][kArmTraceSize];
+/// PC histogram (bucketed by 4 KiB) for ARM and CMeP, sampled every 4096th ARM
+/// instruction, to show where the machine actually spends its time - in particular
+/// after the module phase, which the module-error experiment showed is not the barrier.
+std::map<u32, u32> g_hist_arm_map;
+std::map<u32, u32> g_hist_cmep_map;
+std::map<u32, u32> g_hist_cmep_fine;
+std::map<u32, u32> g_hist_module;
+bool g_hist_on = false;
+u32 g_hist_tick = 0;
+
+constexpr unsigned kUidRingSize = 64;
+u32 g_uid_ring_site[kUidRingSize];
+u32 g_uid_ring_value[kUidRingSize];
+u32 g_uid_ring_result[kUidRingSize];
+u32 g_uid_ring_pos = 0;
+void uid_ring_result(u32 pos, u32 value) { g_uid_ring_result[pos & (kUidRingSize - 1u)] = value; }
+void uid_ring_add(u32 site, u32 uid) {
+    const u32 slot = g_uid_ring_pos++ & (kUidRingSize - 1u);
+    g_uid_ring_site[slot] = site;
+    g_uid_ring_value[slot] = uid;
+}
+u32 g_arm_trace_pos[kArmTraceCores] = {0, 0, 0, 0};
+}  // namespace
 
 namespace {
 /// The Vita's Cortex-A9 runs at 333 MHz; used to convert cycles into wall time.
@@ -82,7 +165,10 @@ std::string resolve_workspace_path(const std::string& path) {
 }
 
 Vita::Vita() = default;
-Vita::~Vita() = default;
+Vita::~Vita() {
+    // Never leave the process-wide event pointer dangling.
+    if (active_events() == &event_log_) set_active_events(nullptr);
+}
 
 // ---------------------------------------------------------------------------
 // Tooling: PC coverage (ZLB_ARM_COV=1 / ZLB_MEP_COV=1, printed by `cov`)
@@ -181,9 +267,20 @@ void Vita::build(const VitaConfig& config) {
     build_cores();
     wire_bridges();
 
+    // The machine owns the event session; from here on, `events()` across the bus,
+    // the devices and the cores resolves to this log.
+    event_log_.set_clock([this] { return emulated_nanoseconds(); });
+    set_active_events(&event_log_);
+
     built_ = true;
     ZLB_LOG_INFO("machine", "board built: 3 processors, %zu MMIO devices",
                  cmep_bus_->devices().size() + arm_bus_->devices().size() + syscon_bus_->devices().size());
+    event_log_.event(EventProvider::Machine, ev::machine::kBuild)
+        .field("detail", std::string("3 processors, ") +
+                             std::to_string(cmep_bus_->devices().size() + arm_bus_->devices().size() +
+                                            syscon_bus_->devices().size()) +
+                             " MMIO devices")
+        .emit();
 }
 
 void Vita::build_buses() {
@@ -314,6 +411,64 @@ void Vita::build_cores() {
     if (MePCore* mep = dynamic_cast<MePCore*>(cmep_.get())) {
         mep->pc_hook = [this](u32 pc) {
             mep_cov_mark(pc);
+            // Secure-runtime state machine: 0x801D54 is the setter for the CMeP's
+            // state word at 0x8076AC (gp-32748). Logging the written value together
+            // with the caller's return address shows who drives the transitions and
+            // where the 3 -> 4 -> 5 -> 8 retry cycle comes from.
+            if (pc == 0x801D54u) {
+                static u32 state_logged = 0;
+                if (state_logged < 24u) {
+                    ++state_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: state <- 0x%X (caller lp=0x%08X)",
+                                     st->r[1], st->lp);
+                    }
+                }
+            }
+            // 0x800C2E is the command dispatcher: it loads 0x806FD8 + $3*4 and jumps
+            // through it, so $3 is the command id. Logging it shows which commands the
+            // secure kernel processes and whether the 3->4->5->8 cycle repeats one.
+            // kprx_auth_sm.self is staged from SLB2 into DRAM at 0x40000500 and the
+            // secure kernel copies it into its own SRAM at 0x0080B000 (verified: the
+            // byte writes there match the decrypted module exactly). This probe says
+            // whether the secure core ever *executes* it, i.e. whether the module's
+            // entry is reached.
+            if (pc >= 0x0080B000u && pc < 0x00810000u) {
+                static u64 module_hits = 0;
+                static u32 module_last = 0;
+                static u32 module_logged = 0;
+                ++module_hits;
+                if (module_logged < 8u && (module_hits <= 4u || (module_hits % 2000000u) == 0u)) {
+                    ++module_logged;
+                    ZLB_LOG_INFO("machine", "secure: kprx_auth_sm hit=%llu pc=0x%08X last=0x%08X",
+                                 static_cast<unsigned long long>(module_hits), pc, module_last);
+                }
+                module_last = pc;
+            }
+            // 0x800BFA is the step machine's entry; its arg4 selects the step
+            // (1..8, >8 goes to the error path). Logging the entry shows whether the
+            // caller repeats the same step, which is what the 3->4->5->8 cycle looks
+            // like from the outside.
+            if (pc == 0x800BFAu) {
+                static u32 step_logged = 0;
+                if (step_logged < 40u) {
+                    ++step_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: step entry arg3=0x%X arg4=0x%X r1=0x%X r2=0x%X lp=0x%08X",
+                                     st->r[3], st->r[4], st->r[1], st->r[2], st->lp);
+                    }
+                }
+            }
+            if (pc == 0x800C2Eu) {
+                static u32 cmd_logged = 0;
+                if (cmd_logged < 40u) {
+                    ++cmd_logged;
+                    if (MePCore* st = dynamic_cast<MePCore*>(cmep_.get())) {
+                        ZLB_LOG_INFO("machine", "secure: dispatch cmd=%u (0x%X) r1=0x%X r2=0x%X lp=0x%08X",
+                                     st->r[3], st->r[3], st->r[1], st->r[2], st->lp);
+                    }
+                }
+            }
             return cmep_pc_hook(pc);
         };
     }
@@ -426,12 +581,66 @@ void Vita::wire_bridges() {
     // Smsched registers the reverse direction on GIC interrupts 200..203.
     cmep_block_->set_mailbox_irq_callbacks(
         [this](unsigned channel, bool asserted) {
+            // The secure kernel's step machine polls software flags that its
+            // interrupt handlers are supposed to set; a write trap on those flags
+            // shows nothing but the reset ever writes them. This log says whether
+            // the mailbox even raises the line that leads to those handlers.
+            static u32 irq_logged = 0;
+            if (asserted && irq_logged < 40u) {
+                ++irq_logged;
+                if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
+                    ZLB_LOG_INFO("machine",
+                                 "secure: mailbox irq to CMeP channel=%u isr=0x%08X imr=0x%08X psw=0x%X "
+                                 "seen=%llu taken=%llu last=%d",
+                                 channel, mep->interrupt_flag_register(), mep->interrupt_mask_register(),
+                                 mep->psw, static_cast<unsigned long long>(mep->irq_sources_seen),
+                                 static_cast<unsigned long long>(mep->irq_sources_taken), mep->irq_last_source);
+                }
+            }
             if (auto* mep = dynamic_cast<MePCore*>(cmep_.get())) {
                 mep->set_irq_level(8u + channel, asserted);
             }
         },
         [this](unsigned channel, bool asserted) {
             kermit_->raise_irq(200u + channel, asserted);
+            // Does the CMeP's post actually reach the ARM: is the GIC output line
+            // asserted, and is any core able to take it (CPSR.I clear)?
+            static u32 to_arm_logged = 0;
+            if (asserted && to_arm_logged < 40u) {
+                ++to_arm_logged;
+                ZLB_LOG_INFO("machine", "mailbox irq to ARM channel=%u gic_line=%d", channel,
+                             kermit_irq_line(*arm_bus_) ? 1 : 0);
+                for (size_t c = 0; c < arm_cores_.size(); ++c) {
+                    if (const ArmCore* ac = dynamic_cast<const ArmCore*>(arm_cores_[c].get())) {
+                        ZLB_LOG_INFO("machine", "   arm%zu pc=0x%08X cpsr=0x%08X IrqEnabled=%d halted=%d",
+                                     c, ac->get_pc(), ac->cpsr, (ac->cpsr & 0x80u) ? 0 : 1,
+                                     ac->halted ? 1 : 0);
+                    }
+                }
+                // The GIC decides whether the raised line can actually be taken.
+                kermit::Gic* gic = nullptr;
+                for (auto& dev : arm_bus_->devices()) {
+                    if (auto* candidate = dynamic_cast<kermit::Gic*>(dev.get())) {
+                        gic = candidate;
+                        break;
+                    }
+                }
+                if (gic != nullptr) {
+                    ZLB_LOG_INFO("machine", "   gic: line=%d cpuif0_enabled=%d pending_count=%u",
+                                 gic->line() ? 1 : 0, gic->cpu_interface(0).enabled() ? 1 : 0,
+                                 gic->distributor().pending_count());
+                    for (unsigned id = 200u; id < 204u; ++id) {
+                        ZLB_LOG_INFO("machine",
+                                     "   gic irq %u: en0=%d pend0=%d | en1=%d pend1=%d | en2=%d pend2=%d",
+                                     id, gic->distributor().enabled(id, 0) ? 1 : 0,
+                                     gic->distributor().pending(id, 0) ? 1 : 0,
+                                     gic->distributor().enabled(id, 1) ? 1 : 0,
+                                     gic->distributor().pending(id, 1) ? 1 : 0,
+                                     gic->distributor().enabled(id, 2) ? 1 : 0,
+                                     gic->distributor().pending(id, 2) ? 1 : 0);
+                    }
+                }
+            }
         });
 
     // The ARM also sees the syscon. The kernel boot loader writes the SC doorbell
@@ -503,6 +712,15 @@ void Vita::wire_bridges() {
     for (u32 base : {0x1A002000u, 0x34000000u, 0x36000000u}) {
         arm_bus_->add_device(std::make_unique<L2CacheController>(base));
     }
+
+    // Absolutely last: cover the windows the guest kernel's own device table declares
+    // and the model has no device for. It has to run after every real device and
+    // mirror above - a storage window is smaller than the block it would cover and
+    // Bus::find_device prefers the smallest window, so installing it earlier silently
+    // shadowed the shared SC window (Ernie.SC@mirror) and the CMeP secure kernel
+    // stopped advancing; and an earlier position also missed the PL310 blocks added
+    // just above.
+    kermit_->install_kernel_windows();
 }
 
 // ---------------------------------------------------------------------------
@@ -641,11 +859,26 @@ bool Vita::fit_parts() {
     cmep_block_->set_keyring_flags(3);
 
     boot_.stage = BootStage::ArmBootRom;
+    event_log_.event(EventProvider::Machine, ev::machine::kPartsFitted)
+        .field("emmc", emmc_ && emmc_->attached() ? path_filename(emmc_->path()) : std::string("none"))
+        .field("syscon", path_filename(firmware))
+        .field("first_loader", path_filename(first_loader))
+        .field("ok", ok)
+        .emit();
     return ok;
 }
 
 void Vita::reset(bool cold) {
     if (!built_) build();
+
+    // A reset starts a fresh trace, and the trace has to begin *here*: the core
+    // resets, the fitted parts and the first boot stage all happen below.
+    event_log_.clear();
+    event_log_.reset_activities();
+    event_stage_activity_ = 0;
+    event_stage_ = BootStage::PowerOn;
+    event_log_.event(EventProvider::Machine, ev::machine::kReset).field("cold", cold).emit();
+
     configure_arm_pc_trace();
     // Restore the boot-phase low SRAM backing before either cold or warm RAM
     // reset. Bus::reset() clears region.bytes(); leaving the secure-kernel alias
@@ -694,8 +927,11 @@ void Vita::reset(bool cold) {
     boot_.stage = BootStage::ArmBootRom;
     kernel_started_ = false;
     kernel_running_ = false;
+    nskbl_seen_ = false;
     milestones_.clear();
     events_.clear();
+
+    note_stage_change();
 
     // GPU/display self-test (round 191, ZLB_GPU_SELFTEST=1, off by default).
     // It is not part of the boot: it fills a scratch framebuffer with colour bars,
@@ -780,9 +1016,70 @@ u64 Vita::total_instructions() const {
 }
 
 double Vita::emulated_seconds() const {
+    // The machine's clock comes from the Kermit block, which is ticked exactly
+    // once per machine step/slice with the CPU cycles that step represents.  The
+    // old implementation read arm0's `cycles`, which stops the moment arm0 parks
+    // in WFE: `boot` then reported the same "emulated time" for the rest of the
+    // run (and `run_for` could never reach its target).  Fall back to the core
+    // only for a machine whose Kermit block has not been ticked yet.
+    if (kermit_) {
+        const u64 cycles = kermit_->total_cycles();
+        if (cycles != 0u) return static_cast<double>(cycles) / kArmClockHz;
+    }
     if (!arm_) return 0.0;
     return static_cast<double>(arm_->cycles) / kArmClockHz;
 }
+
+u64 Vita::emulated_nanoseconds() const {
+    // Same clock as emulated_seconds(), integer and overflow safe: the split form
+    // keeps cycles * 1e9 from overflowing for multi-hour runs.
+    constexpr u64 kClockHz = 333000000ull;
+    u64 cycles = 0;
+    if (kermit_) cycles = kermit_->total_cycles();
+    if (cycles == 0 && arm_) cycles = arm_->cycles;
+    return (cycles / kClockHz) * 1000000000ull + ((cycles % kClockHz) * 1000000000ull) / kClockHz;
+}
+
+namespace {
+void dump_pc_histogram_now(const char* when) {
+    for (int which = 0; which < 2; ++which) {
+        std::map<u32, u32>& map = which == 0 ? g_hist_arm_map : g_hist_cmep_map;
+        if (map.empty()) continue;
+        std::vector<std::pair<u32, u32>> rows(map.begin(), map.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        ZLB_LOG_INFO("machine", "PC histogram %s %s (top buckets, 4 KiB each):",
+                     which == 0 ? "ARM" : "CMeP", when);
+        for (size_t k = 0; k < rows.size() && k < 12u; ++k) {
+            ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                         rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
+        }
+        if (which == 1 && !g_hist_module.empty()) {
+            std::vector<std::pair<u32, u32>> mod(g_hist_module.begin(), g_hist_module.end());
+            std::sort(mod.begin(), mod.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            u64 total = 0;
+            for (const auto& r : mod) total += r.second;
+            ZLB_LOG_INFO("machine", "kprx_auth_sm range total samples: %llu (16-byte buckets)",
+                         static_cast<unsigned long long>(total));
+            for (size_t k = 0; k < mod.size() && k < 12u; ++k) {
+                ZLB_LOG_INFO("machine", "   module pc 0x%05X..0x%05X  %u samples",
+                             mod[k].first << 4, ((mod[k].first + 1u) << 4) - 1u, mod[k].second);
+            }
+        }
+        if (which == 1 && !g_hist_cmep_fine.empty()) {
+            std::vector<std::pair<u32, u32>> fine(g_hist_cmep_fine.begin(), g_hist_cmep_fine.end());
+            std::sort(fine.begin(), fine.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            ZLB_LOG_INFO("machine", "PC histogram CMeP fine %s (256-byte buckets):", when);
+            for (size_t k = 0; k < fine.size() && k < 15u; ++k) {
+                ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                             fine[k].first << 8, ((fine[k].first + 1u) << 8) - 1u, fine[k].second);
+            }
+        }
+    }
+}
+}  // namespace
 
 void Vita::run_slice() {
     const auto no_abort = []() { return false; };
@@ -795,6 +1092,45 @@ void Vita::run_slice() {
         cmep_->run(budget_.cmep, no_abort);
     }
 
+    {
+        static const bool hist_on = [] {
+            const char* v = std::getenv("ZLB_PC_HIST");
+            return v != nullptr && v[0] != '0';
+        }();
+        g_hist_on = hist_on;
+        static u64 slice_no = 0;
+        if (hist_on && (++slice_no % 250000u) == 0u) {
+            char when[48];
+            std::snprintf(when, sizeof(when), "at slice %llu", static_cast<unsigned long long>(slice_no));
+            if (MePCore* mcp = dynamic_cast<MePCore*>(cmep_.get())) {
+                // Full interrupt picture on the secure side: is anything pending, is it
+                // unmasked, and is the CPU actually allowed to take it (PSW.IEC)?
+                ZLB_LOG_INFO("machine",
+                             "CMeP IRQ counters %s: seen=%llu taken=%llu last=%d psw=0x%X "
+                             "isr=0x%08X imr=0x%08X pending=%d",
+                             when, static_cast<unsigned long long>(mcp->irq_sources_seen),
+                             static_cast<unsigned long long>(mcp->irq_sources_taken),
+                             mcp->irq_last_source, mcp->psw, mcp->interrupt_flag_register(),
+                             mcp->interrupt_mask_register(), mcp->cbus.pending_irq());
+            }
+            {
+                // ARM side: is the GIC output line asserted, and can each core take it?
+                const bool line = kermit_irq_line(*arm_bus_);
+                ZLB_LOG_INFO("machine", "ARM IRQ line %s: asserted=%d", when, line ? 1 : 0);
+                for (size_t c = 0; c < arm_cores_.size(); ++c) {
+                    if (arm_cores_[c] == nullptr) continue;
+                    if (const ArmCore* ac = dynamic_cast<const ArmCore*>(arm_cores_[c].get())) {
+                        ZLB_LOG_INFO("machine",
+                                     "ARM core %zu %s: pc=0x%08X cpsr=0x%08X Irq=%d Fiq=%d halted=%d",
+                                     c, when, ac->get_pc(), ac->cpsr,
+                                     (ac->cpsr & 0x80u) ? 0 : 1, (ac->cpsr & 0x40u) ? 0 : 1,
+                                     ac->halted ? 1 : 0);
+                    }
+                }
+            }
+            dump_pc_histogram_now(when);
+        }
+    }
     // The four Kermit cores are stepped *one instruction at a time*, round robin.
     // Giving each core a whole 32-instruction budget before switching (as this
     // did) breaks kernel_boot_loader's barrier at 0x4003B384: the core released
@@ -1047,6 +1383,867 @@ void Vita::run_slice() {
             }
             const u32 arm_pc = core->get_pc();
             arm_cov_mark(arm_pc);
+            // Ring of the most recent ARM PCs. When a module start returns the
+            // MODULEMGR_NO_LIB error the ring is dumped, deduplicated, so the path
+            // that produced the failure is visible (the loader's own code, not the
+            // ordinary resolution pass the persistent probes keep catching).
+            if (i < kArmTraceCores) {
+                g_arm_trace_ring[i][(g_arm_trace_pos[i]++) & (kArmTraceSize - 1u)] = arm_pc;
+            }
+            if (g_hist_on && (++g_hist_tick & 0xFFFu) == 0u) {
+                ++g_hist_arm_map[arm_pc >> 12];
+                if (cmep_ != nullptr) {
+                    const u32 cp = cmep_->get_pc();
+                    ++g_hist_cmep_map[cp >> 12];
+                    ++g_hist_cmep_fine[cp >> 8];
+                    // The staged secure module kprx_auth_sm lives at 0x80B000..0x80E000
+                    // (entry 0x80B000, one segment). Recording that range separately
+                    // shows whether the module's body ever runs and how far it gets.
+                    if (cp >= 0x80A000u && cp < 0x810000u) {
+                        ++g_hist_module[cp >> 4];
+                    }
+                }
+            }
+            // The core records undefined opcodes in last_undefined_instruction, but
+            // nothing in src/machine or src/debug ever looks at it - a guest hitting an
+            // opcode the model does not implement would fail silently. Report every new
+            // one: this is the direct test of "some instruction is handled wrongly".
+            if (i < kArmTraceCores) {
+                static u32 seen_undef[kArmTraceCores] = {};
+                if (const ArmCore* uc = dynamic_cast<const ArmCore*>(core)) {
+                    const u32 undef = uc->last_undefined_instruction;
+                    if (undef != 0u && undef != seen_undef[i]) {
+                        seen_undef[i] = undef;
+                        ZLB_LOG_INFO("machine",
+                                     "UNDEFINED opcode 0x%08X at pc=0x%08X core=%u (cpsr=0x%08X)",
+                                     undef, arm_pc, i, uc->cpsr);
+                    }
+                }
+            }
+            if (arm_pc >= 0x51000000u && arm_pc < 0x51100000u) pc_set_add(arm_pc);
+            nskbl_ring_add(i, arm_pc);
+            // All 25 NSKBL sites that build 0x80024501 (SCE_KERNEL_ERROR_INVALID_UID,
+            // SDK kernel/error.h:310). The failing module start returns that code, so
+            // whichever of them executes is the check that rejects a UID - in this
+            // branch the value is r6 = [r10+8].
+            {
+                static const u32 invalid_uid_sites[] = {
+                    0x51004A12u, 0x51004A2Au, 0x51004B26u, 0x51004B9Eu, 0x51004BC4u,
+                    0x51004C5Eu, 0x51004FBCu, 0x51004FCEu, 0x5100509Au, 0x51005172u,
+                    0x510052A2u, 0x510052ACu, 0x510052CEu, 0x510052D8u, 0x510052F8u,
+                    0x510053B4u, 0x51005420u, 0x510055BAu, 0x510055DEu, 0x510055E8u,
+                    0x5100560Au, 0x51005646u, 0x51005650u, 0x510056C0u, 0x51016CFAu,
+                };
+                for (u32 site : invalid_uid_sites) {
+                    if (arm_pc != site) continue;
+                    static u32 site_logged = 0;
+                    if (site_logged < 20u) {
+                        ++site_logged;
+                        if (const ArmCore* uid_core = dynamic_cast<const ArmCore*>(core)) {
+                            uid_ring_add(arm_pc, uid_core->r[6]);
+                        }
+                    }
+                    break;
+                }
+            }
+            // The module-start failure ends at 0x51005172, which returns
+            // 0x80024501 = SCE_KERNEL_ERROR_INVALID_UID (SDK kernel/error.h line 310).
+            // r6 was loaded from [r10+8] at 0x51005162 and is the UID being rejected:
+            // its bits 0x500000 and 0xA00000 are clear on the failing path.
+            // Division results: 0x5100B84C follows "blx 0x510258D0" (r0 = table base,
+            // r1 = count) in the UID lookup, and 0x5100B856 follows the second call
+            // (r0 = class index, r1 = the first result). Compare both with theory.
+            if (arm_pc == 0x5100B84Cu || arm_pc == 0x5100B856u) {
+                static u32 div_logged = 0;
+                if (div_logged < 20u) {
+                    ++div_logged;
+                    if (const ArmCore* dv = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "div result at 0x%08X: r0=0x%08X r1=0x%08X r2=0x%08X",
+                                     arm_pc, dv->r[0], dv->r[1], dv->r[2]);
+                    }
+                }
+            }
+            // 0x510258D0 is the software division the UID lookup uses for its bucket
+            // index. It starts with "clz r3,r0" at 0x510258EC and "clz r2,r1" at
+            // 0x510258F0, so probing 0x510258F0 (r0 = dividend, r3 = clz(r0)) and
+            // 0x510258F4 (r1 = divisor, r2 = clz(r1)) checks CLZ against theory.
+            if (arm_pc == 0x510258F0u || arm_pc == 0x510258F4u) {
+                static u32 clz_logged = 0;
+                if (clz_logged < 24u) {
+                    ++clz_logged;
+                    if (const ArmCore* cz = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "clz probe 0x%08X: r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X",
+                                     arm_pc, cz->r[0], cz->r[1], cz->r[2], cz->r[3]);
+                    }
+                }
+            }
+            // 0x51004A04 is "ubfx r1,r1,#1,#1": log r1 on entry and on the next
+            // instruction, so the extracted value can be compared with the expected
+            // (uid >> 1) & 1.
+            if (arm_pc == 0x51004A04u || arm_pc == 0x51004A08u) {
+                static u32 bfx_logged = 0;
+                if (bfx_logged < 14u) {
+                    ++bfx_logged;
+                    if (const ArmCore* bf = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "ubfx step 0x%08X: r1=0x%08X r4(uid)=0x%08X",
+                                     arm_pc, bf->r[1], bf->r[4]);
+                    }
+                }
+            }
+            // 0x51004A04 is "ubfx r1,r1,#1,#1" (extract the UID class bit) and
+            // 0x51004A0A is the "bl 0x5100B82C" lookup that uses it. r1 must be
+            // (uid >> 1) & 1 on entry to the lookup - for uid 0x200F3 that is 1.
+            if (arm_pc == 0x51004A0Au) {
+                static u32 class_logged = 0;
+                if (class_logged < 10u) {
+                    ++class_logged;
+                    if (const ArmCore* cls = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "uid lookup: class(r1)=0x%X uid(r4)=0x%08X r2=0x%08X",
+                                     cls->r[1], cls->r[4], cls->r[2]);
+                    }
+                }
+            }
+            // Opcode sanity: 0x51004A12/0x51004A16 are "movw r0,#0x4501" then
+            // "movt r0,#0x8002"; 0x51004A1A is the instruction after them, so r0 must
+            // be 0x80024501 there if movw/movt execute correctly. Likewise 0x51004A22
+            // compares the requested UID (r4) with the record's UID (r0).
+            if (arm_pc == 0x51004A1Au || arm_pc == 0x51004A22u) {
+                static u32 op_logged = 0;
+                if (op_logged < 16u) {
+                    ++op_logged;
+                    if (const ArmCore* op = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "opcode check at 0x%08X: r0=0x%08X r4=0x%08X",
+                                     arm_pc, op->r[0], op->r[4]);
+                    }
+                }
+            }
+            // 0x51004A0E is the "cmp r0,#0" right after the UID lookup at 0x51004A0A:
+            // r0 is the lookup result and r4 the UID being validated. Recording both
+            // shows which UID fails, which is the object the model never created.
+            if (arm_pc == 0x51004A0Eu) {
+                if (const ArmCore* lk = dynamic_cast<const ArmCore*>(core)) {
+                    uid_ring_add(0x51004A0Eu, lk->r[4]);
+                    uid_ring_result(g_uid_ring_pos - 1u, lk->r[0]);
+                }
+            }
+            if (arm_pc == 0x51005172u) {
+                static u32 uid_logged = 0;
+                if (uid_logged < 12u) {
+                    ++uid_logged;
+                    if (const ArmCore* uid_core = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine",
+                                     "module: INVALID_UID at 0x51005172 r6(uid)=0x%08X r10=0x%08X r5=0x%08X r7=0x%08X",
+                                     uid_core->r[6], uid_core->r[10], uid_core->r[5], uid_core->r[7]);
+                    }
+                }
+            }
+            // The registry filler is a block copy whose store is
+            // "strd r4, r5, [r3], #8" at 0x51011D00. Probe its entry and the next
+            // instruction: r3 must advance by exactly 8 (a post-increment bug of 4
+            // would shift every copied record by one word - exactly the observed
+            // off-by-one in the module UIDs).
+            if (arm_pc == 0x51011D00u || arm_pc == 0x51011D04u) {
+                static u32 strd_logged = 0;
+                if (strd_logged < 24u) {
+                    ++strd_logged;
+                    if (const ArmCore* sd = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "strd probe 0x%08X: r1=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r2=0x%08X",
+                                     arm_pc, sd->r[1], sd->r[3], sd->r[4], sd->r[5], sd->r[2]);
+                    }
+                }
+            }
+            // Experiment: when a module start returns a negative result, the loader's
+            // loop at 0x510013F0 does "cmp r0,#0; bge continue" and otherwise stops.
+            // With ZLB_IGNORE_MODULE_ERR=1 the negative result is replaced by 0 so the
+            // loop keeps going - this shows whether the first failure is the only
+            // obstacle or merely the first one.
+            if (arm_pc == 0x510013F0u) {
+                static const bool ignore_err = [] {
+                    const char* v = std::getenv("ZLB_IGNORE_MODULE_ERR");
+                    return v != nullptr && v[0] != '0';
+                }();
+                if (ignore_err) {
+                    if (ArmCore* ic = dynamic_cast<ArmCore*>(core)) {
+                        if ((ic->r[0] & 0x80000000u) != 0u) {
+                            ZLB_LOG_INFO("machine", "module error 0x%08X ignored at 0x%08X",
+                                         ic->r[0], arm_pc);
+                            ic->r[0] = 0u;
+                        }
+                    }
+                }
+            }
+            // All calls to the validator 0x510049F4, with the object it is handed (r0)
+            // and the UID (r1), to see whether every caller passes the same kind of
+            // object or whether some pass a different one.
+            if (arm_pc == 0x510049F4u) {
+                static u32 all_logged = 0;
+                if (all_logged < 40u) {
+                    ++all_logged;
+                    if (const ArmCore* av = dynamic_cast<const ArmCore*>(core)) {
+                        ZLB_LOG_INFO("machine", "validator any: obj=0x%08X uid=0x%08X lr=0x%08X",
+                                     av->r[0], av->r[1], av->r[14]);
+                    }
+                }
+            }
+            // 0x510049F4 is the UID validator: r0 = the table it is handed, r1 = the
+            // UID to validate. Log only the UIDs that matter here - 0x200F3 (ss_mgr)
+            // and 0x200F9 (sdif) - so the table each lookup uses is identifiable.
+            if (arm_pc == 0x510049F4u) {
+                static u32 val_logged = 0;
+                if (val_logged < 24u) {
+                    if (const ArmCore* vc = dynamic_cast<const ArmCore*>(core)) {
+                        const u32 uid = vc->r[1];
+                        if (uid == 0x200F3u || uid == 0x200F9u || uid == 0x200EDu) {
+                            ++val_logged;
+                            // r2 points at the out word. The kernel's low VAs map to
+                            // PA = VA + 0x40300000 (verified: VA 0x60C0 -> PA 0x403060C0),
+                            // so the value left by the *previous* validation can be read
+                            // from RAM directly - no MMU involvement (see the round-49
+                            // lesson about probes perturbing the machine).
+                            u32 out_word = 0xDEADBEEFu;
+                            const u32 out_pa = vc->r[2] + 0x40300000u;
+                            if (out_pa >= 0x40000000u && out_pa < 0x44000000u) {
+                                out_word = arm_bus_->read32(out_pa);
+                            }
+                            ZLB_LOG_INFO("machine",
+                                         "validator call: uid=0x%08X table=0x%08X lr=0x%08X prev_out=0x%08X",
+                                         uid, vc->r[0], vc->r[14], out_word);
+                        }
+                    }
+                }
+            }
+            // Secure World question: does anything ever hand the ARM over to its
+            // TrustZone side? Count instructions per mode and report the first time
+            // each mode is seen. USR/SVC/SYS/IRQ/FIQ/ABT/UND/MON, and the monitor
+            // mode only runs if some code issued SMC.
+            if (const ArmCore* mode_core = dynamic_cast<const ArmCore*>(core)) {
+                static u64 mode_counts[32] = {};
+                static u32 modes_logged = 0;
+                const u32 mode_now = mode_core->mode() & 0x1Fu;
+                if (mode_now < 32u) {
+                    ++mode_counts[mode_now];
+                    if (mode_counts[mode_now] == 1u && modes_logged < 12u) {
+                        ++modes_logged;
+                        ZLB_LOG_INFO("machine", "arm: first instruction in mode 0x%02X (pc=0x%08X core=%d)",
+                                     mode_now, arm_pc, i);
+                    }
+                }
+                // Periodic per-mode census: shows whether the Secure World keeps
+                // being entered after the early boot, and how often.
+                static u64 mode_total = 0;
+                static u32 mode_reports = 0;
+                if (++mode_total % 200000000ull == 0ull && mode_reports < 8u) {
+                    ++mode_reports;
+                    ZLB_LOG_INFO("machine",
+                                 "arm modes: SVC=%llu IRQ=%llu FIQ=%llu SYS=%llu MON=%llu USR=%llu (total=%llu)",
+                                 static_cast<unsigned long long>(mode_counts[0x13]),
+                                 static_cast<unsigned long long>(mode_counts[0x12]),
+                                 static_cast<unsigned long long>(mode_counts[0x11]),
+                                 static_cast<unsigned long long>(mode_counts[0x1F]),
+                                 static_cast<unsigned long long>(mode_counts[0x16]),
+                                 static_cast<unsigned long long>(mode_counts[0x10]),
+                                 static_cast<unsigned long long>(mode_total));
+                }
+            }
+            // Diagnostic (ZLB_MODULE_LOG=1): NSKBL's native module-start loop.  The
+            // remaining boot gap is that only 22 of the 28 modules the bootconfig
+            // lists are ever started (docs/STATUS.md), so this logs both sides of the
+            // question: every slot the loop pulls out of its UID array (`r5` walks it
+            // with `ldr r9/r10, [r5], #4`) and every entry into the start helper
+            // 0x510194C0, whose argument is the module UID.  A loaded-but-skipped
+            // module then shows up as a slot with no matching start.  Read-only: it
+            // inspects registers and never touches the core's state.
+            static const bool module_log = [] {
+                const char* value = std::getenv("ZLB_MODULE_LOG");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            if (module_log) {
+                // Where a core goes idle is where its current thread was parked.  The
+                // module-start thread is abandoned once (round 5/6: 22 starts, 21
+                // returns, and 12M further slices start nothing), so dumping the last
+                // few pcs of every core when it enters the kernel idle loop names the
+                // parking path - the missing piece for "what is the thread waiting on".
+                static u32 idle_ring[kArmCoreCount][8] = {};
+                static u32 idle_ring_at[kArmCoreCount] = {};
+                static u32 idle_logged = 0;
+                // Only interesting once the module phase has begun: the early kernel
+                // init uses the same wfe wait loop, and it must not eat the budget.
+                static bool any_module_start = false;
+                // The interesting window is *after* the last start (UID 0x200ED, the
+                // 22nd); the earlier counters were exhausted long before it, so the
+                // aftermath went unlogged.  This mirrors the count in the loop below.
+                static u32 starts_seen = 0;
+                if (i < static_cast<int>(kArmCoreCount)) {
+                    const u32* ring = idle_ring[i];
+                    const u32 next = idle_ring_at[i]++;
+                    idle_ring[i][next & 7u] = arm_pc;
+                    if (arm_pc == 0x47969Cu && i == 0 && starts_seen >= 22u && idle_logged < 40u &&
+                        ring[(next + 7u) & 7u] != 0x47969Cu) {
+                        ++idle_logged;
+                        std::string path;
+                        for (u32 k = 0; k < 8u; ++k) {
+                            path += format(" %08X", ring[(next + 1u + k) & 7u]);
+                        }
+                        ZLB_LOG_INFO("machine", "module: core %d idle entry #%u from%s", i, idle_logged,
+                                     path.c_str());
+                    }
+                    // The kernel thread switcher restores a thread's context here; the
+                    // pointer (r1) names the thread's control block, which is how the
+                    // parked module-start thread can be found and its saved pc read.
+                    static u32 restore_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x000EC848u && restore_logged < 12u) {
+                        ++restore_logged;
+                        const ArmCore* ctx_arm = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 context restore #%u from=0x%08X ptr=0x%08X sp=0x%08X lr=0x%08X",
+                                     restore_logged, ctx_arm != nullptr ? ctx_arm->r[4] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[1] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[13] : 0u,
+                                     ctx_arm != nullptr ? ctx_arm->r[14] : 0u);
+                    }
+                    // 0x4394CE loads the queue object the library links the op into:
+                    // r8 = [op+0x20], a doubly-linked list with head [r8] and tail [r8+4].
+                    // Knowing the queue address says whether anything ever consumes it.
+                    static u32 q_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004394CEu && q_logged < 4u) {
+                        ++q_logged;
+                        const ArmCore* qc = dynamic_cast<const ArmCore*>(core);
+                        if (qc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: DMA queue op=0x%08X queue=0x%08X (r8) head=0x%08X",
+                                         qc->r[4], qc->r[8], 0u);
+                        }
+                    }
+                    // Trace the enqueue itself: from its call site (0x5BE956) until it
+                    // returns (0x5BE95A). That shows how the DMA library reaches the kernel
+                    // to submit an operation, and where the transfer should be started.
+                    static bool enq_trace = false;
+                    static u32 enq_seen[220];
+                    static u32 enq_count = 0;
+                    static u32 enq_logged2 = 0;
+                    if (starts_seen >= 22u && i == 0) {
+                        if (arm_pc == 0x005BE956u) {
+                            enq_trace = true;
+                            enq_count = 0;
+                        } else if (enq_trace && arm_pc == 0x005BE95Au) {
+                            enq_trace = false;
+                        } else if (enq_trace && enq_count < 220u) {
+                            bool known = false;
+                            for (u32 k = 0; k < enq_count; ++k) {
+                                if (enq_seen[k] == arm_pc) {
+                                    known = true;
+                                    break;
+                                }
+                            }
+                            if (!known) {
+                                enq_seen[enq_count++] = arm_pc;
+                                if (enq_logged2 < 220u) {
+                                    ++enq_logged2;
+                                    ZLB_LOG_INFO("machine", "module: enqueue pc #%u 0x%08X", enq_logged2, arm_pc);
+                                }
+                            }
+                        }
+                    }
+                    // The sibling entry 0x4ADD9C shares 0x4AD714 but passes flag 1. Probing
+                    // both shows which service each of the module's DMA calls reaches.
+                    static u32 sys2_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004ADD9Cu && sys2_logged < 16u) {
+                        ++sys2_logged;
+                        const ArmCore* sc2 = dynamic_cast<const ArmCore*>(core);
+                        if (sc2 != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: syscall 0x4ADD9C #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X",
+                                         sys2_logged, sc2->r[0], sc2->r[1], sc2->r[2], sc2->r[3], sc2->r[14]);
+                        }
+                    }
+                    // The other three sites that build 0x8002D003 are in the KBL's loader
+                    // (VA 0x40024CF8, 0x40024D82, 0x40024DC2), which NSKBL reuses when it
+                    // resolves a module's imports. Probing them catches the failing lookup.
+                    static u32 kbl_logged = 0;
+                    if ((arm_pc == 0x40024CF8u || arm_pc == 0x40024D82u || arm_pc == 0x40024DC2u) &&
+                        kbl_logged < 8u) {
+                        ++kbl_logged;
+                        ArmCore* kb = dynamic_cast<ArmCore*>(core);
+                        if (kb != nullptr) {
+                            // r0 names the structure the lookup is working on (a bootconfig
+                            // library record, later consumed and zeroed). Dump its first
+                            // words and, if one points at a name string, the string itself.
+                            u32 words[4] = {0, 0, 0, 0};
+                            std::string text;
+                            // Try every register as a pointer: the loader's lookup takes
+                            // the library name (or a record holding it) in one of r0..r3,
+                            // and this fires at the moment it is live.
+                            auto read_string_at = [&](u32 va, char* buf, size_t cap) -> bool {
+                                if (va < 0x1000u || va > 0x0FFFFFFFu) return false;
+                                const arm::MmResult r = kb->mmu.translate(va, false, false, kb->mode());
+                                if (!r.ok) return false;
+                                size_t c = 0;
+                                for (; c + 1u < cap; ++c) {
+                                    const char ch =
+                                        static_cast<char>(arm_bus_->read32(r.phys_addr + c) & 0xFFu);
+                                    if (ch < 32 || ch > 126) break;
+                                    buf[c] = ch;
+                                }
+                                buf[c] = '\0';
+                                return c >= 4u;
+                            };
+                            for (u32 k = 0; k < 4u; ++k) {
+                                const arm::MmResult r =
+                                    kb->mmu.translate(kb->r[k], false, false, kb->mode());
+                                if (r.ok) words[k] = arm_bus_->read32(r.phys_addr);
+                            }
+                            char buf[48];
+                            for (u32 k = 0; k < 4u && text.empty(); ++k) {
+                                if (read_string_at(kb->r[k], buf, sizeof(buf))) text = buf;
+                            }
+                            for (u32 w = 0; w < 4u && text.empty(); ++w) {
+                                const u32 candidate = words[w];
+                                for (u32 delta = 0; delta <= 0x40u && text.empty(); delta += 4u) {
+                                    if (read_string_at(candidate + delta, buf, sizeof(buf))) text = buf;
+                                }
+                            }
+                            ZLB_LOG_INFO("machine",
+                                         "module: NO_LIB(KBL) at 0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X "
+                                         "words=[0x%08X 0x%08X 0x%08X 0x%08X] text=\"%s\"",
+                                         arm_pc, kb->r[0], kb->r[1], kb->r[2], kb->r[3], kb->r[14],
+                                         words[0], words[1], words[2], words[3], text.c_str());
+                        }
+                    }
+                    // The code that builds SCE_KERNEL_ERROR_MODULEMGR_NO_LIB (0x8002D003)
+                    // lives at PA 0x407252F0/0x40725378, which maps to VA ~0x5992F0 in the
+                    // module loaded at 0x590000. Probing it shows what the failing lookup
+                    // was holding - the library name pointer in particular.
+                    static u32 nolib_logged = 0;
+                    if ((arm_pc == 0x0058D2F0u || arm_pc == 0x0058D378u) && nolib_logged < 8u) {
+                        ++nolib_logged;
+                        const ArmCore* nb = dynamic_cast<const ArmCore*>(core);
+                        if (nb != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: NO_LIB site 0x%08X r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X core=%d",
+                                         arm_pc, nb->r[0], nb->r[1], nb->r[2], nb->r[3], nb->r[14], i);
+                        }
+                    }
+                    // Trace a module start end to end: from the helper's call (0x510194FE)
+                    // to its return (0x51019502). Start #23 (sdif.skprx) fails with
+                    // MODULEMGR_NO_LIB inside this window, so the distinct code addresses
+                    // are what shows where the import resolution gives up.
+                    static bool start_trace = false;
+                    static u32 start_seen[300];
+                    static u32 start_count = 0;
+                    static u32 start_logged = 0;
+                    if (arm_pc == 0x510194FEu && !start_trace) {
+                        start_trace = true;
+                        start_count = 0;
+                    } else if (start_trace && arm_pc == 0x51019502u) {
+                        start_trace = false;
+                    } else if (start_trace && start_count < 300u) {
+                        bool known = false;
+                        for (u32 k = 0; k < start_count; ++k) {
+                            if (start_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            start_seen[start_count++] = arm_pc;
+                            if (start_logged < 300u) {
+                                ++start_logged;
+                                ZLB_LOG_INFO("machine", "module: start pc #%u 0x%08X", start_logged, arm_pc);
+                            }
+                        }
+                    }
+                    // 0x510194C0 is NSKBL's module-start helper; its arguments carry the
+                    // entry point of the module being started, which is how a failing
+                    // module (sdif.skprx at start #23) can be located.
+                    static u32 helper_logged = 0;
+                    if (arm_pc == 0x510194C0u && helper_logged < 40u) {
+                        ++helper_logged;
+                        const ArmCore* hc = dynamic_cast<const ArmCore*>(core);
+                        if (hc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: start helper #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X core=%d",
+                                         helper_logged, hc->r[0], hc->r[1], hc->r[2], hc->r[3], i);
+                        }
+                    }
+                    // ksceKernelSetEventFlag is implemented at 0x4ADEA8 (the stub 0x43AD88
+                    // jumps there). If the DMA completion really signals the flag the
+                    // parked thread waits on, this call must carry r0 = 0x10AB9.
+                    static u32 sef_logged = 0;
+                    if (arm_pc == 0x004ADEA8u && sef_logged < 8u) {
+                        ++sef_logged;
+                        const ArmCore* sf = dynamic_cast<const ArmCore*>(core);
+                        if (sf != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: SetEventFlag #%u uid=0x%08X bits=0x%08X core=%d t=%.6f",
+                                         sef_logged, sf->r[0], sf->r[1], i, emulated_seconds());
+                        }
+                    }
+                    // Trace the guest's DMA interrupt handler: from its entry (0x438790)
+                    // to its tail (0x43879C), collecting the distinct code addresses and
+                    // the argument the kernel passes in r0.
+                    static bool isr_trace = false;
+                    static u32 isr_seen[200];
+                    static u32 isr_count = 0;
+                    static u32 isr_logged = 0;
+                    if (arm_pc == 0x00438790u && !isr_trace) {
+                        isr_trace = true;
+                        isr_count = 0;
+                        const ArmCore* ia = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine", "module: DMA ISR entry r0=0x%08X r1=0x%08X core=%d",
+                                     ia != nullptr ? ia->r[0] : 0u, ia != nullptr ? ia->r[1] : 0u, i);
+                    } else if (isr_trace && arm_pc == 0x0043879Cu) {
+                        isr_trace = false;
+                    } else if (isr_trace && isr_count < 200u) {
+                        bool known = false;
+                        for (u32 k = 0; k < isr_count; ++k) {
+                            if (isr_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            isr_seen[isr_count++] = arm_pc;
+                            if (isr_logged < 200u) {
+                                ++isr_logged;
+                                ZLB_LOG_INFO("machine", "module: ISR pc #%u 0x%08X", isr_logged, arm_pc);
+                            }
+                        }
+                    }
+                    // The DMA library registered handler 0x438791 for the channel IRQs
+                    // (0x70..0x7F). Whether the guest actually takes the interrupt the
+                    // model pulses is what the completion experiment turns on.
+                    static u32 dmairq_logged = 0;
+                    if (arm_pc == 0x00438790u && dmairq_logged < 8u) {
+                        ++dmairq_logged;
+                        ZLB_LOG_INFO("machine", "module: DMA irq handler 0x438790 ran #%u core=%d t=%.6f",
+                                     dmairq_logged, i, emulated_seconds());
+                    }
+                    // ksceKernelRegisterIntrHandler is implemented at 0xED29C (the stub
+                    // 0x43ACF8 jumps there). Its arguments name the interrupt a driver
+                    // wants - the DMA library's own registration is what says which IRQ
+                    // its completion handler runs on.
+                    static u32 intr_logged = 0;
+                    if (arm_pc == 0x000ED29Cu && intr_logged < 64u) {
+                        ++intr_logged;
+                        const ArmCore* ic = dynamic_cast<const ArmCore*>(core);
+                        if (ic != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: RegisterIntrHandler #%u irq=0x%02X name=0x%08X r2=0x%08X handler=0x%08X "
+                                         "arg=[sp]=0x%08X [sp+4]=0x%08X lr=0x%08X core=%d",
+                                         intr_logged, ic->r[0], ic->r[1], ic->r[2], ic->r[3],
+                                         arm_bus_->read32(static_cast<u32>(ic->r[13])),
+                                         arm_bus_->read32(static_cast<u32>(ic->r[13]) + 4u), ic->r[14], i);
+                        }
+                    }
+                    // 0x4ADD88 is where the library's syscall trampoline (0x43AD28) lands in
+                    // the kernel. Its arguments name the service the DMA library asks for -
+                    // and therefore what the parked thread is really waiting on.
+                    static u32 sys_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004ADD88u && sys_logged < 16u) {
+                        ++sys_logged;
+                        const ArmCore* sc = dynamic_cast<const ArmCore*>(core);
+                        if (sc != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: syscall 0x4ADD88 #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X lr=0x%08X",
+                                         sys_logged, sc->r[0], sc->r[1], sc->r[2], sc->r[3], sc->r[14]);
+                        }
+                    }
+                    // What the kernel actually does between "the DMA operation was
+                    // queued" (0x5BE95A) and "the thread parks": collect the distinct
+                    // code addresses of that window.  1 ms of guest time is thousands
+                    // of instructions, but the distinct set stays small and names the
+                    // functions involved.
+                    static bool trace_window = false;
+                    static u32 window_seen[400];
+                    static u32 window_count = 0;
+                    static u32 window_logged = 0;
+                    if (arm_pc == 0x005BE95Au && starts_seen >= 22u && i == 0) {
+                        trace_window = true;
+                        window_count = 0;
+                    }
+                    if (trace_window && i == 0) {
+                        bool known = false;
+                        for (u32 k = 0; k < window_count; ++k) {
+                            if (window_seen[k] == arm_pc) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known && window_count < 400u) {
+                            window_seen[window_count++] = arm_pc;
+                            if (window_logged < 400u) {
+                                ++window_logged;
+                                ZLB_LOG_INFO("machine", "module: post-enqueue pc #%u 0x%08X t=%.6f",
+                                             window_logged, arm_pc, emulated_seconds());
+                            }
+                        }
+                    }
+                    // 0x5BE95A is the instruction right after the display module's
+                    // ksceKernelDmaOpEnQueue call, so r0 there is that call's return
+                    // value: it decides whether the operation was really queued.
+                    static u32 enq_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x005BE95Au && enq_logged < 6u) {
+                        ++enq_logged;
+                        const ArmCore* eq = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine", "module: DmaOpEnQueue returned 0x%08X (t=%.6f)",
+                                     eq != nullptr ? eq->r[0] : 0u, emulated_seconds());
+                    }
+                    // 0x4399CA is the import wrapper the display module reaches before the
+                    // syscall trampoline (0x43AD28) and the kernel. Its r0 names the import
+                    // slot and its LR names the module's call site, which is what identifies
+                    // the service the module is blocked on.
+                    static u32 imp_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004399CAu && imp_logged < 24u) {
+                        ++imp_logged;
+                        const ArmCore* im = dynamic_cast<const ArmCore*>(core);
+                        if (im != nullptr) {
+                            ZLB_LOG_INFO("machine", "module: import wrapper #%u r0=0x%08X r1=0x%08X r2=0x%08X lr=0x%08X",
+                                         imp_logged, im->r[0], im->r[1], im->r[2], im->r[14]);
+                        }
+                    }
+                    // The kernel routine that ends up parking the thread is 0x4AE710
+                    // (six arguments). Its arguments and its caller name the operation
+                    // the module initialisation is blocked on, which is the one thing
+                    // left unidentified.
+                    static u32 enter_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x004AE710u && enter_logged < 8u) {
+                        ++enter_logged;
+                        const ArmCore* en = dynamic_cast<const ArmCore*>(core);
+                        if (en != nullptr) {
+                            ZLB_LOG_INFO("machine",
+                                         "module: park entry #%u r0=0x%08X r1=0x%08X r2=0x%08X r3=0x%08X "
+                                         "s52=0x%08X s56=0x%08X lr=0x%08X",
+                                         enter_logged, en->r[0], en->r[1], en->r[2], en->r[3],
+                                         arm_bus_->read32(static_cast<u32>(en->r[13]) + 52u),
+                                         arm_bus_->read32(static_cast<u32>(en->r[13]) + 56u), en->r[14]);
+                        }
+                    }
+                    // The wait descriptor at VA 0x0030FA80 (=[TCB+0x0C]) carries two code
+                    // pointers - 0x0048E55C and 0x0049F5D8 - which is where a completion
+                    // would land. Whether they ever execute after the park decides
+                    // between "the wake never comes" and "the wake ran but did not
+                    // resume the thread".
+                    static u32 callback_logged = 0;
+                    if (starts_seen >= 22u && callback_logged < 24u &&
+                        (arm_pc == 0x0048E55Cu || arm_pc == 0x0049F5D8u)) {
+                        ++callback_logged;
+                        ZLB_LOG_INFO("machine", "module: wait callback 0x%08X ran at t=%.6f core=%d",
+                                     arm_pc, emulated_seconds(), i);
+                    }
+                    // The abandoned thread's stack is 0x7D000..0x80000 (TCB+0xDC/+0xE0).
+                    // Any execution with SP inside it means that thread is running, so a
+                    // coarse timeline of such samples answers "did it ever come back".
+                    static double stack_last = -1.0;
+                    static u32 stack_logged = 0;
+                    if (starts_seen >= 22u && stack_logged < 40u) {
+                        const ArmCore* st_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 sp = st_arm != nullptr ? st_arm->r[13] : 0u;
+                        if (sp >= 0x0007D000u && sp < 0x00080000u) {
+                            const double now = emulated_seconds();
+                            if (stack_last < 0.0 || now - stack_last >= 0.05) {
+                                stack_last = now;
+                                ++stack_logged;
+                                ZLB_LOG_INFO("machine", "module: thread-stack sample #%u t=%.6f pc=0x%08X sp=0x%08X core=%d",
+                                             stack_logged, now, arm_pc, sp, i);
+                            }
+                        }
+                    }
+                    // The park site itself: 0x4A93F0 is the call into the kernel thread
+                    // switcher (0x4A3D94 -> 0xEC8AC) with r4 = TPIDRPRW, the current
+                    // thread structure, and [r4+12]/[r4+16] as the wait arguments.
+                    // Logging r4 names the object the abandoned thread waits on.
+                    static u32 park_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A93F0u && park_logged < 60u) {
+                        ++park_logged;
+                        const ArmCore* park_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 tcb = park_arm != nullptr ? park_arm->r[4] : 0u;
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 park #%u t=%.6f TCB=0x%08X sp=0x%08X obj=0x%08X",
+                                     park_logged, emulated_seconds(), tcb,
+                                     park_arm != nullptr ? park_arm->r[13] : 0u,
+                                     park_arm != nullptr ? park_arm->r[0] : 0u);
+                    }
+                    // What the waiting thread asked for: 0x4A9384 is the entry of the
+                    // kernel wait function; r0/r1 are its arguments and LR names the
+                    // caller, which is the operation the module-start thread blocks on.
+                    static u32 waitcall_logged = 0;
+                    if (starts_seen >= 22u && i == 0 && arm_pc == 0x4A9384u && waitcall_logged < 6u) {
+                        ++waitcall_logged;
+                        const ArmCore* wc = dynamic_cast<const ArmCore*>(core);
+                        ZLB_LOG_INFO("machine",
+                                     "module: core 0 wait call #%u r0=0x%08X r1=0x%08X lr=0x%08X sp=0x%08X",
+                                     waitcall_logged, wc != nullptr ? wc->r[0] : 0u,
+                                     wc != nullptr ? wc->r[1] : 0u, wc != nullptr ? wc->r[14] : 0u,
+                                     wc != nullptr ? wc->r[13] : 0u);
+                    }
+                    // Coarse whereabouts of core 0 after the module phase began: every
+                    // 200k executions the pc is logged, which shows whether the
+                    // abandoned thread stays in one loop or moves through the kernel.
+                    static u64 where_tick = 0;
+                    static u32 where_logged = 0;
+                    if (any_module_start && i == 0 && (++where_tick % 2000000ull) == 0ull &&
+                        where_logged < 60u) {
+                        ++where_logged;
+                        ZLB_LOG_INFO("machine", "module: core 0 pc sample %u: 0x%08X", where_logged, arm_pc);
+                    }
+                    // 0x47AE92 is the body of the kernel's wfe wait loop
+                    // (while [r4+4] > 0).  r4 is the object being waited on, so naming
+                    // it (and the counter's value) says *what* the parked thread waits
+                    // for; the two halves at +4/+6 are the same pair NSKBL's spinlock
+                    // 0x51015874 uses.
+                    static u32 wait_logged = 0;
+                    if (arm_pc == 0x47AE92u && i == 0 && starts_seen >= 22u && wait_logged < 400u) {
+                        ++wait_logged;
+                        const ArmCore* wait_arm = dynamic_cast<const ArmCore*>(core);
+                        const u32 obj = wait_arm != nullptr ? wait_arm->r[4] : 0u;
+                        const u32 ctr = wait_arm != nullptr ? wait_arm->r[6] : 0u;
+                        ZLB_LOG_INFO("machine", "module: core 0 wfe-wait #%u object=0x%08X (+4=0x%08X)",
+                                     wait_logged, obj, ctr);
+                    }
+                }
+                static u32 nskbl_last[kArmCoreCount] = {0, 0, 0, 0};
+                if (i < static_cast<int>(kArmCoreCount)) {
+                    const bool in_nskbl = arm_pc >= 0x51000000u && arm_pc < 0x51100000u;
+                    static bool was_in_nskbl[kArmCoreCount] = {false, false, false, false};
+                    if (in_nskbl) {
+                        nskbl_last[i] = arm_pc;
+                        was_in_nskbl[i] = true;
+                    } else if (was_in_nskbl[i]) {
+                        was_in_nskbl[i] = false;
+                        ZLB_LOG_INFO("machine", "module: core %d left NSKBL at 0x%08X -> 0x%08X", i,
+                                     nskbl_last[i], arm_pc);
+                    }
+                }
+                // 0x510012F4 is the batch entry (r0=records, r1=UID array, r2=count);
+                // 0x51001326 / 0x51001368 / 0x5100139C follow the three UID loads in
+                // it - the UID is in r9 at the first and in r10 at the other two;
+                // 0x510194C0 is the start helper.
+                const bool batch = arm_pc == 0x510012F4u;
+                const bool slot = arm_pc == 0x51001326u || arm_pc == 0x51001368u || arm_pc == 0x5100139Cu;
+                // The three instructions after the three `bl 0x510194C0` sites: the
+                // helper's return value is in r0, and a negative one makes the loop
+                // `blt 0x510013F4` straight out, abandoning the rest of the batch.
+                const bool result = arm_pc == 0x510013F0u || arm_pc == 0x51001410u || arm_pc == 0x5100149Cu;
+                // 0x510194E4 is the helper's `pop {r4-r7, r15}`: a start whose
+                // helper never reaches it is a start that never returned.
+                const bool ret = arm_pc == 0x510194E4u;
+                if (batch || slot || result || ret || arm_pc == 0x510194C0u) {
+                    const ArmCore* log_arm = dynamic_cast<const ArmCore*>(core);
+                    const u32 r9 = log_arm != nullptr ? log_arm->r[9] : 0u;
+                    const u32 r10 = log_arm != nullptr ? log_arm->r[10] : 0u;
+                    static u32 module_starts = 0;
+                    static u32 module_slots = 0;
+                    static u32 module_batches = 0;
+                    static u32 module_returns = 0;
+                    if (batch) {
+                        ++module_batches;
+                        ZLB_LOG_INFO("machine",
+                                     "module batch #%u records=0x%08X uids=0x%08X count=%u core=%d",
+                                     module_batches, log_arm != nullptr ? log_arm->r[0] : 0u,
+                                     log_arm != nullptr ? log_arm->r[1] : 0u,
+                                     log_arm != nullptr ? log_arm->r[2] : 0u, i);
+                    } else if (slot) {
+                        const u32 uid = arm_pc == 0x51001326u ? r9 : r10;
+                        ++module_slots;
+                        ZLB_LOG_INFO("machine", "module slot #%u uid=0x%08X next=0x%08X at 0x%08X core=%d",
+                                     module_slots, uid, log_arm != nullptr ? log_arm->r[5] : 0u, arm_pc, i);
+                    } else if (ret) {
+                        ++module_returns;
+                        ZLB_LOG_INFO("machine", "module return #%u core=%d (uids=0x%08X)", module_returns, i,
+                                     log_arm != nullptr ? log_arm->r[5] : 0u);
+                    } else if (result) {
+                        const u32 result_value = log_arm != nullptr ? log_arm->r[0] : 0u;
+                        ZLB_LOG_INFO("machine", "module result 0x%08X at 0x%08X core=%d (uids=0x%08X)",
+                                     result_value, arm_pc, i, log_arm != nullptr ? log_arm->r[5] : 0u);
+                        // Dump the ordered ring for the last few module results regardless
+                        // of sign, so a successful start and a failing one can be diffed -
+                        // the first divergence between them is the answer.
+                        static u32 result_dumps = 0;
+                        // Only the tail of the loop matters: #21, #22 (success) and #23
+                        // (the failure). Dumping the first four results only captured the
+                        // early modules.
+                        if (result_dumps < 4u && module_starts >= 21u) {
+                            ++result_dumps;
+                            const unsigned dump_core = i < kArmTraceCores ? i : 0u;
+                            ZLB_LOG_INFO("machine", "result seq begin result=0x%08X starts=%u",
+                                         result_value, module_starts);
+                            for (u32 back = kArmTraceSize; back > 0u; --back) {
+                                const u32 pc_value =
+                                    g_arm_trace_ring[dump_core]
+                                                    [(g_arm_trace_pos[dump_core] - back) &
+                                                     (kArmTraceSize - 1u)];
+                                if (pc_value != 0u) {
+                                    ZLB_LOG_INFO("machine", "result seq 0x%08X", pc_value);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "result seq end result=0x%08X", result_value);
+                            // The whole-start address set, which is order independent and
+                            // covers everything (the 512-entry ring only covers the tail).
+                            ZLB_LOG_INFO("machine", "result set begin result=0x%08X count=%u",
+                                         result_value, g_pc_set_count);
+                            for (u32 k = 0; k < kPcSetSlots; ++k) {
+                                if (g_pc_set_used[k] != 0u) {
+                                    ZLB_LOG_INFO("machine", "result set 0x%08X", g_pc_set[k]);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "result set end result=0x%08X", result_value);
+                        }
+                        if ((result_value & 0x80000000u) != 0u) {
+                            // Dump the recent PC path (deduplicated, newest first) so the
+                            // code that produced the error is identifiable.
+                            static u32 dumped[64];
+                            u32 dumped_count = 0;
+                            const unsigned trace_core = i < kArmTraceCores ? i : 0u;
+                            for (u32 back = 0; back < kArmTraceSize && dumped_count < 64u; ++back) {
+                                const u32 pc_value =
+                                    g_arm_trace_ring[trace_core]
+                                                    [(g_arm_trace_pos[trace_core] - 1u - back) &
+                                                     (kArmTraceSize - 1u)];
+                                bool known = false;
+                                for (u32 k = 0; k < dumped_count; ++k) {
+                                    if (dumped[k] == pc_value) { known = true; break; }
+                                }
+                                if (!known) dumped[dumped_count++] = pc_value;
+                            }
+                            for (u32 k = 0; k < dumped_count; ++k) {
+                                ZLB_LOG_INFO("machine", "module fail path [%u] 0x%08X", k, dumped[k]);
+                            }
+                            // Every NSKBL address executed during this start, so the
+                            // resolution path is visible even when a flush loop runs.
+                            const unsigned tail_core = i < kNskblRingCores ? i : 0u;
+                            ZLB_LOG_INFO("machine", "module fail uid ring (oldest to newest):");
+                            for (u32 back = kUidRingSize; back > 0u; --back) {
+                                const u32 slot = (g_uid_ring_pos - back) & (kUidRingSize - 1u);
+                                if (g_uid_ring_site[slot] != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail uid 0x%08X at site 0x%08X -> 0x%08X",
+                                                 g_uid_ring_value[slot], g_uid_ring_site[slot],
+                                                 g_uid_ring_result[slot]);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "module fail seq (core %u, oldest to newest):",
+                                         tail_core);
+                            for (u32 back = kNskblRingSize; back > 0u; --back) {
+                                const u32 pc_value =
+                                    g_nskbl_ring[tail_core]
+                                                [(g_nskbl_pos[tail_core] - back) &
+                                                 (kNskblRingSize - 1u)];
+                                if (pc_value != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail seq 0x%08X", pc_value);
+                                }
+                            }
+                            ZLB_LOG_INFO("machine", "module fail set: %u NSKBL addresses", g_pc_set_count);
+                            for (u32 k = 0; k < kPcSetSlots; ++k) {
+                                if (g_pc_set_used[k] != 0u) {
+                                    ZLB_LOG_INFO("machine", "module fail addr 0x%08X", g_pc_set[k]);
+                                }
+                            }
+                        }
+                    } else {
+                        ++module_starts;
+                        any_module_start = true;
+                        starts_seen = module_starts;
+                        pc_set_reset();
+                        for (unsigned c = 0; c < kNskblRingCores; ++c) g_nskbl_pos[c] = 0;
+                        ZLB_LOG_INFO("machine", "module start #%u uid=0x%08X core=%d", module_starts,
+                                     log_arm != nullptr ? log_arm->r[0] : 0u, i);
+                    }
+                }
+            }
             if (satisfy_arm_boot_pc(static_cast<u32>(i), arm_pc)) {
                 // Diagnostic (round 159): a development substitution can *skip* the
                 // instruction it stands in for (and sometimes retarget the PC).  If the
@@ -1109,9 +2306,27 @@ void Vita::run_for(double seconds) {
     const double target = seconds;
     int64_t guard = 0;
     const int64_t guard_limit = 2000000;
+    if (const char* hist = std::getenv("ZLB_PC_HIST"); hist != nullptr && hist[0] != '0') {
+        g_hist_on = true;
+    }
+    dump_pc_histogram_now("at end of run");
     while (emulated_seconds() < target && guard++ < guard_limit) {
         if (stage() == BootStage::Failed) break;
         run_slice();
+    }
+    if (const char* hist = std::getenv("ZLB_PC_HIST"); hist != nullptr && hist[0] != '0') {
+        for (int which = 0; which < 2; ++which) {
+            std::map<u32, u32>& map = which == 0 ? g_hist_arm_map : g_hist_cmep_map;
+            std::vector<std::pair<u32, u32>> rows(map.begin(), map.end());
+            std::sort(rows.begin(), rows.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            ZLB_LOG_INFO("machine", "PC histogram %s (top buckets, 4 KiB each):",
+                         which == 0 ? "ARM" : "CMeP");
+            for (size_t k = 0; k < rows.size() && k < 15u; ++k) {
+                ZLB_LOG_INFO("machine", "   pc 0x%08X..0x%08X  %u samples",
+                             rows[k].first << 12, ((rows[k].first + 1u) << 12) - 1u, rows[k].second);
+            }
+        }
     }
 }
 
@@ -1140,11 +2355,58 @@ void Vita::add_milestone(const std::string& text) {
     if (std::find(milestones_.begin(), milestones_.end(), text) != milestones_.end()) return;
     milestones_.push_back(text);
     ZLB_LOG_INFO("boot", "%s", text.c_str());
+    // Every boot-chain milestone is also a structured event, so the Events panel
+    // and the CSV export see the same story the console log tells.
+    event_log_.event(EventProvider::Boot, ev::boot::kMilestone)
+        .field("text", text)
+        .field("stage", std::string(to_string(boot_.stage)))
+        .emit();
 }
 
 void Vita::log_event(const std::string& text) {
     events_.push_back(text);
     ZLB_LOG_INFO("boot", "%s", text.c_str());
+    event_log_.event(EventProvider::Boot, ev::boot::kMilestone).field("text", text).emit();
+}
+
+void Vita::note_stage_change() {
+    // Close the stage that was running and open the new one. Called from reset()
+    // and from the end of every poll_boot_chain() slice, which is where every
+    // stage transition in the boot chain happens, so one hook covers them all.
+    const BootStage stage = boot_.stage;
+    if (event_stage_activity_ != 0 && stage == event_stage_) return;
+
+    if (event_stage_activity_ != 0) {
+        event_log_.end_event(event_stage_activity_, EventProvider::Boot, ev::boot::kStageEnd)
+            .field("stage", std::string(to_string(event_stage_)))
+            .field("result", std::string(to_string(stage)))
+            .emit();
+        event_stage_activity_ = 0;
+    }
+
+    event_stage_ = stage;
+    EventLog::Builder begin = event_log_.begin_event(EventProvider::Boot, ev::boot::kStageBegin);
+    begin.field("stage", std::string(to_string(stage)));
+    begin.field("index", static_cast<u64>(stage));
+    event_stage_activity_ = begin.emit().activity;
+
+    event_log_.event(EventProvider::Boot, ev::boot::kStage)
+        .field("stage", std::string(to_string(stage)))
+        .field("index", static_cast<u64>(stage))
+        .emit();
+
+    // Terminal stages also get their own event: "the boot chain finished" and
+    // "the boot chain failed" are the two lines everyone looks for in a trace.
+    if (stage == BootStage::KernelRunning) {
+        event_log_.event(EventProvider::Boot, ev::boot::kComplete)
+            .field("stage", std::string(to_string(stage)))
+            .emit();
+    } else if (stage == BootStage::Failed) {
+        event_log_.event(EventProvider::Boot, ev::boot::kFailure)
+            .field("stage", std::string(to_string(event_stage_)))
+            .field("reason", boot_.detail)
+            .emit();
+    }
 }
 
 }  // namespace zlb

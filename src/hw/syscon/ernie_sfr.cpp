@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "common/util.h"
+#include "event/providers.h"
 
 namespace zlb {
 
@@ -741,6 +742,12 @@ void ErnieSfr::tick(u64 cycles) {
         interval_next_ += interval_period_;
         ++interval_fires_;
     } while (interval_next_ <= cycles_);
+    if (events().should_record(EventProvider::Timer, EventLevel::Informational, event_keyword::kTimer)) {
+        events().event(EventProvider::Timer, ev::timer::kExpire)
+            .field("timer", (u64)1)
+            .field("count", (u64)interval_fires_)
+            .emit();
+    }
     regs_[ernie::kSfrIf0 + 1] = static_cast<u8>(regs_[ernie::kSfrIf0 + 1] | ernie::kIf0hTmif01h);
     if ((regs_[ernie::kSfrMk1 + 1] & ernie::kIf0hTmif01h) == 0) {
         pending_vectors_.push_back(ernie::kIntervalTimerVector);

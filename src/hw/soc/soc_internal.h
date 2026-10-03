@@ -772,6 +772,8 @@ private:
     u64 last_lba_ = 0;
     u32 last_count_ = 0;
     std::string last_command_;
+    /// Event tracing: activity id of the open data Transfer Begin, 0 = none.
+    u64 event_activity = 0;
 
     // Response of the last command, little endian, 4 words.
     std::array<u32, 4> response_{};
@@ -984,6 +986,8 @@ private:
         u32 control = 0;
         u32 status = 0;
         bool active = false;
+        /// Event tracing: activity id of the open Transfer Begin, 0 = none.
+        u64 event_activity = 0;
     };
     struct Target {
         u32 base = 0;

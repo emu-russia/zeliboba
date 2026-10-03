@@ -61,6 +61,7 @@
 #include <utility>
 
 #include "common/log.h"
+#include "event/providers.h"
 #include "hw/cmep/cmep_internal.h"
 #include "hw/soc.h"
 #include "hw/syscon.h"
@@ -107,12 +108,30 @@ void MailboxDevice::refresh_irqs(bool force) {
         const bool to_cmep = channel == 0u ? (command & 1u) != 0u : command != 0u;
         const bool to_arm = peek(kCmepToArm + channel * 4u) != 0u;
         if (force || to_cmep_levels_[channel] != to_cmep) {
+            const bool to_cmep_edge = to_cmep && !to_cmep_levels_[channel];
             to_cmep_levels_[channel] = to_cmep;
             if (to_cmep_irq_) to_cmep_irq_(channel, to_cmep);
+            if (to_cmep_edge &&
+                events().should_record(EventProvider::Mailbox, EventLevel::Informational,
+                                       event_keyword::kInterrupt)) {
+                events().event(EventProvider::Mailbox, ev::mailbox::kIrq)
+                    .field("channel", (u64)channel)
+                    .field("target", (u64)0)
+                    .emit();
+            }
         }
         if (force || to_arm_levels_[channel] != to_arm) {
+            const bool to_arm_edge = to_arm && !to_arm_levels_[channel];
             to_arm_levels_[channel] = to_arm;
             if (to_arm_irq_) to_arm_irq_(channel, to_arm);
+            if (to_arm_edge &&
+                events().should_record(EventProvider::Mailbox, EventLevel::Informational,
+                                       event_keyword::kInterrupt)) {
+                events().event(EventProvider::Mailbox, ev::mailbox::kIrq)
+                    .field("channel", (u64)channel)
+                    .field("target", (u64)1)
+                    .emit();
+            }
         }
     }
 }
@@ -127,11 +146,25 @@ void MailboxDevice::reset() {
 void MailboxDevice::set_arm_to_cmep(u32 value) {
     poke(kArmToCmep, value);
     refresh_irqs();
+    if (events().should_record(EventProvider::Mailbox, EventLevel::Informational,
+                               event_keyword::kComm)) {
+        events().event(EventProvider::Mailbox, ev::mailbox::kHandshake)
+            .field("status", (u64)value)
+            .field("side", (u64)1)
+            .emit();
+    }
 }
 
 void MailboxDevice::set_cmep_to_arm(u32 value) {
     poke(kCmepToArm, value);
     refresh_irqs();
+    if (events().should_record(EventProvider::Mailbox, EventLevel::Informational,
+                               event_keyword::kComm)) {
+        events().event(EventProvider::Mailbox, ev::mailbox::kHandshake)
+            .field("status", (u64)value)
+            .field("side", (u64)0)
+            .emit();
+    }
 }
 
 u64 MailboxDevice::read(u32 address, unsigned size) {
@@ -143,6 +176,12 @@ u64 MailboxDevice::read(u32 address, unsigned size) {
             const unsigned shift = (byte_address & 3u) * 8u;
             const u64 byte = (peek(byte_address & ~3u) >> shift) & 0xFFu;
             value |= byte << (i * 8u);
+        }
+        if (events().should_record(EventProvider::Mailbox, EventLevel::Verbose, event_keyword::kComm)) {
+            events().event(EventProvider::Mailbox, ev::mailbox::kReceive)
+                .field("channel", (u64)(((address - kCmepToArm) / 4u) & 3u))
+                .field("value", value)
+                .emit();
         }
         return value;
     }
@@ -163,6 +202,13 @@ bool MailboxDevice::write_data_mailbox(u32 address, unsigned size, u64 value, bo
         set_bits(word_address, mask, outgoing);
     }
     refresh_irqs();
+    if (events().should_record(EventProvider::Mailbox, EventLevel::Verbose, event_keyword::kComm)) {
+        events().event(EventProvider::Mailbox, ev::mailbox::kSend)
+            .field("channel", (u64)0)
+            .field("value", value)
+            .field("direction", (u64)(arm_port ? 1 : 0))
+            .emit();
+    }
     return true;
 }
 

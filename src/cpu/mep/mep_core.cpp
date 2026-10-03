@@ -13,6 +13,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "cpu/factory.h"
+#include "event/providers.h"
 
 namespace zlb {
 namespace {
@@ -91,6 +92,22 @@ bool MePCore::ControlBus::busy() const { return running && !force_expired; }
 
 u32 MePCore::ControlBus::read(unsigned address) const {
     if (address >= regs.size()) return 0;
+    // The secure module kprx_auth_sm configures control registers 0x410..0x415 and
+    // then polls 0x412 for completion. Logging that window shows the whole protocol:
+    // who writes what and what is read back.
+    {
+        static const bool cb_log = [] {
+            const char* v = std::getenv("ZLB_CB_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (cb_log && address >= 0x410u && address < 0x420u) {
+            static u32 n = 0;
+            if (n < 60u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "cb read  0x%03X -> 0x%X", address, regs[address]);
+            }
+        }
+    }
     if (address == 1) return (irq_levels & ~regs[3]) | (irq_edges & regs[3]);
     u32 value = regs[address];
     if (address == kCbTimerStatus) {
@@ -106,6 +123,19 @@ u32 MePCore::ControlBus::read(unsigned address) const {
 
 void MePCore::ControlBus::write(unsigned address, u32 value) {
     if (address >= regs.size()) return;
+    {
+        static const bool cb_log = [] {
+            const char* v = std::getenv("ZLB_CB_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (cb_log && address >= 0x410u && address < 0x420u) {
+            static u32 n = 0;
+            if (n < 80u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "cb write 0x%03X = 0x%X", address, value);
+            }
+        }
+    }
     if (address == 0) {
         // IVR.ICN and ILV describe the last vector fetch; only IML is writable.
         regs[0] = (regs[0] & ~0xF00u) | (value & 0xF00u);
@@ -217,6 +247,12 @@ void MePCore::reset(u32 entry) {
 
     set_pc(entry);
     set_context(entry);
+
+    events().event(EventProvider::Cpu, ev::cpu::kCoreReset)
+        .field("core", static_cast<u64>(0))
+        .field("name", std::string(core_name()))
+        .address("entry", entry)
+        .emit();
     // NOTE: a core reset must not power-cycle the board. The machine layer calls
     // Bus::reset_devices() itself; resetting them here wipes state that the boot
     // chain has already programmed (the ARM->CMeP mailbox, for instance).
@@ -643,6 +679,35 @@ std::string MePCore::mark_undefined(const std::string& what, u32 address) {
 }
 
 StepResult MePCore::step() {
+    // The secure kernel keeps its state in a global written through 0x801d54
+    // ("sw $1,-32748($gp)"). The idle loop waits for the value 9. Trace every call to
+    // that setter with its value and return address: this shows whether 9 is ever set
+    // and, if so, from where.
+    {
+        static const bool st_log = [] {
+            const char* v = std::getenv("ZLB_STATE_LOG");
+            return v != nullptr && v[0] != '0';
+        }();
+        // 0x800A56 is "lw $5,($3)" with $3 = 0xE0000010 (the ARM->CMeP mailbox), so $5 on
+        // the next instruction is the command the ARM sent. Logging it shows which
+        // commands actually arrive - in particular whether 0x101 (the one that sets
+        // state 9) ever does.
+        if (st_log && (pc & ~1u) == 0x800A58u) {
+            static u32 m = 0;
+            if (m < 60u) {
+                ++m;
+                ZLB_LOG_INFO("mep", "mailbox cmd: $5=0x%X (%u)", r[5], r[5]);
+            }
+        }
+        if (st_log && (pc & ~1u) == 0x801D54u) {
+            static u32 n = 0;
+            if (n < 80u) {
+                ++n;
+                ZLB_LOG_INFO("mep", "state set: value=%u (0x%X) lr=0x%X pc=0x%X",
+                             r[1], r[1], lp, pc);
+            }
+        }
+    }
     StepResult out;
     const u32 address = pc;
     out.address = address;
@@ -694,7 +759,9 @@ StepResult MePCore::step() {
 
     const mep::Insn* insn = mep::decode(word);
     out.length = insn->len;
-    out.text = mep::format(*insn, word, address);
+    // See Cpu::step_text: formatting the listing for every instruction is pure
+    // per-instruction overhead when nothing reads StepResult::text.
+    if (step_text) out.text = mep::format(*insn, word, address);
 
     if (insn->op == mep::Op::None || mep::is_reserved(insn->op)) {
         out.faulted = true;
@@ -728,6 +795,9 @@ StepResult MePCore::step() {
     return out;
 }
 
+u32 MePCore::interrupt_flag_register() const { return cbus.read(1); }
+u32 MePCore::interrupt_mask_register() const { return cbus.read(2); }
+
 void MePCore::set_irq_level(unsigned source, bool asserted) {
     cbus.set_irq_level(source, asserted);
     refresh_irq_line();
@@ -749,6 +819,10 @@ void MePCore::refresh_irq_line() {
 bool MePCore::take_pending_irq() {
     refresh_irq_line();
     const int source = cbus.pending_irq();
+    if (source >= 0) {
+        ++irq_sources_seen;
+        irq_last_source = source;
+    }
     if (source < 0 || (psw & (kPswInterruptEnable | kPswHardwareInterruptEnable)) !=
                           (kPswInterruptEnable | kPswHardwareInterruptEnable) ||
         (psw & kPswNmi) != 0) return false;
@@ -775,7 +849,15 @@ bool MePCore::take_pending_irq() {
     // The loop registers are preserved, and a handler can save/restore them
     // with STC/LDC. No pending trailing slot remains at an interrupt boundary.
     rep_pending_back_ = false;
+    ++irq_sources_taken;
     set_pc(vector);
+
+    events().event(EventProvider::Interrupt, ev::interrupt::kDeliver)
+        .field("core", static_cast<u64>(0))
+        .field("line", static_cast<u64>(source))
+        .address("vector", vector)
+        .field("name", std::string(core_name()))
+        .emit();
     return true;
 }
 

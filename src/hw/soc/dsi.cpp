@@ -14,6 +14,8 @@
 // published to the board's IFTU connection even when the DSI IRQ is masked.
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 namespace zlb::kermit {
 namespace {
 
@@ -80,6 +82,14 @@ void DsiController::write(u32 address, unsigned size, u64 value) {
     // A fresh supported start uses phase zero. The physical first-vblank line
     // is not recovered; this deterministic startup phase is a model choice.
     if (was_running != supported_running()) phase_ = 0;
+    if (!was_running && supported_running() &&
+        events().should_record(EventProvider::Display, EventLevel::Informational,
+                               event_keyword::kDisplay)) {
+        events().event(EventProvider::Display, ev::display::kModeSet)
+            .field("mode", (u64)1)
+            .field("running", (u64)(supported_running() ? 1 : 0))
+            .emit();
+    }
     update_irq();
 }
 
@@ -103,6 +113,11 @@ void DsiController::tick(u64 microseconds) {
     phase_ = phase % kPhasePerFrame;
     if (frames == 0) return;
     frames_ += frames;
+    if (events().should_record(EventProvider::Display, EventLevel::Verbose, event_keyword::kDisplay)) {
+        events().event(EventProvider::Display, ev::display::kVblank)
+            .field("count", frames_)
+            .emit();
+    }
     if (frame_callback_) frame_callback_(frames);
     // Pending frames coalesce in the hardware status bit. Retaining raw
     // status while masked is an explicit conventional model choice.
@@ -115,6 +130,13 @@ void DsiController::update_irq() {
     if (asserted == irq_) return;
     irq_ = asserted;
     if (irq_callback_) irq_callback_(kIrqDsi0, irq_);
+    if (asserted && events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                                           event_keyword::kInterrupt)) {
+        events().event(EventProvider::Interrupt, ev::interrupt::kRaise)
+            .field("line", (u64)213)
+            .field("source", (u64)0)
+            .emit();
+    }
 }
 
 void DsiController::set_irq_callback(std::function<void(u32, bool)> callback) {

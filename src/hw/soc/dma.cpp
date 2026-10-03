@@ -29,6 +29,8 @@
 // call) so that it is deterministic and interruptible.
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 namespace zlb::kermit {
 namespace {
 
@@ -237,10 +239,25 @@ void DmaController::start(u32 index) {
     if ((channel.control & kCtlEnable) == 0 || channel.count == 0) {
         channel.status = (channel.status | kStError) & ~kStBusy;
         update_irq();
+        if (events().should_record(EventProvider::Dma, EventLevel::Error, event_keyword::kStorage)) {
+            events().event(EventProvider::Dma, ev::dma::kError)
+                .field("channel", (u64)index)
+                .field("detail", std::string((channel.control & kCtlEnable) == 0 ? "channel disabled"
+                                                                                : "zero count"))
+                .emit();
+        }
         return;
     }
     channel.active = true;
     channel.status = (channel.status & ~(kStDone | kStError)) | kStBusy;
+    if (events().should_record(EventProvider::Dma, EventLevel::Informational, event_keyword::kStorage)) {
+        EventLog::Builder begin = events().begin_event(EventProvider::Dma, ev::dma::kTransferBegin);
+        begin.field("channel", (u64)index)
+            .address("src", channel.source)
+            .address("dst", channel.dest)
+            .field("bytes", (u64)channel.count);
+        channel.event_activity = begin.emit().activity;
+    }
 }
 
 void DmaController::step(u32 index) {
@@ -284,6 +301,21 @@ void DmaController::complete(u32 index, bool ok) {
         if (notify) channel.status |= kStIrq;
     }
     update_irq();
+    if (!ok && events().should_record(EventProvider::Dma, EventLevel::Error, event_keyword::kStorage)) {
+        events().event(EventProvider::Dma, ev::dma::kError)
+            .field("channel", (u64)index)
+            .field("detail", std::string("transfer failed"))
+            .emit();
+    }
+    if (channel.event_activity != 0) {
+        const u64 activity = channel.event_activity;
+        channel.event_activity = 0;
+        events().end_event(activity, EventProvider::Dma, ev::dma::kTransferEnd)
+            .field("channel", (u64)index)
+            .field("bytes", (u64)channel.count)
+            .field("result", ok)
+            .emit();
+    }
 }
 
 u32 DmaController::irq_status() const {

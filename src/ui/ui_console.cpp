@@ -353,6 +353,10 @@ void UiApp::handle_tab_click(int index) {
     if (index < 0 || index >= count) return;
     tab_ = static_cast<UiTab>(index);
     if (tab_ == UiTab::Devices) rebuild_device_list();
+    if (tab_ == UiTab::Events) {
+        refresh_events_tree();
+        rebuild_event_graphs(true);
+    }
 }
 
 void UiApp::toggle_breakpoint_at_selection() {

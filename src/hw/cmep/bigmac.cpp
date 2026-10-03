@@ -46,6 +46,7 @@
 #include <cstring>
 
 #include "common/log.h"
+#include "event/providers.h"
 #include "hw/cmep/cmep_internal.h"
 #include "loader/loader_extra.h"
 
@@ -907,6 +908,14 @@ s32 BigmacDevice::execute(const BigmacCommand& cmd, const std::vector<u8>* key_m
     const u32 index = cmd.index();          // +0x04 (writes) / read1
     const u32 flags = cmd.flags;            // +0x10 (flags, key bits, read2 index)
     const u32 opcode = cmd.opcode();
+    if (events().should_record(EventProvider::Cmep, EventLevel::Informational,
+                               event_keyword::kSecurity)) {
+        events().event(EventProvider::Cmep, ev::cmep::kBigmacBegin)
+            .opcode(EventOpcode::Info)
+            .field("op", (u64)opcode)
+            .field("bytes", (u64)cmd.length)
+            .emit();
+    }
     u32 scratch = cmd.pointer;  ///< +0x14 of the loader's image
 
     auto fail = [this, &cmd](u32 code) {

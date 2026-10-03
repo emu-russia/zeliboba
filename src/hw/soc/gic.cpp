@@ -18,6 +18,8 @@
 // acknowledge/running-priority/EOI state machine.
 #include "hw/soc/soc_internal.h"
 
+#include "event/providers.h"
+
 namespace zlb::kermit {
 namespace {
 
@@ -148,6 +150,13 @@ void GicCpuInterface::write_word(u32 offset, u64 value) {
             // The NS view exposes only EnableGrp1 as bit0. In particular an
             // NSKBL store of zero cannot disable Secure Group0 or FIQEn.
             poke(offset, nonsecure_access_ ? (peek(offset) & ~2ull) | ((value & 1u) << 1) : value);
+            if (events().should_record(EventProvider::Interrupt, EventLevel::Verbose,
+                                       event_keyword::kInterrupt)) {
+                events().event(EventProvider::Interrupt, ev::interrupt::kEnable)
+                    .field("line", (u64)0)
+                    .field("enabled", (value & 1u) != 0)
+                    .emit();
+            }
             return;
         case kIccPmr:
             if (!nonsecure_access_) poke(offset, value & 0xFFu);
@@ -316,6 +325,13 @@ void GicDistributor::set_level(u32 id, bool assertion, unsigned core) {
             // latch, which is hidden while the interrupt is active).
             pending_after_eoi_[index] = true;
         }
+        if (events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                                   event_keyword::kInterrupt)) {
+            events().event(EventProvider::Interrupt, ev::interrupt::kRaise)
+                .field("line", (u64)id)
+                .field("source", (u64)core)
+                .emit();
+        }
         return;
     }
 
@@ -399,6 +415,14 @@ u32 GicDistributor::acknowledge(u32 core, u8 priority_mask) {
         // Level sensitive: the line keeps the pending bit set while asserted.
         pending_[index] = sampled_[index];
     }
+    if (events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                               event_keyword::kInterrupt)) {
+        events().event(EventProvider::Interrupt, ev::interrupt::kDeliver)
+            .field("core", (u64)core)
+            .field("line", (u64)id)
+            .field("vector", (u64)id)
+            .emit();
+    }
     return token;
 }
 
@@ -417,6 +441,13 @@ void GicDistributor::end_of_interrupt(u32 core, u32 id) {
     pending_after_eoi_[index] = false;
     // A pulse that has already expired is gone: EOI must not resurrect it.
     pulse_left_[index] = 0;
+    if (events().should_record(EventProvider::Interrupt, EventLevel::Informational,
+                               event_keyword::kInterrupt)) {
+        events().event(EventProvider::Interrupt, ev::interrupt::kEoi)
+            .field("line", (u64)id)
+            .field("source", (u64)core)
+            .emit();
+    }
 }
 
 u32 GicDistributor::pending_count() const {
@@ -435,7 +466,9 @@ bool GicDistributor::tick_pulses(u64 ticks) {
         if (left <= ticks) {
             pulse_left_[index] = 0;
             const u32 id = index < max_irq_ ? static_cast<u32>(index) : (index - max_irq_) % 32u;
-            const unsigned core = index < max_irq_ ? 0u : 1u + (index - max_irq_) / 32u;
+            const unsigned core = index < max_irq_
+                                      ? 0u
+                                      : 1u + static_cast<unsigned>((index - max_irq_) / 32u);
             set_level(id, false, core);
         } else {
             pulse_left_[index] = static_cast<u32>(left - ticks);
@@ -585,6 +618,14 @@ void GicDistributor::write_word(u32 offset, u64 value) {
                 if ((value32 >> b) & 1u) {
                     if (&target != &enabled_ || id >= 16u) target[index] = state;
                     if (&target == &pending_ && !state && id < 16u) sgi_sources_[access_core_][id] = 0;
+                    if (&target == &enabled_ &&
+                        events().should_record(EventProvider::Interrupt, EventLevel::Verbose,
+                                               event_keyword::kInterrupt)) {
+                        events().event(EventProvider::Interrupt, ev::interrupt::kEnable)
+                            .field("line", (u64)id)
+                            .field("enabled", state)
+                            .emit();
+                    }
                 }
             }
             poke(offset, value32);

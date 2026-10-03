@@ -1,5 +1,7 @@
 #include "bus/bus.h"
 
+#include <string>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +12,7 @@
 
 #include "common/log.h"
 #include "common/util.h"
+#include "event/providers.h"
 
 namespace zlb {
 
@@ -84,6 +87,12 @@ bool bus_read_trap_contains(u32 address) {
 /// Cheap "is a read trap configured" test for the hot read paths.
 static bool read_trap_enabled() { return read_trap().enabled; }
 
+std::string Bus::trap_target_name(u32 address) const {
+    if (const MemRegion* region = region_at(address, 1)) return region->name;
+    if (const Device* device = find_device(address)) return "<dev:" + device->name() + ">";
+    return "<UNMAPPED>";
+}
+
 void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
     if (!bus_write_trap_contains(address)) return;
     const MemRegion* region = region_at(address, 1);
@@ -94,8 +103,9 @@ void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
 #else
     void* caller = nullptr;
 #endif
-    std::fprintf(stderr, "[wtrap] %-14s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
-                 region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
+    const std::string target = trap_target_name(address);
+    std::fprintf(stderr, "[wtrap] %-24s +0x%05X w%u = 0x%llX pc=%08X core=%s caller=%p\n",
+                 target.c_str(), region ? address - region->base : address, size,
                  static_cast<unsigned long long>(value), context.pc, context.core,
                  caller);
 }
@@ -103,8 +113,9 @@ void Bus::note_write_trap(u32 address, unsigned size, u64 value) {
 void Bus::note_read_trap(u32 address, unsigned size, u64 value) {
     if (!bus_read_trap_contains(address)) return;
     const MemRegion* region = region_at(address, 1);
-    std::fprintf(stderr, "[rtrap] %-14s +0x%05X r%u = 0x%llX pc=%08X core=%s\n",
-                 region ? region->name.c_str() : "<none>", region ? address - region->base : address, size,
+    const std::string target = trap_target_name(address);
+    std::fprintf(stderr, "[rtrap] %-24s +0x%05X r%u = 0x%llX pc=%08X core=%s\n",
+                 target.c_str(), region ? address - region->base : address, size,
                  static_cast<unsigned long long>(value), context.pc, context.core);
 }
 
@@ -408,6 +419,44 @@ void Bus::note(AccessKind kind, u32 address, unsigned size, u64 value, Device* d
     record.unmapped = unmapped;
     record.sequence = trace.total();
     trace.push(record);
+
+    // Event tracing (src/event). Unmapped accesses are warnings that are on by
+    // default; raw MMIO/RAM accesses are the high-volume kBusAccess keyword and
+    // stay off until a session asks for them.
+    if (unmapped) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Warning, event_keyword::kMemory)) {
+            const char* kind_name = to_string(kind);
+            events().event(EventProvider::Bus, ev::bus::kUnmapped)
+                .field("kind", std::string(kind_name))
+                .address("address", address)
+                .field("size", static_cast<u64>(size))
+                .field("device", device ? device->name() : std::string("(ram)"))
+                .emit();
+            events().event(EventProvider::Memory, ev::memory::kUnmapped)
+                .field("kind", std::string(kind_name))
+                .address("address", address)
+                .address("pc", context.pc)
+                .emit();
+        }
+    } else if (device != nullptr) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Verbose, event_keyword::kBusAccess)) {
+            events().event(EventProvider::Bus, kind == AccessKind::Write ? ev::bus::kMmioWrite : ev::bus::kMmioRead)
+                .address("address", address)
+                .field("value", value, static_cast<u8>(size))
+                .field("device", device->name())
+                .address("pc", context.pc)
+                .emit();
+        }
+    } else if (trace.trace_ram()) {
+        if (events().should_record(EventProvider::Bus, EventLevel::Verbose, event_keyword::kBusAccess)) {
+            events().event(EventProvider::Bus, ev::bus::kRamAccess)
+                .field("kind", std::string(to_string(kind)))
+                .address("address", address)
+                .field("size", static_cast<u64>(size))
+                .address("pc", context.pc)
+                .emit();
+        }
+    }
 }
 
 bool Bus::slow_read(u32 address, unsigned size, u64& out, Device*& device, bool fetch) {
@@ -549,6 +598,11 @@ u16 Bus::read16(u32 address) {
     u64 out = 0;
     Device* device = nullptr;
     slow_read(address, 2, out, device, false);
+    // Every other accessor reports the slow path - read8/32/64 and all four writes.
+    // read16 was the one that did not, so a 16-bit MMIO read was invisible to
+    // ZLB_RTRAP: the guest's `ldrh` of the per-core window at 0xE3320000 never
+    // appeared in the trace, and it looked as if the kernel only ever wrote there.
+    if (read_trap_enabled()) note_read_trap(address, 2, out);
     return static_cast<u16>(out);
 }
 

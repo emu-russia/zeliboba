@@ -5,10 +5,14 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
 #include "common/log.h"
+#include "debug/nid_table.h"
+#include "event/providers.h"
 #include "common/util.h"
 #include "cpu/arm/arm_core.h"
 #include "cpu/arm/arm_disasm.h"
@@ -228,6 +232,14 @@ bool Debugger::remove_watchpoint(int id) {
 
 void Debugger::clear_watchpoints() { watchpoints_.clear(); }
 
+void Debugger::note_breakpoint(Arch arch, int core, u32 address) {
+    vita_.events().event(EventProvider::Debugger, ev::debugger::kBreakpoint)
+        .field("arch", std::string(to_string(arch)))
+        .field("core", static_cast<u64>(core))
+        .address("address", address)
+        .emit();
+}
+
 void Debugger::check_watchpoints(u64 trace_from) {
     if (watchpoints_.empty()) return;
 
@@ -252,6 +264,12 @@ void Debugger::check_watchpoints(u64 trace_from) {
                                            watch_kind_text(watch.kind), record.address, to_string(record.kind),
                                            static_cast<unsigned long long>(record.value), record.pc);
                 print("[stop] " + last_stop_.reason);
+                vita_.events().event(EventProvider::Debugger, ev::debugger::kWatchpoint)
+                    .field("id", static_cast<u64>(watch.id))
+                    .field("kind", static_cast<u64>(watch.kind))
+                    .address("address", record.address)
+                    .field("value", record.value)
+                    .emit();
                 stop_requested_ = true;
                 return;
             }
@@ -274,9 +292,18 @@ struct MachineStepResult {
 
 void Debugger::step(int count) {
     stop_requested_ = false;
+    // `step` advances one core per architecture.  For the ARM cluster that core is
+    // the *selected* one (`core arm3`): Kermit's four cores run different code, so
+    // resolving Arch::Arm through `Vita::core()` returned arm0 unconditionally, and
+    // `core arm3` + `step` silently stepped the parked arm0 instead - the history
+    // ring was recorded from arm0 too, so it came back empty.
+    auto step_core = [this](Arch arch) -> Cpu* {
+        if (arch == Arch::Arm) return vita_.arm_core(arm_core_index_);
+        return vita_.core(arch);
+    };
     for (int i = 0; i < count && !stop_requested_; ++i) {
         for (Arch arch : {Arch::MeP, Arch::Arm, Arch::Rl78}) {
-            Cpu* cpu = vita_.core(arch);
+            Cpu* cpu = step_core(arch);
             if (!cpu || cpu->halted) continue;
             if (breakpoints_.count(arch) && breakpoints_[arch].count(cpu->get_pc())) {
                 last_stop_.stopped = true;
@@ -284,6 +311,7 @@ void Debugger::step(int count) {
                 last_stop_.address = cpu->get_pc();
                 last_stop_.reason = format("%s breakpoint at 0x%08X", to_string(arch), cpu->get_pc());
                 print("[stop] " + last_stop_.reason);
+                note_breakpoint(arch, 0, cpu->get_pc());
                 return;
             }
         }
@@ -293,7 +321,7 @@ void Debugger::step(int count) {
         for (Bus* bus : buses) trace_from = std::max(trace_from, bus->trace.total());
 
         for (Arch arch : {Arch::MeP, Arch::Rl78, Arch::Arm}) {
-            Cpu* cpu = vita_.core(arch);
+            Cpu* cpu = step_core(arch);
             if (!cpu || cpu->halted) continue;
             if (history_enabled_) {
                 auto& ring = history_[arch];
@@ -422,6 +450,7 @@ void Debugger::run_machine(int64_t slices) {
             last_stop_.reason = format("arm%d breakpoint at 0x%08X", vita_.pc_hook_core(),
                                        vita_.pc_hook_pc());
             print("[stop] " + last_stop_.reason);
+            note_breakpoint(vita_.pc_hook_arch(), vita_.pc_hook_core(), vita_.pc_hook_pc());
             return;
         }
         // Slices bypass step(), so record the PC history here as well - "how did
@@ -464,6 +493,7 @@ bool Debugger::machine_breakpoint_check() {
                     last_stop_.core = i;
                     last_stop_.reason = format("arm%d breakpoint at 0x%08X", i, cpu->get_pc());
                     print("[stop] " + last_stop_.reason);
+                    note_breakpoint(Arch::Arm, i, cpu->get_pc());
                     return true;
                 }
             }
@@ -477,6 +507,7 @@ bool Debugger::machine_breakpoint_check() {
             last_stop_.address = cpu->get_pc();
             last_stop_.reason = format("%s breakpoint at 0x%08X", to_string(arch), cpu->get_pc());
             print("[stop] " + last_stop_.reason);
+            note_breakpoint(arch, 0, cpu->get_pc());
             return true;
         }
     }
@@ -629,6 +660,12 @@ bool Debugger::execute(const std::string& line) {
     std::vector<std::string> args(tokens.begin() + 1, tokens.end());
 
     auto emit = [this](const std::string& text) { print(text); };
+
+    // Verbose breadcrumb: which debugger command ran when. Off unless a session
+    // subscribes to the debug keyword.
+    vita_.events().event(EventProvider::Debugger, ev::debugger::kCommand)
+        .field("text", trimmed)
+        .emit();
 
     if (command == "echo") {
         emit(trimmed.size() > 4 ? trimmed.substr(4) : std::string());
@@ -865,6 +902,14 @@ bool Debugger::execute(const std::string& line) {
             return true;
         }
         const u32 va = arg_address(args, 0, cpu->get_pc());
+        // Optional third form: `vpa <va> <ttbr0>` translates in another address
+        // space.  A user-mode thread has its own TTBR0 (user-mode ASLR, and the
+        // switcher stores the value in the thread's context), so once such a thread
+        // is parked its memory is unreachable through the active tables - which is
+        // exactly the state the boot investigation kept running into.
+        const bool override_ttbr0 = args.size() >= 2u;
+        const u32 saved_ttbr0 = arm->mmu.ttbr0;
+        if (override_ttbr0) arm->mmu.ttbr0 = arg_address(args, 1, saved_ttbr0);
         // Turn the walk recording on just for this query: the walk itself keeps
         // last_walk up to date, but the hot path only publishes it when asked.
         const bool saved_walks = arm->mmu.record_walks;
@@ -872,6 +917,7 @@ bool Debugger::execute(const std::string& line) {
         const arm::MmResult result = arm->mmu.translate(va, false, false, arm->mode());
         const ArmMmu::WalkRecord walk = arm->mmu.last_walk;
         arm->mmu.record_walks = saved_walks;
+        if (override_ttbr0) arm->mmu.ttbr0 = saved_ttbr0;
 
         if (!result.ok) {
             emit(format("VA 0x%08X -> %s (fsr 0x%X)  L1[0x%03X]@0x%08X=0x%08X", va,
@@ -1154,6 +1200,25 @@ bool Debugger::execute(const std::string& line) {
         emit(cmd_keyring(args));
         return true;
     }
+    if (command == "sc") {
+        // What the guest asks the syscon. The model keeps a ring of the last 32
+        // dispatched commands but had no way to print it, so "the kernel sits
+        // idle - what is it polling?" could not be answered from the debugger.
+        const auto& recent = vita_.ernie().recent_commands();
+        emit(format("SC commands served: %llu (last %zu, oldest first)",
+                    static_cast<unsigned long long>(vita_.ernie().commands_served()),
+                    recent.size()));
+        for (const auto& entry : recent) {
+            const char* name = zlb::ernie::sc_command_name(entry.first);
+            emit(format("  0x%04X %-20s reply %u byte(s)", entry.first,
+                        name[0] != '\0' ? name : "(unknown)", entry.second));
+        }
+        return true;
+    }
+    if (command == "nid") {
+        emit(cmd_nid(args));
+        return true;
+    }
     if (command == "bootkeys") {
         // Which resident first-loader build is fitted and which signed block its
         // RSA check expects (see machine/bootkeys.cpp).  Useful when a differently
@@ -1218,6 +1283,10 @@ bool Debugger::execute(const std::string& line) {
         emit(cmd_log(args));
         return true;
     }
+    if (command == "event" || command == "events" || command == "etw") {
+        emit(cmd_event(args));
+        return true;
+    }
     if (command == "help" || command == "?") {
         emit(cmd_help(args));
         return true;
@@ -1249,7 +1318,8 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  regs | reg <name> <v>  registers of the active core\n"
         "  dis [addr] [count]     disassemble\n"
         "  mem [addr] [rows]      hex dump (physical address)\n"
-        "  vpa <va>               translate a VA through the active core's MMU and show the walk\n"
+        "  vpa <va> [ttbr0]       translate a VA through the active core's MMU (or the\n"
+        "                         given TTBR0, e.g. a parked user thread's) and show the walk\n"
         "  vmem <va> [rows]       like vpa, then hex dump the bytes at the resulting PA\n"
         "  poke <addr> <val> [s]  write physical memory (s = 8|16|32)\n"
         "  vpoke <va> <val> [s]   translate a VA through the active core's MMU, then write\n"
@@ -1278,6 +1348,16 @@ std::string Debugger::cmd_help(const std::vector<std::string>& args) {
         "  bpc <addr> | bpl | bpcall\n"
         "  watch <addr> [rwx]     set a watchpoint\n"
         "  watchc [id] | wpl\n"
+        "event tracing (ETW-style)\n"
+        "  event                  session state and the view filter\n"
+        "  event on|off|clear     recording control\n"
+        "  event level <lvl>      critical|error|warning|info|verbose (session)\n"
+        "  event keyword <mask>   boot|storage|interrupt|... | hex | all | default (session)\n"
+        "  event enable|disable <provider|area|all>\n"
+        "  event providers        provider manifest with counts\n"
+        "  event dump|stat|activities|timeline [n]\n"
+        "  event filter ...       the view filter the UI Events panel shares\n"
+        "  event save <file.csv>  export the filtered records\n"
         "misc\n"
         "  log <level>            trace|debug|info|warn|error|off\n"
         "  stage <name>           jump the boot chain to first|second|secure|kbl|nskbl|kernel\n"
@@ -1544,6 +1624,57 @@ std::string Debugger::cmd_faults(const std::vector<std::string>& args) {
     return out;
 }
 
+std::string Debugger::cmd_nid(const std::vector<std::string>& args) {
+    std::string out;
+    if (args.empty()) {
+        out += format("NID database: %zu entries\n", zlb::debug::nid_entry_count());
+        out += "usage: nid <0xNID>   name an import\n";
+        out += "       nid <text>    search function names\n";
+        return out;
+    }
+    const std::string& term = args.front();
+    bool hex = term.size() > 2 && (term[0] == '0') && (term[1] == 'x' || term[1] == 'X');
+    if (!hex) {
+        hex = !term.empty();
+        for (char c : term) {
+            if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                hex = false;
+                break;
+            }
+        }
+    }
+    if (hex) {
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(term.c_str(), &end, 0);
+        if (end != nullptr && *end == '\0') {
+            const std::uint32_t nid = static_cast<std::uint32_t>(value);
+            const std::vector<const zlb::debug::NidEntry*> matches = zlb::debug::nid_lookup(nid);
+            if (matches.empty()) {
+                out += format("0x%08X: no entry in the NID database\n", nid);
+            } else {
+                for (const auto* entry : matches) {
+                    out += format("0x%08X %s::%s  (%s)\n", entry->nid, entry->library, entry->function,
+                                  entry->module);
+                }
+            }
+            return out;
+        }
+    }
+    const std::vector<const zlb::debug::NidEntry*> matches = zlb::debug::nid_search(term);
+    if (matches.empty()) {
+        out += format("no function name contains \"%s\"\n", term.c_str());
+        return out;
+    }
+    out += format("%zu match(es) for \"%s\":\n", matches.size(), term.c_str());
+    const std::size_t limit = matches.size() < 32u ? matches.size() : 32u;
+    for (std::size_t index = 0; index < limit; ++index) {
+        const auto* entry = matches[index];
+        out += format("  0x%08X %s::%s  (%s)\n", entry->nid, entry->library, entry->function, entry->module);
+    }
+    if (matches.size() > limit) out += format("  ... and %zu more\n", matches.size() - limit);
+    return out;
+}
+
 std::string Debugger::cmd_keyring(const std::vector<std::string>& args) {
     (void)args;
     std::string out;
@@ -1593,12 +1724,322 @@ std::string Debugger::cmd_log(const std::vector<std::string>& args) {
     return format("log level: %s", to_string(level));
 }
 
+// ---------------------------------------------------------------------------
+// event - the ETW-style trace session and its views
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string event_usage() {
+    return
+        "usage: event <command>\n"
+        "  event                      session state and the view filter\n"
+        "  event on | off             start/stop recording into the ring buffer\n"
+        "  event clear                drop the recorded records and the counters\n"
+        "  event reset                clear + reset the sequence and the activity stack\n"
+        "  event level <lvl>          session level: critical|error|warning|info|verbose\n"
+        "  event keyword <mask>       session keywords: names (boot|storage|...), hex, all, default\n"
+        "  event enable|disable <what>  a provider name, an area (computation|storage|video|...), or all\n"
+        "  event providers            provider manifest: area, state, count, event vocabulary size\n"
+        "  event dump [n]             n filtered records (newest last), default 32\n"
+        "  event stat [n]             summary table: count, weight (duration), %weight, min/max\n"
+        "  event activities [n]       matched Begin/End spans with durations\n"
+        "  event timeline [buckets]   text histogram of counts and weighted duration per area\n"
+        "  event filter ...           the view filter shared with the UI Events panel:\n"
+        "      level <lvl> | keyword <mask> | provider <name|all|none> | area <name|all|none>\n"
+        "      text <words...> | time <lo_s> <hi_s> | kind <all|activity|oneshot> | clear\n"
+        "  event find <words...>      set the text filter and dump the matches\n"
+        "  event save <file.csv>      export the filtered records to CSV";
+}
+
+std::string event_provider_table(const EventLog& log, const EventFilter& filter) {
+    std::string out = format("%-22s %-15s %-6s %-8s %8s %7s %7s  %s\n", "provider (manifest)", "area", "rec",
+                             "view", "count", "begin", "open", "guid");
+    for (int i = 0; i < kEventProviderCount; ++i) {
+        const EventProvider provider = static_cast<EventProvider>(i);
+        const EventProviderInfo& info = event_provider_info(provider);
+        const EventLog::ProviderCounters& counters = log.provider_counters(provider);
+        out += format("%-22s %-15s %-6s %-8s %8llu %7llu %7llu  %s\n", info.name, to_string(info.area),
+                      log.provider_enabled(provider) ? "on" : "off",
+                      filter.provider_enabled(provider) ? "on" : "off",
+                      static_cast<unsigned long long>(counters.emitted),
+                      static_cast<unsigned long long>(counters.begins),
+                      static_cast<unsigned long long>(counters.open), info.guid);
+    }
+    return out;
+}
+
+std::string event_session_state(const EventLog& log, const EventFilter& filter) {
+    std::string out = format("session %s  level<=%s  keywords=%s  providers=%d/%d  capacity=%zu\n",
+                             log.recording() ? "ON" : "OFF", to_string(log.max_level()),
+                             describe_event_keywords(log.keyword_mask()).c_str(),
+                             [&] {
+                                 int on = 0;
+                                 for (int i = 0; i < kEventProviderCount; ++i) {
+                                     if (log.provider_enabled(static_cast<EventProvider>(i))) ++on;
+                                 }
+                                 return on;
+                             }(),
+                             kEventProviderCount, log.capacity());
+    out += format("records %zu/%zu  total=%llu  filtered=%llu  sequence=%llu  open activities=%zu\n",
+                  log.count(), log.capacity(), static_cast<unsigned long long>(log.total()),
+                  static_cast<unsigned long long>(log.filtered()),
+                  static_cast<unsigned long long>(log.sequence()), log.activity_depth());
+    const EventCounts counts = log.counts(filter);
+    out += format("view    %llu records, span %.6f..%.6f s\n",
+                  static_cast<unsigned long long>(counts.records),
+                  static_cast<double>(log.first_time()) / 1.0e9,
+                  static_cast<double>(log.last_time()) / 1.0e9);
+    return out;
+}
+
+std::string event_timeline_text(const EventLog& log, const EventFilter& filter, int buckets) {
+    if (buckets <= 0) buckets = 24;
+    if (buckets > 120) buckets = 120;
+    const std::vector<EventTimelineBucket> timeline = log.timeline(filter, buckets);
+    if (timeline.empty()) return "no records match the filter";
+
+    u64 max_total = 1;
+    u64 max_weight = 1;
+    for (const EventTimelineBucket& bucket : timeline) {
+        if (bucket.total > max_total) max_total = bucket.total;
+        for (int area = 0; area < kEventAreaCount; ++area) {
+            if (bucket.weight_ns[area] > max_weight) max_weight = bucket.weight_ns[area];
+        }
+    }
+
+    std::string out = format("timeline %zu buckets  %.6f..%.6f s   (bar = event count, weight in ms)\n",
+                             timeline.size(), static_cast<double>(timeline.front().time_ns) / 1.0e9,
+                             static_cast<double>(timeline.back().end_ns) / 1.0e9);
+    out += format("%12s %7s %10s  %s\n", "time (s)", "count", "weight(ms)", "count histogram");
+    for (const EventTimelineBucket& bucket : timeline) {
+        u64 weight = 0;
+        for (int area = 0; area < kEventAreaCount; ++area) weight += bucket.weight_ns[area];
+        const int bar = static_cast<int>(40.0 * static_cast<double>(bucket.total) / static_cast<double>(max_total) + 0.5);
+        std::string text(static_cast<size_t>(bar), '#');
+        out += format("%12.6f %7llu %10.3f  %s\n", static_cast<double>(bucket.time_ns) / 1.0e9,
+                      static_cast<unsigned long long>(bucket.total), static_cast<double>(weight) / 1.0e6, text.c_str());
+    }
+
+    // Area legend, so the weighted-share line is readable without the UI.
+    out += "areas:";
+    for (int area = 0; area < kEventAreaCount; ++area) {
+        u64 weight = 0;
+        u64 count = 0;
+        for (const EventTimelineBucket& bucket : timeline) {
+            weight += bucket.weight_ns[area];
+            count += bucket.counts[area];
+        }
+        if (count == 0 && weight == 0) continue;
+        out += format("  %s=%llu/%.1fms", to_string(static_cast<EventArea>(area)),
+                      static_cast<unsigned long long>(count), static_cast<double>(weight) / 1.0e6);
+    }
+    out += '\n';
+    return out;
+}
+
+}  // namespace
+
+std::string Debugger::cmd_event(const std::vector<std::string>& args) {
+    EventLog& log = vita_.events();
+    EventFilter& filter = event_filter_;
+    const std::string sub = args.empty() ? std::string() : to_lower(args[0]);
+
+    if (sub.empty() || sub == "status") return event_session_state(log, filter);
+    if (sub == "help") return event_usage();
+
+    if (sub == "on" || sub == "off") {
+        log.set_recording(sub == "on");
+        return format("event session: %s", log.recording() ? "ON" : "OFF");
+    }
+    if (sub == "clear") {
+        log.clear();
+        return "event session cleared (records and counters dropped)";
+    }
+    if (sub == "reset") {
+        log.reset();
+        log.reset_activities();
+        return "event session reset (records, counters, sequence and activities)";
+    }
+    if (sub == "level") {
+        if (args.size() < 2) return format("event level: %s", to_string(log.max_level()));
+        EventLevel level = EventLevel::Informational;
+        if (!parse_event_level(args[1], level)) return "usage: event level <critical|error|warning|info|verbose>";
+        log.set_max_level(level);
+        return format("event level: %s", to_string(level));
+    }
+    if (sub == "keyword" || sub == "kw") {
+        if (args.size() < 2) return format("event keywords: %s", describe_event_keywords(log.keyword_mask()).c_str());
+        EventKeyword mask = 0;
+        if (!parse_event_keyword(args[1], mask)) return "usage: event keyword <names|hex|all|default|none>";
+        log.set_keyword_mask(mask);
+        return format("event keywords: %s", describe_event_keywords(mask).c_str());
+    }
+    if (sub == "enable" || sub == "disable") {
+        if (args.size() < 2) return "usage: event enable|disable <provider|area|all>";
+        const bool on = sub == "enable";
+        const std::string what = to_lower(args[1]);
+        if (what == "all") {
+            log.set_all_providers(on);
+            return format("all providers: %s", on ? "on" : "off");
+        }
+        EventProvider provider = EventProvider::Test;
+        if (parse_event_provider(what, provider)) {
+            log.set_provider_enabled(provider, on);
+            return format("provider %s: %s", to_string(provider), on ? "on" : "off");
+        }
+        EventArea area = EventArea::Other;
+        if (parse_event_area(what, area)) {
+            log.set_area_enabled(area, on);
+            return format("area %s: %s", to_string(area), on ? "on" : "off");
+        }
+        return format("unknown provider or area '%s'", args[1].c_str());
+    }
+    if (sub == "providers" || sub == "list") return event_provider_table(log, filter);
+
+    if (sub == "dump" || sub == "tail") {
+        size_t count = 32;
+        if (args.size() > 1) count = static_cast<size_t>(std::strtoul(args[1].c_str(), nullptr, 0));
+        std::vector<EventRecord> records = log.query(filter);
+        if (records.size() > count) records.erase(records.begin(), records.end() - static_cast<long>(count));
+        if (records.empty()) return "no records match the filter";
+        return log.format_table(records);
+    }
+    if (sub == "stat" || sub == "summary") {
+        size_t rows = 20;
+        if (args.size() > 1) rows = static_cast<size_t>(std::strtoul(args[1].c_str(), nullptr, 0));
+        const std::vector<EventSummaryRow> summary = log.summary(filter, rows);
+        if (summary.empty()) return "no records match the filter";
+        std::string out = format("%-14s %-4s %-8s %-18s %8s %11s %8s %10s %10s\n", "provider", "task", "opcode",
+                                 "event", "count", "weight(ms)", "%weight", "min(ms)", "max(ms)");
+        for (const EventSummaryRow& row : summary) {
+            out += format("%-14s %-4u %-8s %-18s %8llu %11.3f %7.1f%% %10.4f %10.4f\n", to_string(row.provider),
+                          row.task, to_string(row.opcode), row.name ? row.name : "?",
+                          static_cast<unsigned long long>(row.count), static_cast<double>(row.weight_ns) / 1.0e6,
+                          row.percent, static_cast<double>(row.min_ns) / 1.0e6,
+                          static_cast<double>(row.max_ns) / 1.0e6);
+        }
+        return out;
+    }
+    if (sub == "activities" || sub == "act") {
+        size_t rows = 32;
+        if (args.size() > 1) rows = static_cast<size_t>(std::strtoul(args[1].c_str(), nullptr, 0));
+        const std::vector<EventActivitySpan> spans = log.activities(filter, rows);
+        if (spans.empty()) return "no activities match the filter";
+        std::string out = format("%-14s %-18s %10s %10s %11s  %s\n", "provider", "event", "begin(s)", "end(s)",
+                                 "duration(ms)", "activity");
+        for (const EventActivitySpan& span : spans) {
+            out += format("%-14s %-18s %10.6f %10.6f %11.4f  0x%llX%s\n", to_string(span.provider),
+                          span.name ? span.name : "?", static_cast<double>(span.begin_ns) / 1.0e9,
+                          static_cast<double>(span.end_ns) / 1.0e9,
+                          static_cast<double>(span.duration_ns) / 1.0e6,
+                          static_cast<unsigned long long>(span.activity), span.open ? " (open)" : "");
+        }
+        return out;
+    }
+    if (sub == "timeline") {
+        int buckets = args.size() > 1 ? std::atoi(args[1].c_str()) : 24;
+        return event_timeline_text(log, filter, buckets);
+    }
+    if (sub == "save" || sub == "export") {
+        if (args.size() < 2) return "usage: event save <file.csv>";
+        const std::string path = resolve_workspace_path(args[1]);
+        std::string error;
+        if (!log.save_csv(path, filter, error)) return "event save failed: " + error;
+        return format("event: %zu records exported to %s", log.query(filter).size(), path.c_str());
+    }
+    if (sub == "find" || sub == "text") {
+        if (args.size() < 2) return "usage: event find <words...>";
+        std::string text;
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (!text.empty()) text += ' ';
+            text += args[i];
+        }
+        filter.text = text;
+        return cmd_event({"dump", "24"});
+    }
+    if (sub == "filter") {
+        if (args.size() < 2) {
+            return format("view filter: level<=%s keywords=%s providers=%s areas=%s text='%s' kind=%s\n"
+                          "             time %.6f..%.6f s\n",
+                          to_string(filter.max_level), describe_event_keywords(filter.keyword).c_str(),
+                          filter.provider_mask == ~0ull ? "all" : hex(filter.provider_mask).c_str(),
+                          filter.area_mask == (1ull << kEventAreaCount) - 1 ? "all" : "some",
+                          filter.text.c_str(),
+                          filter.activities_only ? "activity" : (filter.one_shot_only ? "one-shot" : "all"),
+                          static_cast<double>(filter.time_lo_ns) / 1.0e9,
+                          static_cast<double>(filter.time_hi_ns) / 1.0e9);
+        }
+        const std::string what = to_lower(args[1]);
+        if (what == "clear") {
+            filter = EventFilter{};
+            return "view filter cleared";
+        }
+        if (what == "level" && args.size() > 2) {
+            EventLevel level = EventLevel::Informational;
+            if (!parse_event_level(args[2], level)) return "usage: event filter level <level>";
+            filter.max_level = level;
+            return format("view filter level: %s", to_string(level));
+        }
+        if (what == "keyword" && args.size() > 2) {
+            EventKeyword mask = 0;
+            if (!parse_event_keyword(args[2], mask)) return "usage: event filter keyword <mask>";
+            filter.keyword = mask;
+            return format("view filter keywords: %s", describe_event_keywords(mask).c_str());
+        }
+        if (what == "provider" && args.size() > 2) {
+            const std::string name = to_lower(args[2]);
+            if (name == "all") filter.all_providers();
+            else if (name == "none") filter.clear_providers();
+            else {
+                EventProvider provider = EventProvider::Test;
+                if (!parse_event_provider(name, provider)) return "unknown provider " + args[2];
+                filter.clear_providers();
+                filter.set_provider(provider, true);
+            }
+            return cmd_event({"filter"});
+        }
+        if (what == "area" && args.size() > 2) {
+            const std::string name = to_lower(args[2]);
+            if (name == "all") filter.area_mask = (1ull << kEventAreaCount) - 1;
+            else if (name == "none") filter.area_mask = 0;
+            else {
+                EventArea area = EventArea::Other;
+                if (!parse_event_area(name, area)) return "unknown area " + args[2];
+                filter.area_mask = 1ull << static_cast<int>(area);
+            }
+            return cmd_event({"filter"});
+        }
+        if (what == "text") {
+            filter.text.clear();
+            for (size_t i = 2; i < args.size(); ++i) {
+                if (!filter.text.empty()) filter.text += ' ';
+                filter.text += args[i];
+            }
+            return cmd_event({"filter"});
+        }
+        if (what == "time" && args.size() > 3) {
+            filter.time_lo_ns = static_cast<u64>(std::strtod(args[2].c_str(), nullptr) * 1.0e9);
+            filter.time_hi_ns = static_cast<u64>(std::strtod(args[3].c_str(), nullptr) * 1.0e9);
+            return cmd_event({"filter"});
+        }
+        if (what == "kind" && args.size() > 2) {
+            const std::string kind = to_lower(args[2]);
+            filter.activities_only = kind == "activity" || kind == "activities" || kind == "begin";
+            filter.one_shot_only = kind == "oneshot" || kind == "one-shot" || kind == "info";
+            return cmd_event({"filter"});
+        }
+        return event_usage();
+    }
+    return "unknown event command '" + sub + "'\n" + event_usage();
+}
+
 std::vector<std::string> Debugger::complete(const std::string& prefix) const {
     static const std::vector<std::string> commands = {
         "step", "run", "runm", "until", "reset", "core", "bp", "bpc", "bpl", "watch", "watchc",
         "wpl", "regs", "reg", "dis", "mem", "poke", "save", "trace", "devices", "map", "devget",
         "devset", "emmc", "gpo", "console", "uart", "bootctx", "boot", "faults", "stage", "keyring",
-        "bootkeys", "info", "load",
+        "bootkeys", "nid", "info", "load", "event",
         "log", "help", "quit"};
     std::vector<std::string> out;
     for (const auto& command : commands) {

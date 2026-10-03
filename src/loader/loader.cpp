@@ -23,6 +23,7 @@
 
 #include "common/log.h"
 #include "common/util.h"
+#include "event/providers.h"
 #include "loader/loader_extra.h"
 #include "loader/nid.h"
 
@@ -316,6 +317,30 @@ LoadResult load_image(Bus& bus, const std::vector<u8>& data, const std::string& 
     LoadResult result;
     result.info = identify(data, name);
     const bool explicit_address = address != kAutoAddress;
+
+    // One Begin/End activity per image: how long a module took to identify,
+    // decrypt and map, and what it produced. The destructor runs on every return
+    // path, so a failed load still closes the activity (with result=false).
+    EventLog::Builder load_begin = events().begin_event(EventProvider::Loader, ev::loader::kLoadBegin);
+    load_begin.field("name", name)
+        .field("size", static_cast<u64>(data.size()))
+        .field("kind", std::string(to_string(result.info.kind)))
+        .address("address", address);
+    const u64 load_activity = load_begin.emit().activity;
+    struct LoadEndScope {
+        u64 activity = 0;
+        const std::string* name = nullptr;
+        const LoadResult* result = nullptr;
+        size_t size = 0;
+        ~LoadEndScope() {
+            events().end_event(activity, EventProvider::Loader, ev::loader::kLoadEnd)
+                .field("name", *name)
+                .address("entry", result->entry)
+                .field("bytes", static_cast<u64>(size))
+                .field("result", result->ok)
+                .emit();
+        }
+    } load_end{load_activity, &name, &result, data.size()};
 
     switch (result.info.kind) {
         case ImageKind::Elf: {

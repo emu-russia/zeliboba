@@ -790,3 +790,41 @@ ZLB_TEST(ernie_spi_transfer_answers_the_boot_commands) {
 
     ZLB_EXPECT_EQ(ernie.spi_transfers(), 2u);
 }
+
+// The SC command ring was collected (and serialised) from the beginning but had no
+// reader, so "what is the guest actually asking the syscon" could not be answered
+// from the debugger.  `sc` prints it through ErnieBlock::recent_commands(), and
+// sc_command_name() supplies the USS-1001 names without exposing the model header.
+ZLB_TEST(syscon_recent_commands_are_readable_and_named) {
+    Bus bus;
+    ErnieBlock ernie(bus, nullptr);
+    ernie.install();
+    ernie.set_running_firmware(false);
+
+    ZLB_EXPECT_TRUE(ernie.recent_commands().empty());
+
+    ernie.dispatch_command(0x0000, {});          // get_status
+    ernie.dispatch_command(0x0103, {});          // get_panel_state2
+    ernie.dispatch_command(0x0003, {});          // get_model_string
+
+    const auto& recent = ernie.recent_commands();
+    ZLB_EXPECT_EQ(recent.size(), size_t(3));
+    if (recent.size() == 3) {
+        ZLB_EXPECT_EQ(recent[0].first, 0x0000u);
+        ZLB_EXPECT_EQ(recent[1].first, 0x0103u);
+        ZLB_EXPECT_EQ(recent[2].first, 0x0003u);
+        ZLB_EXPECT_EQ(recent[2].second, 36u);     // the 4 + 32 byte record
+    }
+
+    // Names come from the real USS-1001 table.
+    ZLB_EXPECT_TRUE(std::string(ernie::sc_command_name(0x0000)) == "get_status");
+    ZLB_EXPECT_TRUE(std::string(ernie::sc_command_name(0x0103)) == "get_panel_state2");
+    ZLB_EXPECT_TRUE(std::string(ernie::sc_command_name(0x0003)) == "get_model_string");
+    ZLB_EXPECT_TRUE(ernie::sc_command_name(0x7FFFu)[0] == '\0');
+
+    // ... and the record itself is the six byte state the guest polls for.
+    const std::vector<u8> panel = ernie.dispatch_command(0x0103, {});
+    ZLB_EXPECT_EQ(panel.size(), size_t(36));
+    ZLB_EXPECT_EQ(static_cast<u32>(panel[0]), 0u);        // result = ok
+    ZLB_EXPECT_EQ(static_cast<u32>(panel[2]), 6u);        // payload length
+}

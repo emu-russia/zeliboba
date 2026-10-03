@@ -53,6 +53,7 @@
     <ClCompile Include="..\src\common\*.cpp" />
     <ClCompile Include="..\src\bus\*.cpp" />
     <ClCompile Include="..\src\cpu\**\*.cpp" />
+    <ClCompile Include="..\src\event\*.cpp" />
     <ClCompile Include="..\src\hw\**\*.cpp" />
     <ClCompile Include="..\src\loader\*.cpp" />
     <ClCompile Include="..\src\machine\*.cpp" />

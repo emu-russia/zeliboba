@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "common/log.h"
+#include "event/providers.h"
 #include "hw/cmep.h"
 #include "hw/cmep/cmep_internal.h"
 #include "hw/syscon.h"
@@ -332,6 +333,12 @@ void CmepBlock::service_sc_transfer() {
     desc.command = (static_cast<u32>(desc.mode) << 8) | desc.channel;
     desc.valid = true;
     impl_->last_sc_command = desc.command;
+    if (events().should_record(EventProvider::Cmep, EventLevel::Informational,
+                               event_keyword::kSecurity)) {
+        events().event(EventProvider::Cmep, ev::cmep::kServiceCall)
+            .field("entry", (u64)desc.command)
+            .emit();
+    }
     // sc_xfer's own window computation (0x5CF6C..0x5CF7C): 0xE0B00000 for
     // channel 0 and 0xE0BF0000 + (channel << 16) otherwise.
     if (desc.window == 0) {

@@ -14,6 +14,7 @@
 #include "cpu/cpu.h"
 #include "cpu/factory.h"
 #include "cpu/rl78/rl78_core.h"
+#include "event/providers.h"
 #include "hw/emmc.h"
 #include "hw/syscon/ernie_internal.h"
 #include "hw/syscon/ernie_power.h"
@@ -134,6 +135,43 @@ struct ErnieBlock::Impl {
 
 namespace {
 
+/// `ZLB_SC_PANEL_AFTER=<n>`: answer the first n panel/UART reads from the model
+/// and only then switch to the forced record.  A waiting loop that compares the
+/// record with the previous one (or waits for a bit to *change*) cannot be moved
+/// by a constant answer, so the probe has to change the answer mid-run.
+u32 forced_panel_state_after() {
+    static const u32 value = [] {
+        const char* text = std::getenv("ZLB_SC_PANEL_AFTER");
+        if (text == nullptr || *text == '\0') return 0u;
+        return static_cast<u32>(std::strtoul(text, nullptr, 10));
+    }();
+    return value;
+}
+
+/// `ZLB_SC_PANEL=aa,bb,cc,dd,ee,ff` (also accepts spaces) returns the forced
+/// six-byte panel/UART state record, or nullptr when the switch is off.  Parsed
+/// once; see the case 0x0100/0x0103/0x0130 comment for why it exists.
+const std::vector<u8>* forced_panel_state() {
+    static const std::vector<u8>* value = []() -> const std::vector<u8>* {
+        const char* text = std::getenv("ZLB_SC_PANEL");
+        if (text == nullptr || *text == '\0') return nullptr;
+        static std::vector<u8> bytes;
+        unsigned parsed = 0;
+        for (const char* cursor = text; *cursor != '\0' && parsed < 6u;) {
+            while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
+            char* end = nullptr;
+            const unsigned long byte = std::strtoul(cursor, &end, 16);
+            if (end == cursor) break;
+            bytes.push_back(static_cast<u8>(byte & 0xFFu));
+            ++parsed;
+            cursor = end;
+        }
+        while (bytes.size() < 6u) bytes.push_back(0);
+        return &bytes;
+    }();
+    return value;
+}
+
 /// Build the 4 + 32 byte response record the Ernie SC handlers write at 0x0DD98:
 ///   +0 result (0 = ok, 0xFE = busy, anything else = error)
 ///   +1 status byte (panel / card status)
@@ -238,6 +276,10 @@ bool looks_like_uss1002(const std::vector<u8>& dump) {
 }
 
 }  // namespace
+
+const std::vector<std::pair<u32, u32>>& ErnieBlock::recent_commands() const {
+    return impl_->recent_commands;
+}
 
 void ErnieBlock::Impl::note_command(u32 command, size_t reply_size) {
     recent_commands.push_back({command, static_cast<u32>(reply_size)});
@@ -451,6 +493,18 @@ std::vector<u8> ErnieBlock::Impl::dispatch(u32 command, const std::vector<u8>& p
         case 0x0100:    // get_panel_state (0x36132, length 0x06)
         case 0x0103:    // get_panel_state2 (0x361C5, length 0x06)
         case 0x0130: {  // get_uart_state (0x36266, length 0x06)
+            // Development switch ZLB_SC_PANEL=aa,bb,cc,dd,ee,ff forces this
+            // six-byte record.  While the boot sits idle the guest's syscon worker
+            // polls 0x0103 at ~500 Hz (paired with 0x0003), which is a waiting
+            // loop; this switch exists to find out which value it is waiting for
+            // without guessing the panel's encoding (docs/STATUS.md).  Off by
+            // default - the record is then the SFR ports plus the modelled buttons.
+            static u32 panel_reads = 0;
+            ++panel_reads;
+            if (const std::vector<u8>* forced = forced_panel_state(); forced != nullptr &&
+                panel_reads > forced_panel_state_after()) {
+                return ok_reply(*forced);
+            }
             std::vector<u8> data(6, 0);
             data[0] = sfr ? sfr->peek8(ernie::kSfrP7) : 0;
             data[1] = sfr ? sfr->peek8(ernie::kSfrP5) : 0;
@@ -801,6 +855,12 @@ bool ErnieBlock::read_nvs(u16 offset, size_t length, std::vector<u8>& out) const
 
 std::vector<u8> ErnieBlock::dispatch_command(u32 command, const std::vector<u8>& payload) {
     Impl& impl = *impl_;
+    if (events().should_record(EventProvider::Syscon, EventLevel::Verbose, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kScCommand)
+            .field("cmd", (u64)command)
+            .field("payload", (u64)payload.size())
+            .emit();
+    }
     // The fuel gauge / panel / RTC values are mirrored in ErnieBlock's own
     // members (the public API's setters are inline there), so fold them back
     // into the power model before it answers.
@@ -809,6 +869,12 @@ std::vector<u8> ErnieBlock::dispatch_command(u32 command, const std::vector<u8>&
     impl.power.rtc_seconds = rtc_seconds_;
 
     std::vector<u8> reply = impl.dispatch(command, payload);
+    if (events().should_record(EventProvider::Syscon, EventLevel::Verbose, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kScReply)
+            .field("cmd", (u64)command)
+            .field("result", (u64)reply.size())
+            .emit();
+    }
     ++commands_served_;
     impl.note_command(command, reply.size());
     impl.channel.publish_reply(command, reply);
@@ -882,7 +948,14 @@ void ErnieBlock::tick(u64 cycles) {
 
 void ErnieBlock::set_power_button(bool pressed) {
     impl_->power.set_power_button(pressed);
-    if (pressed) impl_->power.release_soc();
+    if (pressed) {
+        impl_->power.release_soc();
+        if (events().should_record(EventProvider::Syscon, EventLevel::Warning, event_keyword::kPower)) {
+            events().event(EventProvider::Syscon, ev::syscon::kReset)
+                .field("reason", std::string("power-button"))
+                .emit();
+        }
+    }
     soc_released_ = impl_->power.soc_released;
 }
 
@@ -894,6 +967,12 @@ void ErnieBlock::release_soc() {
     impl_->power.release_soc();
     if (impl_->soc_gate != nullptr) impl_->soc_gate->set_released(true);
     soc_released_ = true;
+    if (events().should_record(EventProvider::Syscon, EventLevel::Informational, event_keyword::kPower)) {
+        events().event(EventProvider::Syscon, ev::syscon::kPowerState)
+            .field("from", (u64)0)
+            .field("to", (u64)1)
+            .emit();
+    }
 }
 
 // ---------------------------------------------------------------------------

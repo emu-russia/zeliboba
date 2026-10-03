@@ -9,6 +9,7 @@
 #include "cpu/arm/arm_core.h"
 #include "cpu/mep/mep_core.h"
 #include "cpu/factory.h"
+#include "event/providers.h"
 #include "hw/cmep.h"
 #include "hw/emmc.h"
 #include "hw/soc.h"
@@ -475,6 +476,18 @@ bool Vita::satisfy_arm_boot_fault(u32 core, u32 va, bool write, bool fetch) {
     Cpu* cpu = arm_cores_[core].get();
     ArmCore* arm = dynamic_cast<ArmCore*>(cpu);
     if (!arm || !arm->mmu.enabled()) return false;
+
+    // Every repair below is for the *privileged* boot stages: they exist because the
+    // missing ARM boot ROM / second-loader reset vector never left the inherited low
+    // window in the KBL's tables.  A user-mode address space is a different thing
+    // entirely - it is per process, it is randomised on the Vita (user-mode ASLR),
+    // and its faults belong to the guest's own demand-paging and guard-page logic.
+    // Handing a user process a mapping invented from the boot rule would alias
+    // unrelated physical memory into a randomised VA and hide the fault the guest
+    // wanted to see.  (In an ordinary cold boot this gate changes nothing: the
+    // substitutions do not fire at all - measured, `boot_fault_fixes_ == 0` for the
+    // whole run - it is here so they cannot misfire once userland starts.)
+    if (arm->mode() == arm::kModeUser) return false;
 
     // Diagnostic (ZLB_SECURE_FAULT_LOG=1): the secure stage's repairs below are
     // skipped for the *unsubstituted* run, so a fault there is invisible - and when
@@ -4519,6 +4532,10 @@ bool Vita::start_arm_kernel_boot_loader() {
     boot_.arm_released = true;
     boot_.detail = "ARM released on the kernel boot loader";
     add_milestone("ARM started on kernel_boot_loader at 0x" + hex(kbl_entry_, 8) + " (" + source + ")");
+    event_log_.event(EventProvider::Boot, ev::boot::kArmReleased)
+        .address("entry", arm_entry)
+        .field("cores", static_cast<u64>(kArmCoreCount))
+        .emit();
     return true;
 }
 
@@ -4670,6 +4687,10 @@ bool Vita::start_nskbl() {
     boot_.detail = "ARM in the non-secure world on NSKBL";
     add_milestone("NSKBL decoded to 0x" + hex(kNskblEntry, 8) + " by the KBL's own sceArlzDecode (" +
                   source + ")");
+    event_log_.event(EventProvider::Boot, ev::boot::kArmReleased)
+        .address("entry", kNskblEntry)
+        .field("cores", static_cast<u64>(kArmCoreCount))
+        .emit();
     return true;
 }
 
@@ -4873,6 +4894,10 @@ void Vita::poll_boot_chain() {
             cmep_block_->set_cmep_status(0);
             boot_.cmep_status = 0;
             add_milestone("ARM boot ROM acknowledged the second-loader status 0x009");
+            event_log_.event(EventProvider::Boot, ev::boot::kHandshake)
+                .field("status", static_cast<u64>(9))
+                .field("side", std::string("cmep"))
+                .emit();
         } else if ((status & 0xFFFFu) == 0x101u && !cmep_context_done_) {
             // The missing reset/ROM path is still modelled here. Preserve the
             // pending status and the live CMeP so genuine Smsched can ACK it,
@@ -4881,6 +4906,54 @@ void Vita::poll_boot_chain() {
             cmep_context_done_ = true;
             ZLB_LOG_INFO("boot", "CMeP published 0x101: releasing ARM for the native scheduler handshake");
             add_milestone("CMeP ready for native scheduler -> syscon SoC release (development substitution)");
+            event_log_.event(EventProvider::Boot, ev::boot::kHandshake)
+                .field("status", static_cast<u64>(status & 0xFFFFu))
+                .field("side", std::string("cmep"))
+                .emit();
+            event_log_.event(EventProvider::Mailbox, ev::mailbox::kHandshake)
+                .field("status", static_cast<u64>(status & 0xFFFFu))
+                .field("side", std::string("cmep"))
+                .emit();
+        }
+    }
+
+    // Publish the real boot stage for a *normal* boot.  Only the debug entry
+    // points `stage nskbl` / `stage kernel` used to assign NskblEntry/KernelEntry,
+    // so a cold boot from the first loader reported `arm-kernel-boot-loader` for
+    // the rest of the run - long after NSKBL had loaded every os0 module and the
+    // kernel was executing.  Sample the cluster's PCs instead: NSKBL lives at
+    // VA 0x51000000 and the non-secure kernel below VA 0x00800000.  The Secure
+    // Monitor's relocated handlers (VA 0x003BE1C8) also live low, but they run
+    // before NSKBL, so `nskbl_seen_` gates the kernel transition.
+    if (!kernel_running_) {
+        for (int i = 0; i < kArmCoreCount; ++i) {
+            const Cpu* core = arm_cores_[static_cast<size_t>(i)].get();
+            if (!core) continue;
+            const u32 pc = core->get_pc();
+            if (pc >= 0x51000000u && pc < 0x51060000u) {
+                if (!nskbl_seen_) {
+                    nskbl_seen_ = true;
+                    // If a core is executing NSKBL, the state machine is behind
+                    // regardless of which earlier stage it last recorded.
+                    if (boot_.stage != BootStage::NskblEntry &&
+                        boot_.stage != BootStage::KernelEntry &&
+                        boot_.stage != BootStage::KernelRunning &&
+                        boot_.stage != BootStage::Failed) {
+                        boot_.stage = BootStage::NskblEntry;
+                        boot_.detail = "ARM in the non-secure world on NSKBL";
+                        add_milestone("NSKBL entered at 0x51000000 (non-secure world)");
+                    }
+                }
+            } else if (nskbl_seen_ && pc >= 0x00010000u && pc < 0x00800000u) {
+                // NSKBL handed control to the os0 kernel: it now runs from the low
+                // VA window, and NSKBL itself has already been left behind.
+                kernel_started_ = true;
+                boot_.stage = BootStage::KernelEntry;
+                boot_.arm_entry = pc;
+                boot_.detail = "os0 kernel executing below VA 0x00800000";
+                add_milestone("kernel entered from NSKBL at 0x" + hex(pc, 8));
+                break;
+            }
         }
     }
 
@@ -4890,6 +4963,11 @@ void Vita::poll_boot_chain() {
         boot_.detail = "kernel executing";
         add_milestone("kernel is executing instructions");
     }
+
+    // Every stage transition in the boot chain funnels through this function, so
+    // this single call keeps the event log's Begin/End stage activities in sync
+    // (see Vita::note_stage_change).
+    note_stage_change();
 }
 
 bool Vita::kernel_started() const { return kernel_started_; }

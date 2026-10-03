@@ -86,6 +86,17 @@ public:
     /// External INTC input. Requests remain pending until the device deasserts
     /// its level or software clears an edge-triggered ISR bit.
     void set_irq_level(unsigned source, bool asserted);
+    /// The INTC's own view of a source: the flag register (ISR) and the mask
+    /// register (IMR) decide whether pending_irq() ever returns a source. Exposed
+    /// for diagnostics (the secure kernel polls software flags its handlers set).
+    u32 interrupt_flag_register() const;
+    u32 interrupt_mask_register() const;
+    /// Diagnostics for the secure kernel's missing interrupts: how often the INTC
+    /// had an eligible source and how often the core actually took one, plus the
+    /// last source it saw. Reset with the machine.
+    u64 irq_sources_seen = 0;
+    u64 irq_sources_taken = 0;
+    int irq_last_source = -1;
     /// Board-selected boot vector bank used while CFG.EVM=0. Ordinary MeP
     /// systems use zero; the CMeP boot stages remap this bank through hardware
     /// whose register interface is not yet modeled.

@@ -129,6 +129,11 @@ const ScCommandInfo* sc_command_info(u32 number) {
     return nullptr;
 }
 
+const char* sc_command_name(u32 number) {
+    const ScCommandInfo* info = sc_command_info(number);
+    return info != nullptr ? info->name : "";
+}
+
 // ---------------------------------------------------------------------------
 // ScRegs
 // ---------------------------------------------------------------------------

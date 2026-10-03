@@ -90,6 +90,7 @@ file(GLOB_RECURSE ZLB_CORE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/common/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/bus/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/event/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/hw/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/machine/*.cpp"

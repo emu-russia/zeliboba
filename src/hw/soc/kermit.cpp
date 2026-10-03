@@ -40,8 +40,87 @@
 //   0x18 SC_RESPONSE1    response word 1
 //   0x1C SC_IRQ_ENABLE   bit0 raise the syscon SPI when a response arrives
 //   0x20 SC_DOORBELL     alternative trigger (same as writing SC_COMMAND)
+#include "common/log.h"
 #include "hw/soc/soc_internal.h"
+
+#include <cstdlib>
+#include <functional>
 #include "hw/cmep/cmep_internal.h"
+
+namespace {
+
+// The guest's DMA window (0xE0410000) receives a descriptor and then a doorbell
+// write at +0x020 that carries the physical address of the descriptor chain.  The
+// engine's transfer itself is not implemented, but the doorbell is the point where
+// the hardware would complete and interrupt, so this subclass exists to test that:
+// with ZLB_DMA_IRQ=<n> it asserts interrupt <n> (a pulse) on the doorbell.  The
+// DMA library registered handlers 0x70..0x7F, one per channel, so 0x7D is the
+// natural default for the channel-13 operation the display module submits.
+class DmaWindow : public zlb::kermit::RegisterBlock {
+public:
+    DmaWindow(std::string name, zlb::u32 base, zlb::u32 size, std::function<void(zlb::u32)> raise)
+        : RegisterBlock(std::move(name), base, size), raise_(std::move(raise)) {}
+
+    void tick(zlb::u64 ticks) override {
+        if (!busy_) return;
+        if (ticks >= budget_) {
+            budget_ = 0;
+        } else {
+            budget_ -= static_cast<zlb::u32>(ticks);
+        }
+        if (budget_ == 0u) {
+            busy_ = false;
+            RegisterBlock::write(base() + 0x024u, 4u, 0u);
+            RegisterBlock::write(base() + 0x028u, 4u, 3u);
+            // The completion interrupt is off by default: the guest's completion
+            // routine polls +0x24/+0x28, and delivering the interrupt instead makes
+            // the display thread park on the completion event before it programs a
+            // scanout (measured: IFTU bank ADDRESS stays 0, DSI0 runs with no buffer).
+            // ZLB_DMA_IRQ=<n> turns the pulse back on for interrupt-path debugging.
+            ZLB_LOG_INFO("machine", "module: DMA engine finished after the transfer budget%s",
+                         irq_enabled_ ? " (pulsing the channel interrupt)" : "");
+            if (irq_enabled_ && raise_) raise_(irq_);
+        }
+    }
+
+    void set_budget(zlb::u32 ticks) { budget_ticks_ = ticks ? ticks : 1u; }
+
+    void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
+        RegisterBlock::write(address, size, value);
+        if (enabled_ && address - base() == 0x020u && value != 0) {
+            // +0x24 bit 0 is BUSY and +0x28 is the finished-channel mask; the guest
+            // polls both. The module-start loop spins at 0x438046 ("tst.w r3,#1; bne")
+            // until BUSY clears, and the modules' completion routine 0x438400 bails
+            // out at 0x438432 while ([+0x28] & 3) == 0. So the doorbell claims BUSY
+            // *and* reports the finished channels in the same store, and the engine
+            // clears BUSY when the transfer budget expires - claiming only BUSY parks
+            // the display thread (measured: IFTU bank ADDRESS stays 0, BLANK stays 1,
+            // and the guest runs a frame loop with nothing to scan out), while
+            // finishing on a poll of +0x24 hangs the module loop at start #22.
+            // What is still not modelled is the transfer itself: no bytes move.
+            RegisterBlock::write(base() + 0x024u, 4u, 1u);
+            RegisterBlock::write(base() + 0x028u, 4u, 3u);
+            busy_ = true;
+            budget_ = budget_ticks_;
+            ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> busy for %u ticks",
+                         static_cast<unsigned>(value), budget_ticks_);
+        }
+    }
+
+    void set_irq(zlb::u32 irq) { irq_ = irq; irq_enabled_ = true; }
+    void set_enabled(bool on) { enabled_ = on; }
+
+private:
+    std::function<void(zlb::u32)> raise_;
+    zlb::u32 irq_ = 0x7Cu;
+    bool irq_enabled_ = false;
+    bool enabled_ = false;
+    bool busy_ = false;
+    zlb::u32 budget_ = 0;
+    zlb::u32 budget_ticks_ = 1000u;
+};
+
+}  // namespace
 
 namespace zlb::kermit {
 
@@ -69,7 +148,8 @@ constexpr u32 kScuPowerStatus = 0x08;
 
 /// The device names KermitBlock::tick advances; must match install().
 bool needs_tick(const std::string& name) {
-    return name == "Kermit.GIC" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.Sdif0" ||
+    return name == "Kermit.GIC" || name == "Kermit.GT" || name == "Kermit.PT" || name == "Kermit.DmaWin" ||
+           name == "Kermit.Sdif0" ||
            name == "Kermit.Sdif1" || name == "Kermit.Sdif2" || name == "Kermit.DMA" || name == "Kermit.Display" ||
            name == "Kermit.DSI0" || name == "Kermit.EmcTop" || name == "Kermit.LT5" || name == "Kermit.WT7" || name == "Kermit.Spi0";
 }
@@ -809,12 +889,136 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
     // E8000000 remains opaque peripheral glue. E20B6000 is now established
     // as native ThreadMgr LT5, not an empty/drop-write descriptor window.
     d.bus.add_device(std::make_unique<kermit::RegisterBlock>("Kermit.UnkE8000", 0xE8000000, 0x1000));
+    // 0xE3320000: the per-core control window the non-secure kernel (NSKBL at
+    // 0x51003328, then the kernel's context code at 0x000EC39C) writes.  The
+    // kernel's own TTBR1 maps all of 0xE0000000-0xE7FFFFFF as 1 MiB sections, so
+    // VA == PA here.  Measured with ZLB_WTRAP over a cold boot: for every core it
+    // programs +0x100 = 1 and then +0x000 = 0x87, i.e. 0xE3320000 + 0x1000 * core
+    // with a two-register sequence - 214 writes, and (with the 16-bit read trap
+    // fixed) not one read.  The meaning of the value is not recovered, so the block
+    // only keeps and names the four observed slots instead of dropping the writes,
+    // the way Kermit.UnkE8000 keeps the other opaque window.
+    {
+        auto per_core = std::make_unique<kermit::RegisterBlock>("Kermit.PerCore", 0xE3320000u, 0x4000u);
+        for (u32 core = 0; core < 4u; ++core) {
+            per_core->define(core * 0x1000u, format("CORE%u_00", core));
+            per_core->define(core * 0x1000u + 0x100u, format("CORE%u_100", core));
+        }
+        d.bus.add_device(std::move(per_core));
+    }
     auto lt5 = std::make_unique<kermit::VitaSystemTimer>("Kermit.LT5", kermit::kLt5Base, true, kermit::kIrqLt5);
     auto wt7 = std::make_unique<kermit::VitaSystemTimer>("Kermit.WT7", kermit::kWt7Base, false, kermit::kIrqWt7);
     lt5->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     wt7->set_irq_callback([&d](u32 id, bool level) { d.raise(id, level); });
     d.bus.add_device(std::move(lt5));
     d.bus.add_device(std::move(wt7));
+    // 0xE0410000: the DMA window the guest actually drives.  The kernel's own
+    // device table (PA 0x40102E58) maps it to physical 0x2802A000, and the DMA
+    // library's kick code (0x4381B6..0x438262) writes its descriptor here:
+    // +0x10/+0x14 and +0x30/+0x3C carry callbacks, +0x10C/+0x100 a control word,
+    // and +0x200..+0x23C the descriptor proper (op pointer 0xFA01F0, buffer
+    // 0x7D00F9, size 0x100, code pointers 0x43C000/0x5C1C54).  The window was
+    // unmapped, so every one of those writes vanished and the single read at
+    // +0x3C came back as 0xFFFFFFFF.  Modelled as storage with the observed
+    // offsets: the engine's semantics - and the interrupt that would set the
+    // completion event flag ksceKernelDmaOpSync waits on - are not recovered, so
+    // this only stops the guest's descriptor from disappearing.  The separate
+    // Kermit.DMA block stays at 0xE2060000, where the KBL's console table and
+    // docs/HARDWARE.md place it.
+    {
+        auto dma_win = std::make_unique<DmaWindow>(
+            "Kermit.DmaWin", 0xE0410000u, 0x1000u, [this](u32 id) { pulse_irq(id, 2000000); });
+        // The engine is modelled as an instant completion: the doorbell clears the
+        // busy bit, reports the finished channels and raises the channel interrupt.
+        // That is what takes the guest from "ksceKernelDmaOpSync waits forever" to
+        // "the twenty-second module start returns 0 and the loop moves on" - see
+        // docs/STATUS.md, round 26. What is *not* modelled is the transfer itself:
+        // the bytes never move, so a module that reads the transferred buffer sees
+        // whatever was there before. ZLB_DMA_IRQ only overrides the interrupt number.
+        dma_win->set_enabled(true);
+        if (const char* irq_env = std::getenv("ZLB_DMA_IRQ")) {
+            dma_win->set_irq(static_cast<u32>(std::strtoul(irq_env, nullptr, 0)));
+        }
+        if (const char* budget_env = std::getenv("ZLB_DMA_TICKS")) {
+            dma_win->set_budget(static_cast<u32>(std::strtoul(budget_env, nullptr, 0)));
+        }
+        dma_win->define(0x010, "CTRL_010");
+        dma_win->define(0x014, "CALLBACK_014");
+        dma_win->define(0x020, "DOORBELL");
+        // The completion routine 0x438400 reads these two and leaves at 0x438432
+        // when ([+0x28] & 3) == 0: they are the engine's transfer-finished status,
+        // which the guest never writes. They must be defined or RegisterBlock::write
+        // drops the hardware's update.
+        dma_win->define(0x024, "STATUS_024");
+        dma_win->define(0x028, "STATUS_028");
+        dma_win->define(0x02C, "MASK_02C", 0x07FFFFFF);
+        dma_win->define(0x030, "CTRL_030");
+        dma_win->define(0x03C, "CALLBACK_03C");
+        dma_win->define(0x100, "CTRL_100");
+        dma_win->define(0x104, "FIELD_104");
+        dma_win->define(0x200, "DESC_200");
+        dma_win->define(0x204, "DESC_204");
+        dma_win->define(0x208, "DESC_208");
+        dma_win->define(0x20C, "DESC_20C");
+        dma_win->define(0x210, "DESC_210");
+        dma_win->define(0x214, "DESC_214");
+        dma_win->define(0x218, "DESC_218");
+        dma_win->define(0x21C, "DESC_21C");
+        dma_win->define(0x220, "DESC_220");
+        dma_win->define(0x224, "DESC_224");
+        dma_win->define(0x228, "DESC_228");
+        dma_win->define(0x22C, "DESC_22C");
+        dma_win->define(0x230, "DESC_230");
+        dma_win->define(0x234, "DESC_234");
+        dma_win->define(0x238, "DESC_238");
+        dma_win->define(0x23C, "DESC_23C");
+        d.bus.add_device(std::move(dma_win));
+    }
+    // 0xE04E0000: the companion window of the DMA/secure engine. The kernel's device
+    // table maps it to physical 0x2802B000, and the engine driver (module code at
+    // 0x3BE5xx) writes +0x400 = 0x200000FF and +0x404 = 0xFFFFFFFF there. The window
+    // was unmapped, so both writes vanished. Storage only, like Kermit.DmaWin: the
+    // engine's semantics are not recovered.
+    {
+        auto eng_win = std::make_unique<kermit::RegisterBlock>("Kermit.EngWin", 0xE04E0000u, 0x1000u);
+        eng_win->define(0x400, "CFG_400");
+        eng_win->define(0x404, "CFG_404");
+        d.bus.add_device(std::move(eng_win));
+    }
+    // Windows the guest really writes but the model left unmapped. They come from
+    // the kernel's own device table (PA 0x40102E48: 0x28024000 -> 0xE20BE000,
+    // 0x28025000 -> 0xE3000000, 0x28026000 -> 0xE3010000, 0x28027000 -> 0xE5000000,
+    // 0x28028000 -> 0xE5010000, 0x28029000 -> 0xE0400000, 0x2802A000 -> 0xE0410000,
+    // 0x2802B000 -> 0xE04E0000, 0x2802C000 -> 0xE50C0000) plus the timer blocks the
+    // kernel programs at 0xE20B1000 and 0xE20BC000/0xE20BD000. Before this, ZLB_WTRAP
+    // showed them as <UNMAPPED>: 70 writes to E20B, 10 to E040, 5 to E010 and 4 to
+    // E300/E301 in a single boot. Storage only - the semantics are not recovered.
+    // The windows the guest kernel's device table declares but the model has no
+    // device for are installed by KermitBlock::install_kernel_windows(), which
+    // Vita::wire_bridges() calls *after* every mirror is on the bus. Installing
+    // them here would let a small storage window shadow a mirror that is attached
+    // later - Bus::find_device prefers the smallest window.
+
+    // 0xE20B7000: a second long-range timer channel, right after LT5.  The window
+    // was missing, so the guest's programming fell into unmapped space - measured
+    // with ZLB_WTRAP, the kernel writes +0x00/+0x04/+0x08/+0x0C = 0 and +0x14 = 3
+    // from pc 0xEA074..0xEA07C during boot, i.e. exactly LT5's counter/deadline/aux
+    // offsets.  The guest then never reads it back and never writes CONFIG, so it is
+    // modelled as storage with the timer's register names rather than as a second
+    // ticking timer: the interrupt it would raise is not known, and inventing one
+    // would be a guess (docs/STATUS.md).
+    {
+        auto timer_b = std::make_unique<kermit::RegisterBlock>("Kermit.TimerB", 0xE20B7000u, 0x1000u);
+        timer_b->define(0x00, "COUNTER_LO");
+        timer_b->define(0x04, "COUNTER_HI");
+        timer_b->define(0x08, "DEADLINE_LO");
+        timer_b->define(0x0C, "DEADLINE_HI");
+        timer_b->define(0x10, "AUX_LO");
+        timer_b->define(0x14, "AUX_HI");
+        timer_b->define(0x18, "CONFIG");
+        timer_b->define(0x1C, "STATUS");
+        d.bus.add_device(std::move(timer_b));
+    }
     // Round 142: 0x1D000000 is the hardware /dev/null window (wiki Physical_Memory):
     // SceMsif drains its data stream here.  An empty RegisterBlock is exactly that -
     // reads return 0 (no defined register) and writes are dropped.
@@ -856,9 +1060,84 @@ KermitBlock::KermitBlock(Bus& bus, EmmcCard* card) : impl_(std::make_unique<Impl
                  kermit::kUartBase, kermit::kSdif0Base, kermit::kDmaBase, kermit::kDisplayBase);
 }
 
+void KermitBlock::install_kernel_windows() {
+    Impl& d = *impl_;
+    // The window definitions that were measured good before the coverage commit
+    // e7ce6d6: eleven 4 KiB register files with the offsets the guest actually
+    // touches, plus the two timer banks. The coverage commit replaced them with
+    // offset-learning storage windows over 71 ranges and that changed the guest's
+    // own device probing: the run reaches the same point (254.9M ARM instructions,
+    // 306 SC commands) but the display driver never starts. Restoring these loses
+    // the 'no unmapped writes' coverage but brings the guest display back.
+    struct ExtraWindow {
+        const char* name;
+        u32 base;
+        u32 size;
+    };
+    static const ExtraWindow extra_windows[] = {
+        {"Kermit.Engine0400", 0xE0400000u, 0x1000u}, {"Kermit.Engine300", 0xE3000000u, 0x1000u},
+        {"Kermit.Engine301", 0xE3010000u, 0x1000u},  {"Kermit.Engine500", 0xE5000000u, 0x1000u},
+        {"Kermit.Engine501", 0xE5010000u, 0x1000u},  {"Kermit.EngineBE0", 0xE20BE000u, 0x1000u},
+        {"Kermit.Engine50C", 0xE50C0000u, 0x1000u},  {"Kermit.TimerB1", 0xE20B1000u, 0x1000u},
+        {"Kermit.TimerBC", 0xE20BC000u, 0x1000u},    {"Kermit.TimerBD", 0xE20BD000u, 0x1000u},
+        {"Kermit.Reg010", 0xE0100000u, 0x1000u},
+    };
+    for (const ExtraWindow& w : extra_windows) {
+        auto window = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
+        window->define(0x000, "W_000");
+        window->define(0x004, "W_004");
+        window->define(0x008, "W_008");
+        window->define(0x00C, "W_00C");
+        window->define(0x010, "W_010");
+        window->define(0x014, "W_014");
+        window->define(0x038, "W_038");
+        window->define(0x03C, "W_03C");
+        window->define(0x040, "W_040");
+        window->define(0x044, "W_044");
+        window->define(0x048, "W_048");
+        window->define(0x100, "W_100");
+        window->define(0x104, "W_104");
+        window->define(0x800, "W_800");
+        window->define(0x804, "W_804");
+        window->define(0x904, "W_904");
+        window->define(0x90C, "W_90C");
+        window->define(0x914, "W_914");
+        window->define(0x91C, "W_91C");
+        window->define(0x924, "W_924");
+        window->define(0x92C, "W_92C");
+        window->define(0x934, "W_934");
+        window->define(0x93C, "W_93C");
+        d.bus.add_device(std::move(window));
+    }
+
+    // The guest programs timer channels all over 0xE20B0000..0xE20BFFFF (it wrote
+    // 0xE20B1000, 0xE20B2000, 0xE20B3000, 0xE20B4000, 0xE20B5000, 0xE20B8000 and the
+    // 0xE20BC000/0xE20BD000 pair, each at +0x000..+0x01C). Kermit.TimerB covers
+    // 0xE20B7000, so two banks cover the remainder; every 0x20-byte block's first
+    // eight words are defined, which is what the guest touches.
+    for (const ExtraWindow& w : {ExtraWindow{"Kermit.TimerBankLo", 0xE20B0000u, 0x7000u},
+                                 ExtraWindow{"Kermit.TimerBankHi", 0xE20B8000u, 0x8000u}}) {
+        auto bank = std::make_unique<kermit::RegisterBlock>(w.name, w.base, w.size);
+        for (u32 block = 0; block < w.size; block += 0x20u) {
+            bank->define(block + 0x000u, "T_000");
+            bank->define(block + 0x004u, "T_004");
+            bank->define(block + 0x008u, "T_008");
+            bank->define(block + 0x00Cu, "T_00C");
+            bank->define(block + 0x010u, "T_010");
+            bank->define(block + 0x014u, "T_014");
+            bank->define(block + 0x018u, "T_018");
+            bank->define(block + 0x01Cu, "T_01C");
+        }
+        d.bus.add_device(std::move(bank));
+    }
+
+}
+
 KermitBlock::~KermitBlock() = default;
 
 void KermitBlock::install() { impl_->installed = true; }
+
+u64 KermitBlock::total_cycles() const { return impl_->total_cycles; }
 
 void KermitBlock::reset() {
     Impl& d = *impl_;

@@ -54,6 +54,7 @@ class Cpu {
   Bus* bus; std::string name; u64 instructions, cycles;
   bool halted; std::string halt_reason; u32 pc; bool undefined_instruction;
   std::set<u32> breakpoints;
+  bool step_text;                            // fill StepResult::text (default false)
 
   virtual Arch arch() const;                 // MeP / Arm / Rl78
   virtual const char* core_name() const;
@@ -78,10 +79,22 @@ class Cpu {
 `step()` must:
 1. set `bus->context.pc` and `bus->context.core` to the current PC / core name,
 2. execute exactly one instruction, updating `pc`, `instructions` and `cycles`,
-3. return a `StepResult` with the address, byte length and the disassembly text,
+3. return a `StepResult` with the address and byte length; leave `text` empty
+   unless `step_text` is set (see below),
 4. on an unimplemented encoding set `undefined_instruction = true` and fill
    `StepResult::faulted/fault` instead of throwing,
 5. never advance `pc` past an instruction it did not execute.
+
+**`StepResult::text` is opt-in.** Nothing in the machine, the debugger or the UI
+reads it — every caller discards the `StepResult` of a `step()`/`run()` — so
+formatting the listing in the hot path was pure cost. For the ARM core it was
+also wrong: the old code called `arm_disassemble(*bus, cur_instr_addr_, …)`, i.e.
+read the **virtual** address through the physical bus, which for kernel code with
+`VA != PA` is an unmapped access (and resolving one unmapped byte scans every
+device) and produced garbage text. Measure before touching this: forcing the
+listing back on costs ~4x on a boot-sized run. A tool that wants the text sets
+`step_text = true`; the undefined-instruction message still gets its listing
+unconditionally.
 
 `reset(u32 entry)` is how the boot chain starts a core at an explicit address.
 For ARM the low bit of `entry` selects Thumb state and must be honoured.

@@ -21,6 +21,7 @@
 
 #include "bus/bus.h"
 #include "cpu/cpu.h"
+#include "event/event.h"
 #include "loader/keys.h"
 #include "loader/loader.h"
 #include "machine/bootchain.h"
@@ -223,6 +224,20 @@ public:
 
     /// Emulated time in seconds since reset, derived from the ARM cycle count.
     double emulated_seconds() const;
+
+    /// The same clock in nanoseconds, integer and monotonic. This is the event
+    /// tracing timestamp (see src/event): a trace line and the UI graph describe
+    /// guest time, not host time.
+    u64 emulated_nanoseconds() const;
+
+    // ------------------------------------------------------------------
+    // Event tracing (ETW-style)
+    // ------------------------------------------------------------------
+
+    /// This machine's event session. `Vita::build()` makes it the process-wide
+    /// active log, so the bus, the devices and the cores emit into it.
+    EventLog& events() { return event_log_; }
+    const EventLog& events() const { return event_log_; }
 
     // ------------------------------------------------------------------
     // Boot chain
@@ -682,10 +697,23 @@ private:
 
     std::vector<std::string> milestones_;
     std::vector<std::string> events_;
+
+    /// Event tracing session plus the boot-stage Begin/End bookkeeping: a stage
+    /// opens an activity when it is entered and closes it when the stage changes,
+    /// so the timeline shows how long each link of the boot chain took.
+    EventLog event_log_;
+    u64 event_stage_activity_ = 0;
+    BootStage event_stage_ = BootStage::PowerOn;
+    void note_stage_change();
     BootStatus boot_;
     bool built_ = false;
     bool kernel_started_ = false;
     bool kernel_running_ = false;
+    /// Set once any core has been observed executing inside the NSKBL window
+    /// (VA 0x51000000).  The debug-only `stage nskbl` entry used to be the only
+    /// thing that moved `boot_.stage` off `arm-kernel-boot-loader`, so a normal
+    /// boot reported the boot loader for the whole run even after os0 had started.
+    bool nskbl_seen_ = false;
 
     /// Shared boot SRAM: the ARM boot ROM stages the second loader here and the
     /// CMeP reads it. Both buses alias the same host buffer at 0x1F000000.

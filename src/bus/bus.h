@@ -219,6 +219,10 @@ public:
 
 private:
     void note(AccessKind kind, u32 address, unsigned size, u64 value, Device* device, bool unmapped);
+
+    /// Human-readable target of an address for the ZLB_WTRAP/ZLB_RTRAP lines:
+    /// the memory region, the MMIO device, or "<UNMAPPED>" when nothing claims it.
+    std::string trap_target_name(u32 address) const;
     /// Record a fast-path RAM access when RAM tracing is enabled.
     void fast_trace(AccessKind kind, u32 address, unsigned size, u64 value);
     bool slow_read(u32 address, unsigned size, u64& out, Device*& device, bool fetch);

@@ -352,3 +352,43 @@ ZLB_TEST(debugger_arm_instruction_inspection_never_reads_mmio_or_repairs_faults)
     before_off.expect_unchanged(cpu);
     cpu.fault_hook = {};
 }
+
+// `step`/`run` and the history ring used to resolve Arch::Arm through
+// Vita::core(), which always returns arm0.  Selecting another Kermit core and
+// stepping therefore advanced the parked arm0 instead, and the history came back
+// empty ("history empty - enable it with 'history on'"), so the per-core
+// debugger was unusable for the quad-core kernel work.
+ZLB_TEST(debugger_step_and_history_follow_the_selected_arm_core) {
+    Vita& vita = debugger_test_vita();
+    Debugger& debugger = debugger_test_instance();
+    Bus& bus = vita.arm_bus();
+    auto& arm0 = *dynamic_cast<ArmCore*>(vita.arm_core(0));
+    auto& arm3 = *dynamic_cast<ArmCore*>(vita.arm_core(3));
+
+    constexpr u32 code = 0x43000000u;    // DRAM; `reset()` leaves the MMU off
+    bus.write32(code, 0xE2800001u);      // add r0, r0, #1
+    bus.write32(code + 4u, 0xE2800002u); // add r0, r0, #2
+    arm0.reset(code);
+    arm3.reset(code + 4u);
+    arm0.set_register("CPSR", arm::kModeSystem);
+    arm3.set_register("CPSR", arm::kModeSystem);
+    arm0.set_register("r0", 100);
+    arm3.set_register("r0", 200);
+    arm0.halted = false;
+    arm3.halted = false;
+
+    debugger.set_active_arch(Arch::Arm);
+    debugger.set_arm_core_index(3);
+    debugger.clear_history();
+    debugger.set_history_enabled(true);
+    debugger.step(1);
+    debugger.set_history_enabled(false);
+
+    ZLB_EXPECT_EQ(arm3.r[0], 202u);                         // the selected core ran
+    ZLB_EXPECT_EQ(static_cast<u32>(arm3.get_pc()), code + 8u);
+    ZLB_EXPECT_EQ(arm0.r[0], 100u);                         // the other core did not
+    ZLB_EXPECT_EQ(static_cast<u32>(arm0.get_pc()), code);
+    const auto history = debugger.history(Arch::Arm, 8);
+    ZLB_EXPECT_TRUE(!history.empty());
+    if (!history.empty()) ZLB_EXPECT_EQ(history.back(), code + 4u);
+}

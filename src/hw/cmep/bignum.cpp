@@ -31,6 +31,7 @@
 #include <cstring>
 
 #include "common/log.h"
+#include "event/providers.h"
 #include "hw/cmep/cmep_internal.h"
 
 namespace zlb {
@@ -332,6 +333,12 @@ void BignumDevice::finish_operation() {
     // operation reports "busy" (0x800F0010) until that has happened.
     owner_.flags_device().set_work_state(1);
     port_words_.clear();
+    if (events().should_record(EventProvider::Cmep, EventLevel::Verbose, event_keyword::kSecurity)) {
+        events().event(EventProvider::Cmep, ev::cmep::kBignum)
+            .field("op", (u64)1)
+            .field("bits", (u64)mod_words_ * 32u)
+            .emit();
+    }
 }
 
 u64 BignumDevice::read(u32 address, unsigned size) {
