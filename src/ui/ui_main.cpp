@@ -1512,16 +1512,40 @@ void UiApp::draw_display_panel(const UiRect& area) {
         "no framebuffer yet",
         "",
         "the guest has not submitted a supported display buffer.",
-        "open the Devices tab to inspect display state.",
     };
     const int count = static_cast<int>(sizeof(lines) / sizeof(lines[0]));
-    int y = view.y + std::max(4, view.h / 2 - (count * kLineHeight) / 2);
+    int y = view.y + std::max(4, view.h / 2 - (count * kLineHeight) / 2 - 3 * kLineHeight);
     for (int i = 0; i < count; ++i) {
         const int width_px = Canvas::text_width(lines[i]);
         canvas_.draw_text_clip(view, view.x + (view.w - width_px) / 2, y, lines[i],
                                i == 0 ? ui_theme::kWarn : ui_theme::kTextDim);
         y += kLineHeight;
     }
+
+    // Why there is no picture: the three devices on the path from the guest's
+    // display driver to the panel report their own state, which is what the
+    // Devices tab would show one by one.
+    y += kLineHeight;
+    for (const auto& device : vita_.arm_bus().devices()) {
+        if (!device) continue;
+        const std::string name = device->name();
+        if (name.find("IFTU") == std::string::npos && name.find("DSI") == std::string::npos &&
+            name.find("Display") == std::string::npos) {
+            continue;
+        }
+        const std::string summary = device->summary();
+        if (summary.empty()) continue;
+        canvas_.draw_text_clip(view, view.x + 8, y, format("%-16s %s", name.c_str(), summary.c_str()),
+                               ui_theme::kTextDim);
+        y += kLineHeight;
+    }
+
+    y += kLineHeight;
+    const std::string hint =
+        format("emulated %.3f s, stage=%s - the reference cold boot reaches the guest frame after "
+               "about 1M machine slices",
+               vita_.emulated_seconds(), to_string(vita_.stage()));
+    canvas_.draw_text_clip(view, view.x + 8, y, hint, ui_theme::kAccentDim);
 
     const std::string status = format("stage=%s  detail=%s", to_string(vita_.stage()),
                                       vita_.boot_status().detail.c_str());
