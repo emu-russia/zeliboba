@@ -438,7 +438,6 @@ struct EventsState {
     int focus = 0;
     /// The node the mouse hovers, or -1.
     int hover_row = -1;
-    std::string note;
 };
 
 enum class EditTarget { None, GotoDisassembly, GotoMemory };

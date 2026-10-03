@@ -19,8 +19,6 @@
 // graphs and the table show). The view filter object is shared with the
 // debugger's `event filter` command, so the GUI and the CLI never disagree.
 #include <algorithm>
-#include <cmath>
-#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -307,10 +305,6 @@ void UiApp::refresh_events() {
         state.table.push_back(std::move(row));
     }
     state.selected_row = std::max(0, std::min(state.selected_row, static_cast<int>(state.table.size()) - 1));
-
-    state.note = format("session %s  records %zu/%zu  total=%llu  filtered=%llu", log.recording() ? "ON" : "OFF",
-                        log.count(), log.capacity(), static_cast<unsigned long long>(log.total()),
-                        static_cast<unsigned long long>(log.filtered()));
 }
 
 // ---------------------------------------------------------------------------
