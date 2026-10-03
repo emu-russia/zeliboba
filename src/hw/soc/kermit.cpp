@@ -72,8 +72,14 @@ public:
             busy_ = false;
             RegisterBlock::write(base() + 0x024u, 4u, 0u);
             RegisterBlock::write(base() + 0x028u, 4u, 3u);
-            ZLB_LOG_INFO("machine", "module: DMA engine finished after the transfer budget -> pulse irq 0x%X", irq_);
-            if (raise_) raise_(irq_);
+            // The completion interrupt is off by default: the guest's completion
+            // routine polls +0x24/+0x28, and delivering the interrupt instead makes
+            // the display thread park on the completion event before it programs a
+            // scanout (measured: IFTU bank ADDRESS stays 0, DSI0 runs with no buffer).
+            // ZLB_DMA_IRQ=<n> turns the pulse back on for interrupt-path debugging.
+            ZLB_LOG_INFO("machine", "module: DMA engine finished after the transfer budget%s",
+                         irq_enabled_ ? " (pulsing the channel interrupt)" : "");
+            if (irq_enabled_ && raise_) raise_(irq_);
         }
     }
 
@@ -82,16 +88,18 @@ public:
     void write(zlb::u32 address, unsigned size, zlb::u64 value) override {
         RegisterBlock::write(address, size, value);
         if (enabled_ && address - base() == 0x020u && value != 0) {
-            // +0x24 bit 0 is BUSY, not done: the guest spins at 0x438046
-            // ("tst.w r3,#1; bne") until it clears, then checks [+0x28] at 0x438432
-            // for the finished channels. The engine completes as soon as it is armed.
-            // A poll-driven variant - finish on the first read of +0x24 - was tried
-            // and is *worse*: the thread sleeps on the completion event rather than
-            // polling (start #22 then hangs again, 22 starts / 21 results), so the
-            // engine has to complete unprompted. What is still not modelled is the
-            // transfer itself: the bytes never move.
+            // +0x24 bit 0 is BUSY and +0x28 is the finished-channel mask; the guest
+            // polls both. The module-start loop spins at 0x438046 ("tst.w r3,#1; bne")
+            // until BUSY clears, and the modules' completion routine 0x438400 bails
+            // out at 0x438432 while ([+0x28] & 3) == 0. So the doorbell claims BUSY
+            // *and* reports the finished channels in the same store, and the engine
+            // clears BUSY when the transfer budget expires - claiming only BUSY parks
+            // the display thread (measured: IFTU bank ADDRESS stays 0, BLANK stays 1,
+            // and the guest runs a frame loop with nothing to scan out), while
+            // finishing on a poll of +0x24 hangs the module loop at start #22.
+            // What is still not modelled is the transfer itself: no bytes move.
             RegisterBlock::write(base() + 0x024u, 4u, 1u);
-            RegisterBlock::write(base() + 0x028u, 4u, 0u);
+            RegisterBlock::write(base() + 0x028u, 4u, 3u);
             busy_ = true;
             budget_ = budget_ticks_;
             ZLB_LOG_INFO("machine", "module: DMA doorbell +0x020 = 0x%08X -> busy for %u ticks",
@@ -99,12 +107,13 @@ public:
         }
     }
 
-    void set_irq(zlb::u32 irq) { irq_ = irq; }
+    void set_irq(zlb::u32 irq) { irq_ = irq; irq_enabled_ = true; }
     void set_enabled(bool on) { enabled_ = on; }
 
 private:
     std::function<void(zlb::u32)> raise_;
     zlb::u32 irq_ = 0x7Cu;
+    bool irq_enabled_ = false;
     bool enabled_ = false;
     bool busy_ = false;
     zlb::u32 budget_ = 0;
