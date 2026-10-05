@@ -330,6 +330,17 @@ MeP-стадии (`first loader` → `second_loader` → `secure_kernel`) адр
 обменом через control bus (`stcb/ldcb`). Разбор и сравнительная таблица —
 **`docs/VIPIMG.md`**.
 
+## 7.2 Полный стек использования
+
+Как SDK-демки, user-библиотеки и kernel-модули доходят до Venezia/VIP —
+**`docs/VENEZIA_STACK.md`** (JPEG, AVC, ATRAC9/MP3/AAC/CELP, `sceAudiodecDecode`).
+
+## 7.3 NID обёртки Venezia
+
+`SceVeneziaWrapper` (16 функций; имена восстановлены — это
+`SceCodecEngineWrapper` / `_sceCodecEngine*`) и `SceVeneziaWrapperForDriver` (47) —
+восстановленные таблицы NID: **`docs/VENEZIA_WRAPPER_AVCODEC.md`**.
+
 ## 8. Что осталось нерешённым
 
 1. Семантика NID `0x6C2224BA` (экспортируемая переменная `vnzimg`).
