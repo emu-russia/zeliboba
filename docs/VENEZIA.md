@@ -29,6 +29,7 @@ Venezia — второй вычислительный движок SoC: отде
 | Отладка | JTAG/ICE, общий на control-MeP и Venezia |
 | CPU ID | `ldc $2,17` ($id) у восьми ядер = `0x00300500`, `0x00310500`, … `0x00370500` (номера ядер 48…55) — **по вики, в модели не проверено** |
 | SPRAM | PA `0x1F840000`, размер `0x20000` («SceVeneziaSpram») |
+| Родственный модуль | `os0/kd/vipimg.elf` = `SceVipImage` (VIP): тот же контейнер и NID, образ MeP на 360 КиБ, **без VLIW** — разбор в `docs/VIPIMG.md` |
 
 **SPRAM на этапе загрузки — проверено 2026-10.** Wiki
 ([Venezia](https://wiki.henkaku.xyz/vita/Venezia)) говорит: *SceVeneziaSpram
