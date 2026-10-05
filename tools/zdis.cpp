@@ -14,6 +14,7 @@
 #include "common/util.h"
 #include "cpu/cpu.h"
 #include "cpu/factory.h"
+#include "cpu/mep/mep_core.h"
 
 using namespace zlb;
 
@@ -26,6 +27,7 @@ void usage() {
         "  --offset <n>      skip n bytes into the file\n"
         "  --count <n>       number of instructions (default 64)\n"
         "  --thumb           start in Thumb state (ARM only)\n"
+        "  --vliw            start in MeP VLIW mode (Venezia IVC2 packets)\n"
         "  --arch-raw        print raw words instead of disassembling\n");
 }
 
@@ -58,6 +60,7 @@ int main(int argc, char** argv) {
     int count = 64;
     bool thumb = false;
     bool raw = false;
+    bool vliw = false;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -72,6 +75,7 @@ int main(int argc, char** argv) {
         else if (arg == "--offset") parse_u32(value(), offset);
         else if (arg == "--count") count = std::atoi(value().c_str());
         else if (arg == "--thumb") thumb = true;
+        else if (arg == "--vliw") vliw = true;
         else if (arg == "--arch-raw") raw = true;
         else {
             std::fprintf(stderr, "zdis: unknown option '%s'\n", arg.c_str());
@@ -110,8 +114,19 @@ int main(int argc, char** argv) {
         cpu->reset(load_base);
     }
 
+    if (vliw && arch == Arch::MeP) {
+        // Venezia's VLIW operating mode: the fetch unit pulls 64 bit packets and
+        // issues a core instruction together with the IVC2 slots.
+        if (auto* mep = dynamic_cast<MePCore*>(cpu.get())) {
+            mep->vliw_mode = true;
+        } else {
+            std::fprintf(stderr, "zdis: --vliw is only implemented for the MeP core\n");
+            return 2;
+        }
+    }
+
     std::printf("; %s: %s, %zu bytes at 0x%08X (%s)\n", path_filename(path).c_str(), to_string(arch), length,
-                load_base, thumb ? "thumb" : "default state");
+                load_base, thumb ? "thumb" : (vliw ? "vliw" : "default state"));
 
     if (raw) {
         for (size_t i = 0; i + 4 <= length; i += 4) {

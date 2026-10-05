@@ -13,6 +13,7 @@
 #include "common/log.h"
 #include "common/util.h"
 #include "cpu/factory.h"
+#include "cpu/mep/mep_ivc2.h"
 #include "event/providers.h"
 
 namespace zlb {
@@ -1662,6 +1663,36 @@ u32 MePCore::cond_packed() const {
 
 std::string MePCore::disassemble(u32 address, unsigned& length) {
     set_context(address);
+
+    // In VLIW operating mode (PSW.OM, Venezia only) the fetch unit pulls a 64
+    // bit packet and issues the core instruction together with one or two IVC2
+    // coprocessor slot instructions.  binutils prints the packet as
+    // "<core> + <slot> [ + <slot>]", and so does this.
+    if (vliw_mode) {
+        u8 bytes[8] = {};
+        for (unsigned i = 0; i < 8; ++i) bytes[i] = bus->read8(address + i);
+
+        const mep::Ivc2Packet packet = mep::ivc2_split_packet(bytes);
+        if (packet.valid) {
+            std::string text;
+            length = packet.core_length;
+            if (packet.has_core) {
+                const u32 word = bytes[0] | (static_cast<u32>(bytes[1]) << 8) |
+                                 (static_cast<u32>(bytes[2]) << 16) |
+                                 (static_cast<u32>(bytes[3]) << 24);
+                const mep::Insn* insn = mep::decode(word);
+                text = mep::format(*insn, word, address);
+            }
+            for (unsigned i = 0; i < packet.piece_count; ++i) {
+                if (!text.empty()) text += " + ";
+                text += mep::ivc2_disassemble_slot(packet.pieces[i].slot,
+                                                   packet.pieces[i].word, address);
+            }
+            length = packet.core_length + 4u * packet.piece_count;
+            return text;
+        }
+    }
+
     const u32 word = bus->fetch16(address) | (static_cast<u32>(bus->fetch16(address + 2)) << 16);
     const mep::Insn* insn = mep::decode(word);
     length = insn->len;
